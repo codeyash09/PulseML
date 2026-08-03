@@ -2,6 +2,8 @@
 
 > **Pulse — a live ML training debugger, GUI or CLI, any backend.**
 
+https://pulsedb.netlify.app/
+
 Pulse is a live machine learning training debugger designed to monitor tensors, track metrics, visualize heatmaps and line charts, and interact with an integrated AI analyst.
 
 ---
