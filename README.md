@@ -17,6 +17,18 @@ Pulse is a live machine learning training debugger designed to monitor tensors, 
 
 ---
 
+## Screenshots
+
+### Matrix Selection & Configuration
+*Choose specific variables to monitor or track everything automatically before launching your run.*
+<img width="1423" height="874" alt="Matrix Selection" src="https://github.com/user-attachments/assets/dc8f4047-3e63-4e2b-9d19-04ba54f27258" />
+
+### Live Dashboard & AI Analyst
+*Monitor live metrics while chatting directly with the AI Analyst to debug your model's performance in real time.*
+<img width="1296" height="806" alt="Live Dashboard" src="https://github.com/user-attachments/assets/e9c5e13f-7d2c-4f26-8157-c296bd9ac745" />
+
+---
+
 ## Installation
 
 1. Download the **Pulse** folder and place it in your project workspace.
