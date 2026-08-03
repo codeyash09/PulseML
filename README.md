@@ -6,7 +6,7 @@ PulseML is an intelligent, interactive debugging and monitoring tool designed fo
 
 ---
 
-## 🚀 Key Features
+## Key Features
 
 * **Flexible Matrix Tracking:** Easily select which matrices and metrics to track, or enable automatic tracking for all current and future variables (losses, errors, attention weights, layers, and custom counters).
 * **Interactive Live Dashboard:** Visualize your training runs in real time with dynamic charts, line graphs, and customizable axis configurations.
@@ -14,7 +14,7 @@ PulseML is an intelligent, interactive debugging and monitoring tool designed fo
 
 ---
 
-## 📸 Screenshots
+## Screenshots
 
 ### Matrix Selection & Configuration
 *Choose specific variables to monitor or track everything automatically before launching your run.*
@@ -26,13 +26,13 @@ PulseML is an intelligent, interactive debugging and monitoring tool designed fo
 
 ---
 
-## 🛠️ Installation & Usage
+## Installation & Usage
 
 1. **Download the Pulse Folder** and place it in your project workspace.
 2. **Import and call `auto_track()`** in your training script right before your training loop starts:
 
 ```python
-from pulse.pulse import auto_track
+from PULSE.pulse import auto_track
 
 # Initialize auto-tracking before the loop starts
 auto_track()
