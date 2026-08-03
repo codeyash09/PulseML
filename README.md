@@ -6,7 +6,7 @@ Pulse is a live machine learning training debugger designed to monitor tensors, 
 
 ---
 
-## 🚀 Key Features
+## Key Features
 
 * **GUI Mode:** Opens an interactive matrix picker with live shapes, followed by a live dashboard with a heatmap grid and an integrated AI chat panel.
 * **Smart Scalars:** Scalars (loss, accuracy, learning rate) automatically render as live step-charts rather than heatmaps. Loss-like scalars are auto-detected and pre-selected in the picker.
@@ -17,7 +17,7 @@ Pulse is a live machine learning training debugger designed to monitor tensors, 
 
 ---
 
-## 🛠️ Installation
+## Installation
 
 1. Download the **Pulse** folder and place it in your project workspace.
 2. Install the required dependencies:
@@ -31,7 +31,7 @@ Pulse is a live machine learning training debugger designed to monitor tensors, 
    ```bash
    pip install fpdf --break-system-packages
 
-## ⚡Quickstart & Usage
+##Quickstart & Usage
 
 In your training file, import auto_track from pulse and call it right before your training loop starts:
 ```python
@@ -46,5 +46,5 @@ for epoch in range(num_epochs):
     pass
 
 ```
-## 🔑 AI Chat & API Keys
+## AI Chat & API Keys
 To enable the AI chat panel, set the relevant provider's API key as an environment variable (e.g., ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, DEEPSEEK_API_KEY), or leave it unset to be prompted inside the GUI the first time you send a message.
