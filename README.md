@@ -43,7 +43,7 @@ Pulse is a live machine learning training debugger designed to monitor tensors, 
    ```bash
    pip install fpdf --break-system-packages
 
-##Quickstart & Usage
+## Quickstart & Usage
 
 In your training file, import auto_track from pulse and call it right before your training loop starts:
 ```python
