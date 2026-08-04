@@ -64,7 +64,7 @@ import tkinter as tk
 from tkinter import ttk, Toplevel, scrolledtext, simpledialog
 from PIL import Image, ImageTk
 
-from pulse_backend import (
+from PULSE.pulse_backend import (
     to_numpy, shape_of, tensor_kind, is_trackable, describe_tensor,
     statistics as backend_statistics, scalar_value,
 )
