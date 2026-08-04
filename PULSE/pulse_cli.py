@@ -19,7 +19,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
-from pulse_backend import (
+from PULSE.pulse_backend import (
     available_backends,
     describe_tensor,
     detect_backend,
@@ -27,7 +27,7 @@ from pulse_backend import (
     statistics,
     to_numpy,
 )
-from pulse_pdf import generate_heatmap_pdf
+from PULSE.pulse_pdf import generate_heatmap_pdf
 
 
 class PulseCLI:
