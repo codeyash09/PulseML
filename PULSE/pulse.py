@@ -69,6 +69,8 @@ from PULSE.pulse_backend import (
     statistics as backend_statistics, scalar_value,
 )
 
+import multiprocessing as mp
+
 import litellm
 
 
