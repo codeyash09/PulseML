@@ -42,6 +42,7 @@ will prompt you for one the first time you send a message.
 """
 import io
 import os
+import re
 import sys
 import json
 import time
@@ -89,6 +90,9 @@ TEXT_FAINT = "#5c5c64"
 ORANGE = "#ff5a1f"
 AMBER = "#ffb020"
 TEAL = "#14b8a6"
+
+FIND_MATCH = "#4a3f14"     
+FIND_MATCH_CUR = "#7a5f10"
 RED = "#ff4d4d"
 
 FONT_UI = ("Segoe UI", 10)
@@ -783,35 +787,28 @@ class MatrixConfigUI:
 # ============================================================================
 # chat: AI assistant panel wired to live matrix stats, briefed on its role
 # ============================================================================
-
 SYSTEM_PROMPT = (
-    "You are Pulse, an AI analyst embedded directly inside a live ML training debugger. "
-    "Your job is to help the user find and fix the root cause of instability in their training "
-    "run -- not to give generic machine learning advice.\n\n"
-    "WHAT YOU'RE GIVEN EACH TURN:\n"
-    "- Live statistics for every matrix/tensor the user is tracking: backend (PyTorch/TensorFlow/"
-    "NumPy/CuPy/JAX), shape, min, max, mean, std, and nan/inf counts.\n"
-    "- Scalars (loss, accuracy, learning rate -- anything shape ()) are tracked as a running "
-    "history and charted as a line graph; their stats include the latest value.\n"
-    "- Heatmap images of matrix/tensor variables when available (log-scale color, dark "
-    "background). Look for banding, dead rows/columns, saturation at the extremes, or regions "
-    "that break from the surrounding pattern -- these are usually the tell.\n"
-    "- The user's training code, but only on turns where they've checked 'Send Code' -- if it "
-    "isn't present, don't assume what the code looks like.\n\n"
-    "HOW TO REASON:\n"
-    "- Ground every claim in the specific numbers or image you were actually given. Name the "
-    "matrix and the exact pattern -- 'gradients has std=142.7 and 340 inf values, consistent with "
-    "an exploding gradient' beats 'you may have exploding gradients.'\n"
-    "- Common root causes worth checking against the data: NaN/Inf propagating from an earlier "
-    "layer, exploding or vanishing gradients, dead ReLU units, bad weight initialization, "
-    "learning rate too high, mismatched loss scaling, division by zero or log(0) in a custom "
-    "loss, unnormalized inputs, mixed-precision underflow.\n"
-    "- If code is available, point to the specific line or operation likely responsible. If it "
-    "isn't, say what you'd need to see, and note that checking 'Send Code' would let you look.\n"
-    "- If nothing in the current data looks abnormal, say so plainly rather than inventing a "
-    "problem to sound useful.\n\n"
-    "REMEMBER: WHENEVER THE USER ASKS FOR A DIAGNOSIS, GIVE IT IN ONE SENTENCE, THEN EXPLAIN YOUR REASONING AND THEN PROVIDE A SOLUTION. ALWAYS USE MATHEMATICAL REASONING TO DETERMINE THE ISSUE. IE IF THE REASON IS NUMERICAL INSTABILITY, USE MATH TO SHOW HOW AN ERROR IN THEIR CODE IS CAUSING IT, TRANSLATE EVERYTHING TO MATH\n"
-    "STYLE: Be concise and direct. Lead with the diagnosis or the most likely cause, not preamble."
+    "You are Pulse, an AI analyst embedded in a live ML training debugger. Your job is to find "
+    "the root cause of instability in the user's training run, not to give generic ML advice.\n\n"
+    "INPUTS EACH TURN:\n"
+    "- Live stats per tracked matrix/tensor: backend, shape, min, max, mean, std, nan/inf counts.\n"
+    "- Scalars (loss, accuracy, lr) as a running history with their latest value.\n"
+    "- Heatmap images (log-scale, dark background) when available — look for banding, dead rows/"
+    "columns, saturation, or regions breaking from the surrounding pattern.\n"
+    "- Line-numbered training code, only on turns where 'Send Code' is checked.\n\n"
+    "RESPONSE FORMAT (always, in this order):\n"
+    "1. **Diagnosis** — one sentence, the specific root cause.\n"
+    "2. **Reasoning** — grounded in the actual numbers/image you were given, expressed with real "
+    "math. E.g. if gradients have std=142.7, show the update magnitude: $\\Delta w = \\eta \\cdot "
+    "\\nabla L \\approx 0.01 \\times 142.7$, and explain why that blows up the weights. If it's a "
+    "log(0) or division issue, write the actual expression that hits the singularity. Reference "
+    "code by line number (e.g. `line 42`) when code was sent.\n"
+    "3. **Fix** — a concrete change, not a generic suggestion.\n\n"
+    "Ground every claim in the specific numbers or image you were actually given — 'gradients has "
+    "std=142.7 and 340 inf values' beats 'you may have exploding gradients.' If code is available, "
+    "point to the exact line; if it isn't, say what you'd need and that checking 'Send Code' would "
+    "help. If nothing looks abnormal, say so rather than inventing a problem.\n\n"
+    "Be concise. No preamble before the diagnosis."
 )
 
 # Provider/model choices for the chat panel dropdown. Kept to models that
@@ -900,7 +897,6 @@ PROVIDERS = {
     },
 }
 
-
 class ChatPanel(tk.Frame):
     def __init__(self, parent, get_manifest_fn, get_code_fn=None):
         super().__init__(parent, bg=PANEL)
@@ -932,7 +928,20 @@ class ChatPanel(tk.Frame):
         )
         self.transcript.tag_configure("who_user", foreground=TEAL, font=FONT_UI_BOLD)
         self.transcript.tag_configure("who_ai", foreground=ORANGE, font=FONT_UI_BOLD)
+        self.transcript.tag_configure("bold", font=FONT_UI_BOLD)
+        self.transcript.tag_configure("heading", font=("Segoe UI", 11, "bold"), foreground=AMBER)
+        self.transcript.tag_configure("inline_code", font=FONT_MONO, background=CARD_HOVER, foreground=TEAL)
+        self.transcript.tag_configure("code_block", font=FONT_MONO, background=CARD_HOVER, lmargin1=10, lmargin2=10)
+        self.transcript.tag_configure("math", font=("Cambria Math", 10), foreground=AMBER)
+        self.transcript.tag_configure("find_match", background=FIND_MATCH)
+        self.transcript.tag_configure("find_current", background=FIND_MATCH_CUR)
         self.transcript.pack(fill=tk.BOTH, expand=True, padx=14, pady=8)
+
+        self._find_matches = []
+        self._find_idx = -1
+        self._find_frame = None
+        self.transcript.bind("<Control-f>", lambda e: self._open_find_bar())
+        self.bind_all("<Control-f>", lambda e: self._open_find_bar())
 
         entry_frame = tk.Frame(self, bg=PANEL)
         entry_frame.pack(fill=tk.X, padx=14, pady=(0, 14))
@@ -963,7 +972,68 @@ class ChatPanel(tk.Frame):
 
         self._update_status_indicator()
 
+    def _open_find_bar(self):
+        if getattr(self, "_find_frame", None) is not None:
+            self._find_entry.focus_set()
+            return
+        self._find_frame = tk.Frame(self, bg=PANEL)
+        self._find_frame.pack(fill=tk.X, padx=14, pady=(0, 6))
+        self._find_var = tk.StringVar()
+        self._find_entry = tk.Entry(self._find_frame, textvariable=self._find_var, bg=CARD, fg=TEXT,
+                                     insertbackground=TEXT, relief="flat", font=FONT_UI)
+        self._find_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
+        self._find_entry.bind("<Return>", lambda e: self._find_next())
+        self._find_entry.bind("<KeyRelease>", lambda e: self._run_find())
+        tk.Button(self._find_frame, text="↓", command=self._find_next, bg=CARD, fg=TEXT,
+                  relief="flat", bd=0).pack(side=tk.LEFT, padx=2)
+        tk.Button(self._find_frame, text="✕", command=self._close_find_bar, bg=CARD, fg=TEXT,
+                  relief="flat", bd=0).pack(side=tk.LEFT, padx=2)
+        self._find_entry.focus_set()
+
+    def _close_find_bar(self):
+        self.transcript.tag_remove("find_match", "1.0", tk.END)
+        self.transcript.tag_remove("find_current", "1.0", tk.END)
+        self._find_frame.destroy()
+        self._find_frame = None
+
+    def _run_find(self):
+        query = self._find_var.get()
+        self.transcript.tag_remove("find_match", "1.0", tk.END)
+        self.transcript.tag_remove("find_current", "1.0", tk.END)
+        self._find_matches = []
+        self._find_idx = -1
+        if not query:
+            return
+        start = "1.0"
+        while True:
+            pos = self.transcript.search(query, start, stopindex=tk.END, nocase=True)
+            if not pos:
+                break
+            end = f"{pos}+{len(query)}c"
+            self.transcript.tag_add("find_match", pos, end)
+            self._find_matches.append((pos, end))
+            start = end
+        if self._find_matches:
+            self._find_idx = 0
+            self._goto_current_match()
+
+    def _goto_current_match(self):
+        self.transcript.tag_remove("find_current", "1.0", tk.END)
+        if not self._find_matches:
+            return
+        pos, end = self._find_matches[self._find_idx]
+        self.transcript.tag_add("find_current", pos, end)
+        self.transcript.see(pos)
+
+    def _find_next(self):
+        if not self._find_matches:
+            self._run_find()
+            return
+        self._find_idx = (self._find_idx + 1) % len(self._find_matches)
+        self._goto_current_match()
+
     def _has_active_key(self, provider_name):
+        
         env_var = PROVIDERS[provider_name]["env_key"]
         if env_var is None:
             return True
@@ -980,9 +1050,47 @@ class ChatPanel(tk.Frame):
         self.transcript.configure(state="normal")
         tag = "who_user" if who.startswith("You") else "who_ai"
         self.transcript.insert(tk.END, f"{who}\n", tag)
-        self.transcript.insert(tk.END, f"{text}\n\n")
+        self._insert_formatted(text)
+        self.transcript.insert(tk.END, "\n\n")
         self.transcript.configure(state="disabled")
         self.transcript.see(tk.END)
+
+    def _insert_formatted(self, text):
+        """Minimal markdown-ish renderer: ```code blocks```, `inline code`,
+        **bold**, and $math$/$$math$$ spans (rendered in a distinct color/
+        font rather than literally, since Tk can't do real LaTeX)."""
+        t = self.transcript
+        lines = text.split("\n")
+        in_code_block = False
+        for line in lines:
+            if line.strip().startswith("```"):
+                in_code_block = not in_code_block
+                continue
+            if in_code_block:
+                t.insert(tk.END, line + "\n", "code_block")
+                continue
+            if line.startswith("#"):
+                stripped = line.lstrip("#").strip()
+                t.insert(tk.END, stripped + "\n", "heading")
+                continue
+
+            # inline: **bold**, `code`, $math$
+            pos = 0
+            pattern = re.compile(r"(\*\*.+?\*\*|`.+?`|\$\$.+?\$\$|\$.+?\$)")
+            for m in pattern.finditer(line):
+                if m.start() > pos:
+                    t.insert(tk.END, line[pos:m.start()])
+                chunk = m.group(0)
+                if chunk.startswith("**"):
+                    t.insert(tk.END, chunk[2:-2], "bold")
+                elif chunk.startswith("`"):
+                    t.insert(tk.END, chunk[1:-1], "inline_code")
+                elif chunk.startswith("$$"):
+                    t.insert(tk.END, chunk[2:-2], "math")
+                else:
+                    t.insert(tk.END, chunk[1:-1], "math")
+                pos = m.end()
+            t.insert(tk.END, line[pos:] + "\n")
 
     def send(self):
         question = self.entry.get().strip()
@@ -1033,7 +1141,8 @@ class ChatPanel(tk.Frame):
         if include_code and self.get_code_fn:
             code = self.get_code_fn()
             if code:
-                context += f"\nTraining code (attached by user this turn):\n```python\n{code}\n```\n"
+                numbered = "\n".join(f"{i+1:>4} | {line}" for i, line in enumerate(code.splitlines()))
+                context += f"\nTraining code (line-numbered, attached by user this turn):\n```\n{numbered}\n```\n"
             else:
                 context += "\n(User checked 'Send Code' but no code text is available.)\n"
         return context
@@ -1071,8 +1180,8 @@ class ChatPanel(tk.Frame):
             response = litellm.completion(
                 model=model_name,
                 messages=[{"role": "system", "content": SYSTEM_PROMPT}] + self.history[-10:],
-                max_tokens=800,
-                timeout=30.0,
+                max_tokens=10000,
+                timeout=120.0,
             )
             answer = response.choices[0].message.content
         except Exception as e:
