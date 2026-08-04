@@ -48,17 +48,22 @@ Pulse is a live machine learning training debugger designed to monitor tensors, 
 ## Quickstart & Usage
 
 
-In your training file, import auto_track from pulse and call it right before your training loop starts (Make sure your loop is wrapped in an if __name__ == '__main__':):
+In your training file, import auto_track from pulse and call it right before your training loop starts (Make sure your loop is wrapped in an:
+```python
+   if __name__ == '__main__':
+```
 ```python
 from pulse.pulse import auto_track
 
 # Pass your training function for shape discovery (optional), or call directly
-auto_track()
+if __name__ == '__main__':
 
-# Your training loop
-for epoch in range(num_epochs):
-    # Training logic here
-    pass
+   auto_track()
+
+   # Your training loop
+   for epoch in range(num_epochs):
+       # Training logic here
+       pass
 
 ```
 ## AI Chat & API Keys
