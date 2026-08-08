@@ -1,300 +1,196 @@
 """
-pulse_backend.py
-================
+pulse_pdf.py
+============
 
-Universal backend abstraction for Pulse.
+Labeled PDF snapshot generation for Pulse CLI mode.
 
-Supported backends
-------------------
-- NumPy
-- CuPy
-- PyTorch
-- TensorFlow
-- JAX
+CLI mode never shows heatmaps on screen (see pulse_cli.py) -- matrices and
+tensors are only "tagged" as text. If the user opts in during
+`interactive_setup()`, this module is used instead to save an actual
+labeled heatmap of the tensor to disk each step, one PDF per variable per
+step, organized as:
 
-Everything else is treated as a generic Python object.
+    <output_dir>/<variable_name>/step000001.pdf
+    <output_dir>/<variable_name>/step000002.pdf
+    ...
 
-Pulse should ONLY communicate with this module instead of checking
-for torch/cupy/etc directly.
+Each PDF contains a title/header, the tensor's summary stats (shape,
+dtype, backend, device, min/max/mean/std, nan/inf counts), and a
+log-scale heatmap image of the tensor reduced to 2D.
+
+This module is intentionally standalone -- it does NOT import from pulse.py
+(which pulls in tkinter and other GUI-only dependencies that have no
+business loading in a headless CLI/Colab/SSH session). It only depends on
+pulse_backend.py, matplotlib (Agg backend, so no display is required), and
+fpdf.
 """
 from __future__ import annotations
 
+import os
+import time
+import tempfile
+
 import numpy as np
-from dataclasses import dataclass
-from typing import Any, Optional
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, LogNorm
 
-# ----------------------------------------------------------------------
-# Optional imports
-# ----------------------------------------------------------------------
+from fpdf import FPDF
 
-HAS_TORCH = False
-HAS_TF = False
-HAS_CUPY = False
-HAS_JAX = False
-
-try:
-    import torch
-    HAS_TORCH = True
-except Exception:
-    torch = None
-
-try:
-    import tensorflow as tf
-    HAS_TF = True
-except Exception:
-    tf = None
-
-try:
-    import cupy
-    HAS_CUPY = True
-except Exception:
-    cupy = None
-
-try:
-    import jax
-    import jax.numpy as jnp
-    HAS_JAX = True
-except Exception:
-    jax = None
-    jnp = None
+from PULSE.pulse_backend import to_numpy, tensor_kind, statistics, detect_backend
 
 
 # ----------------------------------------------------------------------
-# Metadata
+# theme -- kept in sync with pulse.py's palette but duplicated locally so
+# this module has zero dependency on pulse.py / tkinter.
 # ----------------------------------------------------------------------
 
-@dataclass
-class TensorInfo:
-    backend: str
-    kind: str
-    shape: tuple
-    ndim: int
-    dtype: str
-    device: Optional[str]
-    object: Any
+_BG = "#0a0a0c"
+_BORDER = "#26262e"
+_TEXT_DIM = "#98989f"
+
+_COLORS = [
+    (0.0, "#0b3d3a"),
+    (0.25, "#14b8a6"),
+    (0.5, "#0a0a0a"),
+    (0.75, "#ffb020"),
+    (1.0, "#ff5a1f"),
+]
+_CMAP = LinearSegmentedColormap.from_list("Heat", _COLORS)
+
+_FIG_SIZE = (6.0, 4.2)
+_FIG_DPI = 130
 
 
 # ----------------------------------------------------------------------
-# Backend detection
+# reduction: collapse any-ndim tensor down to a 2D array suitable for a
+# heatmap, without the interactive axis picker available in GUI mode.
+# Mirrors the *default* config in pulse.py (_default_config): first two
+# axes shown, everything past that fixed at index 0.
 # ----------------------------------------------------------------------
 
-def detect_backend(x):
-    if HAS_TORCH and isinstance(x, torch.Tensor):
-        return "PyTorch"
+def _reduce_to_2d(arr):
+    if arr.ndim == 0:
+        return arr.reshape(1, 1)
+    if arr.ndim == 1:
+        return arr.reshape(1, -1)
+    if arr.ndim == 2:
+        return arr
+    idx = [slice(None), slice(None)] + [0] * (arr.ndim - 2)
+    return arr[tuple(idx)]
 
-    if HAS_TF and tf.is_tensor(x):
-        return "TensorFlow"
 
-    if HAS_CUPY and isinstance(x, cupy.ndarray):
-        return "CuPy"
+def _render_heatmap_png(arr2d, path, var_name, step):
+    safe = np.abs(arr2d.astype(np.float64)) + 1e-12
 
-    if HAS_JAX:
+    # LogNorm needs finite, positive vmin/vmax. NaN/Inf entries are already
+    # reported separately via backend.statistics() on the original tensor --
+    # here they'd otherwise crash the norm (vmax=inf) or render as blank
+    # gaps (nan), so clamp them to the finite range for display purposes
+    # only, before computing bounds.
+    finite = safe[np.isfinite(safe)]
+    if finite.size:
+        vmin, vmax = finite.min(), finite.max()
+    else:
+        vmin, vmax = 1e-12, 1.0
+    safe = np.nan_to_num(safe, nan=vmin, posinf=vmax, neginf=vmin)
+
+    fig, ax = plt.subplots(figsize=_FIG_SIZE, dpi=_FIG_DPI, facecolor=_BG)
+    ax.set_facecolor(_BG)
+    ax.imshow(safe, cmap=_CMAP, norm=LogNorm(vmin=vmin, vmax=vmax), aspect="auto")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_color(_BORDER)
+    ax.set_title(f"{var_name}  ·  step {step}", color=_TEXT_DIM, fontsize=10)
+    fig.tight_layout(pad=0.6)
+    fig.savefig(path, facecolor=_BG)
+    plt.close(fig)
+
+
+# ----------------------------------------------------------------------
+# public entry point
+# ----------------------------------------------------------------------
+
+def generate_heatmap_pdf(var_name, value, step, output_dir="Pulse_Output"):
+    """Render `value` (any Pulse-trackable array/tensor, any backend) as a
+    labeled heatmap and save it as a one-page PDF at:
+
+        <output_dir>/<var_name>/step<NNNNNN>.pdf
+
+    Returns the path to the saved PDF.
+    """
+    var_dir = os.path.join(output_dir, var_name)
+    os.makedirs(var_dir, exist_ok=True)
+
+    arr = to_numpy(value)
+    kind = tensor_kind(value)
+    stats = statistics(value)
+    arr2d = _reduce_to_2d(arr)
+
+    # Render the heatmap to a temp PNG, then embed it in the PDF -- fpdf
+    # can only place raster images from a file path, not directly from an
+    # in-memory numpy array.
+    fd, tmp_png = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        _render_heatmap_png(arr2d, tmp_png, var_name, step)
+
+        pdf = FPDF(orientation="P", unit="mm", format="A4")
+        pdf.add_page()
+
+        pdf.set_fill_color(10, 10, 12)  # matches _BG
+        pdf.rect(0, 0, pdf.w, pdf.h, style="F")
+
+        pdf.set_text_color(245, 245, 247)
+        pdf.set_font("Helvetica", "B", 16)
+        pdf.cell(0, 10, "Pulse", ln=1)
+
+        pdf.set_text_color(152, 152, 159)
+        pdf.set_font("Helvetica", "", 11)
+        pdf.cell(0, 7, f"{var_name}  -  step {step}", ln=1)
+        pdf.cell(0, 6, time.strftime("%Y-%m-%d %H:%M:%S"), ln=1)
+        pdf.ln(4)
+
+        pdf.set_text_color(245, 245, 247)
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(0, 7, "Summary", ln=1)
+
+        pdf.set_font("Courier", "", 10)
+        pdf.set_text_color(200, 200, 205)
+        rows = [
+            ("backend", stats.get("backend")),
+            ("device", stats.get("device")),
+            ("kind", kind),
+            ("shape", stats.get("shape")),
+            ("dtype", stats.get("dtype")),
+            ("min", stats.get("min")),
+            ("max", stats.get("max")),
+            ("mean", stats.get("mean")),
+            ("std", stats.get("std")),
+            ("nan", stats.get("nan")),
+            ("inf", stats.get("inf")),
+        ]
+        for label, val in rows:
+            formatted = f"{val:.6g}" if isinstance(val, float) else str(val)
+            pdf.cell(0, 6, f"{label:<8} {formatted}", ln=1)
+
+        if stats.get("nan") or stats.get("inf"):
+            pdf.set_text_color(255, 77, 77)
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.cell(0, 7, "WARNING: NaN/Inf values present in this tensor", ln=1)
+
+        pdf.ln(4)
+        img_w = pdf.w - 20
+        pdf.image(tmp_png, x=10, w=img_w)
+
+        out_path = os.path.join(var_dir, f"step{step:06d}.pdf")
+        pdf.output(out_path)
+    finally:
         try:
-            if isinstance(x, jax.Array):
-                return "JAX"
-        except Exception:
+            os.remove(tmp_png)
+        except OSError:
             pass
 
-    if isinstance(x, np.ndarray):
-        return "NumPy"
-
-    return "Python"
-
-
-# ----------------------------------------------------------------------
-# Device
-# ----------------------------------------------------------------------
-
-def device_of(x):
-    backend = detect_backend(x)
-
-    if backend == "PyTorch":
-        return str(x.device)
-
-    if backend == "TensorFlow":
-        try:
-            return x.device
-        except Exception:
-            return None
-
-    if backend == "CuPy":
-        try:
-            return f"cuda:{x.device.id}"
-        except Exception:
-            return "cuda"
-
-    if backend == "JAX":
-        try:
-            return str(x.device())
-        except Exception:
-            return None
-
-    return "CPU"
-
-
-# ----------------------------------------------------------------------
-# Shape
-# ----------------------------------------------------------------------
-
-def shape_of(x):
-    try:
-        return tuple(x.shape)
-    except Exception:
-        return ()
-
-
-def ndim_of(x):
-    return len(shape_of(x))
-
-
-# ----------------------------------------------------------------------
-# Type classification
-# ----------------------------------------------------------------------
-def scalar_value(x):
-    """
-    Extract a Python float from any scalar tensor across all supported backends.
-    Pulse expects this helper to exist.
-    """
-    arr = to_numpy(x)
-    if arr.shape != () and arr.size != 1:
-        raise ValueError(f"scalar_value expected a scalar, got shape {arr.shape}")
-    return float(arr)
-
-def tensor_kind(x):
-    shape = shape_of(x)
-
-    if shape == ():
-        return "scalar"
-
-    if len(shape) == 1:
-        return "vector"
-
-    if len(shape) == 2:
-        return "matrix"
-
-    return "tensor"
-
-
-def is_scalar(x):
-    return tensor_kind(x) == "scalar"
-
-
-def is_vector(x):
-    return tensor_kind(x) == "vector"
-
-
-def is_matrix(x):
-    return tensor_kind(x) == "matrix"
-
-
-def is_tensor(x):
-    return tensor_kind(x) == "tensor"
-
-
-# ----------------------------------------------------------------------
-# Conversion
-# ----------------------------------------------------------------------
-
-def to_numpy(x):
-    backend = detect_backend(x)
-
-    if backend == "NumPy":
-        return x
-
-    if backend == "PyTorch":
-        return x.detach().cpu().numpy()
-
-    if backend == "TensorFlow":
-        return x.numpy()
-
-    if backend == "CuPy":
-        return cupy.asnumpy(x)
-
-    if backend == "JAX":
-        return np.asarray(x)
-
-    if isinstance(x, (int, float, complex, bool)):
-        return np.asarray(x)
-
-    try:
-        return np.asarray(x)
-    except Exception:
-        raise TypeError(f"Cannot convert {type(x)} to numpy.")
-
-
-# ----------------------------------------------------------------------
-# Metadata (renamed from inspect to avoid stdlib conflict)
-# ----------------------------------------------------------------------
-
-def describe_tensor(x):
-    backend = detect_backend(x)
-    arr = to_numpy(x)
-
-    return TensorInfo(
-        backend=backend,
-        kind=tensor_kind(x),
-        shape=tuple(arr.shape),
-        ndim=arr.ndim,
-        dtype=str(arr.dtype),
-        device=device_of(x),
-        object=x,
-    )
-
-
-# ----------------------------------------------------------------------
-# Human-readable labels
-# ----------------------------------------------------------------------
-
-def label(x):
-    info = describe_tensor(x)
-    return f"{info.backend} {info.kind} {info.shape}"
-
-
-# ----------------------------------------------------------------------
-# Supported backends
-# ----------------------------------------------------------------------
-
-def available_backends():
-    return {
-        "NumPy": True,
-        "PyTorch": HAS_TORCH,
-        "TensorFlow": HAS_TF,
-        "CuPy": HAS_CUPY,
-        "JAX": HAS_JAX,
-    }
-
-
-# ----------------------------------------------------------------------
-# Statistics
-# ----------------------------------------------------------------------
-
-def statistics(x):
-    arr = to_numpy(x).astype(np.float64)
-    finite = arr[np.isfinite(arr)]
-
-    return {
-        "shape": tuple(arr.shape),
-        "dtype": str(arr.dtype),
-        "backend": detect_backend(x),
-        "kind": tensor_kind(x),
-        "device": device_of(x),
-        "min": float(finite.min()) if finite.size else None,
-        "max": float(finite.max()) if finite.size else None,
-        "mean": float(finite.mean()) if finite.size else None,
-        "std": float(finite.std()) if finite.size else None,
-        "nan": int(np.isnan(arr).sum()),
-        "inf": int(np.isinf(arr).sum()),
-    }
-
-
-# ----------------------------------------------------------------------
-# Variable filtering
-# ----------------------------------------------------------------------
-
-def is_trackable(obj):
-    try:
-        # If describe_tensor and to_numpy both succeed, we consider it trackable.
-        describe_tensor(obj)
-        return True
-    except Exception:
-        return False
+    return out_path
