@@ -1180,8 +1180,8 @@ class ChatPanel(tk.Frame):
             response = litellm.completion(
                 model=model_name,
                 messages=[{"role": "system", "content": SYSTEM_PROMPT}] + self.history[-10:],
-                max_tokens=10000,
-                timeout=120.0,
+                max_tokens=20000,
+                timeout=240.0,
             )
             answer = response.choices[0].message.content
         except Exception as e:
@@ -1757,7 +1757,7 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
         return
 
     if active_mode == "cli":
-        _start_cli_tracker(caller_frame, root, throttle_interval, discovered, runtime_shapes)
+        _start_cli_tracker(caller_frame, root, throttle_interval, discovered, runtime_shapes, code_text)
         return
 
     # ---- UI mode ----
@@ -1836,14 +1836,27 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
     caller_frame.f_trace = persistent_tracer
 
 
-def _start_cli_tracker(caller_frame, root, throttle_interval, discovered, runtime_shapes):
+def _start_cli_tracker(caller_frame, root, throttle_interval, discovered, runtime_shapes, code_text=None):
     """CLI mode: synchronous, in-process -- no subprocess, no multiprocessing
     Queue, no pickling tensors across a process boundary (which can be
     genuinely broken for CUDA tensors anyway). Just prints as training runs
-    and, per your setup choice, saves labeled PDF snapshots."""
+    and, per your setup choice, saves labeled PDF snapshots. The CLI also
+    provides the same AI agent/provider selection flow as the GUI.
+
+    `discovered`/`runtime_shapes` are the exact same static-AST + in-scope
+    merge that feeds the GUI's `MatrixConfigUI` picker (see
+    `_discover_candidates`). Previously this function ignored both and only
+    offered whatever happened to be a local variable at the first traced
+    line -- so anything assigned later in the loop, or only reachable
+    inside a nested function that hadn't run yet, never showed up in the
+    CLI's setup menu even though the GUI would have listed it (as
+    "not run yet"). Threading them through here brings CLI discovery in
+    line with the GUI.
+    """
     from .pulse_cli import PulseCLI
 
-    cli = PulseCLI()
+    cli = PulseCLI(discovered={name: runtime_shapes.get(name) for name in discovered})
+    cli.set_code_text(code_text)
     cli.print_banner()
 
     setup_done = {"value": False}
@@ -1861,17 +1874,40 @@ def _start_cli_tracker(caller_frame, root, throttle_interval, discovered, runtim
 
         local_vars = frame.f_locals
 
+        # Fill in shapes for statically-discovered names as soon as they
+        # actually resolve to a value -- same as the GUI's shape_tracer
+        # dry-run, just kept live instead of front-loaded into a single
+        # pre-pass.
+        for name, val in local_vars.items():
+            if name in cli.discovered and cli.discovered.get(name) is None and is_trackable(val):
+                cli.discovered[name] = shape_of(val)
+
         if not setup_done["value"]:
-            trackable = {n: v for n, v in local_vars.items() if not n.startswith("__") and is_trackable(v)}
-            if trackable:
+            has_resolved_shape = any(shape is not None for shape in cli.discovered.values())
+            has_trackable_local = any(
+                not n.startswith("__") and is_trackable(v) for n, v in local_vars.items()
+            )
+            if has_resolved_shape or has_trackable_local:
                 cli.watch_locals = local_vars
                 cli.interactive_setup()
                 setup_done["value"] = True
             return cli_tracer
 
+        cli.watch_locals = local_vars
+
+        # Auto mode (the CLI's equivalent of the GUI's "track every matrix
+        # automatically" toggle): keep picking up newly-trackable locals as
+        # the loop runs, instead of being limited to what was chosen once
+        # at setup time.
+        if cli.auto_mode:
+            for name, val in local_vars.items():
+                if name.startswith("__"):
+                    continue
+                if is_trackable(val) and name not in cli.tracked_vars:
+                    cli.tracked_vars.append(name)
+
         now = time.time()
         if now - last_logged["t"] > throttle_interval:
-            cli.watch_locals = local_vars
             cli.update()
             last_logged["t"] = now
 
