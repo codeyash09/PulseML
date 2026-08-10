@@ -12,7 +12,7 @@ Pulse is a live machine learning training debugger designed to monitor tensors, 
 
 * **GUI Mode:** Opens an interactive matrix picker with live shapes, followed by a live dashboard with a heatmap grid and an integrated AI chat panel.
 * **Smart Scalars:** Scalars (loss, accuracy, learning rate) automatically render as live step-charts rather than heatmaps. Loss-like scalars are auto-detected and pre-selected in the picker.
-* **CLI Mode:** Built for Colab, SSH, or headless environments, printing tensor stats step-by-step, displaying live ASCII charts for scalars, and supporting optional labeled PDF snapshots.
+* **CLI Mode:** Built for Colab, SSH, or headless environments, printing tensor stats step-by-step, displaying live ASCII charts for scalars, and supporting optional labeled PDF snapshots. Allows for training pausing which allows for the user to tag new matrices and also ask AI to interpret results.
 * **Universal Backend Support:** Automatically detects and works with NumPy, PyTorch, TensorFlow, CuPy, and JAX via `pulse_backend.py`.
 * **High Performance:** Keeps CPU usage low by converting tensors to host-side NumPy arrays, reusing Matplotlib figures (`set_data`) instead of rebuilding them every step, and matching render thumbnail sizes.
 * **Pulse AI Analyst:** Context-aware chat panel briefed on its role that can inspect live matrix statistics, heatmaps, and your training code when "Send Code" is enabled.
