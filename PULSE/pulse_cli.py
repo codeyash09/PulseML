@@ -1,16 +1,6 @@
 """
 pulse_cli.py
 ============
-
-Command-Line Edition of Pulse for Google Colab, SSH, and headless servers.
-
-No GUI, no heatmap images displayed inline -- matrices/tensors are just
-"tagged" (their stats printed each step). Scalars (loss, accuracy, lr,
-anything shape ()) get a live ASCII history chart instead, since that's
-cheap to render as text. If you opt in during setup, matrix/tensor
-snapshots are additionally saved as labeled PDFs (one folder per variable,
-one file per step) via pulse_pdf.generate_heatmap_pdf, for cases where you
-want the actual heatmap later even though nothing's shown on screen now.
 """
 
 from __future__ import annotations
@@ -140,11 +130,20 @@ class PulseCLI:
         self.agent_key: Optional[str] = None
         self.agent_history: List[Dict[str, Any]] = []
         self.code_text: Optional[str] = None
-        
+
+        # Matrix/tensor probing is intentionally decoupled from the training loop.
+        # statistics() on GPU arrays can force a device->host synchronization, so
+        # NEVER run it for tagged matrices on every training step.
+        self._matrix_cache: Dict[str, Dict[str, Any]] = {}
+        self._matrix_cached_vars: set[str] = set()
+        self._last_matrix_probe: float = 0.0
+        self.matrix_probe_interval: float = 1.0
+
         # Interactive Mode & Interrupt Handling
         self.continuous = False
         self.original_sigint = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGINT, self._sigint_handler)
+
 
     def _sigint_handler(self, sig, frame):
         """Intercept Ctrl+C during continuous execution to drop into the debugger."""
@@ -188,6 +187,7 @@ class PulseCLI:
     def _cmd_add(self, var_name: str) -> None:
         if var_name not in self.tracked_vars:
             self.tracked_vars.append(var_name)
+            self._matrix_cached_vars.discard(var_name)
             print(f"✓ Added '{var_name}' to tracking.")
         else:
             print(f"'{var_name}' is already tracked.")
@@ -616,11 +616,13 @@ class PulseCLI:
         return answer
 
     def update(self, step: Optional[int] = None, generate_pdfs: Optional[bool] = None) -> None:
-        """Called at every training step/checkpoint."""
+        """Called at every training step/checkpoint.
 
-        # ANSI Escape Code to cleanly wipe the terminal screen and reset cursor position.
-        sys.stdout.write("\033[2J\033[H")
-        sys.stdout.flush()
+        Scalars are cheap and are sampled every update. Matrix/tensor statistics
+        are expensive (especially on GPU), so they are probed at most once per
+        ``matrix_probe_interval`` seconds. Between probes, Pulse does not even
+        slice or call statistics() on matrices; it only uses the cached result.
+        """
 
         if step is not None:
             self.step = step
@@ -628,9 +630,22 @@ class PulseCLI:
             self.step += 1
 
         want_pdfs = self.generate_pdfs if generate_pdfs is None else generate_pdfs
+        now = time.monotonic()
 
-        print(f"--- Pulse Live Debugger | Step {self.step} ---")
+        # First call probes immediately. After that, matrix inspection is capped
+        # by wall-clock time rather than training-step count.
+        probe_matrices = (
+            not self._matrix_cache
+            or (now - self._last_matrix_probe) >= self.matrix_probe_interval
+            or any(v not in self._matrix_cached_vars for v in self.tracked_vars)
+        )
 
+        scalar_lines: List[tuple[str, float]] = []
+        matrix_lines: List[tuple[str, Dict[str, Any], Any, bool]] = []
+        any_scalar_changed = False
+
+        # Fast path: discover/process scalars every step. Do NOT call
+        # _yield_slices() for matrices unless this is an actual matrix probe.
         for var_name in self.tracked_vars:
             if var_name not in self.watch_locals:
                 continue
@@ -639,37 +654,108 @@ class PulseCLI:
             if not is_trackable(orig_val):
                 continue
 
+            try:
+                kind = describe_tensor(orig_val).kind
+            except Exception:
+                kind = None
+
+            if kind == "scalar":
+                stats = statistics(orig_val)
+                scalar_val = float(to_numpy(orig_val).reshape(-1)[0])
+                hist = self.scalar_histories.setdefault(var_name, [])
+                changed = not hist or hist[-1] != scalar_val
+                if changed:
+                    hist.append(scalar_val)
+                    any_scalar_changed = True
+                scalar_lines.append((var_name, scalar_val))
+                continue
+
+            # Matrix/tensor path. No slicing, no statistics(), and no GPU->CPU
+            # copy at all unless the wall-clock probe is due.
+            if not probe_matrices:
+                continue
+
             for sub_name, val in self._yield_slices(var_name, orig_val):
-                stats = statistics(val)
+                try:
+                    stats = statistics(val)
+                except Exception:
+                    continue
 
-                if stats["kind"] == "scalar":
+                if stats.get("kind") == "scalar":
                     scalar_val = float(to_numpy(val).reshape(-1)[0])
-                    self.scalar_histories.setdefault(sub_name, []).append(scalar_val)
-
-                    print(f"  • {sub_name}: {scalar_val:.4f}")
-                    self._print_ascii_chart(sub_name, self.scalar_histories[sub_name])
+                    hist = self.scalar_histories.setdefault(sub_name, [])
+                    changed = not hist or hist[-1] != scalar_val
+                    if changed:
+                        hist.append(scalar_val)
+                        any_scalar_changed = True
+                    scalar_lines.append((sub_name, scalar_val))
                 else:
+                    self._matrix_cache[sub_name] = {
+                        "base_name": var_name,
+                        "stats": stats,
+                    }
+                    matrix_lines.append((sub_name, stats, val, True))
+
+            self._matrix_cached_vars.add(var_name)
+
+        if probe_matrices:
+            self._last_matrix_probe = now
+
+        # Don't redraw the entire terminal if absolutely nothing visible changed.
+        # A matrix probe always redraws because its snapshot may have changed.
+        should_redraw = probe_matrices or any_scalar_changed or not self.scalar_histories
+
+        if should_redraw:
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
+            print(f"--- Pulse Live Debugger | Step {self.step} ---")
+
+            for sub_name, scalar_val in scalar_lines:
+                hist = self.scalar_histories.get(sub_name, [])
+                print(f"  • {sub_name}: {scalar_val:.6g}")
+                self._print_ascii_chart(sub_name, hist)
+
+            if probe_matrices:
+                # Print matrix statistics ONLY when they were freshly measured.
+                # Cached matrices are deliberately silent between probes.
+                for sub_name, stats, val, fresh in matrix_lines:
                     flag = ""
-                    if stats["nan"] or stats["inf"]:
-                        flag = f"  ⚠ nan={stats['nan']} inf={stats['inf']}"
+                    if stats.get("nan") or stats.get("inf"):
+                        flag = f"  ⚠ nan={stats.get('nan')} inf={stats.get('inf')}"
                     print(
-                        f"  • Tagging '{sub_name}' [{stats['backend']} {stats['kind']} {stats['shape']}] "
-                        f"| mean={stats['mean']:.4f} min={stats['min']:.4f} max={stats['max']:.4f}{flag}"
+                        f"  • Tagging '{sub_name}' "
+                        f"[{stats.get('backend')} {stats.get('kind')} {stats.get('shape')}] "
+                        f"| mean={stats.get('mean'):.4f} min={stats.get('min'):.4f} "
+                        f"max={stats.get('max'):.4f}{flag}"
                     )
 
-                    if want_pdfs:
+                    if want_pdfs and val is not None:
                         safe_name = sub_name.replace("[", "_").replace("]", "").replace(",", "_")
-                        pdf_path = generate_heatmap_pdf(safe_name, val, self.step, output_dir=self.pdf_dir)
-                        print(f"    ↳ saved snapshot: {pdf_path}")
+                        try:
+                            pdf_path = generate_heatmap_pdf(
+                                safe_name, val, self.step, output_dir=self.pdf_dir
+                            )
+                            print(f"    ↳ saved snapshot: {pdf_path}")
+                        except Exception as exc:
+                            print(f"    ↳ ⚠ failed to save PDF snapshot for '{sub_name}': {exc}")
 
-        # If continuous mode is enabled, bail out immediately to keep the loop spinning fast.
+                # If the cache is already populated, show a tiny status line rather
+                # than reprinting every cached matrix on every training iteration.
+                if self._matrix_cache:
+                    print(
+                        f"  [matrices cached: {len(self._matrix_cache)} | "
+                        f"next probe ≤ {self.matrix_probe_interval:g}s]"
+                    )
+
         if self.continuous:
             return
 
         # Interactive Training Loop Prompt
         while True:
             try:
-                cmd = input("\nPulse [Enter=step, /c=continuous, /add <var>, /edit <var>, or ask AI] > ").strip()
+                cmd = input(
+                    "\nPulse [Enter=step, /c=continuous, /add <var>, /edit <var>, or ask AI] > "
+                ).strip()
             except (EOFError, KeyboardInterrupt):
                 print("\nExiting Pulse...")
                 if self.original_sigint and callable(self.original_sigint):
@@ -696,41 +782,88 @@ class PulseCLI:
                 continue
 
             if cmd.lower() == "/tracked":
-                cfg_strs = [f"{v}({self.var_configs[v]})" if v in self.var_configs else v for v in self.tracked_vars]
+                cfg_strs = [
+                    f"{v}({self.var_configs[v]})" if v in self.var_configs else v
+                    for v in self.tracked_vars
+                ]
                 print("Tracked:", ", ".join(cfg_strs) if cfg_strs else "(none)")
                 continue
 
-            # If it's not a recognized command, pass it to the agent as a question.
             print("Pulse AI > ", end="", flush=True)
             answer = self.ask_agent(cmd, include_code=False)
             print(answer)
 
-    def _print_ascii_chart(self, name: str, history: List[float], height: int = 5, width: int = 30) -> None:
-        """Renders a simple ASCII history chart in the terminal -- this is
-        the CLI's equivalent of the GUI's loss/scalar line graph."""
+    def _print_ascii_chart(
+        self,
+        name: str,
+        history: List[float],
+        height: int = 8,
+        width: int = 64,
+    ) -> None:
+        """Render a compact line-style loss/metric graph.
+
+        The X axis advances only when the scalar value changes, so repeated
+        training-loop calls do not create fake horizontal steps.
+        """
         if not history:
             return
 
         data = history[-width:]
-        min_val = min(data)
-        max_val = max(data)
-        val_range = max_val - min_val if max_val != min_val else 1.0
+        if len(data) == 1:
+            print(f"    {data[0]:>10.5g} ┤ ●")
+            print("              └─ step 1")
+            return
 
-        print(f"    [{name} history over last {len(data)} steps]")
-        blocks = " ▂▃▄▅▆▇█"
+        lo = min(data)
+        hi = max(data)
 
-        for h in range(height - 1, -1, -1):
-            threshold = min_val + (h / (height - 1)) * val_range if height > 1 else max_val
-            line = f"    {threshold:7.2f} ┤ "
-            for val in data:
-                normalized = (val - min_val) / val_range if val_range > 0 else 0.5
-                block_idx = int(normalized * (len(blocks) - 1))
-                block_idx = max(0, min(block_idx, len(blocks) - 1))
+        # Give flat/near-flat curves a useful visible range.
+        if hi == lo:
+            pad = max(abs(hi) * 0.02, 1e-6)
+            lo -= pad
+            hi += pad
+        else:
+            pad = (hi - lo) * 0.08
+            lo -= pad
+            hi += pad
 
-                row_frac = h / (height - 1) if height > 1 else 0.5
-                if normalized >= row_frac - (1.0 / (height * 2)):
-                    line += blocks[block_idx]
-                else:
-                    line += " "
-            print(line)
-        print(f"            └" + "─" * len(data))
+        rows = height
+        cols = len(data)
+        grid = [[" "] * cols for _ in range(rows)]
+
+        def y_for(v: float) -> int:
+            norm = (v - lo) / (hi - lo)
+            return max(0, min(rows - 1, int(round((1.0 - norm) * (rows - 1)))))
+
+        ys = [y_for(v) for v in data]
+
+        # Plot points and simple line segments.
+        for i, y in enumerate(ys):
+            grid[y][i] = "●"
+            if i == 0:
+                continue
+            py = ys[i - 1]
+            x = i - 1
+            if py == y:
+                grid[y][x] = "─"
+            else:
+                ch = "╱" if y < py else "╲"
+                grid[y][x] = ch
+                # Fill vertical movement without trying to interpolate a fake
+                # curve; this keeps the terminal graph readable.
+                step_dir = 1 if y > py else -1
+                rr = py + step_dir
+                while rr != y:
+                    if grid[rr][x] == " ":
+                        grid[rr][x] = "│"
+                    rr += step_dir
+
+        print(f"    [{name} | {len(history)} points | showing last {cols}]")
+
+        for r in range(rows):
+            value = hi - (hi - lo) * (r / (rows - 1))
+            print(f"    {value:>10.5g} ┤ " + "".join(grid[r]))
+
+        print("              └" + "─" * cols)
+        print(f"               {max(1, len(history) - cols + 1):<{max(1, cols // 2)}}"
+              f"{len(history)}")
