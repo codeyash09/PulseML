@@ -53,6 +53,10 @@ New Loss Curve after Pulse
 *Monitor live metrics while chatting directly with the AI Analyst to debug your model's performance in real time.*
 <img width="1296" height="806" alt="Live Dashboard" src="https://github.com/user-attachments/assets/e9c5e13f-7d2c-4f26-8157-c296bd9ac745" />
 
+### CLI Dashboard:
+<img width="666" height="572" alt="image" src="https://github.com/user-attachments/assets/d6978fea-ddcb-43cc-aded-f35a9636abd9" />
+
+
 ---
 
 ## Installation
