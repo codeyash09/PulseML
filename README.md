@@ -19,6 +19,25 @@ Pulse is a live machine learning training debugger designed to monitor tensors, 
 
 ---
 
+## Past Debugs
+
+- Debugged my own LLM (Yash-GPT) after I swapped out the vocab to have a size of 50k tokens (2.5x increase compered to before) by finding that I used to do 
+
+```python
+currentX = currentX + hidden2 / math.sqrt(num_layers) 
+```
+
+instead of 
+
+```python
+currentX = currentX + hidden2 / num_layers
+```
+
+which led to currentX growing large and halting training.
+
+
+---
+
 ## Screenshots
 
 ### Matrix Selection & Configuration
