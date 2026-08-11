@@ -40,6 +40,8 @@ which led to currentX growing large and halting training.
 
 New Loss Curve after Pulse
 
+- Debugged a python version of another developer's custom attention mechanism which had an NaN loss that was caused by a missing infinity check before division.
+
 
 ---
 
