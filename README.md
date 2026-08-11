@@ -35,6 +35,9 @@ currentX = currentX + hidden2 / num_layers
 
 which led to currentX growing large and halting training.
 
+<img width="628" height="418" alt="image" src="https://github.com/user-attachments/assets/d1921810-6b46-449b-a6d3-f925cc1de15f" />
+New Loss Curve after Pulse
+
 
 ---
 
