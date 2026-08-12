@@ -64,7 +64,7 @@ New Loss Curve after Pulse
 
 ## Installation
 
-1. Download the **Pulse** folder and place it in your project workspace.
+1. Download the **PULSE** folder and place it in your project workspace.
 2. Install the required dependencies:
    ```bash
    pip install numpy matplotlib pillow litellm --break-system-packages
@@ -84,7 +84,7 @@ In your training file, import auto_track from pulse and call it right before you
    if __name__ == '__main__':
 ```
 ```python
-from pulse.pulse import auto_track
+from PULSE.pulse import auto_track
 
 # Pass your training function for shape discovery (optional), or call directly
 if __name__ == '__main__':
