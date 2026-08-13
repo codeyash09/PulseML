@@ -26,20 +26,12 @@ from PULSE.pulse_pdf import generate_heatmap_pdf
 import litellm
 
 
-# Name-based heuristic for pre-flagging the loss/metric scalar -- same list
-# and same purpose as pulse.py's LOSS_NAME_HINTS/_looks_like_loss, kept as a
-# local copy so this module has no dependency on pulse.py (which pulls in
-# tkinter and isn't safe to import in a headless CLI/Colab/SSH session).
 LOSS_NAME_HINTS = ("loss", "cost", "nll", "cross_entropy", "crossentropy", "objective", "err")
 
 
 def _looks_like_loss(name: str) -> bool:
     n = (name or "").lower()
     return any(hint in n for hint in LOSS_NAME_HINTS)
-
-# ----------------------------------------------------------------------------
-# CLI AI agent
-# ----------------------------------------------------------------------------
 
 SYSTEM_PROMPT = (
     "You are Pulse, an AI analyst embedded in a live ML training debugger. "
@@ -121,7 +113,7 @@ class PulseCLI:
         self.watch_locals = watch_locals or {}
         self.discovered: Dict[str, Optional[tuple]] = dict(discovered or {})
         self.tracked_vars: List[str] = []
-        self.var_configs: Dict[str, str] = {}  # Axis layout mapping e.g. {"A": "0211"}
+        self.var_configs: Dict[str, str] = {} 
         self.auto_mode: bool = False
         self.scalar_histories: Dict[str, List[float]] = {}
         self.step = 0
@@ -132,15 +124,12 @@ class PulseCLI:
         self.agent_history: List[Dict[str, Any]] = []
         self.code_text: Optional[str] = None
 
-        # Matrix/tensor probing is intentionally decoupled from the training loop.
-        # statistics() on GPU arrays can force a device->host synchronization, so
-        # NEVER run it for tagged matrices on every training step.
+   
         self._matrix_cache: Dict[str, Dict[str, Any]] = {}
         self._matrix_cached_vars: set[str] = set()
         self._last_matrix_probe: float = 0.0
         self.matrix_probe_interval: float = 1.0
 
-        # Interactive Mode & Interrupt Handling
         self.continuous = False
         self.original_sigint = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGINT, self._sigint_handler)
@@ -152,7 +141,6 @@ class PulseCLI:
             self.continuous = False
             print("\n[Pulse] Intercepted Ctrl+C. Pausing at next step...")
         else:
-            # If already paused and user hits Ctrl+C again, restore original behavior and exit
             if self.original_sigint:
                 signal.signal(signal.SIGINT, self.original_sigint)
             raise KeyboardInterrupt
@@ -524,8 +512,7 @@ class PulseCLI:
         self.agent_provider = chosen
         self.agent_key = key
         os.environ[env_var] = key
-        # Switching providers mid-conversation would send one provider's turns
-        # to another; start a fresh history so context isn't mixed across models.
+        
         self.agent_history = []
 
         if initial:
@@ -772,8 +759,6 @@ class PulseCLI:
         want_pdfs = self.generate_pdfs if generate_pdfs is None else generate_pdfs
         now = time.monotonic()
 
-        # First call probes immediately. After that, matrix inspection is capped
-        # by wall-clock time rather than training-step count.
         probe_matrices = (
             not self._matrix_cache
             or (now - self._last_matrix_probe) >= self.matrix_probe_interval
@@ -784,8 +769,6 @@ class PulseCLI:
         matrix_lines: List[tuple[str, Dict[str, Any], Any, bool]] = []
         any_scalar_changed = False
 
-        # Fast path: discover/process scalars every step. Do NOT call
-        # _yield_slices() for matrices unless this is an actual matrix probe.
         for var_name in self.tracked_vars:
             if var_name not in self.watch_locals:
                 continue
@@ -810,8 +793,6 @@ class PulseCLI:
                 scalar_lines.append((var_name, scalar_val))
                 continue
 
-            # Matrix/tensor path. No slicing, no statistics(), and no GPU->CPU
-            # copy at all unless the wall-clock probe is due.
             if not probe_matrices:
                 continue
 
@@ -841,8 +822,6 @@ class PulseCLI:
         if probe_matrices:
             self._last_matrix_probe = now
 
-        # Don't redraw the entire terminal if absolutely nothing visible changed.
-        # A matrix probe always redraws because its snapshot may have changed.
         should_redraw = probe_matrices or any_scalar_changed or not self.scalar_histories
 
         if should_redraw:
@@ -856,8 +835,6 @@ class PulseCLI:
                 self._print_ascii_chart(sub_name, hist)
 
             if probe_matrices:
-                # Print matrix statistics ONLY when they were freshly measured.
-                # Cached matrices are deliberately silent between probes.
                 for sub_name, stats, val, fresh in matrix_lines:
                     flag = ""
                     if stats.get("nan") or stats.get("inf"):
@@ -879,8 +856,6 @@ class PulseCLI:
                         except Exception as exc:
                             print(f"    ↳ ⚠ failed to save PDF snapshot for '{sub_name}': {exc}")
 
-                # If the cache is already populated, show a tiny status line rather
-                # than reprinting every cached matrix on every training iteration.
                 if self._matrix_cache:
                     print(
                         f"  [matrices cached: {len(self._matrix_cache)} | "
@@ -890,7 +865,6 @@ class PulseCLI:
         if self.continuous:
             return
 
-        # Interactive Training Loop Prompt
         while True:
             try:
                 cmd = input(
@@ -966,7 +940,6 @@ class PulseCLI:
         lo = min(data)
         hi = max(data)
 
-        # Give flat/near-flat curves a useful visible range.
         if hi == lo:
             pad = max(abs(hi) * 0.02, 1e-6)
             lo -= pad
@@ -986,7 +959,6 @@ class PulseCLI:
 
         ys = [y_for(v) for v in data]
 
-        # Plot points and simple line segments.
         for i, y in enumerate(ys):
             grid[y][i] = "●"
             if i == 0:
@@ -998,8 +970,7 @@ class PulseCLI:
             else:
                 ch = "╱" if y < py else "╲"
                 grid[y][x] = ch
-                # Fill vertical movement without trying to interpolate a fake
-                # curve; this keeps the terminal graph readable.
+               
                 step_dir = 1 if y > py else -1
                 rr = py + step_dir
                 while rr != y:
