@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import shutil
 import signal
 import getpass
 import itertools
@@ -185,6 +186,54 @@ class PulseCLI:
         return trackable
 
     def _cmd_add(self, var_name: str) -> None:
+        """Add a variable to tracking.
+
+        If `var_name` isn't an exact match for a currently-discovered
+        variable, fall back to the same partial-name matching used during
+        interactive setup: show the matches with numbers and let the user
+        pick one.
+        """
+        var_name = var_name.strip()
+        if not var_name:
+            print("Usage: /add <variable name or partial name>")
+            return
+
+        variables = self.discover_variables()
+
+        if var_name not in variables:
+            var_list = sorted(variables.keys(), key=lambda n: (not _looks_like_loss(n), n))
+            terms = [t.strip().lower() for t in var_name.split(",") if t.strip()]
+            matches = [name for name in var_list if any(term in name.lower() for term in terms)]
+
+            if not matches:
+                print(f"[Pulse CLI] No variables match '{var_name}'.")
+                return
+
+            if len(matches) > 1:
+                print("\nMatching variables:")
+                for idx, name in enumerate(matches, 1):
+                    val = variables.get(name)
+                    star = "  ★ loss?" if _looks_like_loss(name) else ""
+                    if val is None:
+                        info = "[not run yet]"
+                    else:
+                        try:
+                            d = describe_tensor(val)
+                            info = f"[{d.backend} {d.kind} {d.shape}]"
+                        except Exception:
+                            info = "[trackable]"
+                    print(f"  {idx}) {name} {info}{star}")
+                choice = input("Select a number to add (Enter to cancel) > ").strip()
+                if not choice:
+                    print("[Pulse CLI] Add cancelled.")
+                    return
+                if not choice.isdigit() or not (0 < int(choice) <= len(matches)):
+                    print("[Pulse CLI] Invalid selection.")
+                    return
+                var_name = matches[int(choice) - 1]
+            else:
+                var_name = matches[0]
+
         if var_name not in self.tracked_vars:
             self.tracked_vars.append(var_name)
             self._matrix_cached_vars.discard(var_name)
@@ -217,6 +266,52 @@ class PulseCLI:
         if config:
             self.var_configs[var_name] = config
             print(f"✓ Saved config '{config}' for '{var_name}'.")
+
+    def _cmd_delete_pdfs(self, var_name: str) -> None:
+        """Delete saved heatmap PDF snapshots for a variable, or all of them.
+
+        Snapshots are saved under `self.pdf_dir/<safe_variable_name>/`, using
+        the same name-sanitization as `update()` uses when writing them.
+        """
+        var_name = var_name.strip()
+        if not var_name:
+            print("Usage: /delete <variable name> or /delete all")
+            return
+
+        if var_name.lower() == "all":
+            if not os.path.isdir(self.pdf_dir):
+                print(f"[Pulse CLI] No PDF output directory found at '{self.pdf_dir}'.")
+                return
+            confirm = input(
+                f"Delete ALL heatmap snapshots under '{self.pdf_dir}'? This cannot be undone. (y/n) > "
+            ).strip().lower()
+            if confirm not in ("y", "yes"):
+                print("[Pulse CLI] Delete cancelled.")
+                return
+            try:
+                shutil.rmtree(self.pdf_dir)
+                print(f"✓ Deleted all heatmap snapshots under '{self.pdf_dir}'.")
+            except Exception as exc:
+                print(f"[Pulse CLI] ⚠ Failed to delete '{self.pdf_dir}': {exc}")
+            return
+
+        safe_name = var_name.replace("[", "_").replace("]", "").replace(",", "_")
+        target_dir = os.path.join(self.pdf_dir, safe_name)
+        if not os.path.isdir(target_dir):
+            print(f"[Pulse CLI] No heatmap snapshots found for '{var_name}' (looked in '{target_dir}').")
+            return
+
+        confirm = input(
+            f"Delete all heatmap snapshots for '{var_name}' in '{target_dir}'? (y/n) > "
+        ).strip().lower()
+        if confirm not in ("y", "yes"):
+            print("[Pulse CLI] Delete cancelled.")
+            return
+        try:
+            shutil.rmtree(target_dir)
+            print(f"✓ Deleted heatmap snapshots for '{var_name}'.")
+        except Exception as exc:
+            print(f"[Pulse CLI] ⚠ Failed to delete '{target_dir}': {exc}")
 
     def interactive_setup(self) -> None:
         """Interactive CLI setup."""
@@ -265,6 +360,9 @@ class PulseCLI:
                 continue
             if lower.startswith("/edit "):
                 self._cmd_edit(choice[6:].strip())
+                continue
+            if lower.startswith("/delete "):
+                self._cmd_delete_pdfs(choice[8:].strip())
                 continue
 
             if lower == "auto":
@@ -361,62 +459,98 @@ class PulseCLI:
 
         self._agent_setup()
 
-    def _agent_setup(self) -> None:
-        """Choose the AI provider first, then obtain its API key, then enter Q&A."""
+    def _select_agent_provider_and_key(self, initial: bool = False) -> bool:
+        """Prompt the user to pick an AI provider and API key.
+
+        When `initial` is True (first-time setup), pressing Enter skips agent
+        setup entirely and leaves the agent disabled. When False (switching
+        mid-run), pressing Enter cancels the switch and keeps whatever
+        agent/key is already active.
+
+        Returns True if the active agent/key changed as a result of this call.
+        """
         names = list(PROVIDERS.keys())
 
-        print("\n" + "=" * 60)
-        print("                    PULSE AI AGENT")
-        print("=" * 60)
-        print("Select an agent/provider:")
+        print("\nSelect an agent/provider:")
         for i, name in enumerate(names, 1):
-            print(f"  {i}) {name}")
+            marker = "  (current)" if name == self.agent_provider else ""
+            print(f"  {i}) {name}{marker}")
+
+        prompt = (
+            "\nAgent number (or Enter to skip) > "
+            if initial
+            else "\nAgent number (or Enter to cancel) > "
+        )
 
         while True:
-            raw = input("\nAgent number (or Enter to skip) > ").strip()
+            raw = input(prompt).strip()
             if not raw:
-                print("[Pulse CLI] AI agent disabled for this run.")
-                return
+                if initial:
+                    print("[Pulse CLI] AI agent disabled for this run.")
+                else:
+                    print("[Pulse CLI] Agent switch cancelled.")
+                return False
             if raw.isdigit() and 1 <= int(raw) <= len(names):
-                self.agent_provider = names[int(raw) - 1]
+                chosen = names[int(raw) - 1]
                 break
             matches = [n for n in names if raw.lower() in n.lower()]
             if len(matches) == 1:
-                self.agent_provider = matches[0]
+                chosen = matches[0]
                 break
             print("[Pulse CLI] Pick a valid agent number or provider name.")
 
-        info = PROVIDERS[self.agent_provider]
+        info = PROVIDERS[chosen]
         env_var = info["env_key"]
         existing = os.environ.get(env_var, "").strip()
 
-        print(f"\n✓ Agent selected: {self.agent_provider}")
+        print(f"\n✓ Agent selected: {chosen}")
         if existing:
             use_existing = input(
                 f"An {env_var} is already set. Use it? (Y/n) > "
             ).strip().lower()
             if use_existing in ("", "y", "yes"):
-                self.agent_key = existing
+                key = existing
             else:
-                self.agent_key = getpass.getpass("API key > ").strip()
+                key = getpass.getpass("API key > ").strip()
         else:
-            self.agent_key = getpass.getpass("API key > ").strip()
+            key = getpass.getpass("API key > ").strip()
 
-        if not self.agent_key:
-            print("[Pulse CLI] No API key entered. AI agent disabled.")
-            self.agent_provider = None
+        if not key:
+            print("[Pulse CLI] No API key entered. Agent unchanged.")
+            if initial:
+                self.agent_provider = None
+            return False
+
+        self.agent_provider = chosen
+        self.agent_key = key
+        os.environ[env_var] = key
+        # Switching providers mid-conversation would send one provider's turns
+        # to another; start a fresh history so context isn't mixed across models.
+        self.agent_history = []
+
+        if initial:
+            print(f"✓ API key accepted for {self.agent_provider}.")
+        else:
+            print(f"✓ Switched to {self.agent_provider}. Conversation history reset for the new agent.")
+        return True
+
+    def _agent_setup(self) -> None:
+        """Choose the AI provider first, then obtain its API key, then enter Q&A."""
+        print("\n" + "=" * 60)
+        print("                    PULSE AI AGENT")
+        print("=" * 60)
+
+        if not self._select_agent_provider_and_key(initial=True):
             return
 
-        os.environ[env_var] = self.agent_key
-        print(f"✓ API key accepted for {self.agent_provider}.")
-
-        self.agent_history = []
         print(
             "\nAgent ready. Ask questions now. Commands:\n"
             "  /vars     show discovered variables\n"
             "  /tracked  show tracked variables\n"
             "  /add      add a new variable to track (e.g., /add my_matrix)\n"
             "  /edit     edit axis configuration (e.g., /edit my_matrix)\n"
+            "  /delete   delete saved heatmap PDFs (e.g., /delete my_matrix, /delete all)\n"
+            "  /agent    switch AI provider/API key\n"
             "  /code     include the training code in the next question\n"
             "  /exit     finish setup and start training\n"
         )
@@ -439,6 +573,12 @@ class PulseCLI:
                 continue
             if question.lower().startswith("/edit "):
                 self._cmd_edit(question[6:].strip())
+                continue
+            if question.lower().startswith("/delete "):
+                self._cmd_delete_pdfs(question[8:].strip())
+                continue
+            if question.lower() == "/agent":
+                self._select_agent_provider_and_key(initial=False)
                 continue
             if question.lower() == "/vars":
                 self._print_variable_summary()
@@ -754,7 +894,8 @@ class PulseCLI:
         while True:
             try:
                 cmd = input(
-                    "\nPulse [Enter=step, /c=continuous, /add <var>, /edit <var>, or ask AI] > "
+                    "\nPulse [Enter=step, /c=continuous, /add <var>, /edit <var>, "
+                    "/delete <var>, /agent, or ask AI] > "
                 ).strip()
             except (EOFError, KeyboardInterrupt):
                 print("\nExiting Pulse...")
@@ -775,6 +916,14 @@ class PulseCLI:
 
             if cmd.lower().startswith("/edit "):
                 self._cmd_edit(cmd[6:].strip())
+                continue
+
+            if cmd.lower().startswith("/delete "):
+                self._cmd_delete_pdfs(cmd[8:].strip())
+                continue
+
+            if cmd.lower() == "/agent":
+                self._select_agent_provider_and_key(initial=False)
                 continue
 
             if cmd.lower() == "/vars":
