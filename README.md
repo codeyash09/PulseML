@@ -1,101 +1,91 @@
 # PulseML
 
-> **Pulse — a live ML training debugger, GUI or CLI, any backend.**
+**Pulse** — a live ML training debugger, GUI or CLI, any backend.
 
-https://pulsedb.netlify.app/
+🔗 [pulsedb.netlify.app](https://pulsedb.netlify.app/)
 
-Pulse is a live machine learning training debugger designed to monitor tensors, track metrics, visualize heatmaps and line charts, and interact with an integrated AI analyst.
-
----
+Pulse is a live machine learning training debugger designed to monitor
+tensors, track metrics, visualize heatmaps and line charts, and interact
+with an integrated AI analyst.
 
 ## Key Features
 
-* **GUI Mode:** Opens an interactive matrix picker with live shapes, followed by a live dashboard with a heatmap grid and an integrated AI chat panel.
-* **Smart Scalars:** Scalars (loss, accuracy, learning rate) automatically render as live step-charts rather than heatmaps. Loss-like scalars are auto-detected and pre-selected in the picker.
-* **CLI Mode:** Built for Colab, SSH, or headless environments, printing tensor stats step-by-step, displaying live ASCII charts for scalars, and supporting optional labeled PDF snapshots. Allows for training pausing which allows for the user to tag new matrices and also ask AI to interpret results.
-* **Universal Backend Support:** Automatically detects and works with NumPy, PyTorch, TensorFlow, CuPy, and JAX via `pulse_backend.py`.
-* **High Performance:** Keeps CPU usage low by converting tensors to host-side NumPy arrays, reusing Matplotlib figures (`set_data`) instead of rebuilding them every step, and matching render thumbnail sizes.
-* **Pulse AI Analyst:** Context-aware chat panel briefed on its role that can inspect live matrix statistics, heatmaps, and your training code when "Send Code" is enabled.
-
----
+- **GUI Mode** — Opens an interactive matrix picker with live shapes,
+  followed by a live dashboard with a heatmap grid and an integrated AI
+  chat panel.
+- **Smart Scalars** — Scalars (loss, accuracy, learning rate)
+  automatically render as live step-charts rather than heatmaps.
+  Loss-like scalars are auto-detected and pre-selected in the picker.
+- **CLI Mode** — Built for Colab, SSH, or headless environments, printing
+  tensor stats step-by-step, displaying live ASCII charts for scalars,
+  and supporting optional labeled PDF snapshots. Supports pausing
+  training so you can tag new matrices or ask the AI to interpret
+  results, right from the terminal.
+- **Universal Backend Support** — Automatically detects and works with
+  NumPy, PyTorch, TensorFlow, CuPy, and JAX via a shared backend
+  abstraction layer.
+- **High Performance** — Keeps overhead low by converting tensors to
+  host-side NumPy arrays, reusing Matplotlib figures (`set_data`) instead
+  of rebuilding them every step, and matching render sizes to the actual
+  on-screen thumbnail.
+- **Pulse AI Analyst** — A context-aware chat panel briefed on its role
+  that can inspect live matrix statistics, heatmaps, and your training
+  code when "Send Code" is enabled.
 
 ## Past Debugs
 
-- Debugged my own LLM (Yash-GPT) after I swapped out the vocab to have a size of 50k tokens (2.5x increase compered to before) by finding that I used to do 
+- Debugged a custom LLM after a vocab size increase (2.5x) by catching a
+  normalization bug — dividing residual growth by `math.sqrt(num_layers)`
+  instead of `num_layers` — that let activations blow up and halted
+  training.
+- Debugged another developer's custom attention mechanism producing NaN
+  loss, tracing it to a missing infinity check before a division.
 
-```python
-currentX = currentX + hidden2 / math.sqrt(num_layers) 
+See [pulsedb.netlify.app](https://pulsedb.netlify.app/) for screenshots
+of matrix selection, the live dashboard, and the CLI view.
+
+## Install
+
+```bash
+pip install pulseml
 ```
 
-instead of 
+`tkinter` is required for GUI mode and ships with most Python installs.
+On Debian/Ubuntu, if it's missing:
 
-```python
-currentX = currentX + hidden2 / num_layers
+```bash
+sudo apt install python3-tk
 ```
 
-which led to currentX growing large and halting training.
+For CLI-mode PDF snapshots, `fpdf2` is installed automatically as part of
+the base package.
 
+## Quickstart
 
-<img width="628" height="418" alt="image" src="https://github.com/user-attachments/assets/d1921810-6b46-449b-a6d3-f925cc1de15f" />
+Import `auto_track` and call it right before your training loop starts.
+Make sure your loop is wrapped in `if __name__ == '__main__':`.
 
-New Loss Curve after Pulse
-
-- Debugged a python version of another developer's custom attention mechanism which had an NaN loss that was caused by a missing infinity check before division.
-
-
----
-
-## Screenshots
-
-### Matrix Selection & Configuration
-*Choose specific variables to monitor or track everything automatically before launching your run.*
-<img width="1423" height="874" alt="Matrix Selection" src="https://github.com/user-attachments/assets/dc8f4047-3e63-4e2b-9d19-04ba54f27258" />
-
-### Live Dashboard & AI Analyst
-*Monitor live metrics while chatting directly with the AI Analyst to debug your model's performance in real time.*
-<img width="1296" height="806" alt="Live Dashboard" src="https://github.com/user-attachments/assets/e9c5e13f-7d2c-4f26-8157-c296bd9ac745" />
-
-### CLI Dashboard:
-*Just use CTRL+C to access the /add command, /edit command, and chat with the AI Analyst directly in the terminal window.*
-<img width="666" height="572" alt="image" src="https://github.com/user-attachments/assets/d6978fea-ddcb-43cc-aded-f35a9636abd9" />
-
-
----
-
-## Installation
-
-1. Download the **PULSE** folder and place it in your project workspace.
-2. Install the required dependencies:
-   ```bash
-   pip install numpy matplotlib pillow litellm --break-system-packages
-
-1. Ensure Tkinter is available (on Debian/Ubuntu:
-   ```bash
-   sudo apt install python3-tk)
-2. Optional for CLI-mode PDF snapshots:
-   ```bash
-   pip install fpdf --break-system-packages
-
-## Quickstart & Usage
-
-
-In your training file, import auto_track from pulse and call it right before your training loop starts (Make sure your loop is wrapped in an:
 ```python
-   if __name__ == '__main__':
-```
-```python
-from PULSE.pulse import auto_track
+from pulse import auto_track
 
-# Pass your training function for shape discovery (optional), or call directly
 if __name__ == '__main__':
+    auto_track()   # pass your training function for shape discovery, or call directly
 
-   auto_track()
-
-   # Your training loop
-   for epoch in range(num_epochs):
-       # Training logic here
-       pass
-
+    # Your training loop
+    for epoch in range(num_epochs):
+        # Training logic here
+        pass
 ```
+
 ## AI Chat & API Keys
-To enable the AI chat panel, set the relevant provider's API key as an environment variable (e.g., ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, DEEPSEEK_API_KEY), or leave it unset to be prompted inside the GUI the first time you send a message.
+
+To enable the AI chat panel, set the relevant provider's API key as an
+environment variable (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`GEMINI_API_KEY`, `DEEPSEEK_API_KEY`) — or leave it unset and Pulse will
+prompt you for one inside the GUI the first time you send a message.
+
+## License
+
+Proprietary. See `LICENSE`. Use of this software is governed by the
+terms in that file — copying, redistribution, and reverse engineering
+are not permitted.
