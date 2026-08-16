@@ -62,10 +62,10 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap, LogNorm
 
 import tkinter as tk
-from tkinter import ttk, Toplevel, scrolledtext, simpledialog
+from tkinter import ttk, Toplevel, scrolledtext, simpledialog, messagebox
 from PIL import Image, ImageTk
 
-from PULSE.pulse_backend import (
+from pulse.pulse_backend import (
     to_numpy, shape_of, tensor_kind, is_trackable, describe_tensor,
     statistics as backend_statistics, scalar_value,
 )
@@ -808,7 +808,28 @@ SYSTEM_PROMPT = (
     "std=142.7 and 340 inf values' beats 'you may have exploding gradients.' If code is available, "
     "point to the exact line; if it isn't, say what you'd need and that checking 'Send Code' would "
     "help. If nothing looks abnormal, say so rather than inventing a problem.\n\n"
-    "Be concise. No preamble before the diagnosis."
+    "Be concise. No preamble before the diagnosis.\n\n"
+
+    "CODE FIXES:\n"
+    "If, and only if, the user explicitly asks you to fix, edit, patch, or change the code (not just "
+    "diagnose it) AND training code has been sent this turn, respond with ONLY a single JSON object "
+    "and nothing else -- no prose before or after it, no markdown code fences, no Diagnosis/Reasoning/"
+    "Fix sections. The JSON object must have exactly these fields:\n"
+    "  old: a list of code snippets to find, each copied EXACTLY from the line-numbered training "
+    "code shown to you, including original indentation and whitespace, but WITHOUT the line-number "
+    "prefix ('  12 | ') itself.\n"
+    "  new: a list of the same length as old, where new[i] is the full replacement for old[i].\n"
+    "  explanation: a short, concise text description of what changed and why.\n"
+    "Rules for old/new:\n"
+    "  - Each snippet in old must appear VERBATIM and exactly ONCE in the current file. Include "
+    "enough surrounding lines (not just the single changed line) so the match is unambiguous.\n"
+    "  - Each new[i] is the complete replacement block for old[i] -- to add a line, copy old[i] and "
+    "append the new line(s) to it; to remove a line, copy old[i] and omit it.\n"
+    "  - Never use placeholders like '...' or '# unchanged' inside old or new; both must be literal, "
+    "complete code.\n"
+    "  - If code wasn't sent this turn, or the user hasn't asked for a fix, do not emit this JSON "
+    "format -- answer normally per RESPONSE FORMAT above, and if a fix was requested without code, "
+    "say that checking 'Send Code' is needed first."
 )
 
 # Provider/model choices for the chat panel dropdown. Kept to models that
@@ -898,10 +919,12 @@ PROVIDERS = {
 }
 
 class ChatPanel(tk.Frame):
-    def __init__(self, parent, get_manifest_fn, get_code_fn=None):
+    def __init__(self, parent, get_manifest_fn, get_code_fn=None, script_path=None, on_code_change=None):
         super().__init__(parent, bg=PANEL)
         self.get_manifest_fn = get_manifest_fn
         self.get_code_fn = get_code_fn
+        self.script_path = script_path
+        self.on_code_change = on_code_change
         self.history = []
         self.session_keys = {}
 
@@ -1188,7 +1211,133 @@ class ChatPanel(tk.Frame):
             answer = f"(request failed: {e})"
 
         self.history.append({"role": "assistant", "content": answer})
-        self.after(0, lambda: self._append("Pulse", answer))
+
+        fix = self._parse_code_fix(answer)
+        if fix is not None:
+            # File IO + the revert confirmation dialog both need to happen on
+            # the Tk main thread, not this background request thread.
+            self.after(0, lambda: self._handle_code_fix(fix))
+        else:
+            self.after(0, lambda: self._append("Pulse", answer))
+
+    @staticmethod
+    def _parse_code_fix(answer):
+        """If `answer` is a well-formed code-fix JSON payload, return it, else None."""
+        text = (answer or "").strip()
+        if not text:
+            return None
+
+        # Agents sometimes wrap JSON in ```json ... ``` fences despite being told not to.
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:]
+            text = text.strip()
+
+        if not (text.startswith("{") and text.endswith("}")):
+            return None
+
+        try:
+            payload = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        old, new, explanation = payload.get("old"), payload.get("new"), payload.get("explanation")
+        if not isinstance(old, list) or not isinstance(new, list):
+            return None
+        if not old or len(old) != len(new):
+            return None
+        if not all(isinstance(x, str) for x in old) or not all(isinstance(x, str) for x in new):
+            return None
+
+        return {"old": old, "new": new, "explanation": explanation if isinstance(explanation, str) else ""}
+
+    def _handle_code_fix(self, fix):
+        """Apply an agent-proposed code fix to `self.script_path` on disk, show
+        what changed in the transcript, then offer to revert it immediately.
+
+        Each old[i] must appear exactly once in the current file contents;
+        snippets that don't match cleanly are skipped and reported rather
+        than guessed at. Runs on the Tk main thread (scheduled via `after`)
+        since it both touches disk and needs to pop a confirmation dialog.
+        """
+        if not self.script_path:
+            self._append(
+                "Pulse",
+                "(Proposed a code fix, but no script file path is known, so it can't be written to "
+                "disk.)\n\nExplanation: " + (fix["explanation"] or "(none given)"),
+            )
+            return
+
+        try:
+            with open(self.script_path, "r", encoding="utf-8") as f:
+                original_content = f.read()
+        except OSError as exc:
+            self._append("Pulse", f"⚠ Could not read '{self.script_path}' to apply the fix: {exc}")
+            return
+
+        content = original_content
+        applied, skipped = [], []
+        for old, new in zip(fix["old"], fix["new"]):
+            count = content.count(old)
+            if count == 1:
+                content = content.replace(old, new, 1)
+                applied.append((old, new))
+            elif count == 0:
+                skipped.append((old, "no exact match found in the file"))
+            else:
+                skipped.append((old, f"matched {count} times (ambiguous), skipped for safety"))
+
+        lines = []
+        if fix["explanation"]:
+            lines.append(f"**Explanation:** {fix['explanation']}")
+
+        if not applied:
+            lines.append("\n⚠ No changes were applied -- none of the proposed snippets matched the file cleanly:")
+            for old, reason in skipped:
+                lines.append(f"  - {reason}: `{old.splitlines()[0][:80]}...`")
+            self._append("Pulse", "\n".join(lines))
+            return
+
+        try:
+            with open(self.script_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError as exc:
+            self._append("Pulse", f"⚠ Failed to write changes to '{self.script_path}': {exc}")
+            return
+
+        if self.on_code_change:
+            self.on_code_change(content)
+
+        lines.append(f"\n✓ Applied {len(applied)} change(s) to `{self.script_path}`:")
+        for old, new in applied:
+            lines.append(f"  - replaced `{old.splitlines()[0][:80]}...` with `{new.splitlines()[0][:80]}...`")
+        if skipped:
+            lines.append(f"\n⚠ Skipped {len(skipped)} proposed change(s) that didn't match cleanly:")
+            for old, reason in skipped:
+                lines.append(f"  - {reason}: `{old.splitlines()[0][:80]}...`")
+        self._append("Pulse", "\n".join(lines))
+
+        revert = messagebox.askyesno(
+            "Revert code fix?",
+            f"Revert the change to '{os.path.basename(self.script_path)}' and restore it to how it "
+            "was before this fix?",
+            parent=self,
+        )
+        if revert:
+            try:
+                with open(self.script_path, "w", encoding="utf-8") as f:
+                    f.write(original_content)
+                if self.on_code_change:
+                    self.on_code_change(original_content)
+                self._append("Pulse", f"✓ Reverted '{self.script_path}' to its state before this fix.")
+            except OSError as exc:
+                self._append("Pulse", f"⚠ Failed to revert '{self.script_path}': {exc}")
+        else:
+            self._append("Pulse", "✓ Change kept.")
 
 
 # ============================================================================
@@ -1204,7 +1353,7 @@ class Dashboard:
     THUMB_SIZE = (170, 170)
     COLS = 3
 
-    def __init__(self, session_id, display_configs, code_text=None, config_queue=None, control_queue=None, known_names=None):
+    def __init__(self, session_id, display_configs, code_text=None, config_queue=None, control_queue=None, known_names=None, script_path=None):
         self.session_id = session_id
         self.cache = session_dir(session_id)
         self.manifest_path = os.path.join(self.cache, "manifest.json")
@@ -1212,6 +1361,7 @@ class Dashboard:
         self.config_queue = config_queue
         self.control_queue = control_queue
         self.code_text = code_text
+        self.script_path = script_path
         self.known_names = set(known_names or [])
         self._tiles = {}
         self._manifest = {}
@@ -1248,7 +1398,13 @@ class Dashboard:
         self.canvas.bind("<Configure>", self._on_canvas_resize)
         self._tile_outer_w = self.THUMB_SIZE[0] + 44
 
-        self.chat_panel = ChatPanel(right, get_manifest_fn=lambda: self._manifest, get_code_fn=lambda: self.code_text)
+        self.chat_panel = ChatPanel(
+            right,
+            get_manifest_fn=lambda: self._manifest,
+            get_code_fn=lambda: self.code_text,
+            script_path=self.script_path,
+            on_code_change=self._on_code_change,
+        )
         self.chat_panel.pack(fill=tk.BOTH, expand=True)
 
         self.hidden_tiles = set()
@@ -1264,6 +1420,11 @@ class Dashboard:
         add_btn.pack(anchor="w")
 
         self._poll()
+
+    def _on_code_change(self, new_code_text):
+        """Called by the chat panel after it applies or reverts a code fix on
+        disk, so subsequent turns (and 'Send Code') use the up-to-date text."""
+        self.code_text = new_code_text
 
     def _load_manifest(self):
         for _ in range(10):
@@ -1631,8 +1792,8 @@ class Dashboard:
         self.root.mainloop()
 
 
-def _run_dashboard(session_id, display_configs, code_text=None, config_queue=None, control_queue=None, known_names=None):
-    Dashboard(session_id, display_configs, code_text=code_text, config_queue=config_queue, control_queue=control_queue, known_names=known_names).run()
+def _run_dashboard(session_id, display_configs, code_text=None, config_queue=None, control_queue=None, known_names=None, script_path=None):
+    Dashboard(session_id, display_configs, code_text=code_text, config_queue=config_queue, control_queue=control_queue, known_names=known_names, script_path=script_path).run()
 
 
 # ============================================================================
@@ -1715,14 +1876,19 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
     caller_frame = sys._getframe(1)
     root = os.path.normcase(os.path.abspath(project_root)) if project_root else None
 
-    if code_text is None:
-        entry_path = caller_frame.f_code.co_filename
-        if os.path.exists(entry_path) and not entry_path.startswith("<"):
-            try:
-                with open(entry_path, "r", encoding="utf-8", errors="ignore") as f:
-                    code_text = f.read()
-            except OSError:
-                code_text = None
+    # The caller's own source file -- this is what the CLI agent's code-fix
+    # feature writes back to, so it's resolved regardless of whether code_text
+    # ends up being auto-read from it or passed in explicitly.
+    entry_path = caller_frame.f_code.co_filename
+    if entry_path.startswith("<") or not os.path.exists(entry_path):
+        entry_path = None
+
+    if code_text is None and entry_path:
+        try:
+            with open(entry_path, "r", encoding="utf-8", errors="ignore") as f:
+                code_text = f.read()
+        except OSError:
+            code_text = None
 
     discovered = _discover_candidates(caller_frame, root)
 
@@ -1757,7 +1923,7 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
         return
 
     if active_mode == "cli":
-        _start_cli_tracker(caller_frame, root, throttle_interval, discovered, runtime_shapes, code_text)
+        _start_cli_tracker(caller_frame, root, throttle_interval, discovered, runtime_shapes, code_text, entry_path)
         return
 
     # ---- UI mode ----
@@ -1789,7 +1955,7 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
 
     dash_process = mp.Process(
         target=_run_dashboard,
-        args=(_session_id, display_configs, code_text, shared_config_queue, control_queue, sorted(discovered)),
+        args=(_session_id, display_configs, code_text, shared_config_queue, control_queue, sorted(discovered), entry_path),
         daemon=True,
     )
     dash_process.start()
@@ -1836,7 +2002,7 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
     caller_frame.f_trace = persistent_tracer
 
 
-def _start_cli_tracker(caller_frame, root, throttle_interval, discovered, runtime_shapes, code_text=None):
+def _start_cli_tracker(caller_frame, root, throttle_interval, discovered, runtime_shapes, code_text=None, script_path=None):
     """CLI mode: synchronous, in-process -- no subprocess, no multiprocessing
     Queue, no pickling tensors across a process boundary (which can be
     genuinely broken for CUDA tensors anyway). Just prints as training runs
@@ -1852,11 +2018,15 @@ def _start_cli_tracker(caller_frame, root, throttle_interval, discovered, runtim
     CLI's setup menu even though the GUI would have listed it (as
     "not run yet"). Threading them through here brings CLI discovery in
     line with the GUI.
+
+    `script_path` is the caller's own source file -- passed through so the
+    CLI agent's code-fix feature (see PulseCLI._apply_code_fix) knows which
+    file on disk to write proposed fixes to.
     """
     from .pulse_cli import PulseCLI
 
     cli = PulseCLI(discovered={name: runtime_shapes.get(name) for name in discovered})
-    cli.set_code_text(code_text)
+    cli.set_code_text(code_text, script_path=script_path)
     cli.print_banner()
 
     setup_done = {"value": False}
