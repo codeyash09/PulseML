@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 import time
 import shutil
 import signal
@@ -14,7 +15,7 @@ import getpass
 import itertools
 from typing import Any, Dict, List, Optional
 
-from PULSE.pulse_backend import (
+from pulse.pulse_backend import (
     available_backends,
     describe_tensor,
     detect_backend,
@@ -22,16 +23,24 @@ from PULSE.pulse_backend import (
     statistics,
     to_numpy,
 )
-from PULSE.pulse_pdf import generate_heatmap_pdf
+from pulse.pulse_pdf import generate_heatmap_pdf
 import litellm
 
 
+# Name-based heuristic for pre-flagging the loss/metric scalar -- same list
+# and same purpose as pulse.py's LOSS_NAME_HINTS/_looks_like_loss, kept as a
+# local copy so this module has no dependency on pulse.py (which pulls in
+# tkinter and isn't safe to import in a headless CLI/Colab/SSH session).
 LOSS_NAME_HINTS = ("loss", "cost", "nll", "cross_entropy", "crossentropy", "objective", "err")
 
 
 def _looks_like_loss(name: str) -> bool:
     n = (name or "").lower()
     return any(hint in n for hint in LOSS_NAME_HINTS)
+
+# ----------------------------------------------------------------------------
+# CLI AI agent
+# ----------------------------------------------------------------------------
 
 SYSTEM_PROMPT = (
     "You are Pulse, an AI analyst embedded in a live ML training debugger. "
@@ -44,7 +53,26 @@ SYSTEM_PROMPT = (
     "1. Diagnosis — one sentence, the specific root cause.\n"
     "2. Reasoning — grounded in the actual numbers and code, with real math.\n"
     "3. Fix — a concrete change.\n\n"
-    "Be concise. Do not invent problems or data that were not provided."
+    "Be concise. Do not invent problems or data that were not provided.\n\n"
+
+    "CODE FIXES:\n"
+    "If, and only if, the user explicitly asks you to fix, edit, patch, or change the code "
+    "(not just diagnose it), respond with ONLY a single JSON object and nothing else -- no prose "
+    "before or after it, no markdown code fences. The JSON object must have exactly these fields:\n"
+    "  old: a list of code snippets to find, each copied EXACTLY from the line-numbered training "
+    "code shown to you, including original indentation and whitespace, but WITHOUT the line-number "
+    "prefix ('  12 | ') itself.\n"
+    "  new: a list of the same length as old, where new[i] is the full replacement for old[i].\n"
+    "  explanation: a short, concise text description of what changed and why.\n"
+    "Rules for old/new:\n"
+    "  - Each snippet in old must appear VERBATIM and exactly ONCE in the current file. Include "
+    "enough surrounding lines (not just the single changed line) so the match is unambiguous.\n"
+    "  - Each new[i] is the complete replacement block for old[i] -- to add a line, copy old[i] and "
+    "append the new line(s) to it; to remove a line, copy old[i] and omit it.\n"
+    "  - Never use placeholders like '...' or '# unchanged' inside old or new; both must be literal, "
+    "complete code.\n"
+    "  - If you were not shown the code, or the user has not asked for a fix, do not emit this JSON "
+    "format -- answer normally per RESPONSE FORMAT above."
 )
 
 PROVIDERS = {
@@ -113,7 +141,7 @@ class PulseCLI:
         self.watch_locals = watch_locals or {}
         self.discovered: Dict[str, Optional[tuple]] = dict(discovered or {})
         self.tracked_vars: List[str] = []
-        self.var_configs: Dict[str, str] = {} 
+        self.var_configs: Dict[str, str] = {}  # Axis layout mapping e.g. {"A": "0211"}
         self.auto_mode: bool = False
         self.scalar_histories: Dict[str, List[float]] = {}
         self.step = 0
@@ -123,13 +151,22 @@ class PulseCLI:
         self.agent_key: Optional[str] = None
         self.agent_history: List[Dict[str, Any]] = []
         self.code_text: Optional[str] = None
+        self.script_path: Optional[str] = None
 
-   
+        # Backup of the file's contents from immediately before the most
+        # recent agent-applied code fix, so that fix can be reverted.
+        self._pending_revert_path: Optional[str] = None
+        self._pending_revert_backup: Optional[str] = None
+
+        # Matrix/tensor probing is intentionally decoupled from the training loop.
+        # statistics() on GPU arrays can force a device->host synchronization, so
+        # NEVER run it for tagged matrices on every training step.
         self._matrix_cache: Dict[str, Dict[str, Any]] = {}
         self._matrix_cached_vars: set[str] = set()
         self._last_matrix_probe: float = 0.0
         self.matrix_probe_interval: float = 1.0
 
+        # Interactive Mode & Interrupt Handling
         self.continuous = False
         self.original_sigint = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGINT, self._sigint_handler)
@@ -141,6 +178,7 @@ class PulseCLI:
             self.continuous = False
             print("\n[Pulse] Intercepted Ctrl+C. Pausing at next step...")
         else:
+            # If already paused and user hits Ctrl+C again, restore original behavior and exit
             if self.original_sigint:
                 signal.signal(signal.SIGINT, self.original_sigint)
             raise KeyboardInterrupt
@@ -156,8 +194,10 @@ class PulseCLI:
             print(f"  {status} {name}")
         print("-" * 50 + "\n")
 
-    def set_code_text(self, code_text: Optional[str]) -> None:
+    def set_code_text(self, code_text: Optional[str], script_path: Optional[str] = None) -> None:
         self.code_text = code_text
+        if script_path is not None:
+            self.script_path = script_path
 
     def discover_variables(self) -> Dict[str, Any]:
         trackable: Dict[str, Any] = {}
@@ -512,7 +552,8 @@ class PulseCLI:
         self.agent_provider = chosen
         self.agent_key = key
         os.environ[env_var] = key
-        
+        # Switching providers mid-conversation would send one provider's turns
+        # to another; start a fresh history so context isn't mixed across models.
         self.agent_history = []
 
         if initial:
@@ -740,7 +781,122 @@ class PulseCLI:
             answer = f"(request failed: {exc})"
 
         self.agent_history.append({"role": "assistant", "content": answer})
+
+        fix = self._parse_code_fix(answer)
+        if fix is not None:
+            return self._apply_code_fix(fix)
         return answer
+
+    @staticmethod
+    def _parse_code_fix(answer: str) -> Optional[Dict[str, Any]]:
+        """If `answer` is a well-formed code-fix JSON payload, return it, else None."""
+        text = (answer or "").strip()
+        if not text:
+            return None
+
+        # Agents sometimes wrap JSON in ```json ... ``` fences despite being told not to.
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:]
+            text = text.strip()
+
+        if not (text.startswith("{") and text.endswith("}")):
+            return None
+
+        try:
+            payload = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        old, new, explanation = payload.get("old"), payload.get("new"), payload.get("explanation")
+        if not isinstance(old, list) or not isinstance(new, list):
+            return None
+        if not old or len(old) != len(new):
+            return None
+        if not all(isinstance(x, str) for x in old) or not all(isinstance(x, str) for x in new):
+            return None
+
+        return {"old": old, "new": new, "explanation": explanation if isinstance(explanation, str) else ""}
+
+    def _apply_code_fix(self, fix: Dict[str, Any]) -> str:
+        """Apply an agent-proposed code fix to `self.script_path` on disk.
+
+        Each old[i] must appear exactly once in the current file contents;
+        snippets that don't match cleanly are skipped and reported rather
+        than guessed at. On success, a single-level backup is kept so the
+        user can immediately revert back to the pre-fix file.
+        """
+        if not self.script_path:
+            return (
+                "[Pulse CLI] The agent proposed a code fix, but no script file path is known, "
+                "so it can't be written to disk.\n\nExplanation: " + (fix["explanation"] or "(none given)")
+            )
+
+        try:
+            with open(self.script_path, "r", encoding="utf-8") as f:
+                original_content = f.read()
+        except OSError as exc:
+            return f"[Pulse CLI] ⚠ Could not read '{self.script_path}' to apply the fix: {exc}"
+
+        content = original_content
+        applied, skipped = [], []
+        for old, new in zip(fix["old"], fix["new"]):
+            count = content.count(old)
+            if count == 1:
+                content = content.replace(old, new, 1)
+                applied.append((old, new))
+            elif count == 0:
+                skipped.append((old, "no exact match found in the file"))
+            else:
+                skipped.append((old, f"matched {count} times (ambiguous), skipped for safety"))
+
+        lines = ["[Pulse CLI] Code fix"]
+        if fix["explanation"]:
+            lines.append(f"Explanation: {fix['explanation']}")
+
+        if not applied:
+            lines.append("\n⚠ No changes were applied -- none of the proposed snippets matched the file cleanly:")
+            for old, reason in skipped:
+                lines.append(f"  - {reason}: {old.splitlines()[0][:80]}...")
+            return "\n".join(lines)
+
+        try:
+            with open(self.script_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError as exc:
+            return f"[Pulse CLI] ⚠ Failed to write changes to '{self.script_path}': {exc}"
+
+        self.code_text = content
+        self._pending_revert_path = self.script_path
+        self._pending_revert_backup = original_content
+
+        lines.append(f"\n✓ Applied {len(applied)} change(s) to '{self.script_path}':")
+        for old, new in applied:
+            lines.append(f"  - replaced:\n      {old.splitlines()[0][:80]}...\n    with:\n      {new.splitlines()[0][:80]}...")
+        if skipped:
+            lines.append(f"\n⚠ Skipped {len(skipped)} proposed change(s) that didn't match cleanly:")
+            for old, reason in skipped:
+                lines.append(f"  - {reason}: {old.splitlines()[0][:80]}...")
+
+        print("\n".join(lines))
+
+        revert = input("\nRevert this change and restore the file to how it was before? (y/n) > ").strip().lower()
+        if revert in ("y", "yes"):
+            try:
+                with open(self.script_path, "w", encoding="utf-8") as f:
+                    f.write(original_content)
+                self.code_text = original_content
+                self._pending_revert_path = None
+                self._pending_revert_backup = None
+                return f"✓ Reverted '{self.script_path}' to its state before this fix."
+            except OSError as exc:
+                return f"[Pulse CLI] ⚠ Failed to revert '{self.script_path}': {exc}"
+
+        return "✓ Change kept."
 
     def update(self, step: Optional[int] = None, generate_pdfs: Optional[bool] = None) -> None:
         """Called at every training step/checkpoint.
@@ -759,6 +915,8 @@ class PulseCLI:
         want_pdfs = self.generate_pdfs if generate_pdfs is None else generate_pdfs
         now = time.monotonic()
 
+        # First call probes immediately. After that, matrix inspection is capped
+        # by wall-clock time rather than training-step count.
         probe_matrices = (
             not self._matrix_cache
             or (now - self._last_matrix_probe) >= self.matrix_probe_interval
@@ -769,6 +927,8 @@ class PulseCLI:
         matrix_lines: List[tuple[str, Dict[str, Any], Any, bool]] = []
         any_scalar_changed = False
 
+        # Fast path: discover/process scalars every step. Do NOT call
+        # _yield_slices() for matrices unless this is an actual matrix probe.
         for var_name in self.tracked_vars:
             if var_name not in self.watch_locals:
                 continue
@@ -793,6 +953,8 @@ class PulseCLI:
                 scalar_lines.append((var_name, scalar_val))
                 continue
 
+            # Matrix/tensor path. No slicing, no statistics(), and no GPU->CPU
+            # copy at all unless the wall-clock probe is due.
             if not probe_matrices:
                 continue
 
@@ -822,6 +984,8 @@ class PulseCLI:
         if probe_matrices:
             self._last_matrix_probe = now
 
+        # Don't redraw the entire terminal if absolutely nothing visible changed.
+        # A matrix probe always redraws because its snapshot may have changed.
         should_redraw = probe_matrices or any_scalar_changed or not self.scalar_histories
 
         if should_redraw:
@@ -835,6 +999,8 @@ class PulseCLI:
                 self._print_ascii_chart(sub_name, hist)
 
             if probe_matrices:
+                # Print matrix statistics ONLY when they were freshly measured.
+                # Cached matrices are deliberately silent between probes.
                 for sub_name, stats, val, fresh in matrix_lines:
                     flag = ""
                     if stats.get("nan") or stats.get("inf"):
@@ -856,6 +1022,8 @@ class PulseCLI:
                         except Exception as exc:
                             print(f"    ↳ ⚠ failed to save PDF snapshot for '{sub_name}': {exc}")
 
+                # If the cache is already populated, show a tiny status line rather
+                # than reprinting every cached matrix on every training iteration.
                 if self._matrix_cache:
                     print(
                         f"  [matrices cached: {len(self._matrix_cache)} | "
@@ -865,6 +1033,7 @@ class PulseCLI:
         if self.continuous:
             return
 
+        # Interactive Training Loop Prompt
         while True:
             try:
                 cmd = input(
@@ -940,6 +1109,7 @@ class PulseCLI:
         lo = min(data)
         hi = max(data)
 
+        # Give flat/near-flat curves a useful visible range.
         if hi == lo:
             pad = max(abs(hi) * 0.02, 1e-6)
             lo -= pad
@@ -959,6 +1129,7 @@ class PulseCLI:
 
         ys = [y_for(v) for v in data]
 
+        # Plot points and simple line segments.
         for i, y in enumerate(ys):
             grid[y][i] = "●"
             if i == 0:
@@ -970,7 +1141,8 @@ class PulseCLI:
             else:
                 ch = "╱" if y < py else "╲"
                 grid[y][x] = ch
-               
+                # Fill vertical movement without trying to interpolate a fake
+                # curve; this keeps the terminal graph readable.
                 step_dir = 1 if y > py else -1
                 rr = py + step_dir
                 while rr != y:
