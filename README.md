@@ -28,9 +28,11 @@ with an integrated AI analyst.
   host-side NumPy arrays, reusing Matplotlib figures (`set_data`) instead
   of rebuilding them every step, and matching render sizes to the actual
   on-screen thumbnail.
-- **Pulse AI Analyst** — A context-aware chat panel briefed on its role
-  that can inspect live matrix statistics, heatmaps, and your training
-  code when "Send Code" is enabled.
+  - **Pulse AI Agent** — A context-aware chat panel briefed on its role
+    that can inspect live matrix statistics, heatmaps, and your training code.
+    When a fix is needed, it returns a precise structured format that
+    allows Pulse to autonomously apply code modifications—giving you true
+    agentic debugging at a fraction of the cost.
 
 ## Past Debugs
 
