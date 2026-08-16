@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pulseml"
+version = "0.1.3"
+description = "A live ML training debugger - GUI or CLI, any backend (NumPy, PyTorch, TensorFlow, CuPy, JAX)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [
+    { name = "Yash Patel", email = "codeyash09@gmail.com" }
+]
+keywords = [
+    "machine-learning", "deep-learning", "debugging", "pytorch",
+    "tensorflow", "numpy", "jax", "cupy", "training", "visualization"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: Other/Proprietary License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Debuggers",
+]
+dependencies = [
+    "numpy",
+    "matplotlib",
+    "pillow",
+    "litellm",
+    "fpdf2",
+]
+
+[project.optional-dependencies]
+torch = ["torch"]
+tensorflow = ["tensorflow"]
+cupy = ["cupy-cuda12x"]
+jax = ["jax"]
+
+[project.urls]
+Homepage = "https://github.com/codeyash09/PulseML"
+Issues = "https://github.com/codeyash09/PulseML/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
