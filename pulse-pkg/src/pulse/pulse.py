@@ -29,6 +29,11 @@ rather than rebuilt from scratch every step, render sizes match the actual
 on-screen thumbnail so nothing is drawn larger than needed, and stats are
 computed without forcing unnecessary float64 copies of large tensors.
 
+Robustness: individual tracked variables that turn out to be None, NaN-only,
+or otherwise unreadable at a given step are reported as such in the
+dashboard/manifest (and to the AI agent) instead of raising -- one bad
+variable never takes down the background worker or the whole session.
+
 Install:
     pip install numpy matplotlib pillow litellm --break-system-packages
     # tkinter ships with most Python installs; on Debian/Ubuntu:
@@ -181,6 +186,21 @@ def _looks_like_loss(name):
     return any(hint in n for hint in LOSS_NAME_HINTS)
 
 
+def _values_equal(a, b) -> bool:
+    """NaN-safe / None-safe equality, used when deciding whether a scalar's
+    value actually changed since the last recorded point. `nan != nan` is
+    always True in plain Python, so without this a NaN (or None) scalar that
+    repeats every step would get treated as "changed" every single step."""
+    if a is None or b is None:
+        return a is b
+    try:
+        if a != a and b != b:  # both NaN
+            return True
+    except TypeError:
+        pass
+    return a == b
+
+
 # ============================================================================
 # core: background heatmap/linechart-rendering worker process + stats
 # ============================================================================
@@ -274,20 +294,31 @@ def _reduce_to_2d(matrix, config):
 
 def _downsample_for_display(points, target=TARGET_SCALAR_DISPLAY_POINTS):
     """Bucket-average a (step, value) point list down to ~`target` points for
-    rendering. This never mutates the original history."""
-    n = len(points)
-    if n <= target:
-        return list(points)
+    rendering. This never mutates the original history.
 
-    bucket = math.ceil(n / target)
-    out = []
-    for i in range(0, n, bucket):
-        chunk = points[i:i + bucket]
-        avg_value = sum(p[1] for p in chunk) / len(chunk)
-        # use mean step index for better x placement
-        avg_step = int(round(sum(p[0] for p in chunk) / len(chunk)))
-        out.append((avg_step, avg_value))
-    return out
+    `points` may contain None values (unreadable that step) -- those are
+    dropped before averaging so a single None doesn't turn an entire bucket
+    into None/NaN; a bucket with no readable points at all is skipped.
+    """
+    n = len(points)
+    cleaned = points if n <= target else points
+
+    def _bucketize(pts):
+        out = []
+        bucket = max(1, math.ceil(len(pts) / target)) if len(pts) > target else 1
+        for i in range(0, len(pts), bucket):
+            chunk = pts[i:i + bucket]
+            readable = [p for p in chunk if p[1] is not None and math.isfinite(p[1])]
+            if not readable:
+                continue
+            avg_value = sum(p[1] for p in readable) / len(readable)
+            avg_step = int(round(sum(p[0] for p in readable) / len(readable)))
+            out.append((avg_step, avg_value))
+        return out
+
+    if n <= target:
+        return _bucketize(list(points)) if any(p[1] is None or not math.isfinite(p[1]) for p in points) else list(points)
+    return _bucketize(list(points))
 
 
 def _atomic_write_json(path, payload, retries=12, delay=0.05):
@@ -327,14 +358,32 @@ def _save_heatmap(arr2d, path, var, fig_cache):
     spines, colorbar, layout pass) from scratch every step. This is the
     single biggest CPU saving in Pulse -- Figure construction and layout is
     far more expensive than updating an existing artist's data.
+
+    NaN/inf-safe: `LogNorm(vmin=nan, vmax=nan)` raises, so if a tensor has
+    gone entirely NaN/inf this falls back to a flat placeholder range
+    instead of crashing the worker process.
     """
     safe = np.abs(arr2d.astype(np.float64)) + 1e-12
+    finite_mask = np.isfinite(safe)
+
+    if finite_mask.any():
+        vmin = float(np.min(safe[finite_mask]))
+        vmax = float(np.max(safe[finite_mask]))
+        if vmin == vmax:
+            vmax = vmin + 1e-12
+        # Replace non-finite cells with vmin so imshow has something valid
+        # to draw everywhere; the log/scale is still driven by real data.
+        safe = np.where(finite_mask, safe, vmin)
+    else:
+        safe = np.full_like(safe, 1e-12)
+        vmin, vmax = 1e-12, 1.0
+
     entry = fig_cache.get(var)
 
     if entry is None:
         fig, ax = plt.subplots(figsize=FIG_SIZE, dpi=FIG_DPI, facecolor=BG)
         ax.set_facecolor(BG)
-        im = ax.imshow(safe, cmap=CMAP, norm=LogNorm(vmin=safe.min(), vmax=safe.max()), aspect="auto")
+        im = ax.imshow(safe, cmap=CMAP, norm=LogNorm(vmin=vmin, vmax=vmax), aspect="auto")
         ax.set_xticks([])
         ax.set_yticks([])
         for spine in ax.spines.values():
@@ -345,7 +394,7 @@ def _save_heatmap(arr2d, path, var, fig_cache):
         fig, ax, im = entry
         im.set_data(safe)
         try:
-            im.set_norm(LogNorm(vmin=safe.min(), vmax=safe.max()))
+            im.set_norm(LogNorm(vmin=vmin, vmax=vmax))
         except Exception:
             pass  # degenerate (all-equal) arrays -- keep the previous norm
 
@@ -356,9 +405,14 @@ def _save_heatmap(arr2d, path, var, fig_cache):
 
 def _save_linechart(points, path, var_name, fig_cache):
     """Renders a scalar's (step, value) point history -- already downsampled
-    for display by the caller -- as a step chart (flat until the value
-    actually changes, then jumps), which is the GUI equivalent of the CLI's
-    ASCII chart. Same reuse-the-figure strategy as `_save_heatmap`."""
+    (and NaN/None-filtered) for display by the caller -- as a step chart
+    (flat until the value actually changes, then jumps), which is the GUI
+    equivalent of the CLI's ASCII chart. Same reuse-the-figure strategy as
+    `_save_heatmap`.
+
+    If nothing readable is left after filtering, draws an empty chart with
+    a small "no readable data" label rather than failing.
+    """
     xs = [p[0] for p in points]
     ys = [p[1] for p in points]
     entry = fig_cache.get(var_name)
@@ -373,16 +427,22 @@ def _save_linechart(points, path, var_name, fig_cache):
         for spine in ax.spines.values():
             spine.set_color(BORDER)
         ax.grid(color=BORDER, linewidth=0.4, alpha=0.5)
+        if not points:
+            ax.text(0.5, 0.5, "no readable data", color=TEXT_FAINT, fontsize=7,
+                     ha="center", va="center", transform=ax.transAxes)
         fig.tight_layout(pad=0.4)
         fig_cache[var_name] = (fig, ax, line, scatter)
     else:
         fig, ax, line, scatter = entry
         line.set_data(xs, ys)
-        ax.relim()
-        ax.autoscale_view()
+        if points:
+            ax.relim()
+            ax.autoscale_view()
 
     if points:
         scatter.set_offsets([[xs[-1], ys[-1]]])
+    else:
+        scatter.set_offsets(np.empty((0, 2)))
 
     tmp = path + ".tmp.png"
     fig.savefig(tmp, facecolor=BG)
@@ -399,7 +459,8 @@ def _worker_main(queue, display_configs, session_id):
     # is only appended when the value actually differs from the last one
     # recorded, so a loss that's flat for 500 steps costs one point, not 500
     # -- the step chart drawstyle in _save_linechart fills in the flat
-    # segments visually without needing a point at every step.
+    # segments visually without needing a point at every step. `value` may
+    # be None (variable was None or unreadable that step).
     scalar_histories = {}
     # var -> latest step index seen (whether or not it produced a new point),
     # used only to extend the rendered line up to "now".
@@ -441,6 +502,22 @@ def _worker_main(queue, display_configs, session_id):
 
         var, matrix, config_override = item
 
+        # A variable can legitimately be None (not yet assigned, or an
+        # optional value that's currently unset). Report it plainly instead
+        # of letting it reach to_numpy()/tensor_kind() and raise.
+        if matrix is None:
+            manifest[var] = {
+                "kind": "scalar",
+                "backend": "NoneType",
+                "latest_value": None,
+                "nan": 0,
+                "inf": 0,
+                "error": "NoneType",
+                "updated": time.time(),
+            }
+            _atomic_write_json(manifest_path, manifest)
+            continue
+
         try:
             kind = tensor_kind(matrix)
             if kind == "scalar":
@@ -448,7 +525,15 @@ def _worker_main(queue, display_configs, session_id):
                 # rolling (step, value) history -- deduplicated so flat runs
                 # don't cost a point per step -- and render it as a step
                 # chart rather than a 1x1 "heatmap", which would be useless.
-                value = scalar_value(matrix)
+                try:
+                    value = scalar_value(matrix)
+                    if value is not None and not math.isfinite(value):
+                        # NaN/inf scalar: keep it as the recorded value (so
+                        # nan/inf counters and the agent can see it) but
+                        # never let it reach chart math that assumes finite.
+                        pass
+                except Exception:
+                    value = None
 
                 # Only advance the step counter when the scalar value actually changes.
                 # This makes the x-axis move only on real changes.
@@ -456,7 +541,7 @@ def _worker_main(queue, display_configs, session_id):
                 hist = scalar_histories.setdefault(var, [])
                 last_value = hist[-1][1] if hist else None
 
-                if hist and last_value == value:
+                if hist and _values_equal(last_value, value):
                     # value unchanged: do not increment step counter, do not append a new point
                     step_count = last_step
                 else:
@@ -465,13 +550,19 @@ def _worker_main(queue, display_configs, session_id):
                     scalar_step_counters[var] = step_count
                     hist.append((step_count, value))
 
-                # For rendering, use the raw history (no synthetic extension).
+                # For rendering, use the raw history (no synthetic extension),
+                # filtering out None/NaN/inf points so the chart never has to
+                # do math on them.
                 display_points = _downsample_for_display(hist)
                 version_tag = time.time_ns()
                 img_path = os.path.join(cache, f"{var}_{version_tag}.png")
                 _save_linechart(display_points, img_path, var, linechart_figs)
 
-                stats = backend_statistics(matrix)
+                try:
+                    stats = backend_statistics(matrix)
+                except Exception as exc:
+                    stats = {"kind": "scalar", "backend": "unknown", "nan": 0, "inf": 0,
+                              "error": f"{type(exc).__name__}: {exc}"}
                 stats["image"] = img_path
                 stats["updated"] = time.time()
                 stats["latest_value"] = value
@@ -808,6 +899,10 @@ SYSTEM_PROMPT = (
     "std=142.7 and 340 inf values' beats 'you may have exploding gradients.' If code is available, "
     "point to the exact line; if it isn't, say what you'd need and that checking 'Send Code' would "
     "help. If nothing looks abnormal, say so rather than inventing a problem.\n\n"
+    "Some variables may show latest_value=None, backend=NoneType, or an 'error' field instead of "
+    "normal stats -- that means the variable is currently None or was unreadable that step, not "
+    "that it's missing. Treat that as real signal (e.g. an optional loss term never getting set, "
+    "or a value that already went NaN/inf and is now failing to convert) rather than ignoring it.\n\n"
     "Be concise. No preamble before the diagnosis.\n\n"
 
     "CODE FIXES:\n"
@@ -1148,11 +1243,13 @@ class ChatPanel(tk.Frame):
         context = "Current tracked matrix/scalar stats:\n"
         for name, s in manifest.items():
             if "error" in s:
-                context += f"- {name}: error reading matrix ({s['error']})\n"
+                context += f"- {name}: NoneType/error reading matrix ({s['error']})\n"
                 continue
             if s.get("kind") == "scalar":
+                latest = s.get("latest_value")
+                value_str = "None" if latest is None else str(latest)
                 context += (
-                    f"- {name}: scalar, backend={s.get('backend')}, latest_value={s.get('latest_value')}, "
+                    f"- {name}: scalar, backend={s.get('backend')}, latest_value={value_str}, "
                     f"nan={s.get('nan')} inf={s.get('inf')}\n"
                 )
             else:
@@ -1504,7 +1601,12 @@ class Dashboard:
 
             if is_scalar:
                 latest = stats.get("latest_value")
-                latest_str = f"{latest:.4f}" if isinstance(latest, (int, float)) else "n/a"
+                if latest is None:
+                    latest_str = "NoneType"
+                elif isinstance(latest, (int, float)) and math.isfinite(latest):
+                    latest_str = f"{latest:.4f}"
+                else:
+                    latest_str = "NaN/inf"
                 tile["sub"].configure(text=f"value={latest_str}", fg=TEXT_DIM)
             else:
                 flag = "  \u26a0 flagged" if is_flagged else "  nominal"
