@@ -9,6 +9,8 @@ import os
 import sys
 import json
 import time
+import math
+import shutil
 import signal
 import getpass
 import itertools
@@ -37,6 +39,24 @@ def _looks_like_loss(name: str) -> bool:
     n = (name or "").lower()
     return any(hint in n for hint in LOSS_NAME_HINTS)
 
+
+def _values_equal(a, b) -> bool:
+    """NaN-safe / None-safe equality for scalar history dedup.
+
+    `nan != nan` is always True in Python, so without this a NaN (or None)
+    scalar that repeats every step would get appended to history -- and
+    re-rendered -- every single step instead of being deduped like any
+    other repeated value.
+    """
+    if a is None or b is None:
+        return a is b
+    try:
+        if a != a and b != b:  # both NaN
+            return True
+    except TypeError:
+        pass
+    return a == b
+
 # ----------------------------------------------------------------------------
 # CLI AI agent
 # ----------------------------------------------------------------------------
@@ -53,6 +73,11 @@ SYSTEM_PROMPT = (
     "2. Reasoning — grounded in the actual numbers and code, with real math.\n"
     "3. Fix — a concrete change.\n\n"
     "Be concise. Do not invent problems or data that were not provided.\n\n"
+    "Some tracked values may show up as 'NoneType' (the variable currently holds None, or "
+    "hasn't run yet) or flagged as NaN/inf-only in the chart. Treat those as data too -- a "
+    "variable that is NoneType or all-NaN at a point in training is itself often the root "
+    "cause (e.g. an optional metric never getting set, or a loss that has already collapsed "
+    "to NaN before this step) rather than a gap to ignore.\n\n"
 
     "CODE FIXES:\n"
     "If, and only if, the user explicitly asks you to fix, edit, patch, or change the code "
@@ -294,32 +319,8 @@ class PulseCLI:
             self.var_configs[var_name] = config
             print(f"✓ Saved config '{config}' for '{var_name}'.")
 
-    def _untrack_one(self, var_name: str) -> None:
-        """Clear all cached state associated with a single tracked variable
-        (axis config, scalar history, matrix cache), including any sliced
-        sub-names like 'var_name[0,1]' produced by _yield_slices.
-        """
-        self.var_configs.pop(var_name, None)
-        self.scalar_histories.pop(var_name, None)
-        self._matrix_cached_vars.discard(var_name)
-
-        prefix = f"{var_name}["
-        for key in list(self._matrix_cache.keys()):
-            if key == var_name or key.startswith(prefix):
-                self._matrix_cache.pop(key, None)
-        for key in list(self.scalar_histories.keys()):
-            if key.startswith(prefix):
-                self.scalar_histories.pop(key, None)
-
     def _cmd_delete(self, var_name: str) -> None:
-        """Stop tracking a variable (or all variables) for the AI agent and
-        the live view.
-
-        This does not touch anything on disk -- it just removes the
-        variable(s) from `self.tracked_vars` and clears any cached state so
-        it no longer shows up in the live display or in the context sent to
-        the AI agent. Use `/add` again to resume tracking it.
-        """
+        """Remove a variable from tracking, or clear all tracked variables."""
         var_name = var_name.strip()
         if not var_name:
             print("Usage: /delete <variable name> or /delete all")
@@ -329,25 +330,99 @@ class PulseCLI:
             if not self.tracked_vars:
                 print("[Pulse CLI] No variables are currently tracked.")
                 return
+
+            removed = list(self.tracked_vars)
+            self.tracked_vars.clear()
+            self.var_configs.clear()
+            self.scalar_histories.clear()
+            self._matrix_cache.clear()
+            self._matrix_cached_vars.clear()
+            print(f"✓ Removed all variables from tracking: {', '.join(removed)}")
+            return
+
+        # Exact name first, then partial-name matching.
+        target = var_name
+        if target not in self.tracked_vars:
+            matches = [
+                name for name in self.tracked_vars
+                if var_name.lower() in name.lower()
+            ]
+
+            if not matches:
+                print(f"[Pulse CLI] '{var_name}' is not currently tracked.")
+                return
+
+            if len(matches) > 1:
+                print("\nMatching tracked variables:")
+                for idx, name in enumerate(matches, 1):
+                    print(f"  {idx}) {name}")
+                choice = input("Select a number to delete (Enter to cancel) > ").strip()
+                if not choice:
+                    print("[Pulse CLI] Delete cancelled.")
+                    return
+                if not choice.isdigit() or not (0 < int(choice) <= len(matches)):
+                    print("[Pulse CLI] Invalid selection.")
+                    return
+                target = matches[int(choice) - 1]
+            else:
+                target = matches[0]
+
+        self.tracked_vars.remove(target)
+        self.var_configs.pop(target, None)
+        self.scalar_histories.pop(target, None)
+        self._matrix_cached_vars.discard(target)
+
+        # Remove cached sliced entries belonging to this base variable.
+        for cache_name in list(self._matrix_cache):
+            if (
+                cache_name == target
+                or cache_name.startswith(f"{target}[")
+            ):
+                del self._matrix_cache[cache_name]
+
+        print(f"✓ Removed '{target}' from tracking.")
+
+    def _cmd_delete_pdfs(self, var_name: str) -> None:
+        """Delete saved heatmap PDF snapshots for a variable, or all of them."""
+        var_name = var_name.strip()
+        if not var_name:
+            print("Usage: /deletepdf <variable name> or /deletepdf all")
+            return
+
+        if var_name.lower() == "all":
+            if not os.path.isdir(self.pdf_dir):
+                print(f"[Pulse CLI] No PDF output directory found at '{self.pdf_dir}'.")
+                return
             confirm = input(
-                f"Stop tracking ALL variables ({', '.join(self.tracked_vars)})? (y/n) > "
+                f"Delete ALL heatmap snapshots under '{self.pdf_dir}'? This cannot be undone. (y/n) > "
             ).strip().lower()
             if confirm not in ("y", "yes"):
-                print("[Pulse CLI] Cancelled.")
+                print("[Pulse CLI] Delete cancelled.")
                 return
-            for name in list(self.tracked_vars):
-                self._untrack_one(name)
-            self.tracked_vars = []
-            print("✓ Stopped tracking all variables.")
+            try:
+                shutil.rmtree(self.pdf_dir)
+                print(f"✓ Deleted all heatmap snapshots under '{self.pdf_dir}'.")
+            except Exception as exc:
+                print(f"[Pulse CLI] ⚠ Failed to delete '{self.pdf_dir}': {exc}")
             return
 
-        if var_name not in self.tracked_vars:
-            print(f"[Pulse CLI] '{var_name}' is not currently tracked.")
+        safe_name = var_name.replace("[", "_").replace("]", "").replace(",", "_")
+        target_dir = os.path.join(self.pdf_dir, safe_name)
+        if not os.path.isdir(target_dir):
+            print(f"[Pulse CLI] No heatmap snapshots found for '{var_name}' (looked in '{target_dir}').")
             return
 
-        self._untrack_one(var_name)
-        self.tracked_vars.remove(var_name)
-        print(f"✓ Stopped tracking '{var_name}'.")
+        confirm = input(
+            f"Delete all heatmap snapshots for '{var_name}' in '{target_dir}'? (y/n) > "
+        ).strip().lower()
+        if confirm not in ("y", "yes"):
+            print("[Pulse CLI] Delete cancelled.")
+            return
+        try:
+            shutil.rmtree(target_dir)
+            print(f"✓ Deleted heatmap snapshots for '{var_name}'.")
+        except Exception as exc:
+            print(f"[Pulse CLI] ⚠ Failed to delete '{target_dir}': {exc}")
 
     def interactive_setup(self) -> None:
         """Interactive CLI setup."""
@@ -396,6 +471,9 @@ class PulseCLI:
                 continue
             if lower.startswith("/edit "):
                 self._cmd_edit(choice[6:].strip())
+                continue
+            if lower.startswith("/deletepdf "):
+                self._cmd_delete_pdfs(choice[11:].strip())
                 continue
             if lower.startswith("/delete "):
                 self._cmd_delete(choice[8:].strip())
@@ -585,7 +663,7 @@ class PulseCLI:
             "  /tracked  show tracked variables\n"
             "  /add      add a new variable to track (e.g., /add my_matrix)\n"
             "  /edit     edit axis configuration (e.g., /edit my_matrix)\n"
-            "  /delete   stop tracking a variable (e.g., /delete my_matrix, /delete all)\n"
+            "  /delete   remove a variable from tracking (e.g., /delete my_matrix, /delete all)\n  /deletepdf delete saved heatmap PDFs (e.g., /deletepdf my_matrix, /deletepdf all)\n"
             "  /agent    switch AI provider/API key\n"
             "  /code     include the training code in the next question\n"
             "  /exit     finish setup and start training\n"
@@ -610,6 +688,9 @@ class PulseCLI:
             if question.lower().startswith("/edit "):
                 self._cmd_edit(question[6:].strip())
                 continue
+            if question.lower().startswith("/deletepdf "):
+                self._cmd_delete_pdfs(question[11:].strip())
+                continue
             if question.lower().startswith("/delete "):
                 self._cmd_delete(question[8:].strip())
                 continue
@@ -629,9 +710,6 @@ class PulseCLI:
                 question = input("Code question > ").strip()
                 if not question:
                     continue
-            elif question.startswith("/"):
-                print("[Pulse] Error: Command Not Found")
-                continue
 
             print("Pulse > ", end="", flush=True)
             answer = self.ask_agent(question, include_code=include_code)
@@ -737,15 +815,27 @@ class PulseCLI:
         for name in sorted(variables):
             val = variables[name]
             if val is None:
-                lines.append(f"- {name}: not run yet")
+                lines.append(f"- {name}: NoneType (not run yet, or currently None)")
                 continue
             try:
                 for sub_name, s_val in self._yield_slices(name, val):
-                    s = statistics(s_val)
+                    if s_val is None:
+                        lines.append(f"- {sub_name}: NoneType")
+                        continue
+                    try:
+                        s = statistics(s_val)
+                    except Exception as exc:
+                        lines.append(f"- {sub_name}: unable to read stats ({exc})")
+                        continue
                     if s.get("kind") == "scalar":
+                        try:
+                            scalar_val = float(to_numpy(s_val).reshape(-1)[0])
+                            value_str = str(scalar_val)
+                        except Exception:
+                            value_str = "NoneType"
                         lines.append(
                             f"- {sub_name}: scalar backend={s.get('backend')} "
-                            f"value={float(to_numpy(s_val).reshape(-1)[0])} "
+                            f"value={value_str} "
                             f"nan={s.get('nan')} inf={s.get('inf')}"
                         )
                     else:
@@ -916,6 +1006,10 @@ class PulseCLI:
         are expensive (especially on GPU), so they are probed at most once per
         ``matrix_probe_interval`` seconds. Between probes, Pulse does not even
         slice or call statistics() on matrices; it only uses the cached result.
+
+        Individual variables that are currently None, NaN-only, or otherwise
+        unreadable are reported as such (rather than raising) so one bad
+        variable never takes down the whole debugger mid-training.
         """
 
         if step is not None:
@@ -934,7 +1028,7 @@ class PulseCLI:
             or any(v not in self._matrix_cached_vars for v in self.tracked_vars)
         )
 
-        scalar_lines: List[tuple[str, float]] = []
+        scalar_lines: List[tuple[str, Optional[float]]] = []
         matrix_lines: List[tuple[str, Dict[str, Any], Any, bool]] = []
         any_scalar_changed = False
 
@@ -945,6 +1039,15 @@ class PulseCLI:
                 continue
 
             orig_val = self.watch_locals[var_name]
+
+            if orig_val is None:
+                hist = self.scalar_histories.setdefault(var_name, [])
+                if not hist or not _values_equal(hist[-1], None):
+                    hist.append(None)
+                    any_scalar_changed = True
+                scalar_lines.append((var_name, None))
+                continue
+
             if not is_trackable(orig_val):
                 continue
 
@@ -954,10 +1057,19 @@ class PulseCLI:
                 kind = None
 
             if kind == "scalar":
-                stats = statistics(orig_val)
-                scalar_val = float(to_numpy(orig_val).reshape(-1)[0])
+                try:
+                    stats = statistics(orig_val)
+                    scalar_val = float(to_numpy(orig_val).reshape(-1)[0])
+                except Exception as exc:
+                    hist = self.scalar_histories.setdefault(var_name, [])
+                    if not hist or not _values_equal(hist[-1], None):
+                        hist.append(None)
+                        any_scalar_changed = True
+                    scalar_lines.append((var_name, None))
+                    print(f"  ⚠ '{var_name}' could not be read this step: {type(exc).__name__}: {exc}")
+                    continue
                 hist = self.scalar_histories.setdefault(var_name, [])
-                changed = not hist or hist[-1] != scalar_val
+                changed = not hist or not _values_equal(hist[-1], scalar_val)
                 if changed:
                     hist.append(scalar_val)
                     any_scalar_changed = True
@@ -970,15 +1082,32 @@ class PulseCLI:
                 continue
 
             for sub_name, val in self._yield_slices(var_name, orig_val):
+                if val is None:
+                    hist = self.scalar_histories.setdefault(sub_name, [])
+                    if not hist or not _values_equal(hist[-1], None):
+                        hist.append(None)
+                        any_scalar_changed = True
+                    scalar_lines.append((sub_name, None))
+                    continue
+
                 try:
                     stats = statistics(val)
-                except Exception:
+                except Exception as exc:
+                    print(f"  ⚠ '{sub_name}' could not be read this step: {type(exc).__name__}: {exc}")
                     continue
 
                 if stats.get("kind") == "scalar":
-                    scalar_val = float(to_numpy(val).reshape(-1)[0])
+                    try:
+                        scalar_val = float(to_numpy(val).reshape(-1)[0])
+                    except Exception:
+                        hist = self.scalar_histories.setdefault(sub_name, [])
+                        if not hist or not _values_equal(hist[-1], None):
+                            hist.append(None)
+                            any_scalar_changed = True
+                        scalar_lines.append((sub_name, None))
+                        continue
                     hist = self.scalar_histories.setdefault(sub_name, [])
-                    changed = not hist or hist[-1] != scalar_val
+                    changed = not hist or not _values_equal(hist[-1], scalar_val)
                     if changed:
                         hist.append(scalar_val)
                         any_scalar_changed = True
@@ -1006,7 +1135,10 @@ class PulseCLI:
 
             for sub_name, scalar_val in scalar_lines:
                 hist = self.scalar_histories.get(sub_name, [])
-                print(f"  • {sub_name}: {scalar_val:.6g}")
+                if scalar_val is None:
+                    print(f"  • {sub_name}: NoneType  ⚠ (unreadable this step)")
+                else:
+                    print(f"  • {sub_name}: {scalar_val:.6g}")
                 self._print_ascii_chart(sub_name, hist)
 
             if probe_matrices:
@@ -1016,11 +1148,19 @@ class PulseCLI:
                     flag = ""
                     if stats.get("nan") or stats.get("inf"):
                         flag = f"  ⚠ nan={stats.get('nan')} inf={stats.get('inf')}"
+                    mean_v, min_v, max_v = stats.get("mean"), stats.get("min"), stats.get("max")
+
+                    def _fmt(v):
+                        try:
+                            return f"{v:.4f}"
+                        except (TypeError, ValueError):
+                            return "n/a"
+
                     print(
                         f"  • Tagging '{sub_name}' "
                         f"[{stats.get('backend')} {stats.get('kind')} {stats.get('shape')}] "
-                        f"| mean={stats.get('mean'):.4f} min={stats.get('min'):.4f} "
-                        f"max={stats.get('max'):.4f}{flag}"
+                        f"| mean={_fmt(mean_v)} min={_fmt(min_v)} "
+                        f"max={_fmt(max_v)}{flag}"
                     )
 
                     if want_pdfs and val is not None:
@@ -1049,7 +1189,7 @@ class PulseCLI:
             try:
                 cmd = input(
                     "\nPulse [Enter=step, /c=continuous, /add <var>, /edit <var>, "
-                    "/delete <var>, /agent, /code, or ask AI] > "
+                    "/delete <var>, /deletepdf <var>, /agent, or ask AI] > "
                 ).strip()
             except (EOFError, KeyboardInterrupt):
                 print("\nExiting Pulse...")
@@ -1072,6 +1212,9 @@ class PulseCLI:
                 self._cmd_edit(cmd[6:].strip())
                 continue
 
+            if cmd.lower().startswith("/deletepdf "):
+                self._cmd_delete_pdfs(cmd[11:].strip())
+                continue
             if cmd.lower().startswith("/delete "):
                 self._cmd_delete(cmd[8:].strip())
                 continue
@@ -1092,24 +1235,14 @@ class PulseCLI:
                 print("Tracked:", ", ".join(cfg_strs) if cfg_strs else "(none)")
                 continue
 
-            include_code = False
-            if cmd.lower() == "/code":
-                include_code = True
-                cmd = input("Code question > ").strip()
-                if not cmd:
-                    continue
-            elif cmd.startswith("/"):
-                print("[Pulse] Error: Command Not Found")
-                continue
-
             print("Pulse AI > ", end="", flush=True)
-            answer = self.ask_agent(cmd, include_code=include_code)
+            answer = self.ask_agent(cmd, include_code=False)
             print(answer)
 
     def _print_ascii_chart(
         self,
         name: str,
-        history: List[float],
+        history: List[Optional[float]],
         height: int = 8,
         width: int = 64,
     ) -> None:
@@ -1117,18 +1250,33 @@ class PulseCLI:
 
         The X axis advances only when the scalar value changes, so repeated
         training-loop calls do not create fake horizontal steps.
+
+        `history` may contain None (variable was unreadable/NoneType that
+        step) or NaN/inf floats. Those points are never fed into the min/max/
+        round math -- they're drawn as a distinct '!' marker instead -- since
+        `round(float('nan'))` raises and would otherwise crash every call.
         """
         if not history:
             return
 
         data = history[-width:]
+        finite = [v for v in data if isinstance(v, (int, float)) and math.isfinite(v)]
+
+        if not finite:
+            print(f"    [{name} | {len(history)} points] ⚠ no readable values (None/NaN/inf) -- nothing to chart")
+            return
+
         if len(data) == 1:
-            print(f"    {data[0]:>10.5g} ┤ ●")
+            v = data[0]
+            if isinstance(v, (int, float)) and math.isfinite(v):
+                print(f"    {v:>10.5g} ┤ ●")
+            else:
+                print(f"    {'None/NaN':>10} ┤ !")
             print("              └─ step 1")
             return
 
-        lo = min(data)
-        hi = max(data)
+        lo = min(finite)
+        hi = max(finite)
 
         # Give flat/near-flat curves a useful visible range.
         if hi == lo:
@@ -1148,12 +1296,22 @@ class PulseCLI:
             norm = (v - lo) / (hi - lo)
             return max(0, min(rows - 1, int(round((1.0 - norm) * (rows - 1)))))
 
-        ys = [y_for(v) for v in data]
+        def _readable(v):
+            return isinstance(v, (int, float)) and math.isfinite(v)
 
-        # Plot points and simple line segments.
+        ys = [y_for(v) if _readable(v) else None for v in data]
+        any_broken = False
+
+        # Plot points and simple line segments. Unreadable points (None/NaN/
+        # inf) get a '!' marker on the bottom row and never anchor a line
+        # segment, so a single bad step doesn't distort the whole chart.
         for i, y in enumerate(ys):
+            if y is None:
+                any_broken = True
+                grid[rows - 1][i] = "!"
+                continue
             grid[y][i] = "●"
-            if i == 0:
+            if i == 0 or ys[i - 1] is None:
                 continue
             py = ys[i - 1]
             x = i - 1
@@ -1171,7 +1329,8 @@ class PulseCLI:
                         grid[rr][x] = "│"
                     rr += step_dir
 
-        print(f"    [{name} | {len(history)} points | showing last {cols}]")
+        flag = "  ⚠ '!' = None/NaN/inf this step" if any_broken else ""
+        print(f"    [{name} | {len(history)} points | showing last {cols}]{flag}")
 
         for r in range(rows):
             value = hi - (hi - lo) * (r / (rows - 1))
