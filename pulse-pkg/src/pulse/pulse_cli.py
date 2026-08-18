@@ -9,7 +9,6 @@ import os
 import sys
 import json
 import time
-import shutil
 import signal
 import getpass
 import itertools
@@ -295,11 +294,31 @@ class PulseCLI:
             self.var_configs[var_name] = config
             print(f"✓ Saved config '{config}' for '{var_name}'.")
 
-    def _cmd_delete_pdfs(self, var_name: str) -> None:
-        """Delete saved heatmap PDF snapshots for a variable, or all of them.
+    def _untrack_one(self, var_name: str) -> None:
+        """Clear all cached state associated with a single tracked variable
+        (axis config, scalar history, matrix cache), including any sliced
+        sub-names like 'var_name[0,1]' produced by _yield_slices.
+        """
+        self.var_configs.pop(var_name, None)
+        self.scalar_histories.pop(var_name, None)
+        self._matrix_cached_vars.discard(var_name)
 
-        Snapshots are saved under `self.pdf_dir/<safe_variable_name>/`, using
-        the same name-sanitization as `update()` uses when writing them.
+        prefix = f"{var_name}["
+        for key in list(self._matrix_cache.keys()):
+            if key == var_name or key.startswith(prefix):
+                self._matrix_cache.pop(key, None)
+        for key in list(self.scalar_histories.keys()):
+            if key.startswith(prefix):
+                self.scalar_histories.pop(key, None)
+
+    def _cmd_delete(self, var_name: str) -> None:
+        """Stop tracking a variable (or all variables) for the AI agent and
+        the live view.
+
+        This does not touch anything on disk -- it just removes the
+        variable(s) from `self.tracked_vars` and clears any cached state so
+        it no longer shows up in the live display or in the context sent to
+        the AI agent. Use `/add` again to resume tracking it.
         """
         var_name = var_name.strip()
         if not var_name:
@@ -307,39 +326,28 @@ class PulseCLI:
             return
 
         if var_name.lower() == "all":
-            if not os.path.isdir(self.pdf_dir):
-                print(f"[Pulse CLI] No PDF output directory found at '{self.pdf_dir}'.")
+            if not self.tracked_vars:
+                print("[Pulse CLI] No variables are currently tracked.")
                 return
             confirm = input(
-                f"Delete ALL heatmap snapshots under '{self.pdf_dir}'? This cannot be undone. (y/n) > "
+                f"Stop tracking ALL variables ({', '.join(self.tracked_vars)})? (y/n) > "
             ).strip().lower()
             if confirm not in ("y", "yes"):
-                print("[Pulse CLI] Delete cancelled.")
+                print("[Pulse CLI] Cancelled.")
                 return
-            try:
-                shutil.rmtree(self.pdf_dir)
-                print(f"✓ Deleted all heatmap snapshots under '{self.pdf_dir}'.")
-            except Exception as exc:
-                print(f"[Pulse CLI] ⚠ Failed to delete '{self.pdf_dir}': {exc}")
+            for name in list(self.tracked_vars):
+                self._untrack_one(name)
+            self.tracked_vars = []
+            print("✓ Stopped tracking all variables.")
             return
 
-        safe_name = var_name.replace("[", "_").replace("]", "").replace(",", "_")
-        target_dir = os.path.join(self.pdf_dir, safe_name)
-        if not os.path.isdir(target_dir):
-            print(f"[Pulse CLI] No heatmap snapshots found for '{var_name}' (looked in '{target_dir}').")
+        if var_name not in self.tracked_vars:
+            print(f"[Pulse CLI] '{var_name}' is not currently tracked.")
             return
 
-        confirm = input(
-            f"Delete all heatmap snapshots for '{var_name}' in '{target_dir}'? (y/n) > "
-        ).strip().lower()
-        if confirm not in ("y", "yes"):
-            print("[Pulse CLI] Delete cancelled.")
-            return
-        try:
-            shutil.rmtree(target_dir)
-            print(f"✓ Deleted heatmap snapshots for '{var_name}'.")
-        except Exception as exc:
-            print(f"[Pulse CLI] ⚠ Failed to delete '{target_dir}': {exc}")
+        self._untrack_one(var_name)
+        self.tracked_vars.remove(var_name)
+        print(f"✓ Stopped tracking '{var_name}'.")
 
     def interactive_setup(self) -> None:
         """Interactive CLI setup."""
@@ -390,7 +398,7 @@ class PulseCLI:
                 self._cmd_edit(choice[6:].strip())
                 continue
             if lower.startswith("/delete "):
-                self._cmd_delete_pdfs(choice[8:].strip())
+                self._cmd_delete(choice[8:].strip())
                 continue
 
             if lower == "auto":
@@ -577,7 +585,7 @@ class PulseCLI:
             "  /tracked  show tracked variables\n"
             "  /add      add a new variable to track (e.g., /add my_matrix)\n"
             "  /edit     edit axis configuration (e.g., /edit my_matrix)\n"
-            "  /delete   delete saved heatmap PDFs (e.g., /delete my_matrix, /delete all)\n"
+            "  /delete   stop tracking a variable (e.g., /delete my_matrix, /delete all)\n"
             "  /agent    switch AI provider/API key\n"
             "  /code     include the training code in the next question\n"
             "  /exit     finish setup and start training\n"
@@ -603,7 +611,7 @@ class PulseCLI:
                 self._cmd_edit(question[6:].strip())
                 continue
             if question.lower().startswith("/delete "):
-                self._cmd_delete_pdfs(question[8:].strip())
+                self._cmd_delete(question[8:].strip())
                 continue
             if question.lower() == "/agent":
                 self._select_agent_provider_and_key(initial=False)
@@ -621,6 +629,9 @@ class PulseCLI:
                 question = input("Code question > ").strip()
                 if not question:
                     continue
+            elif question.startswith("/"):
+                print("[Pulse] Error: Command Not Found")
+                continue
 
             print("Pulse > ", end="", flush=True)
             answer = self.ask_agent(question, include_code=include_code)
@@ -1038,7 +1049,7 @@ class PulseCLI:
             try:
                 cmd = input(
                     "\nPulse [Enter=step, /c=continuous, /add <var>, /edit <var>, "
-                    "/delete <var>, /agent, or ask AI] > "
+                    "/delete <var>, /agent, /code, or ask AI] > "
                 ).strip()
             except (EOFError, KeyboardInterrupt):
                 print("\nExiting Pulse...")
@@ -1062,7 +1073,7 @@ class PulseCLI:
                 continue
 
             if cmd.lower().startswith("/delete "):
-                self._cmd_delete_pdfs(cmd[8:].strip())
+                self._cmd_delete(cmd[8:].strip())
                 continue
 
             if cmd.lower() == "/agent":
@@ -1081,8 +1092,18 @@ class PulseCLI:
                 print("Tracked:", ", ".join(cfg_strs) if cfg_strs else "(none)")
                 continue
 
+            include_code = False
+            if cmd.lower() == "/code":
+                include_code = True
+                cmd = input("Code question > ").strip()
+                if not cmd:
+                    continue
+            elif cmd.startswith("/"):
+                print("[Pulse] Error: Command Not Found")
+                continue
+
             print("Pulse AI > ", end="", flush=True)
-            answer = self.ask_agent(cmd, include_code=False)
+            answer = self.ask_agent(cmd, include_code=include_code)
             print(answer)
 
     def _print_ascii_chart(
