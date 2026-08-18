@@ -4,6 +4,8 @@
 
 🔗 [pulsedb.netlify.app](https://pulsedb.netlify.app/)
 
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/pulseml?period=total&units=NONE&left_color=BLACK&right_color=GREY&left_text=downloads)](https://pepy.tech/projects/pulseml)
+
 Pulse is a live machine learning training debugger designed to monitor
 tensors, track metrics, visualize heatmaps and line charts, and interact
 with an integrated AI analyst.
