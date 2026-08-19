@@ -30,10 +30,11 @@ with an integrated AI analyst.
   host-side NumPy arrays, reusing Matplotlib figures (`set_data`) instead
   of rebuilding them every step, and matching render sizes to the actual
   on-screen thumbnail.
-- **Pulse AI Analyst** — A context-aware chat panel briefed on its role
-  that can inspect live matrix statistics, heatmaps, and your training
-  code when "Send Code" is enabled.
-
+- **Pulse AI Agent** — A dedicated agent that not only will suggest, find,
+  and explain fixes and errors in your code using heatmap and scalar data,
+  but it will also implement the fix if directly prompted while also providing
+  an instant undo button in order to make sure that the changes don't
+  negatively impact the code.
 ## Past Debugs
 
 - Debugged a custom LLM after a vocab size increase (2.5x) by catching a
