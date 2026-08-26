@@ -1,5 +1,7 @@
 # PulseML
 
+Working on multi step agentic capabilities and implementing more functions to check validity of matmul deterministically.
+
 **Pulse** — a live ML training debugger, GUI or CLI, any backend.
 
 🔗 [pulsedb.netlify.app](https://pulsedb.netlify.app/)
