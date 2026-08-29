@@ -386,7 +386,7 @@ The goal isn't simply to tell you that your model is broken.
 
 ## License
 
-Proprietary. See [`LICENSE`](LICENSE).
+Proprietary. See [`LICENSE`](/pulse-pkg/LICENSE).
 
 Use of this software is governed by the terms in that file. Copying,
 redistribution, and reverse engineering are not permitted.
