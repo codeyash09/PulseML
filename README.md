@@ -12,6 +12,27 @@ Pulse is a live ML training debugger for GUI and CLI environments, built to work
 
 ---
 
+# Quickstart
+
+Import `auto_track` immediately before your training loop.
+
+Make sure your loop is wrapped in `if __name__ == '__main__':`.
+
+```python
+from pulse import auto_track
+
+if __name__ == '__main__':
+    auto_track()
+
+    for epoch in range(num_epochs):
+        # Your training code
+        pass
+```
+
+Pulse discovers variables available for monitoring and launches the appropriate debugging interface.
+
+---
+
 ## Debug the Training Process While It Runs
 
 Most ML debugging starts after something has already gone wrong.
@@ -309,27 +330,6 @@ sudo apt install python3-tk
 ```
 
 For CLI-mode PDF snapshots, `fpdf2` is installed automatically with the base package.
-
----
-
-# Quickstart
-
-Import `auto_track` immediately before your training loop.
-
-Make sure your loop is wrapped in `if __name__ == '__main__':`.
-
-```python
-from pulse import auto_track
-
-if __name__ == '__main__':
-    auto_track()
-
-    for epoch in range(num_epochs):
-        # Your training code
-        pass
-```
-
-Pulse discovers variables available for monitoring and launches the appropriate debugging interface.
 
 ---
 
