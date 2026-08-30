@@ -54,11 +54,14 @@ import time
 import uuid
 import tempfile
 import threading
+import traceback
 import sysconfig
 import multiprocessing as mp
 import ast
 import base64
 import math
+import __main__
+import subprocess
 
 import numpy as np
 import matplotlib
@@ -184,6 +187,38 @@ LOSS_NAME_HINTS = ("loss", "cost", "nll", "cross_entropy", "crossentropy", "obje
 def _looks_like_loss(name):
     n = (name or "").lower()
     return any(hint in n for hint in LOSS_NAME_HINTS)
+
+
+def _default_var_state(name, shape):
+    """Loss-like scalars, and any scalar in general, default to full 'track'
+    (cheap regardless). Everything else (matrices/tensors, or a shape we
+    don't know yet) defaults to lightweight 'lotrack' -- this is what keeps
+    tracking "everything" affordable by default. See Dashboard for how a
+    variable gets promoted back to full tracking later, manually or via the
+    agent's PROMOTE directive.
+    """
+    if _looks_like_loss(name):
+        return "track"
+    if shape == ():
+        return "track"
+    return "lotrack"
+
+
+import math as _math_module
+
+
+def _safe_eval_math(expr: str):
+    """Evaluate a plain arithmetic/math expression deterministically -- LLMs
+    are unreliable at exact arithmetic, so the agent can hand off anything
+    like update magnitudes or ratios here instead of eyeballing it. Only
+    numbers, operators, and `math` module names are reachable; no builtins,
+    so this is safe to eval() directly.
+    """
+    allowed_names = {k: v for k, v in vars(_math_module).items() if not k.startswith("_")}
+    try:
+        return eval(expr, {"__builtins__": {}}, allowed_names)  # noqa: S307 -- restricted namespace above
+    except Exception as exc:
+        return f"(calc error: {exc})"
 
 
 def _values_equal(a, b) -> bool:
@@ -449,11 +484,18 @@ def _save_linechart(points, path, var_name, fig_cache):
     os.replace(tmp, path)
 
 
-def _worker_main(queue, display_configs, session_id):
+def _worker_main(queue, display_configs, session_id, var_states=None):
     cache = session_dir(session_id)
     manifest_path = os.path.join(cache, "manifest.json")
     manifest = {}
     last_numpy_arrays = {}
+    # var -> "track" (full stats + heatmap) or "lotrack" (stats only, no
+    # heatmap ever generated -- this is what keeps tracking "everything"
+    # affordable by default). Started from auto_track()'s initial picker
+    # result and updated live via ("STATE", var, new_state) queue messages
+    # sent by the Dashboard (right-click menu, or the agent's PROMOTE
+    # directive).
+    var_states = dict(var_states or {})
 
     # var -> full, NEVER-truncated list of (step, value) tuples. A new point
     # is only appended when the value actually differs from the last one
@@ -462,9 +504,21 @@ def _worker_main(queue, display_configs, session_id):
     # segments visually without needing a point at every step. `value` may
     # be None (variable was None or unreadable that step).
     scalar_histories = {}
-    # var -> latest step index seen (whether or not it produced a new point),
-    # used only to extend the rendered line up to "now".
-    scalar_step_counters = {}
+    # Step numbering is now SHARED across every scalar rather than each
+    # variable keeping its own independent counter: it only advances when
+    # the loss/metric scalar (the first variable whose name looks like a
+    # loss) actually changes value, so every chart's x-axis stays in sync
+    # with real training progress instead of every scalar assignment. If no
+    # loss-like variable is ever seen, this falls back to advancing whenever
+    # ANY scalar changes -- the old per-call behavior, just on a shared
+    # counter instead of per-variable ones.
+    step_state = {"global_step": 0, "loss_var": None, "last_loss_value": None}
+    # var -> bounded recent-values deque, mirrored into each scalar's
+    # manifest entry as "recent" so the Dashboard (a separate process) can
+    # do spike/divergence detection for auto-intervention without needing
+    # the full never-truncated history shipped over.
+    import collections as _collections
+    recent_values = _collections.defaultdict(lambda: _collections.deque(maxlen=20))
 
     # Persistent Matplotlib figures, reused across steps instead of being
     # rebuilt every call -- see _save_heatmap / _save_linechart.
@@ -475,6 +529,11 @@ def _worker_main(queue, display_configs, session_id):
         item = queue.get()
         if item is None:
             break
+
+        if isinstance(item, tuple) and item[0] == "STATE":
+            _, var, new_state = item
+            var_states[var] = new_state
+            continue
 
         if isinstance(item, tuple) and item[0] == "CONFIG":
             _, var, new_config = item
@@ -526,29 +585,54 @@ def _worker_main(queue, display_configs, session_id):
                 # don't cost a point per step -- and render it as a step
                 # chart rather than a 1x1 "heatmap", which would be useless.
                 try:
-                    value = scalar_value(matrix)
-                    if value is not None and not math.isfinite(value):
-                        # NaN/inf scalar: keep it as the recorded value (so
-                        # nan/inf counters and the agent can see it) but
-                        # never let it reach chart math that assumes finite.
-                        pass
+                    stats = backend_statistics(matrix)
+                except Exception as exc:
+                    stats = {"kind": "scalar", "backend": "unknown", "nan": 0, "inf": 0,
+                              "error": f"{type(exc).__name__}: {exc}"}
+
+                try:
+                    # Derive `value` from the SAME statistics() call that produced
+                    # the nan/inf flags above, instead of a second, independent
+                    # scalar_value() conversion of the live tensor. Two separate
+                    # conversions of a live (possibly GPU/async) tensor can
+                    # disagree -- e.g. the second read racing an in-flight op --
+                    # which was the cause of normal, finite loss values getting
+                    # flagged as NaN/inf on the dashboard/chart. For a true
+                    # scalar, mean over its single element is just that element,
+                    # so this stays perfectly consistent with stats['nan']/
+                    # stats['inf'].
+                    raw_value = stats.get("mean")
+                    value = float(raw_value) if raw_value is not None else None
                 except Exception:
                     value = None
 
-                # Only advance the step counter when the scalar value actually changes.
-                # This makes the x-axis move only on real changes.
-                last_step = scalar_step_counters.get(var, 0)
+                # Advance the SHARED step counter only when the loss-like
+                # scalar changes (once one has been identified); otherwise
+                # (no loss-like var seen yet this session) fall back to
+                # advancing on any scalar's change, same spirit as before.
+                is_loss = _looks_like_loss(var)
+                if is_loss and step_state["loss_var"] is None:
+                    step_state["loss_var"] = var
+
+                if step_state["loss_var"] == var:
+                    if not _values_equal(step_state["last_loss_value"], value):
+                        step_state["global_step"] += 1
+                    step_state["last_loss_value"] = value
+                elif step_state["loss_var"] is None:
+                    prev_hist = scalar_histories.get(var, [])
+                    prev_val = prev_hist[-1][1] if prev_hist else None
+                    if not prev_hist or not _values_equal(prev_val, value):
+                        step_state["global_step"] += 1
+
+                # Per-variable dedup is unchanged: only append a new point
+                # for THIS var if its own value actually differs from its
+                # own last recorded value -- just tagged with the shared
+                # step number instead of a private counter.
                 hist = scalar_histories.setdefault(var, [])
                 last_value = hist[-1][1] if hist else None
-
-                if hist and _values_equal(last_value, value):
-                    # value unchanged: do not increment step counter, do not append a new point
-                    step_count = last_step
-                else:
-                    # value changed (or first value): advance step and append
-                    step_count = last_step + 1
-                    scalar_step_counters[var] = step_count
-                    hist.append((step_count, value))
+                if not hist or not _values_equal(last_value, value):
+                    hist.append((step_state["global_step"], value))
+                    recent_values[var].append(value)
 
                 # For rendering, use the raw history (no synthetic extension),
                 # filtering out None/NaN/inf points so the chart never has to
@@ -558,35 +642,46 @@ def _worker_main(queue, display_configs, session_id):
                 img_path = os.path.join(cache, f"{var}_{version_tag}.png")
                 _save_linechart(display_points, img_path, var, linechart_figs)
 
-                try:
-                    stats = backend_statistics(matrix)
-                except Exception as exc:
-                    stats = {"kind": "scalar", "backend": "unknown", "nan": 0, "inf": 0,
-                              "error": f"{type(exc).__name__}: {exc}"}
                 stats["image"] = img_path
                 stats["updated"] = time.time()
                 stats["latest_value"] = value
+                stats["recent"] = list(recent_values[var])
                 manifest[var] = stats
 
             else:
-                arr = to_numpy(matrix)
-                last_numpy_arrays[var] = arr
+                var_state = var_states.get(var, "lotrack")
 
-                config = config_override or display_configs.get(var) or _default_config(arr.ndim)
-                arr2d = _reduce_to_2d(arr, config)
+                if var_state == "lotrack":
+                    # Lightweight tracking: compute cheap stats only, never
+                    # touch the heatmap pipeline (no to_numpy/reduce/imshow/
+                    # savefig) -- this is what keeps tracking "everything"
+                    # affordable by default. No "image" key at all, so the
+                    # Dashboard knows to render this as a stats-only row.
+                    stats = backend_statistics(matrix)
+                    stats.pop("image", None)
+                    stats["updated"] = time.time()
+                    stats["state"] = "lotrack"
+                    manifest[var] = stats
+                else:
+                    arr = to_numpy(matrix)
+                    last_numpy_arrays[var] = arr
 
-                version_tag = time.time_ns()
-                img_path = os.path.join(cache, f"{var}_{version_tag}.png")
-                _save_heatmap(arr2d, img_path, var, heatmap_figs)
+                    config = config_override or display_configs.get(var) or _default_config(arr.ndim)
+                    arr2d = _reduce_to_2d(arr, config)
 
-                # pass the ORIGINAL tensor (not the numpy conversion) so
-                # backend/device detection stays accurate (torch/tf/etc),
-                # not flattened down to "NumPy" just because we converted
-                # it internally for slicing.
-                stats = backend_statistics(matrix)
-                stats["image"] = img_path
-                stats["updated"] = time.time()
-                manifest[var] = stats
+                    version_tag = time.time_ns()
+                    img_path = os.path.join(cache, f"{var}_{version_tag}.png")
+                    _save_heatmap(arr2d, img_path, var, heatmap_figs)
+
+                    # pass the ORIGINAL tensor (not the numpy conversion) so
+                    # backend/device detection stays accurate (torch/tf/etc),
+                    # not flattened down to "NumPy" just because we converted
+                    # it internally for slicing.
+                    stats = backend_statistics(matrix)
+                    stats["image"] = img_path
+                    stats["updated"] = time.time()
+                    stats["state"] = "track"
+                    manifest[var] = stats
         except Exception as e:
             manifest[var] = {"error": str(e), "updated": time.time()}
 
@@ -594,14 +689,21 @@ def _worker_main(queue, display_configs, session_id):
 
 
 class HeatmapCreatorBG:
-    def __init__(self, display_configs, session_id):
+    def __init__(self, display_configs, session_id, var_states=None):
         self.session_id = session_id
         self.queue = mp.Queue()
-        self.process = mp.Process(target=_worker_main, args=(self.queue, display_configs, session_id), daemon=True)
+        self.process = mp.Process(
+            target=_worker_main,
+            args=(self.queue, display_configs, session_id, var_states or {}),
+            daemon=True,
+        )
         self.process.start()
 
     def log_matrix(self, var, matrix, config_override=None):
         self.queue.put((var, matrix, config_override))
+
+    def update_state(self, var, new_state):
+        self.queue.put(("STATE", var, new_state))
 
     def update_config(self, var, new_config):
         self.queue.put(("CONFIG", var, new_config))
@@ -615,12 +717,13 @@ class HeatmapCreatorBG:
 # config_ui: initial matrix discovery + selection/axis picker
 # ============================================================================
 
-def discover_static_names(caller_frame):
-    """Parse the caller's source with ast to find every assignment target
-    anywhere in the file -- including inside nested functions that haven't
+def discover_static_names_from_file(filepath):
+    """Parse a single file's source with ast to find every assignment
+    target anywhere in it -- including inside nested functions that haven't
     run yet (e.g. a `scores` matrix inside an `attention()` only called
     from within the training loop). Pure source parsing, doesn't execute
-    anything, so it's safe to run before training starts."""
+    anything, so it's safe to run before training starts. Works on any
+    file, not just the entry script -- see _discover_project_files."""
     discovered = set()
 
     class Visitor(ast.NodeVisitor):
@@ -659,17 +762,154 @@ def discover_static_names(caller_frame):
                 for elt in target.elts:
                     self.collect(elt)
 
-    filename = caller_frame.f_code.co_filename
-    if os.path.exists(filename):
+    if os.path.exists(filepath):
         try:
-            with open(filename, "r", encoding="utf8") as f:
-                tree = ast.parse(f.read(), filename)
+            with open(filepath, "r", encoding="utf8") as f:
+                tree = ast.parse(f.read(), filepath)
             Visitor().visit(tree)
         except Exception:
             pass
 
     noise = {"i", "j", "k", "_", "self", "cls", "e", "args", "kwargs"}
     return discovered - noise
+
+
+def discover_static_names(caller_frame):
+    """Back-compat wrapper: static discovery for just the caller's own file."""
+    return discover_static_names_from_file(caller_frame.f_code.co_filename)
+
+
+def _discover_project_files(entry_path, root=None, max_files=25):
+    """Find other local (non-stdlib, non-site-packages) .py files this
+    script imports, directly or transitively, so a modularized project's
+    variables (e.g. defined inside a model.py/utils.py this script imports)
+    can be offered as trackable candidates -- and included as code context
+    for the agent -- even before that code has actually run once.
+
+    Purely static: reads each file's `import`/`from ... import` statements
+    and resolves them via importlib.util.find_spec (never executes
+    anything). Capped by max_files so a huge codebase doesn't turn setup
+    into a slow crawl, and stays within `root` if one was given, same as
+    the runtime tracer already does.
+    """
+    if not entry_path or not os.path.exists(entry_path):
+        return []
+
+    import importlib.util
+
+    entry_norm = os.path.normcase(os.path.abspath(entry_path))
+    seen = {entry_norm}
+    to_scan = [entry_path]
+    found = []
+
+    while to_scan and len(found) < max_files:
+        path = to_scan.pop(0)
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                tree = ast.parse(f.read(), path)
+        except Exception:
+            continue
+
+        module_names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    module_names.add(alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                if node.module and node.level == 0:
+                    module_names.add(node.module.split(".")[0])
+
+        for name in sorted(module_names):
+            if not name or len(found) >= max_files:
+                break
+            try:
+                spec = importlib.util.find_spec(name)
+            except Exception:
+                spec = None
+            if spec is None or not spec.origin or not spec.origin.endswith(".py"):
+                continue
+
+            resolved = os.path.normcase(os.path.abspath(spec.origin))
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+
+            if _is_library_frame(spec.origin):
+                continue
+            if root and not resolved.startswith(root):
+                continue
+
+            found.append(spec.origin)
+            to_scan.append(spec.origin)
+
+    return found
+
+
+class AgentSetupDialog:
+    """Minimal UI setup: pick a provider, enter its API key, done. Matches
+    the CLI's zero-config default -- everything else (which variables to
+    track, autofix, code-in-context) already has a sensible default and
+    doesn't need a prompt. References the module-level PROVIDERS dict
+    defined further down in this file (fine -- this only runs at
+    auto_track() call time, well after the whole module has loaded).
+    """
+
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Pulse")
+        self.root.geometry("420x260")
+        apply_dark_theme(self.root)
+        _header_bar(self.root, "Set up your AI agent")
+
+        body = ttk.Frame(self.root)
+        body.pack(fill=tk.BOTH, expand=True, padx=20, pady=16)
+
+        ttk.Label(body, text="PROVIDER", style="Faint.TLabel").pack(anchor="w")
+        self.provider_var = tk.StringVar(value=list(PROVIDERS.keys())[0])
+        dropdown = tk.OptionMenu(body, self.provider_var, *PROVIDERS.keys())
+        dropdown.config(bg=CARD, fg=TEXT, activebackground=CARD_HOVER, activeforeground=TEXT,
+                         relief="flat", highlightthickness=0, font=FONT_UI)
+        dropdown["menu"].config(bg=CARD, fg=TEXT, activebackground=ORANGE, activeforeground="#0a0a0a")
+        dropdown.pack(fill=tk.X, pady=(4, 14))
+
+        ttk.Label(body, text="API KEY", style="Faint.TLabel").pack(anchor="w")
+        self.key_var = tk.StringVar()
+        entry = ttk.Entry(body, textvariable=self.key_var, show="*")
+        entry.pack(fill=tk.X, pady=(4, 4))
+
+        self.existing_note = ttk.Label(body, text="", style="Dim.TLabel", wraplength=370)
+        self.existing_note.pack(anchor="w", pady=(0, 14))
+
+        def _check_existing(*_):
+            env_var = PROVIDERS[self.provider_var.get()]["env_key"]
+            if os.environ.get(env_var):
+                self.existing_note.config(text=f"{env_var} is already set -- leave blank to use it.")
+            else:
+                self.existing_note.config(text="")
+
+        self.provider_var.trace_add("write", _check_existing)
+        _check_existing()
+
+        self.result = None
+
+        def submit():
+            provider = self.provider_var.get()
+            key = self.key_var.get().strip()
+            env_var = PROVIDERS[provider]["env_key"]
+            if not key:
+                key = os.environ.get(env_var, "").strip()
+            if not key:
+                messagebox.showerror("API key required", f"Enter an API key for {provider}, or set {env_var} first.")
+                return
+            self.result = (provider, key)
+            self.root.destroy()
+
+        entry.bind("<Return>", lambda e: submit())
+        ttk.Button(body, text="Start  \u2192", style="Accent.TButton", command=submit).pack(fill=tk.X, pady=(4, 0))
+
+    def run(self):
+        self.root.mainloop()
+        return self.result
 
 
 class MatrixConfigUI:
@@ -686,29 +926,25 @@ class MatrixConfigUI:
         self.discovered = matrices
         self.final_configs = {}
         self.matrix_vars = {}
-        self.axis_buttons = {}
-        self.on_config_change = on_config_change  # callback(name, new_config)
-        self.auto_mode = tk.BooleanVar(value=False)
+        self.on_config_change = on_config_change  # callback(name, new_config) -- used by the Dashboard later
+        self.auto_mode = tk.BooleanVar(value=True)
         self.result = None
 
         top = ttk.Frame(body)
         top.pack(fill=tk.X, pady=(0, 12))
         ttk.Checkbutton(
             top,
-            text="Track every matrix automatically (incl. ones that appear later)",
+            text="Track everything automatically (recommended -- includes anything that appears later)",
             variable=self.auto_mode,
         ).pack(side=tk.LEFT)
         ttk.Button(top, text="Select All", command=self._select_all).pack(side=tk.RIGHT)
 
-        left_frame = ttk.LabelFrame(body, text="  1 · SELECT MATRICES  ", padding=12)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
-
-        self.right_frame = ttk.LabelFrame(
+        left_frame = ttk.LabelFrame(
             body,
-            text="  2 · CONFIGURE AXES  ·  click = show  ·  double-click = iterate  ·  right-click = reset  ",
+            text="  Variables  ·  everything is tracked by default -- you can add/remove any time, including from the dashboard later  ",
             padding=12,
         )
-        self.right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(8, 0))
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self.search_var = tk.StringVar()
         search_frame = ttk.Frame(left_frame)
@@ -735,7 +971,7 @@ class MatrixConfigUI:
         ordered_names = sorted(self.discovered.items(), key=lambda kv: (not _looks_like_loss(kv[0]), kv[0]))
         preselected = []
         for name, shape in ordered_names:
-            self.final_configs[name] = [0] * len(shape) if shape else []
+            self.final_configs[name] = _default_config(len(shape)) if shape else []
             is_loss = _looks_like_loss(name)
             var = tk.BooleanVar(value=is_loss)
             self.matrix_vars[name] = var
@@ -750,7 +986,6 @@ class MatrixConfigUI:
                 self.list_frame,
                 text=f"{name}{shape_str}{star}",
                 variable=var,
-                command=lambda n=name: self._toggle_matrix_view(n),
             )
             self._matrix_checkbuttons[name] = cb
             cb.pack(anchor="w", pady=4)
@@ -758,8 +993,6 @@ class MatrixConfigUI:
                 preselected.append(name)
 
         self._filter_matrix_list()
-        for name in preselected:
-            self._toggle_matrix_view(name)
 
         btn_frame = ttk.Frame(self.root)
         btn_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=16)
@@ -778,89 +1011,8 @@ class MatrixConfigUI:
 
     def _select_all(self):
         for name, var in self.matrix_vars.items():
-            if not var.get():
-                var.set(True)
-                self._toggle_matrix_view(name)
+            var.set(True)
 
-
-    def _open_axis_slideshow(self, name, axis_idx):
-        # Ensure the axis is in iterate mode; if not, initialize it to iterate@0
-        cfg = self.final_configs.setdefault(name, [0] * len(self.discovered[name]))
-        if cfg[axis_idx] < 2:
-            cfg[axis_idx] = 2  # iterate@0
-
-        # helper to get current iterate index
-        def get_iter_index():
-            return cfg[axis_idx] - 2
-
-        popup = Toplevel(self.root)
-        popup.title(f"{name} — Axis {axis_idx} slideshow")
-        popup.configure(bg=BG)
-        popup.geometry("420x320")
-
-        # image placeholder (you can replace with actual image loading from cache)
-        img_label = ttk.Label(popup, text="(preview)", style="Dim.TLabel")
-        img_label.pack(pady=(12, 6))
-
-        idx_label = ttk.Label(popup, text=f"Index: {get_iter_index()}", font=FONT_UI_BOLD)
-        idx_label.pack()
-
-        btn_frame = ttk.Frame(popup)
-        btn_frame.pack(pady=12)
-
-        def apply_and_notify():
-            # update button text in the main axis UI
-            self._set_axis_val(name, axis_idx, cfg[axis_idx])
-            if callable(self.on_config_change):
-                # send a copy of the config
-                self.on_config_change(name, list(cfg))
-
-        def prev_idx():
-            if get_iter_index() > 0:
-                cfg[axis_idx] -= 1
-                idx_label.config(text=f"Index: {get_iter_index()}")
-                apply_and_notify()
-
-        def next_idx():
-            # clamp to axis length - 1
-            axis_len = self.discovered[name][axis_idx]
-            if get_iter_index() < max(0, axis_len - 1):
-                cfg[axis_idx] += 1
-                idx_label.config(text=f"Index: {get_iter_index()}")
-                apply_and_notify()
-
-        ttk.Button(btn_frame, text="Previous", command=prev_idx).pack(side=tk.LEFT, padx=8)
-        ttk.Button(btn_frame, text="Next", command=next_idx).pack(side=tk.LEFT, padx=8)
-        ttk.Button(popup, text="Close", command=popup.destroy).pack(pady=(8, 12))
-
-
-    def _toggle_matrix_view(self, name):
-        if self.matrix_vars[name].get():
-            shape = self.discovered[name]
-            if not shape:  # empty tuple (scalar) or None (not seen yet) -- nothing to configure
-                return
-            row_frame = ttk.Frame(self.right_frame, name=name.lower().replace(".", "_"))
-            row_frame.pack(fill=tk.X, pady=7, anchor="w")
-            ttk.Label(row_frame, text=f"{name}", font=FONT_UI_BOLD).pack(side=tk.LEFT, padx=(0, 8))
-            self.axis_buttons[name] = []
-            for axis_idx, dim_size in enumerate(shape):
-                btn = ttk.Button(row_frame, text=f"Ax {axis_idx}\n({dim_size})\n{_axis_val_label(0)}", width=8)
-                btn.pack(side=tk.LEFT, padx=3)
-                btn.bind("<Button-1>", lambda e, n=name, ax=axis_idx: self._set_axis_val(n, ax, 1))
-                btn.bind("<Button-3>", lambda e, n=name, ax=axis_idx: self._set_axis_val(n, ax, 0))
-
-                self.axis_buttons[name].append(btn)
-        else:
-            try:
-                self.right_frame.nametowidget(name.lower().replace(".", "_")).destroy()
-                del self.axis_buttons[name]
-            except Exception:
-                pass
-
-    def _set_axis_val(self, name, axis_idx, val):
-        self.final_configs[name][axis_idx] = val
-        dim_size = self.discovered[name][axis_idx]
-        self.axis_buttons[name][axis_idx].config(text=f"Ax {axis_idx}\n({dim_size})\n{_axis_val_label(val)}")
 
     def _submit(self):
         if self.auto_mode.get():
@@ -905,23 +1057,41 @@ SYSTEM_PROMPT = (
     "or a value that already went NaN/inf and is now failing to convert) rather than ignoring it.\n\n"
     "Be concise. No preamble before the diagnosis.\n\n"
 
+    "TOOLS (use inline, each on its own line within your Reasoning, only when actually useful):\n"
+    "  CALC: <python arithmetic expression>\n"
+    "    You are not reliable at exact arithmetic. Anything like an update magnitude, a ratio, "
+    "or a comparison between two numbers you were given -- hand it off here instead of computing "
+    "it yourself. Pulse evaluates it deterministically (only numbers, operators, and `math` module "
+    "functions are available) and gives you the exact result. You may include more than one.\n"
+    "  PROMOTE: <comma-separated variable names>\n"
+    "    Some tracked matrices/tensors are in lightweight 'lotrack' mode (intermittent sampling, "
+    "stats only, no heatmap) -- each variable's stats include its state. If one of them looks like "
+    "it needs a closer look (heatmap + full stats), name it here and Pulse will switch it to full "
+    "tracking. Only promote variables that are currently lotrack.\n\n"
+
     "CODE FIXES:\n"
     "If, and only if, the user explicitly asks you to fix, edit, patch, or change the code (not just "
     "diagnose it) AND training code has been sent this turn, respond with ONLY a single JSON object "
     "and nothing else -- no prose before or after it, no markdown code fences, no Diagnosis/Reasoning/"
     "Fix sections. The JSON object must have exactly these fields:\n"
-    "  old: a list of code snippets to find, each copied EXACTLY from the line-numbered training "
-    "code shown to you, including original indentation and whitespace, but WITHOUT the line-number "
-    "prefix ('  12 | ') itself.\n"
+    "  old: a list of code snippets to find, each copied EXACTLY from the line-numbered code shown "
+    "to you, including original indentation and whitespace, but WITHOUT the line-number prefix "
+    "('  12 | ') itself.\n"
     "  new: a list of the same length as old, where new[i] is the full replacement for old[i].\n"
+    "  files: OPTIONAL, a list of the same length as old, where files[i] is the exact file header "
+    "(e.g. \"model.py\") that old[i]/new[i] belongs to, if more than one file was sent this turn. "
+    "Omit this field entirely (or use null/\"\" for an entry) to default to the main script.\n"
     "  explanation: a short, concise text description of what changed and why.\n"
     "Rules for old/new:\n"
-    "  - Each snippet in old must appear VERBATIM and exactly ONCE in the current file. Include "
+    "  - Each snippet in old must appear VERBATIM and exactly ONCE in its target file. Include "
     "enough surrounding lines (not just the single changed line) so the match is unambiguous.\n"
     "  - Each new[i] is the complete replacement block for old[i] -- to add a line, copy old[i] and "
     "append the new line(s) to it; to remove a line, copy old[i] and omit it.\n"
     "  - Never use placeholders like '...' or '# unchanged' inside old or new; both must be literal, "
     "complete code.\n"
+    "  - If the actual bug lives in another file that was sent this turn (e.g. a modularized "
+    "project's model.py), fix it there via files[i] rather than working around it in the main "
+    "script.\n"
     "  - If code wasn't sent this turn, or the user hasn't asked for a fix, do not emit this JSON "
     "format -- answer normally per RESPONSE FORMAT above, and if a fix was requested without code, "
     "say that checking 'Send Code' is needed first."
@@ -1013,15 +1183,149 @@ PROVIDERS = {
     },
 }
 
+class _SpinnerLabel:
+    """Tiny /-\\| spinner driven by Tk's `after()` loop, used in the chat
+    panel to show which agent stage (Suggesting/Developing/Implementing
+    fix) is currently in flight without blocking the UI thread.
+    """
+
+    _FRAMES = "/-\\|"
+
+    def __init__(self, widget, label_fn):
+        self.widget = widget
+        self.label_fn = label_fn  # () -> text to show, or None to stop
+        self._frame_idx = 0
+        self._job = None
+
+    def _tick(self):
+        text = self.label_fn()
+        if text is None:
+            self.stop()
+            return
+        frame = self._FRAMES[self._frame_idx % len(self._FRAMES)]
+        self._frame_idx += 1
+        try:
+            self.widget.configure(text=f"{text}... {frame}")
+        except tk.TclError:
+            return
+        self._job = self.widget.after(120, self._tick)
+
+    def start(self):
+        self.stop()
+        self._frame_idx = 0
+        self._tick()
+
+    def stop(self):
+        if self._job is not None:
+            try:
+                self.widget.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+        try:
+            self.widget.configure(text="")
+        except tk.TclError:
+            pass
+
+
+# Adaptive multi-pass agent pipeline (mirrors PulseCLI.ask_agent in
+# pulse_cli.py). Instead of a fixed 3-call sequence, how many passes
+# actually run adapts to what's asked and what comes back:
+#   Pass 1 -- LOCATE:   read everything, identify the region(s) of the error.
+#   Pass 2 -- ANALYZE:  a focused second read of just those regions, propose
+#                        a fix (diagnosis + reasoning).
+#   Pass 3 -- DEVELOP:  develop and implement the fix (code-fix JSON, if a
+#                        code change was actually asked for).
+#   Pass 4 -- VERIFY:   check the math/logic of the fix. Pass -> hand it to
+#                        the user. Fail -> revise and re-check (bounded).
+#   Pass 5 -- SWEEP:    re-read the whole thing again for OTHER, unrelated
+#                        errors; if any turn up, ask the user whether to fix
+#                        those too.
+#   Pass 6:             if the user says yes, recurse through the same
+#                        format (passes 1-5) for the newly-found issue(s).
+# Each call posts to the transcript as soon as it's ready, with the spinner
+# showing which pass is currently running.
+_PASS1_LOCATE = (
+    "PASS 1 -- LOCATE: Read through everything you were given (stats, image, code, history) and "
+    "identify the specific region(s) where the problem likely originates -- file/line numbers, "
+    "variable names, or code sections. Respond with ONLY a short bullet list of the suspect "
+    "location(s). No diagnosis, no fix yet."
+)
+_PASS2_ANALYZE_TMPL = (
+    "Suspect region(s) from your first read:\n{regions}\n\n"
+    "PASS 2 -- ANALYZE: Take a focused second look at just those regions. Give the Diagnosis (one "
+    "sentence, the specific root cause) and the Reasoning behind it (grounded in the actual "
+    "numbers/image/code you were given, with real math, referencing line numbers). Do not "
+    "implement the fix yet."
+)
+_PASS3_FIX_TEXT = (
+    "PASS 3 -- DEVELOP: Give the Fix: a concrete, concise change (not generic advice), in 1-3 "
+    "sentences."
+)
+_PASS3_IMPLEMENT = (
+    "PASS 3 -- DEVELOP & IMPLEMENT: The user wants this fix applied to their code. Respond with "
+    "ONLY the code-fix JSON object described in your instructions (old/new/explanation) -- no "
+    "prose, no markdown fences."
+)
+_PASS4_VERIFY_TMPL = (
+    "The fix you are about to apply:\n{fix_desc}\n\n"
+    "PASS 4 -- VERIFY: Carefully check the math/logic of this fix against the numbers and code you "
+    'were given. Respond with ONLY a JSON object of the form {{"passes": true or false, "reason": '
+    '"one sentence"}}. passes=true only if the fix is logically/numerically correct and actually '
+    "addresses the diagnosed root cause."
+)
+_PASS4_REVISE_TMPL = (
+    "Your proposed fix did not pass verification: {reason}\n\n"
+    "Revise it. Respond with ONLY the corrected code-fix JSON object (old/new/explanation) -- no "
+    "prose, no markdown fences."
+)
+_PASS5_SWEEP = (
+    "PASS 5 -- FULL RE-READ: Re-read the ENTIRE code/context again -- not just the region you just "
+    "fixed -- and check for any OTHER, unrelated bugs or issues. Respond with ONLY a JSON object of "
+    'the form {"other_errors_found": true or false, "summary": "short description, or empty string '
+    'if none"}.'
+)
+_IMPLEMENT_KEYWORDS = ("fix", "edit", "patch", "change the code", "apply", "implement")
+_MAX_VERIFY_ATTEMPTS = 3
+
+_CALC_RE = re.compile(r"^\s*CALC:\s*(.+)$", re.MULTILINE)
+_PROMOTE_RE = re.compile(r"^\s*PROMOTE:\s*(.+)$", re.MULTILINE)
+
+
+def _extract_directives(text):
+    """Pull CALC:/PROMOTE: lines out of an agent response, returning
+    (cleaned_text, calc_exprs, promote_names). Cleaned text has those lines
+    stripped so they don't clutter what's shown in the transcript.
+    """
+    calc_exprs = [m.strip() for m in _CALC_RE.findall(text) if m.strip()]
+    promote_names = []
+    for m in _PROMOTE_RE.findall(text):
+        promote_names.extend(n.strip() for n in m.split(",") if n.strip())
+
+    cleaned = _CALC_RE.sub("", text)
+    cleaned = _PROMOTE_RE.sub("", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, calc_exprs, promote_names
+
+
 class ChatPanel(tk.Frame):
-    def __init__(self, parent, get_manifest_fn, get_code_fn=None, script_path=None, on_code_change=None):
+    def __init__(self, parent, get_manifest_fn, get_code_fn=None, script_path=None, on_code_change=None, promote_fn=None, get_extra_files_fn=None, initial_provider=None, restart_fn=None):
         super().__init__(parent, bg=PANEL)
         self.get_manifest_fn = get_manifest_fn
         self.get_code_fn = get_code_fn
         self.script_path = script_path
         self.on_code_change = on_code_change
+        self.promote_fn = promote_fn  # (var_name) -> None, switches a lotrack var to full tracking
+        self.get_extra_files_fn = get_extra_files_fn  # () -> {path: text} for other local project files
+        self.restart_fn = restart_fn  # (provider_name) -> None, restarts the whole training process
+        self._label_for_path = {}
+        self._path_for_label = {}
         self.history = []
         self.session_keys = {}
+        # Set whenever a code fix is actually written to disk during the
+        # current top-level _ask() call -- checked once at the end of that
+        # call to decide whether to trigger a restart (see _ask/PASS 3-6).
+        self._fix_applied_this_turn = False
 
         head = tk.Frame(self, bg=PANEL)
         head.pack(fill=tk.X, padx=14, pady=(14, 6))
@@ -1031,12 +1335,17 @@ class ChatPanel(tk.Frame):
         self.dot.pack(side=tk.LEFT, padx=(0, 8))
         tk.Label(head, text="PULSE AI ANALYST", bg=PANEL, fg=TEXT, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
 
-        self.provider_var = tk.StringVar(value=list(PROVIDERS.keys())[0])
+        self.provider_var = tk.StringVar(value=initial_provider or list(PROVIDERS.keys())[0])
         self.provider_dropdown = tk.OptionMenu(head, self.provider_var, *PROVIDERS.keys(), command=self._on_provider_change)
         self.provider_dropdown.config(bg=CARD, fg=TEXT, activebackground=CARD_HOVER, activeforeground=TEXT,
                                        relief="flat", highlightthickness=0, font=("Segoe UI", 9))
         self.provider_dropdown["menu"].config(bg=CARD, fg=TEXT, activebackground=ORANGE, activeforeground="#0a0a0a")
         self.provider_dropdown.pack(side=tk.RIGHT)
+
+        self.status_label = tk.Label(head, text="", bg=PANEL, fg=AMBER, font=FONT_MONO)
+        self.status_label.pack(side=tk.RIGHT, padx=(0, 10))
+        self._spinner_text = {"value": None}
+        self._spinner = _SpinnerLabel(self.status_label, lambda: self._spinner_text["value"])
 
         self.transcript = scrolledtext.ScrolledText(
             self, wrap=tk.WORD, state="disabled", height=24,
@@ -1071,7 +1380,7 @@ class ChatPanel(tk.Frame):
         )
         send_btn.pack(side=tk.RIGHT)
 
-        self.send_code_var = tk.BooleanVar(value=False)
+        self.send_code_var = tk.BooleanVar(value=True)
         code_check = tk.Checkbutton(
             entry_frame, text="Send Code", variable=self.send_code_var,
             bg=PANEL, fg=TEXT_DIM, selectcolor=CARD,
@@ -1164,6 +1473,16 @@ class ChatPanel(tk.Frame):
     def _on_provider_change(self, _selection):
         self._update_status_indicator()
 
+    def _set_stage(self, label):
+        """label=None stops the spinner and clears the status text; a string
+        starts/updates it (e.g. 'Suggesting fix', 'Developing fix',
+        'Implementing fix')."""
+        self._spinner_text["value"] = label
+        if label is None:
+            self._spinner.stop()
+        else:
+            self._spinner.start()
+
     def _append(self, who, text):
         self.transcript.configure(state="normal")
         tag = "who_user" if who.startswith("You") else "who_ai"
@@ -1238,6 +1557,32 @@ class ChatPanel(tk.Frame):
 
         threading.Thread(target=self._ask, args=(question, include_code, current_provider), daemon=True).start()
 
+    def _build_file_labels(self, extra_files):
+        """Give every file a short, unique display label (usually just its
+        basename) used both in the code shown to the agent and later to
+        resolve which real file a proposed fix's "file" field refers to.
+        """
+        label_for_path, path_for_label, used = {}, {}, set()
+
+        def add(path):
+            if not path or path in label_for_path:
+                return
+            base = os.path.basename(path)
+            label = base
+            if label in used:
+                parent = os.path.basename(os.path.dirname(path))
+                label = f"{parent}/{base}"
+            used.add(label)
+            label_for_path[path] = label
+            path_for_label[label] = path
+
+        add(self.script_path)
+        for p in extra_files:
+            add(p)
+
+        self._label_for_path = label_for_path
+        self._path_for_label = path_for_label
+
     def _build_context(self, include_code=False):
         manifest = self.get_manifest_fn() or {}
         context = "Current tracked matrix/scalar stats:\n"
@@ -1253,18 +1598,35 @@ class ChatPanel(tk.Frame):
                     f"nan={s.get('nan')} inf={s.get('inf')}\n"
                 )
             else:
+                state = s.get("state", "track")
                 context += (
                     f"- {name}: shape={s.get('shape')} backend={s.get('backend')} kind={s.get('kind')} "
                     f"min={s.get('min')} max={s.get('max')} mean={s.get('mean')} std={s.get('std')} "
-                    f"nan={s.get('nan')} inf={s.get('inf')}\n"
+                    f"nan={s.get('nan')} inf={s.get('inf')} state={state}\n"
                 )
         if include_code and self.get_code_fn:
             code = self.get_code_fn()
+            extra_files = (self.get_extra_files_fn() or {}) if self.get_extra_files_fn else {}
+            self._build_file_labels(extra_files)
+            entry_label = self._label_for_path.get(self.script_path, "main_script.py")
+
             if code:
                 numbered = "\n".join(f"{i+1:>4} | {line}" for i, line in enumerate(code.splitlines()))
-                context += f"\nTraining code (line-numbered, attached by user this turn):\n```\n{numbered}\n```\n"
+                context += f"\n=== {entry_label} (main script, line-numbered) ===\n```\n{numbered}\n```\n"
             else:
                 context += "\n(User checked 'Send Code' but no code text is available.)\n"
+
+            if extra_files:
+                context += (
+                    "\nThis project is modularized -- other local files it imports are included "
+                    "below, each line-numbered under its own header. When proposing a code fix, "
+                    "set each fix's \"file\" to the exact header shown here (e.g. \"model.py\") so "
+                    f"Pulse edits the right file. Omit \"file\" to default to {entry_label}.\n"
+                )
+                for path, text in extra_files.items():
+                    label = self._label_for_path.get(path, os.path.basename(path))
+                    numbered = "\n".join(f"{i+1:>4} | {line}" for i, line in enumerate(text.splitlines()))
+                    context += f"\n=== {label} ===\n```\n{numbered}\n```\n"
         return context
 
     def _image_payloads(self):
@@ -1288,34 +1650,266 @@ class ChatPanel(tk.Frame):
                 pass
         return payloads
 
-    def _ask(self, question, include_code, provider_name):
-        model_name = PROVIDERS[provider_name]["model"]
-        context = self._build_context(include_code=include_code)
-        user_content = [{"type": "text", "text": f"{context}\nQuestion: {question}"}]
-        user_content.extend(self._image_payloads())
-
-        self.history.append({"role": "user", "content": user_content})
-
+    def _call_model(self, model_name, instruction, image_payloads=None, max_tokens=2000):
+        """One lightweight completion call: system prompt + recent history +
+        a one-off stage instruction (+ images on the first call only, so
+        they aren't re-uploaded on every stage). Does not touch
+        self.history -- the caller decides what gets persisted once the
+        whole pipeline finishes.
+        """
+        content = [{"type": "text", "text": instruction}]
+        if image_payloads:
+            content.extend(image_payloads)
+        messages = (
+            [{"role": "system", "content": SYSTEM_PROMPT}]
+            + self.history[-10:]
+            + [{"role": "user", "content": content}]
+        )
         try:
             response = litellm.completion(
                 model=model_name,
-                messages=[{"role": "system", "content": SYSTEM_PROMPT}] + self.history[-10:],
-                max_tokens=20000,
-                timeout=240.0,
+                messages=messages,
+                max_tokens=max_tokens,
+                timeout=120.0,
             )
-            answer = response.choices[0].message.content
+            return (response.choices[0].message.content or "").strip()
         except Exception as e:
-            answer = f"(request failed: {e})"
+            return f"(request failed: {e})"
 
-        self.history.append({"role": "assistant", "content": answer})
+    def _apply_directives(self, calc_exprs, promote_names):
+        """Deterministically compute any CALC: expressions and figure out
+        which PROMOTE: names match a currently-known variable. Pure
+        computation only -- no Tk calls -- so this is safe to run on the
+        background request thread. Returns (note_text, calc_lines,
+        promoted_names) for the caller to display/apply on the main thread.
+        """
+        calc_lines = ""
+        if calc_exprs:
+            computed = [(expr, _safe_eval_math(expr)) for expr in calc_exprs]
+            calc_lines = "\n".join(f"  {expr} = {result}" for expr, result in computed)
 
-        fix = self._parse_code_fix(answer)
-        if fix is not None:
-            # File IO + the revert confirmation dialog both need to happen on
-            # the Tk main thread, not this background request thread.
-            self.after(0, lambda: self._handle_code_fix(fix))
-        else:
-            self.after(0, lambda: self._append("Pulse", answer))
+        promoted = []
+        if promote_names and self.promote_fn:
+            manifest = self.get_manifest_fn() or {}
+            known = list(manifest.keys())
+            for raw_name in promote_names:
+                name = raw_name.strip()
+                if not name:
+                    continue
+                if name in known:
+                    target = name
+                else:
+                    matches = [k for k in known if name.lower() in k.lower()]
+                    target = matches[0] if len(matches) == 1 else None
+                if target:
+                    promoted.append(target)
+
+        notes = []
+        if calc_lines:
+            notes.append(f"Pulse computed these deterministically -- use these exact values:\n{calc_lines}")
+        if promoted:
+            notes.append(f"Promoted to full tracking: {', '.join(promoted)}.")
+
+        return "\n\n".join(notes), calc_lines, promoted
+
+    def _ask_yes_no_blocking(self, title, message):
+        """Show a yes/no dialog from the background request thread and
+        block until answered, by scheduling the actual messagebox call on
+        the Tk main thread (via after) and waiting on an Event."""
+        result = {}
+        event = threading.Event()
+
+        def _show():
+            try:
+                result["value"] = messagebox.askyesno(title, message, parent=self)
+            finally:
+                event.set()
+
+        self.after(0, _show)
+        event.wait()
+        return bool(result.get("value"))
+
+    @staticmethod
+    def _parse_json_obj(answer):
+        """Generic defensive JSON-object parser for the verify (pass 4) and
+        sweep (pass 5) responses -- same tolerance for stray code fences as
+        _parse_code_fix, but without requiring any particular fields."""
+        text = (answer or "").strip()
+        if not text:
+            return None
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:]
+            text = text.strip()
+        if not (text.startswith("{") and text.endswith("}")):
+            return None
+        try:
+            payload = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _describe_fix(fix):
+        parts = []
+        for i, (old, new) in enumerate(zip(fix["old"], fix["new"])):
+            parts.append(f"--- change {i + 1} ---\nOLD:\n{old}\nNEW:\n{new}")
+        if fix.get("explanation"):
+            parts.append(f"Explanation: {fix['explanation']}")
+        return "\n\n".join(parts)
+
+    def _verify_fix_with_retries(self, model_name, fix):
+        """PASS 4: check the fix's math/logic before it's handed to the
+        user. If it fails, ask the agent to revise and re-check, up to
+        _MAX_VERIFY_ATTEMPTS times. Returns (fix, passed, reason)."""
+        reason = ""
+        for attempt in range(_MAX_VERIFY_ATTEMPTS):
+            fix_desc = self._describe_fix(fix)
+            self.after(0, lambda: self._set_stage("Checking the fix"))
+            verify_answer = self._call_model(
+                model_name, _PASS4_VERIFY_TMPL.format(fix_desc=fix_desc), max_tokens=200
+            )
+            verdict = self._parse_json_obj(verify_answer)
+            if verdict is None:
+                return fix, True, "(verification response was unparsable; proceeding anyway)"
+            passes = bool(verdict.get("passes"))
+            reason = str(verdict.get("reason", "")).strip()
+            if passes:
+                return fix, True, reason
+            if attempt == _MAX_VERIFY_ATTEMPTS - 1:
+                break
+            self.after(0, lambda: self._set_stage("Revising fix"))
+            revised_answer = self._call_model(
+                model_name, _PASS4_REVISE_TMPL.format(reason=reason), max_tokens=4000
+            )
+            revised = self._parse_code_fix(revised_answer)
+            if revised is None:
+                break
+            fix = revised
+        return fix, False, (reason or "(verification did not clearly pass after retries)")
+
+    def _run_sweep_and_maybe_recurse(self, model_name, include_code, provider_name, _depth):
+        """PASS 5: re-read everything for OTHER, unrelated errors. If any
+        turn up, ask the user whether to fix those too (PASS 6 recurses
+        through the same 1-5 format for the new issue)."""
+        self.after(0, lambda: self._set_stage("Reading for other errors"))
+        sweep_answer = self._call_model(model_name, _PASS5_SWEEP, max_tokens=300)
+        self.after(0, lambda: self._set_stage(None))
+        sweep = self._parse_json_obj(sweep_answer)
+        found = bool(sweep.get("other_errors_found")) if sweep else False
+        summary = str(sweep.get("summary", "")).strip() if sweep else ""
+
+        if not found or not summary:
+            return
+
+        self.after(0, lambda: self._append("Pulse (5 · Full re-read)", f"Found other possible issue(s):\n\n{summary}"))
+        want_fix = self._ask_yes_no_blocking("Fix other errors?", f"{summary}\n\nFix these too?")
+        if not want_fix:
+            return
+
+        self.after(0, lambda: self._append("Pulse", "(6) Following the established format for the additional issue(s)..."))
+        self._ask(f"Please also fix this: {summary}", include_code, provider_name, _depth=_depth + 1)
+
+    def _ask(self, question, include_code, provider_name, _depth=0):
+        """Runs the question through an adaptive multi-pass pipeline
+        instead of a fixed number of calls -- how many passes actually run
+        depends on whether a code fix was asked for, whether it verifies
+        cleanly, and whether a final sweep turns up anything else:
+
+          1. LOCATE  -- read everything, identify the region(s) of the error.
+          2. ANALYZE -- focused second read of those regions; diagnosis + reasoning.
+          3. DEVELOP -- develop and implement the fix (code-fix JSON, if requested).
+          4. VERIFY  -- check the fix's math/logic; revise and re-check on failure.
+          5. SWEEP   -- re-read everything for OTHER errors; ask the user y/n.
+          6.         -- if yes, recurse through 1-5 for the new issue(s).
+
+        Each pass posts to the transcript as soon as it's ready, with the
+        header spinner showing which pass is running. Only the top-level
+        call (_depth == 0) restarts the training process afterward, once,
+        if any fix landed anywhere in the (possibly recursive) chain.
+        """
+        if _depth == 0:
+            self._fix_applied_this_turn = False
+
+        model_name = PROVIDERS[provider_name]["model"]
+        context = self._build_context(include_code=include_code)
+        base_text = f"{context}\nQuestion: {question}"
+        images = self._image_payloads()
+
+        self.history.append({"role": "user", "content": [{"type": "text", "text": base_text}] + images})
+
+        wants_implementation = include_code and any(
+            kw in question.lower() for kw in _IMPLEMENT_KEYWORDS
+        )
+
+        # Pass 1: locate the region(s) of the error.
+        self.after(0, lambda: self._set_stage("Reading for region of error"))
+        regions = self._call_model(model_name, f"{base_text}\n\n{_PASS1_LOCATE}", images, max_tokens=200)
+        self.after(0, lambda: self._append("Pulse (1 · Region of error)", regions))
+
+        # Pass 2: focused second read + diagnosis/reasoning.
+        self.after(0, lambda: self._set_stage("Analyzing"))
+        raw_analysis = self._call_model(model_name, _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=700)
+        analysis, calc_exprs, promote_names = _extract_directives(raw_analysis)
+        self.after(0, lambda: self._append("Pulse (2 · Diagnosis & reasoning)", analysis))
+
+        directive_note = ""
+        if calc_exprs or promote_names:
+            directive_note, calc_lines, promoted = self._apply_directives(calc_exprs, promote_names)
+            if calc_lines:
+                self.after(0, lambda: self._append("Pulse (verified calculations)", calc_lines))
+            for target in promoted:
+                self.after(0, lambda t=target: self.promote_fn(t))
+            if promoted:
+                promoted_str = ", ".join(promoted)
+                self.after(0, lambda s=promoted_str: self._append("Pulse", f"⚙ Promoted to full tracking (agent request): {s}"))
+            if directive_note:
+                self.history.append({"role": "user", "content": [{"type": "text", "text": directive_note}]})
+
+        full_answer = f"{regions}\n\n{analysis}"
+
+        if not wants_implementation:
+            self.after(0, lambda: self._set_stage("Developing fix"))
+            fix_text = self._call_model(model_name, _PASS3_FIX_TEXT, max_tokens=300)
+            self.after(0, lambda: self._set_stage(None))
+            full_answer += f"\n\n{fix_text}"
+            self.after(0, lambda: self._append("Pulse (3 · Fix)", fix_text))
+            self.history.append({"role": "assistant", "content": full_answer})
+            return
+
+        # Pass 3: develop and implement the fix.
+        self.after(0, lambda: self._set_stage("Developing & implementing fix"))
+        fix_answer = self._call_model(model_name, _PASS3_IMPLEMENT, max_tokens=4000)
+        fix = self._parse_code_fix(fix_answer)
+        if fix is None:
+            self.after(0, lambda: self._set_stage(None))
+            full_answer += f"\n\n{fix_answer}"
+            self.after(0, lambda: self._append("Pulse (3 · Fix)", fix_answer))
+            self.history.append({"role": "assistant", "content": full_answer})
+            return
+
+        # Pass 4: verify the fix's math/logic before handing it to the
+        # user; revise and re-check on failure (bounded retries).
+        fix, verify_ok, verify_reason = self._verify_fix_with_retries(model_name, fix)
+        status = "passed" if verify_ok else "did not clearly pass -- applying best effort"
+        self.after(0, lambda: self._append("Pulse (4 · Verification)", f"{status}: {verify_reason}"))
+
+        self.after(0, lambda: self._set_stage(None))
+        self.history.append({"role": "assistant", "content": full_answer})
+
+        write_lines, applied_by_path, _originals = self._write_code_fix(fix)
+        self.after(0, lambda: self._append("Pulse", write_lines))
+        if applied_by_path:
+            self._fix_applied_this_turn = True
+
+        # Pass 5 (+ 6): only worth a full re-read if a fix actually landed.
+        if applied_by_path and _depth < 3:
+            self._run_sweep_and_maybe_recurse(model_name, include_code, provider_name, _depth)
+
+        if _depth == 0 and self._fix_applied_this_turn and self.restart_fn:
+            self.after(0, lambda: self._append("Pulse", "⚙ Restarting the training loop to pick up the fix..."))
+            self.restart_fn(provider_name)
 
     @staticmethod
     def _parse_code_fix(answer):
@@ -1343,98 +1937,197 @@ class ChatPanel(tk.Frame):
             return None
 
         old, new, explanation = payload.get("old"), payload.get("new"), payload.get("explanation")
+        files = payload.get("files")
         if not isinstance(old, list) or not isinstance(new, list):
             return None
         if not old or len(old) != len(new):
             return None
         if not all(isinstance(x, str) for x in old) or not all(isinstance(x, str) for x in new):
             return None
+        if files is not None:
+            if not isinstance(files, list) or len(files) != len(old):
+                return None
+            if not all(f is None or isinstance(f, str) for f in files):
+                return None
+        else:
+            files = [None] * len(old)
 
-        return {"old": old, "new": new, "explanation": explanation if isinstance(explanation, str) else ""}
+        return {
+            "old": old, "new": new, "files": files,
+            "explanation": explanation if isinstance(explanation, str) else "",
+        }
 
-    def _handle_code_fix(self, fix):
-        """Apply an agent-proposed code fix to `self.script_path` on disk, show
-        what changed in the transcript, then offer to revert it immediately.
+    def _resolve_fix_path(self, file_label):
+        """Map a fix entry's optional "file" label back to a real path on
+        disk, defaulting to the main script when unset. Falls back to
+        substring matching (case-insensitive) since the agent may not
+        reproduce a header exactly."""
+        if not file_label or not file_label.strip():
+            return self.script_path
+        label = file_label.strip()
+        if label in self._path_for_label:
+            return self._path_for_label[label]
+        matches = [p for lbl, p in self._path_for_label.items() if label.lower() in lbl.lower()]
+        if len(matches) == 1:
+            return matches[0]
+        return None
 
-        Each old[i] must appear exactly once in the current file contents;
-        snippets that don't match cleanly are skipped and reported rather
-        than guessed at. Runs on the Tk main thread (scheduled via `after`)
-        since it both touches disk and needs to pop a confirmation dialog.
+    def _write_code_fix(self, fix):
+        """Apply an agent-proposed code fix to the file(s) it targets,
+        writing directly to disk. Pure I/O -- no Tk calls -- so this is
+        safe to run on the background request thread (see _ask). Each fix
+        entry may target a different file (see "files" in the code-fix
+        schema, for a modularized project) -- edits are grouped by resolved
+        file path so each file is read/written once regardless of how many
+        snippets in it changed.
+
+        Each old[i] must appear exactly once in its target file's current
+        contents; snippets that don't match cleanly, or whose file can't be
+        resolved, are skipped and reported rather than guessed at.
+
+        Returns (display_text, applied_by_path, originals): applied_by_path
+        maps touched file path -> [(old, new), ...] (empty if nothing
+        landed); originals maps path -> its content before this edit, kept
+        around in case a manual revert is ever needed.
         """
-        if not self.script_path:
-            self._append(
-                "Pulse",
-                "(Proposed a code fix, but no script file path is known, so it can't be written to "
-                "disk.)\n\nExplanation: " + (fix["explanation"] or "(none given)"),
-            )
-            return
+        by_path = {}
+        unresolved = []
+        for old, new, label in zip(fix["old"], fix["new"], fix["files"]):
+            path = self._resolve_fix_path(label)
+            if not path:
+                unresolved.append((old, label))
+                continue
+            by_path.setdefault(path, []).append((old, new))
 
-        try:
-            with open(self.script_path, "r", encoding="utf-8") as f:
-                original_content = f.read()
-        except OSError as exc:
-            self._append("Pulse", f"⚠ Could not read '{self.script_path}' to apply the fix: {exc}")
-            return
-
-        content = original_content
-        applied, skipped = [], []
-        for old, new in zip(fix["old"], fix["new"]):
-            count = content.count(old)
-            if count == 1:
-                content = content.replace(old, new, 1)
-                applied.append((old, new))
-            elif count == 0:
-                skipped.append((old, "no exact match found in the file"))
-            else:
-                skipped.append((old, f"matched {count} times (ambiguous), skipped for safety"))
+        if not by_path and not unresolved:
+            return "(Proposed a code fix with nothing to apply.)", {}, {}
 
         lines = []
         if fix["explanation"]:
             lines.append(f"**Explanation:** {fix['explanation']}")
 
-        if not applied:
-            lines.append("\n⚠ No changes were applied -- none of the proposed snippets matched the file cleanly:")
-            for old, reason in skipped:
-                lines.append(f"  - {reason}: `{old.splitlines()[0][:80]}...`")
-            self._append("Pulse", "\n".join(lines))
-            return
+        originals = {}
+        applied_by_path = {}
+        skipped = []
 
-        try:
-            with open(self.script_path, "w", encoding="utf-8") as f:
-                f.write(content)
-        except OSError as exc:
-            self._append("Pulse", f"⚠ Failed to write changes to '{self.script_path}': {exc}")
-            return
+        for path, pairs in by_path.items():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    original_content = f.read()
+            except OSError as exc:
+                for old, _new in pairs:
+                    skipped.append((old, path, f"couldn't read file: {exc}"))
+                continue
 
-        if self.on_code_change:
-            self.on_code_change(content)
+            content = original_content
+            applied = []
+            for old, new in pairs:
+                count = content.count(old)
+                if count == 1:
+                    content = content.replace(old, new, 1)
+                    applied.append((old, new))
+                elif count == 0:
+                    skipped.append((old, path, "no exact match found in the file"))
+                else:
+                    skipped.append((old, path, f"matched {count} times (ambiguous), skipped for safety"))
 
-        lines.append(f"\n✓ Applied {len(applied)} change(s) to `{self.script_path}`:")
-        for old, new in applied:
-            lines.append(f"  - replaced `{old.splitlines()[0][:80]}...` with `{new.splitlines()[0][:80]}...`")
+            if not applied:
+                continue
+
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+            except OSError as exc:
+                lines.append(f"⚠ Failed to write changes to '{path}': {exc}")
+                continue
+
+            originals[path] = original_content
+            applied_by_path[path] = applied
+            if path == self.script_path and self.on_code_change:
+                self.on_code_change(content)
+
+        for old, label in unresolved:
+            skipped.append((old, label or "(unspecified file)", "couldn't determine which file this targets"))
+
+        if not applied_by_path:
+            lines.append("\n⚠ No changes were applied -- none of the proposed snippets matched cleanly:")
+            for old, where, reason in skipped:
+                lines.append(f"  - [{os.path.basename(str(where))}] {reason}: `{old.splitlines()[0][:80]}...`")
+            return "\n".join(lines), {}, {}
+
+        for path, applied in applied_by_path.items():
+            lines.append(f"\n✓ Applied {len(applied)} change(s) to `{os.path.basename(path)}`:")
+            for old, new in applied:
+                lines.append(f"  - replaced `{old.splitlines()[0][:80]}...` with `{new.splitlines()[0][:80]}...`")
         if skipped:
             lines.append(f"\n⚠ Skipped {len(skipped)} proposed change(s) that didn't match cleanly:")
-            for old, reason in skipped:
-                lines.append(f"  - {reason}: `{old.splitlines()[0][:80]}...`")
-        self._append("Pulse", "\n".join(lines))
+            for old, where, reason in skipped:
+                lines.append(f"  - [{os.path.basename(str(where))}] {reason}: `{old.splitlines()[0][:80]}...`")
 
-        revert = messagebox.askyesno(
-            "Revert code fix?",
-            f"Revert the change to '{os.path.basename(self.script_path)}' and restore it to how it "
-            "was before this fix?",
-            parent=self,
+        return "\n".join(lines), applied_by_path, originals
+
+    def report_training_trouble(self, problem):
+        """Called by the Dashboard when auto-intervention detects training
+        going bad (a value went NaN/inf, or a loss-like scalar spiked) and
+        has already paused the user's training loop via the control queue.
+        Surfaces what was detected and, if an AI provider is already
+        configured, automatically asks the agent to diagnose -- and if it
+        can, fix -- it. Unlike report_script_error, the process is still
+        alive and paused (not crashed), so if a fix gets applied the user
+        can just hit "Resume Training" once they're ready.
+        """
+        self._append(
+            "Pulse",
+            f"⚠ Auto-paused training -- this looks like it's going bad:\n\n{problem}",
         )
-        if revert:
-            try:
-                with open(self.script_path, "w", encoding="utf-8") as f:
-                    f.write(original_content)
-                if self.on_code_change:
-                    self.on_code_change(original_content)
-                self._append("Pulse", f"✓ Reverted '{self.script_path}' to its state before this fix.")
-            except OSError as exc:
-                self._append("Pulse", f"⚠ Failed to revert '{self.script_path}': {exc}")
-        else:
-            self._append("Pulse", "✓ Change kept.")
+
+        current_provider = self.provider_var.get()
+        if not self._has_active_key(current_provider):
+            self._append(
+                "Pulse",
+                "Pick a provider and enter an API key above, then ask me about this and "
+                "I'll take a look.",
+            )
+            return
+
+        question = (
+            f"Pulse just auto-paused training because it detected a problem: {problem}\n"
+            "Please diagnose the root cause and, if you can, fix it."
+        )
+        self._append("You (training auto-paused)", "(auto-reported by Pulse)")
+        threading.Thread(target=self._ask, args=(question, True, current_provider), daemon=True).start()
+
+    def report_script_error(self, tb_text):
+        """Called by the Dashboard when it finds a crash file: the user's
+        script raised an uncaught exception somewhere (an init error, or
+        anything that happened after auto_track() was called) and the
+        process has already exited. Surfaces the traceback and, if an AI
+        provider is already configured, automatically asks the agent to
+        diagnose -- and if it can, fix -- it, the same way a normal
+        question would. The fix still can't un-crash the process that
+        already exited, but it means the *next* run has a shot at working.
+        """
+        self._append(
+            "Pulse",
+            "⚠ Your script crashed with an uncaught exception (the process has already exited). "
+            f"Here's the traceback:\n\n```\n{tb_text}\n```",
+        )
+
+        current_provider = self.provider_var.get()
+        if not self._has_active_key(current_provider):
+            self._append(
+                "Pulse",
+                "Pick a provider and enter an API key above, then ask me about this error and "
+                "I'll take a look.",
+            )
+            return
+
+        question = (
+            f"My script just crashed with this uncaught exception:\n{tb_text}\n"
+            "Please diagnose the root cause and, if you can, fix it."
+        )
+        self._append("You (script crashed)", "(auto-reported by Pulse)")
+        threading.Thread(target=self._ask, args=(question, True, current_provider), daemon=True).start()
 
 
 # ============================================================================
@@ -1450,18 +2143,33 @@ class Dashboard:
     THUMB_SIZE = (170, 170)
     COLS = 3
 
-    def __init__(self, session_id, display_configs, code_text=None, config_queue=None, control_queue=None, known_names=None, script_path=None):
+    def __init__(self, session_id, display_configs, code_text=None, config_queue=None, control_queue=None, known_names=None, script_path=None, var_states=None, extra_files=None, initial_provider=None):
         self.session_id = session_id
         self.cache = session_dir(session_id)
         self.manifest_path = os.path.join(self.cache, "manifest.json")
+        self.crash_path = os.path.join(self.cache, "crash.json")
+        self._crash_reported = False
         self.display_configs = display_configs
         self.config_queue = config_queue
         self.control_queue = control_queue
         self.code_text = code_text
         self.script_path = script_path
+        self.extra_files = dict(extra_files or {})
         self.known_names = set(known_names or [])
+        self.var_states = dict(var_states or {})
+        self.initial_provider = initial_provider
         self._tiles = {}
         self._manifest = {}
+
+        # Auto-intervention: watch tracked values for signs training is
+        # going bad (a scalar going non-finite, or a loss-like scalar
+        # spiking well above its recent range) and, if so, pause training
+        # (via the same control_queue used for ADD_VAR) and automatically
+        # ask the agent to diagnose -- and if it can, fix -- it.
+        self.auto_intervene = tk.BooleanVar(value=True)
+        self.explosion_multiplier = 5.0
+        self.is_paused = False
+        self._last_intervention_signature = None
 
         self.root = tk.Tk()
         self.root.title("Pulse — Live Dashboard")
@@ -1481,8 +2189,25 @@ class Dashboard:
         left_head.pack(fill=tk.X, padx=18, pady=(16, 4))
         tk.Label(left_head, text="TRACKED MATRICES", bg=BG, fg=TEXT_DIM,
                  font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
-        tk.Label(left_head, text="  right-click a tile to reconfigure axes", bg=BG, fg=TEXT_FAINT,
+        tk.Label(left_head, text="  \"lo\" tiles are lightweight (stats only) -- right-click to track fully, change axes, or remove", bg=BG, fg=TEXT_FAINT,
                  font=FONT_MONO).pack(side=tk.LEFT)
+        tk.Checkbutton(
+            left_head, text="Auto-fix", variable=self.auto_intervene,
+            bg=BG, fg=TEXT_DIM, selectcolor=CARD, activebackground=BG, activeforeground=TEXT,
+            font=FONT_MONO, bd=0, highlightthickness=0, cursor="hand2",
+        ).pack(side=tk.RIGHT)
+
+        self.pause_banner = tk.Frame(left, bg=RED)
+        pause_inner = tk.Frame(self.pause_banner, bg=RED)
+        pause_inner.pack(fill=tk.X, padx=18, pady=8)
+        self.pause_label = tk.Label(pause_inner, text="", bg=RED, fg="#0a0a0a", font=FONT_UI_BOLD, anchor="w")
+        self.pause_label.pack(side=tk.LEFT)
+        tk.Button(
+            pause_inner, text="▶ Resume Training", command=self._resume_training,
+            bg="#0a0a0a", fg=TEXT, activebackground=CARD_HOVER, activeforeground=TEXT,
+            relief="flat", font=FONT_UI_BOLD, padx=10, pady=4, bd=0, cursor="hand2",
+        ).pack(side=tk.RIGHT)
+        # Not packed yet -- _poll() packs/unpacks it as is_paused changes.
 
         self.canvas = tk.Canvas(left, bg=BG, highlightthickness=0)
         scrollbar = ttk.Scrollbar(left, orient="vertical", command=self.canvas.yview)
@@ -1501,6 +2226,10 @@ class Dashboard:
             get_code_fn=lambda: self.code_text,
             script_path=self.script_path,
             on_code_change=self._on_code_change,
+            promote_fn=self._promote_to_track,
+            get_extra_files_fn=lambda: self.extra_files,
+            initial_provider=self.initial_provider,
+            restart_fn=self._restart_training,
         )
         self.chat_panel.pack(fill=tk.BOTH, expand=True)
 
@@ -1535,8 +2264,23 @@ class Dashboard:
         return {}
 
     def _poll(self):
+        if not self._crash_reported and os.path.exists(self.crash_path):
+            self._crash_reported = True
+            try:
+                with open(self.crash_path, "r", encoding="utf-8") as f:
+                    crash = json.load(f)
+                self.chat_panel.report_script_error(crash.get("traceback", "(no traceback captured)"))
+            except Exception:
+                pass
+
         manifest = self._load_manifest()
         self._manifest = manifest
+
+        if self.auto_intervene.get() and not self.is_paused:
+            problem = self._check_for_trouble(manifest)
+            if problem and problem != self._last_intervention_signature:
+                self._last_intervention_signature = problem
+                self._trigger_auto_intervention(problem)
 
         for name, stats in sorted(manifest.items()):
             if name in self.hidden_tiles:
@@ -1544,12 +2288,32 @@ class Dashboard:
             if "error" in stats:
                 self.pending_tiles.discard(name)
                 continue
+
             img_path = stats.get("image")
+            is_scalar = stats.get("kind") == "scalar"
+
+            if not img_path and not is_scalar:
+                # lotrack: stats-only, no heatmap was ever generated for this
+                # variable -- render a lightweight text tile instead.
+                self.pending_tiles.discard(name)
+                self._render_lotrack_tile(name, stats)
+                continue
+
             if not img_path or not os.path.exists(img_path):
                 continue
 
             tile = self._tiles.get(name)
             current_img_path = img_path
+
+            if tile is not None and tile.get("kind") == "lotrack":
+                # Just got promoted and now has a real image -- tear down the
+                # old text-only tile so it can be rebuilt as an image tile.
+                try:
+                    tile["frame"].destroy()
+                except Exception:
+                    pass
+                tile = None
+                self._tiles.pop(name, None)
 
             if tile is not None and tile.get("img_path") == current_img_path:
                 continue
@@ -1559,7 +2323,6 @@ class Dashboard:
             thumb.thumbnail(self.THUMB_SIZE)
             photo = ImageTk.PhotoImage(thumb)
 
-            is_scalar = stats.get("kind") == "scalar"
             nan = stats.get("nan", 0) or 0
             inf = stats.get("inf", 0) or 0
             is_flagged = bool(nan or inf)
@@ -1587,13 +2350,14 @@ class Dashboard:
                 label.bind("<Button-1>", on_click)
                 label.bind("<Button-3>", self._make_tile_context_menu(name))
 
-                tile = {"frame": frame, "label": label, "sub": sub, "img_path": current_img_path}
+                tile = {"frame": frame, "label": label, "sub": sub, "img_path": current_img_path, "kind": "track"}
                 self._tiles[name] = tile
             else:
                 tile["frame"].configure(highlightbackground=border_color)
                 tile["label"].configure(image=photo)
                 tile["label"].image = photo
                 tile["img_path"] = current_img_path
+                tile["kind"] = "track"
                 tile["label"].unbind("<Button-1>")
                 tile["label"].bind("<Button-1>", lambda e, n=name: self._enlarge(n, self._tiles[n]["img_path"]))
                 tile["label"].unbind("<Button-3>")
@@ -1625,6 +2389,135 @@ class Dashboard:
         self._relayout()
         self.root.after(self.REFRESH_MS, self._poll)
 
+    def _check_for_trouble(self, manifest):
+        """Look at the current manifest for signs training is going bad.
+        Returns a short human-readable description, or None. Mirrors the
+        CLI's PulseCLI._check_for_trouble: non-finite scalar values are an
+        unambiguous trigger; a loss-like scalar spiking to
+        explosion_multiplier-x its own recent minimum is a softer one.
+        Also flags any matrix/tensor (track or lotrack) whose latest stats
+        show nan/inf.
+        """
+        reasons = []
+        for name, stats in manifest.items():
+            if "error" in stats:
+                continue
+            if stats.get("kind") == "scalar":
+                latest = stats.get("latest_value")
+                if latest is not None and isinstance(latest, (int, float)) and not math.isfinite(latest):
+                    reasons.append(f"'{name}' just went non-finite (NaN/inf): {latest}")
+                    continue
+                if _looks_like_loss(name) and latest is not None:
+                    recent = [v for v in (stats.get("recent") or []) if v is not None and math.isfinite(v)]
+                    if len(recent) >= 5:
+                        baseline = min(recent[:-1])
+                        if baseline > 0 and latest > baseline * self.explosion_multiplier:
+                            reasons.append(
+                                f"'{name}' spiked to {latest:.4g}, "
+                                f"{latest / baseline:.1f}x its recent minimum ({baseline:.4g})"
+                            )
+            else:
+                nan = stats.get("nan", 0) or 0
+                inf = stats.get("inf", 0) or 0
+                if nan or inf:
+                    reasons.append(f"'{name}' has nan={nan} inf={inf}")
+        return "; ".join(reasons) if reasons else None
+
+    def _trigger_auto_intervention(self, problem):
+        """Pause the user's training loop (via control_queue -- see
+        persistent_tracer's PAUSE/RESUME handling in pulse.py) and
+        automatically hand the problem to the agent to diagnose and, if it
+        can, fix -- without waiting for the user to notice and ask.
+        """
+        self.is_paused = True
+        if self.control_queue is not None:
+            try:
+                self.control_queue.put(("PAUSE", None))
+            except Exception:
+                pass
+        self.pause_label.configure(
+            text=f"⚠ Auto-paused: {problem}"
+        )
+        if not self.pause_banner.winfo_ismapped():
+            self.pause_banner.pack(fill=tk.X, side=tk.TOP, before=self.canvas)
+        self.chat_panel.report_training_trouble(problem)
+
+    def _resume_training(self):
+        self.is_paused = False
+        self._last_intervention_signature = None
+        if self.control_queue is not None:
+            try:
+                self.control_queue.put(("RESUME", None))
+            except Exception:
+                pass
+        if self.pause_banner.winfo_ismapped():
+            self.pause_banner.pack_forget()
+
+    def _restart_training(self, provider_name):
+        """Called by the chat panel right after a code fix has been
+        applied to disk, so the training loop actually runs the fixed
+        code -- the process that owns the loop is still executing the old
+        code in memory otherwise. This process (the Dashboard) doesn't own
+        the loop itself, so it just signals the trainer process via
+        control_queue; see auto_track()'s persistent_tracer for the
+        RESTART handler, which tears everything down and os.execv's a
+        fresh process, threading the active provider through so the next
+        run's setup auto-fills the agent and API key instead of asking
+        again.
+        """
+        if self.control_queue is not None:
+            try:
+                self.control_queue.put(("RESTART", provider_name))
+            except Exception:
+                pass
+
+    def _fmt_num(self, v):
+        try:
+            return f"{v:.4f}"
+        except (TypeError, ValueError):
+            return "n/a"
+
+    def _render_lotrack_tile(self, name, stats):
+        """Stats-only tile for a 'lotrack' variable: no heatmap was ever
+        generated for it, so there's nothing to render but the numbers.
+        Right-click still offers "Track fully" to promote it.
+        """
+        mean_v = stats.get("mean")
+        nan = stats.get("nan", 0) or 0
+        inf = stats.get("inf", 0) or 0
+        is_flagged = bool(nan or inf)
+        border_color = RED if is_flagged else BORDER
+        text = f"mean={self._fmt_num(mean_v)}\nnan={nan}  inf={inf}"
+
+        tile = self._tiles.get(name)
+        if tile is None or tile.get("kind") != "lotrack":
+            if tile is not None:
+                try:
+                    tile["frame"].destroy()
+                except Exception:
+                    pass
+            frame = tk.Frame(self.grid_frame, bg=CARD, highlightbackground=border_color,
+                              highlightthickness=1, bd=0, width=self.THUMB_SIZE[0], height=self.THUMB_SIZE[1])
+            frame.pack_propagate(False)
+            inner = tk.Frame(frame, bg=CARD)
+            inner.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+            tk.Label(inner, text="lo", bg=CARD, fg=TEXT_FAINT, font=FONT_MONO_BOLD, anchor="w").pack(anchor="w")
+            caption = tk.Label(inner, text=name, bg=CARD, fg=TEXT, font=FONT_UI_BOLD, anchor="w", wraplength=self.THUMB_SIZE[0] - 20)
+            caption.pack(fill=tk.X, pady=(6, 4), anchor="w")
+            sub = tk.Label(inner, text=text, bg=CARD, fg=(RED if is_flagged else TEXT_DIM),
+                            font=FONT_MONO, anchor="w", justify="left")
+            sub.pack(fill=tk.X, anchor="w")
+
+            frame.bind("<Button-3>", self._make_tile_context_menu(name))
+            inner.bind("<Button-3>", self._make_tile_context_menu(name))
+            for w in inner.winfo_children():
+                w.bind("<Button-3>", self._make_tile_context_menu(name))
+
+            self._tiles[name] = {"frame": frame, "sub": sub, "img_path": None, "kind": "lotrack"}
+        else:
+            tile["frame"].configure(highlightbackground=border_color)
+            tile["sub"].configure(text=text, fg=(RED if is_flagged else TEXT_DIM))
+
     def _relayout(self):
         panel_width = self.canvas.winfo_width()
         cols = max(1, panel_width // self._tile_outer_w) if panel_width > 1 else self.COLS
@@ -1638,13 +2531,45 @@ class Dashboard:
             self.COLS = new_cols
             self._relayout()
 
+    def _promote_to_track(self, name):
+        """Switch a lotrack variable to full tracking -- called from the
+        right-click menu, or by the agent via a PROMOTE: directive."""
+        self.var_states[name] = "track"
+        if self.config_queue is not None:
+            try:
+                self.config_queue.put(("STATE", name, "track"))
+            except Exception:
+                pass
+        self.root.after(0, self._poll)
+
+    def _demote_to_lotrack(self, name):
+        self.var_states[name] = "lotrack"
+        if self.config_queue is not None:
+            try:
+                self.config_queue.put(("STATE", name, "lotrack"))
+            except Exception:
+                pass
+        tile = self._tiles.pop(name, None)
+        if tile is not None:
+            try:
+                tile["frame"].destroy()
+            except Exception:
+                pass
+        self.root.after(0, self._poll)
+
     def _make_tile_context_menu(self, name):
         def handler(event):
             stats = self._manifest.get(name, {})
+            is_scalar = stats.get("kind") == "scalar"
+            state = self.var_states.get(name) or ("track" if is_scalar else "lotrack")
             menu = tk.Menu(self.root, tearoff=0, bg=CARD, fg=TEXT, activebackground=ORANGE,
                             activeforeground="#0a0a0a", bd=0, relief="flat")
-            if stats.get("kind") != "scalar":
-                menu.add_command(label="Change Axes", command=lambda: self._open_axis_picker_popup(name))
+            if not is_scalar:
+                if state == "lotrack":
+                    menu.add_command(label="Track fully (stats + heatmap)", command=lambda: self._promote_to_track(name))
+                else:
+                    menu.add_command(label="Change Axes", command=lambda: self._open_axis_picker_popup(name))
+                    menu.add_command(label="Set to lo-track (lightweight)", command=lambda: self._demote_to_lotrack(name))
                 menu.add_separator()
             menu.add_command(label="Delete", command=lambda: self._delete_tile(name))
             menu.post(event.x_root, event.y_root)
@@ -1721,6 +2646,8 @@ class Dashboard:
         self.hidden_tiles.discard(name)
         self.known_names.add(name)
         self.pending_tiles.add(name)
+        default_state = _default_var_state(name, None)
+        self.var_states[name] = default_state
         if self.control_queue is not None:
             try:
                 self.control_queue.put(("ADD_VAR", name))
@@ -1728,6 +2655,7 @@ class Dashboard:
                 pass
         if self.config_queue is not None:
             try:
+                self.config_queue.put(("STATE", name, default_state))
                 self.config_queue.put(("CONFIG", name, _default_config(2)))
             except Exception:
                 pass
@@ -1894,8 +2822,8 @@ class Dashboard:
         self.root.mainloop()
 
 
-def _run_dashboard(session_id, display_configs, code_text=None, config_queue=None, control_queue=None, known_names=None, script_path=None):
-    Dashboard(session_id, display_configs, code_text=code_text, config_queue=config_queue, control_queue=control_queue, known_names=known_names, script_path=script_path).run()
+def _run_dashboard(session_id, display_configs, code_text=None, config_queue=None, control_queue=None, known_names=None, script_path=None, var_states=None, extra_files=None, initial_provider=None):
+    Dashboard(session_id, display_configs, code_text=code_text, config_queue=config_queue, control_queue=control_queue, known_names=known_names, script_path=script_path, var_states=var_states, extra_files=extra_files, initial_provider=initial_provider).run()
 
 
 # ============================================================================
@@ -1947,8 +2875,20 @@ def _discover_candidates(caller_frame, root):
     """Merge static (ast, whole-source, not-yet-run) names with runtime
     (is_trackable-filtered, currently-in-scope) shapes -- so both a matrix
     only reachable inside a nested function AND whatever's already sitting
-    in scope right now end up as candidates."""
-    static_names = discover_static_names(caller_frame)
+    in scope right now end up as candidates.
+
+    Static discovery isn't limited to the entry script: for a modularized
+    project, variables assigned inside a function defined in another local
+    file (e.g. model.py's forward()) show up here too, before that function
+    has ever run -- see _discover_project_files. Runtime tracing already
+    followed into other files naturally (sys.settrace is global, not
+    per-file), so this closes the one place that was entry-script-only.
+    """
+    entry_path = caller_frame.f_code.co_filename
+    static_names = discover_static_names_from_file(entry_path)
+
+    for other_path in _discover_project_files(entry_path, root):
+        static_names |= discover_static_names_from_file(other_path)
 
     runtime = {}
     for name, val in caller_frame.f_locals.items():
@@ -1960,6 +2900,32 @@ def _discover_candidates(caller_frame, root):
     discovered = {name: None for name in static_names}
     discovered.update(runtime)
     return discovered
+
+
+def _install_pulse_excepthook(session_id):
+    """Install a sys.excepthook that persists any uncaught exception's
+    traceback to this session's cache dir before letting the default hook
+    print it and the process exit normally. The Dashboard polls for this
+    file (see Dashboard._poll) and, once found, automatically asks the
+    agent to diagnose (and, if it can, fix) it -- covering errors that
+    happen anywhere after auto_track() was called, not just ones caught
+    during the initial dry run.
+    """
+    previous_hook = sys.excepthook
+
+    def _hook(exc_type, exc_value, exc_tb):
+        if not issubclass(exc_type, KeyboardInterrupt):
+            try:
+                tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+                _atomic_write_json(
+                    os.path.join(session_dir(session_id), "crash.json"),
+                    {"traceback": tb_text, "time": time.time()},
+                )
+            except Exception:
+                pass
+        previous_hook(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _hook
 
 
 def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_root=None, mode="auto"):
@@ -1992,6 +2958,25 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
         except OSError:
             code_text = None
 
+    # For a modularized project, gather the source of other local files this
+    # script imports too (model.py, utils.py, etc.) -- capped so a huge repo
+    # doesn't blow up the agent's context -- so "Send Code"/`/code` and any
+    # proposed code fix can actually see and reference functions that live
+    # outside the entry script. Keyed by the path shown to the agent.
+    extra_files = {}
+    if entry_path:
+        total_chars = len(code_text or "")
+        for other_path in _discover_project_files(entry_path, root):
+            if total_chars > 200_000 or len(extra_files) >= 12:
+                break
+            try:
+                with open(other_path, "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            extra_files[other_path] = text
+            total_chars += len(text)
+
     discovered = _discover_candidates(caller_frame, root)
 
     runtime_shapes = {k: v for k, v in discovered.items() if v is not None}
@@ -2010,13 +2995,19 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
                 runtime_shapes[name] = shape_of(val)
         return shape_tracer
 
+    # If the dry run itself raises (e.g. a genuine init/setup bug in the
+    # user's code, not just "hasn't reached the loop yet"), don't silently
+    # swallow it -- capture it so the agent can be handed the traceback and
+    # a shot at fixing it once it's set up, instead of Pulse just quietly
+    # doing nothing and the user never finding out why.
+    startup_error = None
     if train_fn is not None:
         sys.settrace(shape_tracer)
         caller_frame.f_trace = shape_tracer
         try:
             train_fn()
         except Exception:
-            pass
+            startup_error = traceback.format_exc()
         finally:
             sys.settrace(None)
 
@@ -2025,44 +3016,80 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
         return
 
     if active_mode == "cli":
-        _start_cli_tracker(caller_frame, root, throttle_interval, discovered, runtime_shapes, code_text, entry_path)
+        _start_cli_tracker(
+            caller_frame, root, throttle_interval, discovered, runtime_shapes,
+            code_text, entry_path, extra_files=extra_files, startup_error=startup_error,
+        )
         return
 
     # ---- UI mode ----
-    picker_data = {var: runtime_shapes.get(var) for var in discovered}
-    ui = MatrixConfigUI(picker_data)
-    result = ui.run()
+    # If this process was just restarted after a code fix (see the
+    # "RESTART" handling in persistent_tracer below), PULSE_AUTO_PROVIDER
+    # carries the provider that was active before the restart -- its API
+    # key is already sitting in os.environ (set right before the restart
+    # happened), so both get auto-filled here instead of popping the setup
+    # dialog and asking the user all over again.
+    auto_provider = os.environ.pop("PULSE_AUTO_PROVIDER", None)
+    result = None
+    if auto_provider and auto_provider in PROVIDERS:
+        auto_key = os.environ.get(PROVIDERS[auto_provider]["env_key"], "").strip()
+        if auto_key:
+            result = (auto_provider, auto_key)
+            print(f"[PULSE] Resumed with agent {auto_provider} (auto-filled after restart).")
+    if result is None:
+        dialog = AgentSetupDialog()
+        result = dialog.run()
     if not result:
         print("[PULSE] Setup cancelled.")
         return
+    initial_provider, api_key = result
+    os.environ[PROVIDERS[initial_provider]["env_key"]] = api_key
 
-    auto_mode = result["auto"]
-    if auto_mode:
-        tracked_vars = set(result["vars"])
-        display_configs = {}
-    else:
-        tracked_vars = set(result["vars"].keys())
-        display_configs = {k: v for k, v in result["vars"].items() if v}
+    # Zero-config, same as the CLI: track everything by default.
+    tracked_vars = set(discovered.keys())
+    display_configs = {}
+    auto_mode = True
 
     if not tracked_vars:
-        print("[PULSE] No matrices selected.")
+        print("[PULSE] No trackable variables found.")
         return
 
-    print(f"[PULSE] Mode: UI | Tracking: {sorted(tracked_vars)}" + (" (+ auto-discovering new ones)" if auto_mode else ""))
+    var_states = {name: _default_var_state(name, runtime_shapes.get(name)) for name in tracked_vars}
 
     _session_id = str(uuid.uuid4())[:8]
-    _debugger_bg = HeatmapCreatorBG(display_configs, _session_id)
+    _debugger_bg = HeatmapCreatorBG(display_configs, _session_id, var_states)
     shared_config_queue = _debugger_bg.queue
     control_queue = mp.Queue()
 
     dash_process = mp.Process(
         target=_run_dashboard,
-        args=(_session_id, display_configs, code_text, shared_config_queue, control_queue, sorted(discovered), entry_path),
+        args=(_session_id, display_configs, code_text, shared_config_queue, control_queue, sorted(discovered), entry_path, var_states, extra_files, initial_provider),
         daemon=True,
     )
     dash_process.start()
 
+    # If the dry run above already crashed, hand that off to the Dashboard
+    # immediately via the same crash file the excepthook below uses -- no
+    # need to wait for a live exception once the agent is ready.
+    if startup_error:
+        try:
+            _atomic_write_json(
+                os.path.join(session_dir(_session_id), "crash.json"),
+                {"traceback": startup_error, "time": time.time()},
+            )
+        except Exception:
+            pass
+
+    # Catch any uncaught exception that crashes the rest of the user's
+    # script (init errors, bugs that only show up once the loop starts,
+    # etc.) and hand the traceback to the Dashboard via the same crash file
+    # mechanism, so the agent can diagnose -- and potentially fix -- it even
+    # though the process still has to exit afterward (Python can't resume
+    # past an unhandled exception; a fix just means the next run works).
+    _install_pulse_excepthook(_session_id)
+
     last_logged = {}
+    paused = {"value": False}
 
     def persistent_tracer(frame, event, arg):
         while True:
@@ -2070,9 +3097,62 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
                 msg = control_queue.get_nowait()
             except Exception:
                 break
-            if isinstance(msg, tuple) and msg and msg[0] == "ADD_VAR":
-                tracked_vars.add(msg[1])
-                last_logged.pop(msg[1], None)
+            if isinstance(msg, tuple) and msg:
+                if msg[0] == "ADD_VAR":
+                    tracked_vars.add(msg[1])
+                    last_logged.pop(msg[1], None)
+                elif msg[0] == "PAUSE":
+                    paused["value"] = True
+                elif msg[0] == "RESUME":
+                    paused["value"] = False
+                elif msg[0] == "RESTART":
+                    # The chat panel just applied a code fix to disk --
+                    # restart the whole process so the training loop
+                    # actually runs the fixed code (this process is still
+                    # executing the old code in memory otherwise). The
+                    # active provider is threaded through PULSE_AUTO_PROVIDER
+                    # so the next run's setup auto-fills the agent and API
+                    # key (already set in os.environ) instead of asking
+                    # again -- see the UI-mode setup above.
+                    provider_name = msg[1] if len(msg) > 1 else None
+                    if provider_name:
+                        os.environ["PULSE_AUTO_PROVIDER"] = provider_name
+                    try:
+                        _debugger_bg.shutdown()
+                    except Exception:
+                        pass
+                    try:
+                        dash_process.terminate()
+                    except Exception:
+                        pass
+                    sys.settrace(None)
+                    print("\n[PULSE] Fix applied -- restarting the training loop to pick it up...\n")
+                    sys.stdout.flush()
+# Replace the final os.execv line with this:
+                    script_path = getattr(sys.modules.get('__main__'), '__file__', None)
+                    
+                    script_path = os.path.abspath(script_path)
+                    
+
+                    # Spawn the new process safely using subprocess (which handles spaces on Windows)
+                    subprocess.Popen([sys.executable, script_path] + sys.argv[1:])
+                    sys.exit(0)
+        # bad (NaN/inf, a loss spike) and asked training to hold here until
+        # the user hits "Resume Training" -- or a fix gets applied and they
+        # resume manually. Blocks this exact line from executing further,
+        # which is as close to "pausing training" as Pulse can get without
+        # owning the training loop itself.
+        while paused["value"]:
+            try:
+                msg = control_queue.get(timeout=0.2)
+            except Exception:
+                msg = None
+            if isinstance(msg, tuple) and msg:
+                if msg[0] == "RESUME":
+                    paused["value"] = False
+                elif msg[0] == "ADD_VAR":
+                    tracked_vars.add(msg[1])
+                    last_logged.pop(msg[1], None)
 
         filename = frame.f_code.co_filename
         if _is_library_frame(filename):
@@ -2104,7 +3184,53 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
     caller_frame.f_trace = persistent_tracer
 
 
-def _start_cli_tracker(caller_frame, root, throttle_interval, discovered, runtime_shapes, code_text=None, script_path=None):
+def _install_cli_excepthook(cli):
+    """Catch any uncaught exception that crashes the rest of the user's
+    script (anywhere after CLI tracing starts -- an init error, or a bug
+    that only shows up once the loop runs) and offer to have the agent
+    diagnose -- and potentially fix -- it right there, before the process
+    actually exits. Python can't resume execution past an unhandled
+    exception, but a fix means the *next* run has a shot at working.
+    """
+    previous_hook = sys.excepthook
+
+    def _hook(exc_type, exc_value, exc_tb):
+        previous_hook(exc_type, exc_value, exc_tb)
+        if issubclass(exc_type, KeyboardInterrupt):
+            return
+        tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        print("\n[Pulse] Your script just crashed with the exception above.")
+        try:
+            if not cli.agent_provider:
+                resp = input(
+                    "[Pulse] Set up an AI agent now so Pulse can try to diagnose/fix it? (y/n) > "
+                ).strip().lower()
+                if resp not in ("y", "yes"):
+                    return
+                if not cli._select_agent_provider_and_key(initial=True):
+                    return
+            else:
+                resp = input(
+                    "[Pulse] Ask the agent to diagnose (and try to fix) this? (y/n) > "
+                ).strip().lower()
+                if resp not in ("y", "yes"):
+                    return
+        except (EOFError, KeyboardInterrupt):
+            return
+
+        question = (
+            f"My script just crashed with this uncaught exception:\n{tb_text}\n"
+            "Please diagnose the root cause and, if you can, fix it."
+        )
+        cli.ask_agent(question, include_code=True)
+
+    sys.excepthook = _hook
+
+
+def _start_cli_tracker(
+    caller_frame, root, throttle_interval, discovered, runtime_shapes,
+    code_text=None, script_path=None, extra_files=None, startup_error=None,
+):
     """CLI mode: synchronous, in-process -- no subprocess, no multiprocessing
     Queue, no pickling tensors across a process boundary (which can be
     genuinely broken for CUDA tensors anyway). Just prints as training runs
@@ -2123,13 +3249,27 @@ def _start_cli_tracker(caller_frame, root, throttle_interval, discovered, runtim
 
     `script_path` is the caller's own source file -- passed through so the
     CLI agent's code-fix feature (see PulseCLI._apply_code_fix) knows which
-    file on disk to write proposed fixes to.
+    file on disk to write proposed fixes to by default. `extra_files` is
+    {path: text} for other local project files this script imports (a
+    modularized project's model.py/utils.py/etc.), so the agent can see and
+    propose fixes to code that isn't in the entry script at all.
+    `startup_error` is a formatted traceback if the dry run passed to
+    auto_track() raised -- surfaced immediately so the user can ask the
+    agent to fix a bug that was blocking training from even starting.
     """
     from .pulse_cli import PulseCLI
 
     cli = PulseCLI(discovered={name: runtime_shapes.get(name) for name in discovered})
     cli.set_code_text(code_text, script_path=script_path)
+    cli.extra_files = dict(extra_files or {})
+    cli.pending_startup_error = startup_error
     cli.print_banner()
+    _install_cli_excepthook(cli)
+
+    if startup_error:
+        print("[Pulse] The function passed to auto_track() raised an exception during its dry run:")
+        print(startup_error)
+        print("[Pulse] Set up an AI agent below and Pulse will offer to diagnose/fix it before continuing.\n")
 
     setup_done = {"value": False}
     last_logged = {"t": 0.0}
@@ -2149,10 +3289,18 @@ def _start_cli_tracker(caller_frame, root, throttle_interval, discovered, runtim
         # Fill in shapes for statically-discovered names as soon as they
         # actually resolve to a value -- same as the GUI's shape_tracer
         # dry-run, just kept live instead of front-loaded into a single
-        # pre-pass.
+        # pre-pass. If a variable was defaulted to 'lotrack' before its
+        # shape was known and it turns out to actually be a scalar, upgrade
+        # it to full 'track' -- scalars are cheap regardless.
         for name, val in local_vars.items():
             if name in cli.discovered and cli.discovered.get(name) is None and is_trackable(val):
                 cli.discovered[name] = shape_of(val)
+                if (
+                    name in cli.tracked_vars
+                    and cli.var_states.get(name) == "lotrack"
+                    and shape_of(val) == ()
+                ):
+                    cli.var_states[name] = "track"
 
         if not setup_done["value"]:
             has_resolved_shape = any(shape is not None for shape in cli.discovered.values())
@@ -2177,6 +3325,7 @@ def _start_cli_tracker(caller_frame, root, throttle_interval, discovered, runtim
                     continue
                 if is_trackable(val) and name not in cli.tracked_vars:
                     cli.tracked_vars.append(name)
+                    cli.var_states[name] = cli._default_state_for(name, val)
 
         now = time.time()
         if now - last_logged["t"] > throttle_interval:
@@ -2187,7 +3336,8 @@ def _start_cli_tracker(caller_frame, root, throttle_interval, discovered, runtim
 
     sys.settrace(cli_tracer)
     caller_frame.f_trace = cli_tracer
-    print("[PULSE] Mode: CLI | tracing started -- run your training loop now.")
+    # No routine "tracing started" print -- minimal UI stays silent unless
+    # something's actually wrong (a read error, a crash, auto-intervention).
 
 
 def shutdown():
