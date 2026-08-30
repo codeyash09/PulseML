@@ -6,6 +6,7 @@ pulse_cli.py
 from __future__ import annotations
 
 import os
+import re
 import sys
 import json
 import time
@@ -14,6 +15,8 @@ import shutil
 import signal
 import getpass
 import itertools
+import subprocess
+import threading
 from typing import Any, Dict, List, Optional
 
 from pulse.pulse_backend import (
@@ -79,22 +82,43 @@ SYSTEM_PROMPT = (
     "cause (e.g. an optional metric never getting set, or a loss that has already collapsed "
     "to NaN before this step) rather than a gap to ignore.\n\n"
 
+    "TOOLS (use inline, each on its own line, only when actually useful -- omit both if not needed):\n"
+    "  CALC: <python arithmetic expression>\n"
+    "    You are not reliable at exact arithmetic. Anything like an update magnitude, a ratio, "
+    "or a comparison between two numbers you were given -- hand it off here instead of computing "
+    "it yourself. Pulse evaluates it deterministically (only numbers, operators, and `math` "
+    "module functions are available) and gives you the exact result. You may include more than "
+    "one CALC: line.\n"
+    "  PROMOTE: <comma-separated variable names>\n"
+    "    Some tracked matrices/tensors are in lightweight 'lotrack' mode (intermittent sampling, "
+    "stats only, no PDFs) -- see each variable's [track]/[lotrack] tag in the state you were "
+    "given. If one of them looks like it needs a closer look, name it here and Pulse will switch "
+    "it to full tracking. Only promote variables that are currently [lotrack]; don't bother for "
+    "ones already [track].\n"
+    "  Put CALC:/PROMOTE: lines anywhere in your Reasoning, not in the Diagnosis or Fix.\n\n"
+
     "CODE FIXES:\n"
     "If, and only if, the user explicitly asks you to fix, edit, patch, or change the code "
     "(not just diagnose it), respond with ONLY a single JSON object and nothing else -- no prose "
     "before or after it, no markdown code fences. The JSON object must have exactly these fields:\n"
-    "  old: a list of code snippets to find, each copied EXACTLY from the line-numbered training "
-    "code shown to you, including original indentation and whitespace, but WITHOUT the line-number "
+    "  old: a list of code snippets to find, each copied EXACTLY from the line-numbered code "
+    "shown to you, including original indentation and whitespace, but WITHOUT the line-number "
     "prefix ('  12 | ') itself.\n"
     "  new: a list of the same length as old, where new[i] is the full replacement for old[i].\n"
+    "  files: OPTIONAL, a list of the same length as old, where files[i] is the exact file header "
+    "(e.g. \"model.py\") that old[i]/new[i] belongs to, if more than one file was sent this turn. "
+    "Omit this field entirely (or use null/\"\" for an entry) to default to the main script.\n"
     "  explanation: a short, concise text description of what changed and why.\n"
     "Rules for old/new:\n"
-    "  - Each snippet in old must appear VERBATIM and exactly ONCE in the current file. Include "
+    "  - Each snippet in old must appear VERBATIM and exactly ONCE in its target file. Include "
     "enough surrounding lines (not just the single changed line) so the match is unambiguous.\n"
     "  - Each new[i] is the complete replacement block for old[i] -- to add a line, copy old[i] and "
     "append the new line(s) to it; to remove a line, copy old[i] and omit it.\n"
     "  - Never use placeholders like '...' or '# unchanged' inside old or new; both must be literal, "
     "complete code.\n"
+    "  - If the actual bug lives in another file that was sent this turn (e.g. a modularized "
+    "project's model.py), fix it there via files[i] rather than working around it in the main "
+    "script.\n"
     "  - If you were not shown the code, or the user has not asked for a fix, do not emit this JSON "
     "format -- answer normally per RESPONSE FORMAT above."
 )
@@ -155,6 +179,122 @@ PROVIDERS = {
 }
 
 
+import math as _math_module
+
+
+def _safe_eval_math(expr: str):
+    """Evaluate a plain arithmetic/math expression deterministically -- LLMs
+    are unreliable at exact arithmetic, so the agent can hand off anything
+    like update magnitudes or ratios here instead of eyeballing it. Only
+    numbers, operators, and `math` module names are reachable; no builtins,
+    no attribute access beyond that, so this is safe to eval() directly.
+    """
+    allowed_names = {k: v for k, v in vars(_math_module).items() if not k.startswith("_")}
+    allowed_names["math"] = _math_module
+    try:
+        return eval(expr, {"__builtins__": {}}, allowed_names)  # noqa: S307 -- restricted namespace above
+    except Exception as exc:
+        return f"(calc error: {exc})"
+
+
+class _Spinner:
+    """Minimal terminal spinner (/-\\|) shown while an agent stage is running.
+
+    Used as a context manager: `with _Spinner("Diagnosing"): ...`. Prints
+    nothing else -- callers are responsible for printing the stage's result
+    once the spinner stops.
+    """
+
+    _FRAMES = "/-\\|"
+
+    def __init__(self, label: str):
+        self.label = label
+        self._stop_evt = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _run(self) -> None:
+        for frame in itertools.cycle(self._FRAMES):
+            if self._stop_evt.is_set():
+                break
+            sys.stdout.write(f"\r{self.label}... {frame}")
+            sys.stdout.flush()
+            time.sleep(0.12)
+        sys.stdout.write("\r" + " " * (len(self.label) + 6) + "\r")
+        sys.stdout.flush()
+
+    def __enter__(self) -> "_Spinner":
+        self._stop_evt.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop_evt.set()
+        if self._thread:
+            self._thread.join()
+
+
+# Adaptive multi-pass agent pipeline (see PulseCLI.ask_agent). Instead of a
+# fixed 3-call sequence, the number of passes actually run adapts to what's
+# being asked and what comes back:
+#   Pass 1 -- LOCATE:   read everything, identify the region(s) of the error.
+#   Pass 2 -- ANALYZE:  a focused second read of just those regions, propose
+#                        a fix (diagnosis + reasoning).
+#   Pass 3 -- DEVELOP:  develop and implement the fix (code-fix JSON, if a
+#                        code change was actually asked for).
+#   Pass 4 -- VERIFY:   check the math/logic of the fix. Pass -> hand it to
+#                        the user. Fail -> revise and re-check (bounded).
+#   Pass 5 -- SWEEP:    re-read the whole thing again for OTHER, unrelated
+#                        errors; if any turn up, ask the user whether to fix
+#                        those too.
+#   Pass 6:             if the user says yes, recurse through the same
+#                        format (passes 1-5) for the newly-found issue(s).
+# Each call is kept small/cheap (small max_tokens) and streams to the
+# terminal as soon as it's ready, same spirit as the old fixed pipeline.
+_PASS1_LOCATE = (
+    "PASS 1 -- LOCATE: Read through everything you were given (stats, code, history) and identify "
+    "the specific region(s) where the problem likely originates -- file/line numbers, variable "
+    "names, or code sections. Respond with ONLY a short bullet list of the suspect location(s). "
+    "No diagnosis, no fix yet."
+)
+_PASS2_ANALYZE_TMPL = (
+    "Suspect region(s) from your first read:\n{regions}\n\n"
+    "PASS 2 -- ANALYZE: Take a focused second look at just those regions. Give the Diagnosis (one "
+    "sentence, the specific root cause) and the Reasoning behind it (grounded in the actual "
+    "numbers/code you were given, with real math, referencing line numbers). Do not implement the "
+    "fix yet."
+)
+_PASS3_FIX_TEXT = (
+    "PASS 3 -- DEVELOP: Give the Fix: a concrete, concise change (not generic advice), in 1-3 "
+    "sentences."
+)
+_PASS3_IMPLEMENT = (
+    "PASS 3 -- DEVELOP & IMPLEMENT: The user wants this fix applied to their code. Respond with "
+    "ONLY the code-fix JSON object described in your instructions (old/new/explanation) -- no "
+    "prose, no markdown fences."
+)
+_PASS4_VERIFY_TMPL = (
+    "The fix you are about to apply:\n{fix_desc}\n\n"
+    "PASS 4 -- VERIFY: Carefully check the math/logic of this fix against the numbers and code you "
+    'were given. Respond with ONLY a JSON object of the form {{"passes": true or false, "reason": '
+    '"one sentence"}}. passes=true only if the fix is logically/numerically correct and actually '
+    "addresses the diagnosed root cause."
+)
+_PASS4_REVISE_TMPL = (
+    "Your proposed fix did not pass verification: {reason}\n\n"
+    "Revise it. Respond with ONLY the corrected code-fix JSON object (old/new/explanation) -- no "
+    "prose, no markdown fences."
+)
+_PASS5_SWEEP = (
+    "PASS 5 -- FULL RE-READ: Re-read the ENTIRE code/context again -- not just the region you just "
+    "fixed -- and check for any OTHER, unrelated bugs or issues. Respond with ONLY a JSON object of "
+    'the form {"other_errors_found": true or false, "summary": "short description, or empty string '
+    'if none"}.'
+)
+_IMPLEMENT_KEYWORDS = ("fix", "edit", "patch", "change the code", "apply", "implement")
+_MAX_VERIFY_ATTEMPTS = 3
+
+
 class PulseCLI:
     def __init__(
         self,
@@ -166,9 +306,20 @@ class PulseCLI:
         self.discovered: Dict[str, Optional[tuple]] = dict(discovered or {})
         self.tracked_vars: List[str] = []
         self.var_configs: Dict[str, str] = {}  # Axis layout mapping e.g. {"A": "0211"}
+        # Per-variable tracking depth: "track" (full stats + PDFs if enabled,
+        # probed every matrix_probe_interval) or "lotrack" (intermittent,
+        # stats-only, never generates a PDF -- the default for matrices/
+        # tensors so tracking "everything" stays cheap). Scalars are always
+        # effectively full-track regardless of what's stored here. A
+        # variable not present in tracked_vars is simply not tracked at all.
+        self.var_states: Dict[str, str] = {}
         self.auto_mode: bool = False
         self.scalar_histories: Dict[str, List[float]] = {}
         self.step = 0
+        # Global step only advances when the loss/metric scalar (the first
+        # tracked var that looks like a loss) actually changes value -- see
+        # update(). None until a loss-like var is seen at least once.
+        self._last_loss_value: Optional[float] = None
         self.generate_pdfs = False
         self.pdf_dir = pdf_dir
         self.agent_provider: Optional[str] = None
@@ -176,19 +327,51 @@ class PulseCLI:
         self.agent_history: List[Dict[str, Any]] = []
         self.code_text: Optional[str] = None
         self.script_path: Optional[str] = None
+        # {path: text} for other local project files this script imports
+        # (a modularized project's model.py/utils.py/etc.) -- set by
+        # pulse.py's auto_track() so /code and "fix it" can see and edit
+        # code that isn't in the entry script at all.
+        self.extra_files: Dict[str, str] = {}
+        self._label_for_path: Dict[str, str] = {}
+        self._path_for_label: Dict[str, str] = {}
+        # A formatted traceback if the dry run passed to auto_track() raised
+        # -- surfaced once the agent is set up so a bug blocking training
+        # from even starting can still get diagnosed/fixed.
+        self.pending_startup_error: Optional[str] = None
 
-        # Backup of the file's contents from immediately before the most
-        # recent agent-applied code fix, so that fix can be reverted.
-        self._pending_revert_path: Optional[str] = None
-        self._pending_revert_backup: Optional[str] = None
+        # Backups of every file touched by the most recent agent-applied
+        # code fix (path -> original content). Kept around in case a
+        # revert is ever needed manually; the normal flow now auto-restarts
+        # after a fix instead of asking to revert (see _restart_process).
+        self._pending_revert_backups: Dict[str, str] = {}
+        # Set by _apply_code_fix whenever a fix is actually written to
+        # disk during the current top-level ask_agent() call. Checked once,
+        # at the end of that call, to decide whether to restart the process.
+        self._fix_applied_this_turn: bool = False
 
         # Matrix/tensor probing is intentionally decoupled from the training loop.
         # statistics() on GPU arrays can force a device->host synchronization, so
-        # NEVER run it for tagged matrices on every training step.
+        # NEVER run it for tagged matrices on every training step. "track" and
+        # "lotrack" variables are probed on separate, independent cadences.
         self._matrix_cache: Dict[str, Dict[str, Any]] = {}
         self._matrix_cached_vars: set[str] = set()
         self._last_matrix_probe: float = 0.0
         self.matrix_probe_interval: float = 1.0
+        self._last_lotrack_probe: float = 0.0
+        self.lotrack_probe_interval: float = 5.0
+
+        # Auto-intervention: watch tracked values for signs training is
+        # going bad (a scalar going non-finite, or a loss-like scalar
+        # spiking well above its recent range) and, if so, automatically
+        # pause (even out of continuous mode) and ask the agent to diagnose
+        # -- and if it can, fix -- it, without waiting for the user to
+        # notice and ask manually. On by default; toggle with /autofix.
+        self.auto_intervene: bool = True
+        self.explosion_multiplier: float = 5.0
+        self._last_intervention_signature: Optional[str] = None
+        # /code is on by default -- every manually-asked question includes
+        # the training code (and any cross-file context) unless turned off.
+        self.include_code_default: bool = True
 
         # Interactive Mode & Interrupt Handling
         self.continuous = False
@@ -208,15 +391,7 @@ class PulseCLI:
             raise KeyboardInterrupt
 
     def print_banner(self) -> None:
-        backends = available_backends()
-        print("\n" + "=" * 50)
-        print("                PULSE CLI EDITION                ")
-        print("=" * 50)
-        print("Detected backend(s):")
-        for name, active in backends.items():
-            status = "✓" if active else "✗"
-            print(f"  {status} {name}")
-        print("-" * 50 + "\n")
+        pass  # minimal UI: no banner -- setup only asks for a provider/API key below
 
     def set_code_text(self, code_text: Optional[str], script_path: Optional[str] = None) -> None:
         self.code_text = code_text
@@ -236,6 +411,82 @@ class PulseCLI:
                 trackable[name] = None
 
         return trackable
+
+    def _default_state_for(self, name: str, val: Any) -> str:
+        """Loss-like scalars are always cheap to compute so they default to
+        full 'track'. Everything else (matrices/tensors, or anything whose
+        shape isn't known yet) defaults to lightweight 'lotrack' -- this is
+        what keeps "track everything" affordable. Once a not-yet-resolved
+        variable turns out to actually be a scalar, callers upgrade it to
+        'track' automatically (see the runtime tracer in pulse.py).
+        """
+        if _looks_like_loss(name):
+            return "track"
+        if val is not None:
+            try:
+                if describe_tensor(val).kind == "scalar":
+                    return "track"
+            except Exception:
+                pass
+        return "lotrack"
+
+    def _state_of(self, name: str) -> str:
+        return self.var_states.get(name, "track")
+
+    def _set_var_state(self, var_name: str, new_state: str, quiet: bool = False) -> Optional[str]:
+        """Shared implementation behind /track and /lotrack (and the agent's
+        PROMOTE directive, which calls this with quiet=True). Returns the
+        canonical variable name that was changed, or None if nothing changed
+        (not tracked, ambiguous match while quiet, or user cancelled).
+        """
+        var_name = var_name.strip()
+        if not var_name:
+            if not quiet:
+                print(f"Usage: /{new_state} <variable name>  (or /{new_state} all)")
+            return None
+
+        if var_name.lower() == "all":
+            changed = [v for v in self.tracked_vars if self.var_states.get(v, "track") != new_state]
+            for v in changed:
+                self.var_states[v] = new_state
+                self._matrix_cached_vars.discard(v)
+            if not quiet:
+                print(f"✓ Set {len(changed)} variable(s) to '{new_state}'.")
+            return "all" if changed else None
+
+        target = var_name
+        if target not in self.tracked_vars:
+            matches = [n for n in self.tracked_vars if var_name.lower() in n.lower()]
+            if not matches:
+                if not quiet:
+                    print(f"[Pulse CLI] '{var_name}' is not currently tracked.")
+                return None
+            if len(matches) > 1:
+                if quiet:
+                    # Ambiguous and unattended (agent-triggered) -- don't guess.
+                    return None
+                print("\nMatching tracked variables:")
+                for idx, name in enumerate(matches, 1):
+                    print(f"  {idx}) {name}")
+                choice = input("Select a number (Enter to cancel) > ").strip()
+                if not choice or not choice.isdigit() or not (0 < int(choice) <= len(matches)):
+                    print("[Pulse CLI] Cancelled.")
+                    return None
+                target = matches[int(choice) - 1]
+            else:
+                target = matches[0]
+
+        self.var_states[target] = new_state
+        self._matrix_cached_vars.discard(target)  # force a fresh probe under the new cadence
+        if not quiet:
+            print(f"✓ '{target}' is now '{new_state}'.")
+        return target
+
+    def _cmd_track(self, var_name: str, quiet: bool = False) -> Optional[str]:
+        return self._set_var_state(var_name, "track", quiet=quiet)
+
+    def _cmd_lotrack(self, var_name: str, quiet: bool = False) -> Optional[str]:
+        return self._set_var_state(var_name, "lotrack", quiet=quiet)
 
     def _cmd_add(self, var_name: str) -> None:
         """Add a variable to tracking.
@@ -289,10 +540,11 @@ class PulseCLI:
         if var_name not in self.tracked_vars:
             self.tracked_vars.append(var_name)
             self._matrix_cached_vars.discard(var_name)
-            print(f"✓ Added '{var_name}' to tracking.")
+            self.var_states[var_name] = self._default_state_for(var_name, variables.get(var_name))
+            state_note = "  ★ loss? -> full track" if _looks_like_loss(var_name) else f"  ({self.var_states[var_name]})"
+            print(f"✓ Added '{var_name}' to tracking.{state_note}")
         else:
             print(f"'{var_name}' is already tracked.")
-        self._cmd_edit(var_name)
 
     def _cmd_edit(self, var_name: str) -> None:
         if var_name not in self.tracked_vars:
@@ -334,6 +586,7 @@ class PulseCLI:
             removed = list(self.tracked_vars)
             self.tracked_vars.clear()
             self.var_configs.clear()
+            self.var_states.clear()
             self.scalar_histories.clear()
             self._matrix_cache.clear()
             self._matrix_cached_vars.clear()
@@ -369,6 +622,7 @@ class PulseCLI:
 
         self.tracked_vars.remove(target)
         self.var_configs.pop(target, None)
+        self.var_states.pop(target, None)
         self.scalar_histories.pop(target, None)
         self._matrix_cached_vars.discard(target)
 
@@ -425,7 +679,13 @@ class PulseCLI:
             print(f"[Pulse CLI] ⚠ Failed to delete '{target_dir}': {exc}")
 
     def interactive_setup(self) -> None:
-        """Interactive CLI setup."""
+        """Zero-config, zero-noise CLI setup: silently track everything
+        Pulse can see, skip straight to picking an AI provider/API key (the
+        only thing this actually needs to ask), and let training run
+        without printing anything else unless something goes wrong. Power
+        users can still narrow things down with /add, /delete, /track,
+        /lotrack, /autofix once training is running (Ctrl+C to pause).
+        """
         variables = self.discover_variables()
         if not variables:
             print("[Pulse CLI] No trackable variables found in scope.")
@@ -433,145 +693,18 @@ class PulseCLI:
 
         var_list = sorted(variables.keys(), key=lambda n: (not _looks_like_loss(n), n))
 
-        def show_matches(matches: List[str]) -> None:
-            print("\nMatching variables:")
-            for idx, name in enumerate(matches, 1):
-                val = variables[name]
-                star = "  ★ loss?" if _looks_like_loss(name) else ""
-                if val is None:
-                    info = "[not run yet]"
-                else:
-                    try:
-                        d = describe_tensor(val)
-                        info = f"[{d.backend} {d.kind} {d.shape}]"
-                    except Exception:
-                        info = "[trackable]"
-                print(f"  {idx}) {name} {info}{star}")
-
-        print("Detected variables:")
-        show_matches(var_list)
-        print(
-            "\nSelect variables:"
-            "\n  • numbers: 1,2,5"
-            "\n  • partial name + Enter: matri   (finds matrix, matrices, matrix_...)"
-            "\n  • exact/partial names: matrix,matrix2"
-            "\n  • all = track everything currently known"
-            "\n  • auto = track everything, including variables appearing later"
-            "\n  • blank = skip tracking"
-        )
-
-        while True:
-            choice = input("\nPulse variables > ").strip()
-            if not choice:
-                return
-
-            lower = choice.lower()
-            if lower.startswith("/add "):
-                self._cmd_add(choice[5:].strip())
-                continue
-            if lower.startswith("/edit "):
-                self._cmd_edit(choice[6:].strip())
-                continue
-            if lower.startswith("/deletepdf "):
-                self._cmd_delete_pdfs(choice[11:].strip())
-                continue
-            if lower.startswith("/delete "):
-                self._cmd_delete(choice[8:].strip())
-                continue
-
-            if lower == "auto":
-                self.auto_mode = True
-                self.tracked_vars = [name for name in var_list if variables[name] is not None]
-                started = ", ".join(self.tracked_vars) if self.tracked_vars else "(none yet)"
-                print(f"\n✓ Auto-tracking every trackable variable (already in scope: {started})")
-                break
-
-            if lower == "all":
-                self.tracked_vars = var_list[:]
-                print(f"\n✓ Tracking variables: {', '.join(self.tracked_vars)}")
-                break
-
-            if all(part.strip().isdigit() for part in choice.split(",")):
-                indices = [int(x.strip()) for x in choice.split(",") if x.strip()]
-                selected = [var_list[i - 1] for i in indices if 0 < i <= len(var_list)]
-                if selected:
-                    self.tracked_vars = list(dict.fromkeys(selected))
-                    print(f"\n✓ Tracking variables: {', '.join(self.tracked_vars)}")
-                    break
-                print("[Pulse CLI] No valid variable numbers.")
-                continue
-
-            terms = [x.strip().lower() for x in choice.split(",") if x.strip()]
-            matches = [
-                name for name in var_list
-                if any(term in name.lower() for term in terms)
-            ]
-
-            if not matches:
-                print(f"[Pulse CLI] No variables match '{choice}'. Try another partial name.")
-                continue
-
-            show_matches(matches)
-            if len(matches) == 1:
-                confirm = input(f"Track '{matches[0]}'? (y/n) > ").strip().lower()
-                if confirm in ("y", "yes"):
-                    self.tracked_vars = [matches[0]]
-                    print(f"\n✓ Tracking variables: {matches[0]}")
-                    break
-                continue
-
-            print(
-                "\nEnter the matching numbers to track, another partial name to narrow it, "
-                "or 'all' to track every match."
-            )
-            subchoice = input(f"Match selection [{choice}] > ").strip()
-
-            if subchoice.lower() == "all":
-                self.tracked_vars = matches
-                print(f"\n✓ Tracking variables: {', '.join(self.tracked_vars)}")
-                break
-
-            if all(part.strip().isdigit() for part in subchoice.split(",")):
-                nums = [int(x.strip()) for x in subchoice.split(",") if x.strip()]
-                selected = [matches[i - 1] for i in nums if 0 < i <= len(matches)]
-                if selected:
-                    self.tracked_vars = list(dict.fromkeys(selected))
-                    print(f"\n✓ Tracking variables: {', '.join(self.tracked_vars)}")
-                    break
-
-            narrowed = [
-                name for name in matches
-                if subchoice.lower() in name.lower()
-            ]
-            if narrowed:
-                self.tracked_vars = narrowed
-                print(f"\n✓ Tracking variables: {', '.join(self.tracked_vars)}")
-                break
-
-            print("[Pulse CLI] Invalid selection.")
-
-        has_matrix_like = any(
-            variables.get(name) is not None
-            and describe_tensor(variables[name]).kind in ("vector", "matrix", "tensor")
-            for name in self.tracked_vars
-        )
-        if has_matrix_like:
-            print(
-                "\nNo heatmaps are shown in this CLI view -- matrices/tensors are just "
-                "tagged (their stats printed each step)."
-            )
-            resp = input(
-                f"Save labeled PDF snapshots to '{self.pdf_dir}/<variable>/' each step? (y/n): "
-            ).strip().lower()
-            self.generate_pdfs = resp in ("y", "yes")
-            if self.generate_pdfs:
-                print(f"[Pulse CLI] PDF snapshots enabled -> {self.pdf_dir}/<variable>/stepNNNNNN.pdf\n")
-            else:
-                print("[Pulse CLI] PDF snapshots disabled -- only stats will be printed.\n")
-        else:
-            print()
+        self.auto_mode = True
+        self.tracked_vars = list(var_list)
+        self.var_states = {name: self._default_state_for(name, variables[name]) for name in var_list}
+        self.generate_pdfs = False  # opt-in only, via /track + a future setting -- no prompt by default
 
         self._agent_setup()
+
+        # Run silently by default -- no per-step prompt, no dashboard
+        # printing -- unless the user explicitly interrupts (Ctrl+C) or
+        # something worth flagging happens (a read error, or the
+        # auto-intervention check in update() finding real trouble).
+        self.continuous = True
 
     def _select_agent_provider_and_key(self, initial: bool = False) -> bool:
         """Prompt the user to pick an AI provider and API key.
@@ -649,74 +782,64 @@ class PulseCLI:
         return True
 
     def _agent_setup(self) -> None:
-        """Choose the AI provider first, then obtain its API key, then enter Q&A."""
-        print("\n" + "=" * 60)
-        print("                    PULSE AI AGENT")
-        print("=" * 60)
+        """The one thing CLI setup actually asks for: which AI provider,
+        and its API key. Everything else (variable tracking, autofix,
+        /code, PDF snapshots) already has a sensible default and needs no
+        prompt. Training starts silently right after this.
 
-        if not self._select_agent_provider_and_key(initial=True):
+        If this process was just restarted after a code fix (see
+        _restart_process), PULSE_AUTO_PROVIDER carries the provider that
+        was active before the restart -- its API key is already sitting in
+        os.environ (set right before the restart happened), so both get
+        auto-filled here instead of prompting the user all over again.
+        """
+        auto_provider = os.environ.pop("PULSE_AUTO_PROVIDER", None)
+        if auto_provider and auto_provider in PROVIDERS:
+            env_var = PROVIDERS[auto_provider]["env_key"]
+            key = os.environ.get(env_var, "").strip()
+            if key:
+                self.agent_provider = auto_provider
+                self.agent_key = key
+                self.agent_history = []
+                print(f"[Pulse] Resumed with agent {auto_provider} (auto-filled after restart).")
+
+        if not self.agent_provider and not self._select_agent_provider_and_key(initial=True):
             return
 
-        print(
-            "\nAgent ready. Ask questions now. Commands:\n"
-            "  /vars     show discovered variables\n"
-            "  /tracked  show tracked variables\n"
-            "  /add      add a new variable to track (e.g., /add my_matrix)\n"
-            "  /edit     edit axis configuration (e.g., /edit my_matrix)\n"
-            "  /delete   remove a variable from tracking (e.g., /delete my_matrix, /delete all)\n  /deletepdf delete saved heatmap PDFs (e.g., /deletepdf my_matrix, /deletepdf all)\n"
-            "  /agent    switch AI provider/API key\n"
-            "  /code     include the training code in the next question\n"
-            "  /exit     finish setup and start training\n"
-        )
+        if self.pending_startup_error:
+            print("[Pulse] Your dry run raised an exception:")
+            print(self.pending_startup_error)
+            question = (
+                f"My script just crashed with this uncaught exception:\n{self.pending_startup_error}\n"
+                "Please diagnose the root cause and, if you can, fix it."
+            )
+            self.ask_agent(question, include_code=True)
+            self.pending_startup_error = None
 
-        while True:
-            try:
-                question = input("\nYou > ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                break
+    def _restart_process(self) -> None:
+        """Restart the whole process so the training loop actually runs
+        the fixed code -- an already-running process keeps executing the
+        old code that's still sitting in memory otherwise. Called once,
+        automatically, right after a code fix from the agent has been
+        applied to disk (see ask_agent's PASS 3/4).
 
-            if not question:
-                continue
-            if question.lower() in ("/exit", "exit", "quit", "q"):
-                break
-
-            # Interactive Setup Commands
-            if question.lower().startswith("/add "):
-                self._cmd_add(question[5:].strip())
-                continue
-            if question.lower().startswith("/edit "):
-                self._cmd_edit(question[6:].strip())
-                continue
-            if question.lower().startswith("/deletepdf "):
-                self._cmd_delete_pdfs(question[11:].strip())
-                continue
-            if question.lower().startswith("/delete "):
-                self._cmd_delete(question[8:].strip())
-                continue
-            if question.lower() == "/agent":
-                self._select_agent_provider_and_key(initial=False)
-                continue
-            if question.lower() == "/vars":
-                self._print_variable_summary()
-                continue
-            if question.lower() == "/tracked":
-                print("Tracked:", ", ".join(self.tracked_vars) if self.tracked_vars else "(none)")
-                continue
-
-            include_code = False
-            if question.lower() == "/code":
-                include_code = True
-                question = input("Code question > ").strip()
-                if not question:
-                    continue
-
-            print("Pulse > ", end="", flush=True)
-            answer = self.ask_agent(question, include_code=include_code)
-            print(answer)
-
-        print("\n✓ AI setup complete. Starting training.")
-        print("  Press 'Ctrl+C' at any time while training runs to pause and drop into the agent prompt.")
+        The active provider is threaded through PULSE_AUTO_PROVIDER so the
+        next run's setup auto-fills the agent and API key (already set in
+        os.environ) instead of prompting the user again -- see
+        _agent_setup.
+        """
+        if self.agent_provider:
+            os.environ["PULSE_AUTO_PROVIDER"] = self.agent_provider
+        print("\n[Pulse] Fix applied -- restarting the training loop to pick it up...\n")
+        sys.stdout.flush()
+        script_path = getattr(sys.modules.get('__main__'), '__file__', None)
+                            
+        script_path = os.path.abspath(script_path)
+                            
+        
+        # Spawn the new process safely using subprocess (which handles spaces on Windows)
+        subprocess.Popen([sys.executable, script_path] + sys.argv[1:])
+        sys.exit(0)
 
     def _print_variable_summary(self) -> None:
         variables = self.discover_variables()
@@ -808,6 +931,50 @@ class PulseCLI:
             except Exception:
                 pass
 
+    def _build_file_labels(self) -> None:
+        """Give every file (entry script + extra project files) a short,
+        unique display label -- usually just its basename -- used both in
+        the code shown to the agent and later to resolve which real file a
+        proposed fix's "file" field refers to.
+        """
+        label_for_path: Dict[str, str] = {}
+        path_for_label: Dict[str, str] = {}
+        used: set = set()
+
+        def add(path: Optional[str]) -> None:
+            if not path or path in label_for_path:
+                return
+            base = os.path.basename(path)
+            label = base
+            if label in used:
+                parent = os.path.basename(os.path.dirname(path))
+                label = f"{parent}/{base}"
+            used.add(label)
+            label_for_path[path] = label
+            path_for_label[label] = path
+
+        add(self.script_path)
+        for p in self.extra_files:
+            add(p)
+
+        self._label_for_path = label_for_path
+        self._path_for_label = path_for_label
+
+    def _resolve_fix_path(self, file_label: Optional[str]) -> Optional[str]:
+        """Map a fix entry's optional "file" label back to a real path on
+        disk, defaulting to the entry script when unset. Falls back to
+        substring matching (case-insensitive) since the agent may not
+        reproduce a header exactly."""
+        if not file_label or not file_label.strip():
+            return self.script_path
+        label = file_label.strip()
+        if label in self._path_for_label:
+            return self._path_for_label[label]
+        matches = [p for lbl, p in self._path_for_label.items() if label.lower() in lbl.lower()]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
     def _build_agent_context(self, include_code: bool = False) -> str:
         variables = self.discover_variables()
         lines = ["Current Pulse variable state:"]
@@ -829,7 +996,9 @@ class PulseCLI:
                         continue
                     if s.get("kind") == "scalar":
                         try:
-                            scalar_val = float(to_numpy(s_val).reshape(-1)[0])
+                            # Reuse `s` (the statistics() result) instead of a second,
+                            # independent to_numpy() conversion -- see update() for why.
+                            scalar_val = float(s.get("mean"))
                             value_str = str(scalar_val)
                         except Exception:
                             value_str = "NoneType"
@@ -839,30 +1008,233 @@ class PulseCLI:
                             f"nan={s.get('nan')} inf={s.get('inf')}"
                         )
                     else:
+                        state_tag = f" [{self._state_of(name)}]" if name in self.tracked_vars else ""
                         lines.append(
                             f"- {sub_name}: shape={s.get('shape')} backend={s.get('backend')} "
                             f"kind={s.get('kind')} min={s.get('min')} max={s.get('max')} "
                             f"mean={s.get('mean')} std={s.get('std')} "
-                            f"nan={s.get('nan')} inf={s.get('inf')}"
+                            f"nan={s.get('nan')} inf={s.get('inf')}{state_tag}"
                         )
             except Exception as exc:
                 lines.append(f"- {name}: unable to read stats ({exc})")
 
-        cfg_strs = [f"{v}({self.var_configs[v]})" if v in self.var_configs else v for v in self.tracked_vars]
+        cfg_strs = [
+            f"{v}({self.var_configs[v]})[{self._state_of(v)}]" if v in self.var_configs else f"{v}[{self._state_of(v)}]"
+            for v in self.tracked_vars
+        ]
         lines.append(
             "\nTracked variables: "
             + (", ".join(cfg_strs) if cfg_strs else "(none)")
+            + "\n('track' = full stats every probe, PDFs if enabled. 'lotrack' = intermittent, "
+            "stats-only, no PDFs ever -- most matrices/tensors default here. Use a PROMOTE: line "
+            "in your Reasoning to switch a lo-tracked variable to full tracking if you need a "
+            "closer look at it.)"
         )
 
         if include_code and self.code_text:
+            self._build_file_labels()
+            entry_label = self._label_for_path.get(self.script_path, "main_script.py")
             numbered = "\n".join(
                 f"{i+1:>4} | {line}" for i, line in enumerate(self.code_text.splitlines())
             )
-            lines.append(f"\nTraining code (line-numbered):\n```\n{numbered}\n```")
+            lines.append(f"\n=== {entry_label} (main script, line-numbered) ===\n```\n{numbered}\n```")
+
+            if self.extra_files:
+                lines.append(
+                    "\nThis project is modularized -- other local files it imports are included "
+                    "below, each line-numbered under its own header. When proposing a code fix, "
+                    "set each fix's \"file\" to the exact header shown here (e.g. \"model.py\") so "
+                    f"Pulse edits the right file. Omit \"file\" to default to {entry_label}."
+                )
+                for path, text in self.extra_files.items():
+                    label = self._label_for_path.get(path, os.path.basename(path))
+                    numbered = "\n".join(
+                        f"{i+1:>4} | {line}" for i, line in enumerate(text.splitlines())
+                    )
+                    lines.append(f"\n=== {label} ===\n```\n{numbered}\n```")
 
         return "\n".join(lines)
 
-    def ask_agent(self, question: str, include_code: bool = False) -> str:
+    def _call_model(self, instruction: str, max_tokens: int = 2000) -> str:
+        """One lightweight completion call: system prompt + recent history +
+        a one-off stage instruction. Does not touch self.agent_history --
+        callers decide what (if anything) gets persisted once the whole
+        pipeline is done, so intermediate stage instructions don't bloat the
+        conversation the next question is built on.
+        """
+        messages = (
+            [{"role": "system", "content": SYSTEM_PROMPT}]
+            + self.agent_history[-10:]
+            + [{"role": "user", "content": instruction}]
+        )
+        try:
+            response = litellm.completion(
+                model=PROVIDERS[self.agent_provider]["model"],
+                messages=messages,
+                max_tokens=max_tokens,
+                timeout=120.0,
+            )
+            return (response.choices[0].message.content or "").strip()
+        except Exception as exc:
+            return f"(request failed: {exc})"
+
+    _CALC_RE = re.compile(r"^\s*CALC:\s*(.+)$", re.MULTILINE)
+    _PROMOTE_RE = re.compile(r"^\s*PROMOTE:\s*(.+)$", re.MULTILINE)
+
+    @classmethod
+    def _extract_directives(cls, text: str):
+        """Pull CALC:/PROMOTE: lines out of an agent response, returning
+        (cleaned_text, calc_exprs, promote_names). Cleaned text has those
+        lines stripped so they don't clutter what's printed/stored.
+        """
+        calc_exprs = [m.strip() for m in cls._CALC_RE.findall(text) if m.strip()]
+        promote_names = []
+        for m in cls._PROMOTE_RE.findall(text):
+            promote_names.extend(n.strip() for n in m.split(",") if n.strip())
+
+        cleaned = cls._CALC_RE.sub("", text)
+        cleaned = cls._PROMOTE_RE.sub("", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return cleaned, calc_exprs, promote_names
+
+    def _apply_directives(self, calc_exprs: List[str], promote_names: List[str]) -> str:
+        """Deterministically compute any CALC: expressions and apply any
+        PROMOTE: requests, returning a short human-readable summary to
+        print and to feed back into the agent's own history (so it sees
+        the verified numbers on the next turn instead of trusting its own
+        arithmetic).
+        """
+        notes = []
+
+        if calc_exprs:
+            computed = [(expr, _safe_eval_math(expr)) for expr in calc_exprs]
+            calc_lines = "\n".join(f"  {expr} = {result}" for expr, result in computed)
+            print(f"  🧮 Verified calculations:\n{calc_lines}")
+            notes.append(f"Pulse computed these deterministically -- use these exact values:\n{calc_lines}")
+
+        if promote_names:
+            promoted = []
+            for name in promote_names:
+                result = self._cmd_track(name, quiet=True)
+                if result:
+                    promoted.append(result if result != "all" else "all tracked variables")
+            if promoted:
+                print(f"  ⚙ Promoted to full tracking (agent request): {', '.join(promoted)}")
+                notes.append(f"Promoted to full tracking: {', '.join(promoted)}.")
+
+        return "\n\n".join(notes)
+
+    @staticmethod
+    def _parse_json_obj(answer: str) -> Optional[Dict[str, Any]]:
+        """Generic defensive JSON-object parser, used for the verify (pass
+        4) and sweep (pass 5) responses -- same tolerance for stray code
+        fences as _parse_code_fix, but without requiring any particular
+        fields."""
+        text = (answer or "").strip()
+        if not text:
+            return None
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:]
+            text = text.strip()
+        if not (text.startswith("{") and text.endswith("}")):
+            return None
+        try:
+            payload = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _describe_fix(fix: Dict[str, Any]) -> str:
+        parts = []
+        for i, (old, new) in enumerate(zip(fix["old"], fix["new"])):
+            parts.append(f"--- change {i + 1} ---\nOLD:\n{old}\nNEW:\n{new}")
+        if fix.get("explanation"):
+            parts.append(f"Explanation: {fix['explanation']}")
+        return "\n\n".join(parts)
+
+    def _verify_fix_with_retries(self, fix: Dict[str, Any]):
+        """PASS 4: check the fix's math/logic before it's handed to the
+        user. If it fails, ask the agent to revise and re-check, up to
+        _MAX_VERIFY_ATTEMPTS times. Returns (fix, passed, reason).
+        """
+        reason = ""
+        for attempt in range(_MAX_VERIFY_ATTEMPTS):
+            fix_desc = self._describe_fix(fix)
+            with _Spinner("Checking the fix"):
+                verify_answer = self._call_model(
+                    _PASS4_VERIFY_TMPL.format(fix_desc=fix_desc), max_tokens=200
+                )
+            verdict = self._parse_json_obj(verify_answer)
+            if verdict is None:
+                # Unparsable verdict -- don't block the user on a formatting
+                # slip; hand off the fix as-is with a note.
+                return fix, True, "(verification response was unparsable; proceeding anyway)"
+            passes = bool(verdict.get("passes"))
+            reason = str(verdict.get("reason", "")).strip()
+            if passes:
+                return fix, True, reason
+            if attempt == _MAX_VERIFY_ATTEMPTS - 1:
+                break
+            with _Spinner("Revising fix"):
+                revised_answer = self._call_model(
+                    _PASS4_REVISE_TMPL.format(reason=reason), max_tokens=4000
+                )
+            revised = self._parse_code_fix(revised_answer)
+            if revised is None:
+                break
+            fix = revised
+        return fix, False, (reason or "(verification did not clearly pass after retries)")
+
+    def _run_sweep_and_maybe_recurse(self, include_code: bool, _depth: int) -> None:
+        """PASS 5: re-read everything for OTHER, unrelated errors. If any
+        turn up, ask the user whether to fix those too (PASS 6 recurses
+        through the same 1-5 format for the new issue)."""
+        with _Spinner("Reading for other errors"):
+            sweep_answer = self._call_model(_PASS5_SWEEP, max_tokens=300)
+        sweep = self._parse_json_obj(sweep_answer)
+        found = bool(sweep.get("other_errors_found")) if sweep else False
+        summary = str(sweep.get("summary", "")).strip() if sweep else ""
+
+        if not found or not summary:
+            return
+
+        print(f"\n[5] Full re-read found other possible issue(s):\n{summary}\n")
+        try:
+            resp = input("Fix other errors? (y/n) > ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if resp not in ("y", "yes"):
+            return
+
+        print("\n[6] Following the established format for the additional issue(s)...")
+        self.ask_agent(
+            f"Please also fix this: {summary}", include_code=include_code, _depth=_depth + 1
+        )
+
+    def ask_agent(self, question: str, include_code: bool = False, _depth: int = 0) -> str:
+        """Runs the question through an adaptive multi-pass pipeline
+        instead of a fixed number of calls -- how many passes actually run
+        depends on whether a code fix was asked for, whether it verifies
+        cleanly, and whether a final sweep turns up anything else:
+
+          1. LOCATE  -- read everything, identify the region(s) of the error.
+          2. ANALYZE -- focused second read of those regions; diagnosis + reasoning.
+          3. DEVELOP -- develop and implement the fix (code-fix JSON, if requested).
+          4. VERIFY  -- check the fix's math/logic; revise and re-check on failure.
+          5. SWEEP   -- re-read everything for OTHER errors; ask the user y/n.
+          6.         -- if yes, recurse through 1-5 for the new issue(s).
+
+        Each pass prints as soon as it's ready, with a small spinner shown
+        while it's in flight. Only the top-level call (_depth == 0)
+        restarts the process afterward, once, if any fix was applied
+        anywhere in the (possibly recursive) chain.
+        """
+        if _depth == 0:
+            self._fix_applied_this_turn = False
+
         if not self.agent_provider or not self.agent_key:
             return "(AI agent is not enabled. Run setup again or set the API key.)"
 
@@ -870,23 +1242,68 @@ class PulseCLI:
         user_content = f"{context}\n\nQuestion: {question}"
         self.agent_history.append({"role": "user", "content": user_content})
 
-        try:
-            response = litellm.completion(
-                model=PROVIDERS[self.agent_provider]["model"],
-                messages=[{"role": "system", "content": SYSTEM_PROMPT}] + self.agent_history[-10:],
-                max_tokens=20000,
-                timeout=240.0,
+        wants_implementation = include_code and any(
+            kw in question.lower() for kw in _IMPLEMENT_KEYWORDS
+        )
+
+        # Pass 1: locate the region(s) of the error.
+        with _Spinner("Reading for region of error"):
+            regions = self._call_model(_PASS1_LOCATE, max_tokens=200)
+        print(f"\n[1] Region of error\n{regions}\n")
+
+        # Pass 2: focused second read + diagnosis/reasoning. May include
+        # CALC:/PROMOTE: directives, stripped out and executed
+        # deterministically rather than trusted from the model.
+        with _Spinner("Analyzing"):
+            raw_analysis = self._call_model(
+                _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=700
             )
-            answer = response.choices[0].message.content
-        except Exception as exc:
-            answer = f"(request failed: {exc})"
+        analysis, calc_exprs, promote_names = self._extract_directives(raw_analysis)
+        print(f"[2] Diagnosis & reasoning\n{analysis}\n")
+        directive_note = self._apply_directives(calc_exprs, promote_names)
+        if directive_note:
+            self.agent_history.append({"role": "user", "content": directive_note})
 
-        self.agent_history.append({"role": "assistant", "content": answer})
+        full_answer = f"{regions}\n\n{analysis}"
 
-        fix = self._parse_code_fix(answer)
-        if fix is not None:
-            return self._apply_code_fix(fix)
-        return answer
+        if not wants_implementation:
+            # No code change requested -- pass 3 is just the concrete fix
+            # in text; nothing to verify or sweep.
+            with _Spinner("Developing fix"):
+                fix_text = self._call_model(_PASS3_FIX_TEXT, max_tokens=300)
+            print(f"[3] Fix\n{fix_text}\n")
+            full_answer += f"\n\n{fix_text}"
+            self.agent_history.append({"role": "assistant", "content": full_answer})
+            return full_answer
+
+        # Pass 3: develop and implement the fix.
+        with _Spinner("Developing & implementing fix"):
+            fix_answer = self._call_model(_PASS3_IMPLEMENT, max_tokens=4000)
+        fix = self._parse_code_fix(fix_answer)
+        if fix is None:
+            print(f"[3] Fix\n{fix_answer}\n")
+            full_answer += f"\n\n{fix_answer}"
+            self.agent_history.append({"role": "assistant", "content": full_answer})
+            return full_answer
+
+        # Pass 4: verify the fix's math/logic before handing it to the
+        # user; revise and re-check on failure (bounded retries).
+        fix, verify_ok, verify_reason = self._verify_fix_with_retries(fix)
+        status = "passed" if verify_ok else "did not clearly pass -- applying best effort"
+        print(f"[4] Verification {status}: {verify_reason}\n")
+
+        self.agent_history.append({"role": "assistant", "content": full_answer})
+        apply_result = self._apply_code_fix(fix)
+        result = f"{full_answer}\n\n{apply_result}"
+
+        # Pass 5 (+ 6): only worth a full re-read if a fix actually landed.
+        if self._fix_applied_this_turn and _depth < 3:
+            self._run_sweep_and_maybe_recurse(include_code, _depth)
+
+        if _depth == 0 and self._fix_applied_this_turn:
+            self._restart_process()  # does not return
+
+        return result
 
     @staticmethod
     def _parse_code_fix(answer: str) -> Optional[Dict[str, Any]]:
@@ -914,131 +1331,269 @@ class PulseCLI:
             return None
 
         old, new, explanation = payload.get("old"), payload.get("new"), payload.get("explanation")
+        files = payload.get("files")
         if not isinstance(old, list) or not isinstance(new, list):
             return None
         if not old or len(old) != len(new):
             return None
         if not all(isinstance(x, str) for x in old) or not all(isinstance(x, str) for x in new):
             return None
+        if files is not None:
+            if not isinstance(files, list) or len(files) != len(old):
+                return None
+            if not all(f is None or isinstance(f, str) for f in files):
+                return None
+        else:
+            files = [None] * len(old)
 
-        return {"old": old, "new": new, "explanation": explanation if isinstance(explanation, str) else ""}
+        return {
+            "old": old, "new": new, "files": files,
+            "explanation": explanation if isinstance(explanation, str) else "",
+        }
 
     def _apply_code_fix(self, fix: Dict[str, Any]) -> str:
-        """Apply an agent-proposed code fix to `self.script_path` on disk.
+        """Apply an agent-proposed code fix to the file(s) it targets.
 
-        Each old[i] must appear exactly once in the current file contents;
-        snippets that don't match cleanly are skipped and reported rather
-        than guessed at. On success, a single-level backup is kept so the
-        user can immediately revert back to the pre-fix file.
+        Each fix entry may target a different file (see "files" in the
+        code-fix schema, for a modularized project) -- edits are grouped by
+        resolved file path so each file is read/written once regardless of
+        how many snippets in it changed. Each old[i] must appear exactly
+        once in its target file's current contents; snippets that don't
+        match cleanly, or whose file can't be resolved, are skipped and
+        reported rather than guessed at. On success, backups of every
+        touched file are kept so the user can revert them all together.
         """
-        if not self.script_path:
-            return (
-                "[Pulse CLI] The agent proposed a code fix, but no script file path is known, "
-                "so it can't be written to disk.\n\nExplanation: " + (fix["explanation"] or "(none given)")
-            )
+        self._build_file_labels()
 
-        try:
-            with open(self.script_path, "r", encoding="utf-8") as f:
-                original_content = f.read()
-        except OSError as exc:
-            return f"[Pulse CLI] ⚠ Could not read '{self.script_path}' to apply the fix: {exc}"
+        by_path: Dict[str, List[tuple]] = {}
+        unresolved = []
+        for old, new, label in zip(fix["old"], fix["new"], fix["files"]):
+            path = self._resolve_fix_path(label)
+            if not path:
+                unresolved.append((old, label))
+                continue
+            by_path.setdefault(path, []).append((old, new))
 
-        content = original_content
-        applied, skipped = [], []
-        for old, new in zip(fix["old"], fix["new"]):
-            count = content.count(old)
-            if count == 1:
-                content = content.replace(old, new, 1)
-                applied.append((old, new))
-            elif count == 0:
-                skipped.append((old, "no exact match found in the file"))
-            else:
-                skipped.append((old, f"matched {count} times (ambiguous), skipped for safety"))
+        if not by_path and not unresolved:
+            return "[Pulse CLI] Proposed a code fix with nothing to apply."
 
         lines = ["[Pulse CLI] Code fix"]
         if fix["explanation"]:
             lines.append(f"Explanation: {fix['explanation']}")
 
-        if not applied:
-            lines.append("\n⚠ No changes were applied -- none of the proposed snippets matched the file cleanly:")
-            for old, reason in skipped:
-                lines.append(f"  - {reason}: {old.splitlines()[0][:80]}...")
+        originals: Dict[str, str] = {}
+        applied_by_path: Dict[str, List[tuple]] = {}
+        skipped = []
+
+        for path, pairs in by_path.items():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    original_content = f.read()
+            except OSError as exc:
+                for old, _new in pairs:
+                    skipped.append((old, path, f"couldn't read file: {exc}"))
+                continue
+
+            content = original_content
+            applied = []
+            for old, new in pairs:
+                count = content.count(old)
+                if count == 1:
+                    content = content.replace(old, new, 1)
+                    applied.append((old, new))
+                elif count == 0:
+                    skipped.append((old, path, "no exact match found in the file"))
+                else:
+                    skipped.append((old, path, f"matched {count} times (ambiguous), skipped for safety"))
+
+            if not applied:
+                continue
+
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+            except OSError as exc:
+                lines.append(f"⚠ Failed to write changes to '{path}': {exc}")
+                continue
+
+            originals[path] = original_content
+            applied_by_path[path] = applied
+            if path == self.script_path:
+                self.code_text = content
+            elif path in self.extra_files:
+                self.extra_files[path] = content
+
+        for old, label in unresolved:
+            skipped.append((old, label or "(unspecified file)", "couldn't determine which file this targets"))
+
+        if not applied_by_path:
+            lines.append("\n⚠ No changes were applied -- none of the proposed snippets matched cleanly:")
+            for old, where, reason in skipped:
+                lines.append(f"  - [{os.path.basename(str(where))}] {reason}: {old.splitlines()[0][:80]}...")
             return "\n".join(lines)
 
-        try:
-            with open(self.script_path, "w", encoding="utf-8") as f:
-                f.write(content)
-        except OSError as exc:
-            return f"[Pulse CLI] ⚠ Failed to write changes to '{self.script_path}': {exc}"
-
-        self.code_text = content
-        self._pending_revert_path = self.script_path
-        self._pending_revert_backup = original_content
-
-        lines.append(f"\n✓ Applied {len(applied)} change(s) to '{self.script_path}':")
-        for old, new in applied:
-            lines.append(f"  - replaced:\n      {old.splitlines()[0][:80]}...\n    with:\n      {new.splitlines()[0][:80]}...")
+        for path, applied in applied_by_path.items():
+            lines.append(f"\n✓ Applied {len(applied)} change(s) to '{os.path.basename(path)}':")
+            for old, new in applied:
+                lines.append(f"  - replaced:\n      {old.splitlines()[0][:80]}...\n    with:\n      {new.splitlines()[0][:80]}...")
         if skipped:
             lines.append(f"\n⚠ Skipped {len(skipped)} proposed change(s) that didn't match cleanly:")
-            for old, reason in skipped:
-                lines.append(f"  - {reason}: {old.splitlines()[0][:80]}...")
+            for old, where, reason in skipped:
+                lines.append(f"  - [{os.path.basename(str(where))}] {reason}: {old.splitlines()[0][:80]}...")
 
         print("\n".join(lines))
 
-        revert = input("\nRevert this change and restore the file to how it was before? (y/n) > ").strip().lower()
-        if revert in ("y", "yes"):
-            try:
-                with open(self.script_path, "w", encoding="utf-8") as f:
-                    f.write(original_content)
-                self.code_text = original_content
-                self._pending_revert_path = None
-                self._pending_revert_backup = None
-                return f"✓ Reverted '{self.script_path}' to its state before this fix."
-            except OSError as exc:
-                return f"[Pulse CLI] ⚠ Failed to revert '{self.script_path}': {exc}"
+        self._pending_revert_backups = dict(originals)  # path -> original content
+        self._fix_applied_this_turn = True  # tells ask_agent's top-level call to restart afterward
 
-        return "✓ Change kept."
+        return "\n".join(lines)
+
+    def _cmd_code(self, arg: str) -> None:
+        """Toggle whether questions include the training code (and any
+        cross-file project context) by default. On by default."""
+        arg = arg.strip().lower()
+        if arg in ("on", "true", "1", "enable", "enabled"):
+            self.include_code_default = True
+            print("✓ Code is now included with every question by default.")
+        elif arg in ("off", "false", "0", "disable", "disabled"):
+            self.include_code_default = False
+            print("✓ Code will no longer be included by default.")
+        else:
+            self.include_code_default = not self.include_code_default
+            state = "ON" if self.include_code_default else "OFF"
+            print(f"✓ Sending code by default is now {state}.")
+
+    def _cmd_autofix(self, arg: str) -> None:
+        """Toggle auto-intervention: Pulse watching tracked values for signs
+        of trouble and automatically pausing + asking the agent to diagnose
+        (and try to fix) it, without waiting to be asked."""
+        arg = arg.strip().lower()
+        if arg in ("on", "true", "1", "enable", "enabled"):
+            self.auto_intervene = True
+            print("✓ Auto-intervention is ON -- Pulse will pause and ask the agent if training looks like it's going bad.")
+        elif arg in ("off", "false", "0", "disable", "disabled"):
+            self.auto_intervene = False
+            print("✓ Auto-intervention is OFF -- Pulse will only diagnose issues when you ask.")
+        else:
+            state = "ON" if self.auto_intervene else "OFF"
+            print(f"Auto-intervention is currently {state}. Usage: /autofix on|off")
+
+    def _check_for_trouble(self) -> Optional[str]:
+        """Look at the current tracked values for signs training is going
+        bad. Returns a short human-readable description of what's wrong, or
+        None if nothing looks off. Two triggers, deliberately conservative
+        to avoid false alarms:
+          - any tracked scalar's latest value is non-finite (NaN/inf) --
+            unambiguous, always worth stopping for.
+          - a loss-like scalar has spiked to `explosion_multiplier`x (or
+            more) its own recent minimum -- a strong divergence signal
+            without needing a hardcoded absolute threshold.
+        Also flags any cached matrix/tensor whose most recent stats show
+        nan/inf, whether it's fully tracked or lotracked.
+        """
+        reasons = []
+
+        for var_name in self.tracked_vars:
+            hist = self.scalar_histories.get(var_name)
+            if not hist:
+                continue
+            latest = hist[-1]
+            if latest is not None and isinstance(latest, (int, float)) and not math.isfinite(latest):
+                reasons.append(f"'{var_name}' just went non-finite (NaN/inf): {latest}")
+                continue
+            if _looks_like_loss(var_name) and latest is not None:
+                finite_recent = [v for v in hist[-20:] if v is not None and math.isfinite(v)]
+                if len(finite_recent) >= 5:
+                    baseline = min(finite_recent[:-1])
+                    if baseline > 0 and latest > baseline * self.explosion_multiplier:
+                        reasons.append(
+                            f"'{var_name}' spiked to {latest:.4g}, "
+                            f"{latest / baseline:.1f}x its recent minimum ({baseline:.4g})"
+                        )
+
+        for sub_name, entry in self._matrix_cache.items():
+            stats = entry.get("stats", {})
+            if stats.get("nan") or stats.get("inf"):
+                reasons.append(f"'{sub_name}' has nan={stats.get('nan')} inf={stats.get('inf')}")
+
+        return "; ".join(reasons) if reasons else None
 
     def update(self, step: Optional[int] = None, generate_pdfs: Optional[bool] = None) -> None:
         """Called at every training step/checkpoint.
 
-        Scalars are cheap and are sampled every update. Matrix/tensor statistics
-        are expensive (especially on GPU), so they are probed at most once per
-        ``matrix_probe_interval`` seconds. Between probes, Pulse does not even
-        slice or call statistics() on matrices; it only uses the cached result.
+        The global step counter only advances when the loss/metric scalar
+        (the first tracked variable that looks like a loss) actually
+        changes value -- calling update() every micro-iteration of a loop
+        that only updates loss occasionally no longer inflates the step
+        count. If no loss-like variable is tracked, the step counter just
+        falls back to incrementing on every call, same as before.
+
+        Matrix/tensor statistics are expensive (especially on GPU), so they
+        are probed on a schedule -- but the schedule now depends on each
+        variable's state: fully-'track'ed variables use matrix_probe_interval
+        (and, if enabled, get PDF snapshots); 'lotrack' variables use the
+        much slower lotrack_probe_interval, never get PDFs, and are printed
+        as a single condensed stats line instead of the full tagging line.
+        Between probes, Pulse does not even slice or call statistics() on a
+        variable; it only uses the cached result.
 
         Individual variables that are currently None, NaN-only, or otherwise
         unreadable are reported as such (rather than raising) so one bad
         variable never takes down the whole debugger mid-training.
         """
+        loss_var = next((v for v in self.tracked_vars if _looks_like_loss(v)), None)
+        new_loss_value: Optional[float] = None
+        if loss_var is not None and loss_var in self.watch_locals:
+            raw = self.watch_locals[loss_var]
+            if raw is not None and is_trackable(raw):
+                try:
+                    if describe_tensor(raw).kind == "scalar":
+                        new_loss_value = float(statistics(raw).get("mean"))
+                except Exception:
+                    new_loss_value = None
 
         if step is not None:
             self.step = step
-        else:
+        elif loss_var is None:
+            # No loss-like variable tracked -- nothing to gate on, so fall
+            # back to the old "advance every call" behavior.
             self.step += 1
+        else:
+            if not _values_equal(self._last_loss_value, new_loss_value):
+                self.step += 1
+            self._last_loss_value = new_loss_value
 
         want_pdfs = self.generate_pdfs if generate_pdfs is None else generate_pdfs
         now = time.monotonic()
 
-        # First call probes immediately. After that, matrix inspection is capped
-        # by wall-clock time rather than training-step count.
-        probe_matrices = (
+        # First call probes immediately. After that, each state has its own
+        # independent wall-clock cadence.
+        probe_track = (
             not self._matrix_cache
             or (now - self._last_matrix_probe) >= self.matrix_probe_interval
-            or any(v not in self._matrix_cached_vars for v in self.tracked_vars)
+            or any(v not in self._matrix_cached_vars for v in self.tracked_vars if self._state_of(v) == "track")
         )
+        probe_lotrack = (
+            (now - self._last_lotrack_probe) >= self.lotrack_probe_interval
+            or any(v not in self._matrix_cached_vars for v in self.tracked_vars if self._state_of(v) == "lotrack")
+        )
+        probe_matrices = probe_track or probe_lotrack
 
         scalar_lines: List[tuple[str, Optional[float]]] = []
-        matrix_lines: List[tuple[str, Dict[str, Any], Any, bool]] = []
+        # (sub_name, stats, val, state)
+        matrix_lines: List[tuple[str, Dict[str, Any], Any, str]] = []
         any_scalar_changed = False
 
         # Fast path: discover/process scalars every step. Do NOT call
-        # _yield_slices() for matrices unless this is an actual matrix probe.
+        # _yield_slices() for matrices unless a probe for that variable's
+        # state is actually due this call.
         for var_name in self.tracked_vars:
             if var_name not in self.watch_locals:
                 continue
 
             orig_val = self.watch_locals[var_name]
+            var_state = self._state_of(var_name)
+            due_this_var = probe_track if var_state == "track" else probe_lotrack
 
             if orig_val is None:
                 hist = self.scalar_histories.setdefault(var_name, [])
@@ -1059,7 +1614,15 @@ class PulseCLI:
             if kind == "scalar":
                 try:
                     stats = statistics(orig_val)
-                    scalar_val = float(to_numpy(orig_val).reshape(-1)[0])
+                    # Derive scalar_val from the SAME statistics() call that produced
+                    # the nan/inf flags, rather than converting the tensor a second,
+                    # independent time via to_numpy(). Two separate conversions of a
+                    # live (possibly GPU/async) tensor can disagree -- e.g. the second
+                    # read racing an in-flight op -- which was causing normal, finite
+                    # loss values to get flagged as NaN/inf. For a true scalar, mean
+                    # over its single element is just that element, so this stays
+                    # perfectly consistent with stats['nan']/stats['inf'].
+                    scalar_val = float(stats.get("mean"))
                 except Exception as exc:
                     hist = self.scalar_histories.setdefault(var_name, [])
                     if not hist or not _values_equal(hist[-1], None):
@@ -1077,8 +1640,8 @@ class PulseCLI:
                 continue
 
             # Matrix/tensor path. No slicing, no statistics(), and no GPU->CPU
-            # copy at all unless the wall-clock probe is due.
-            if not probe_matrices:
+            # copy at all unless this variable's own probe cadence is due.
+            if not due_this_var:
                 continue
 
             for sub_name, val in self._yield_slices(var_name, orig_val):
@@ -1098,7 +1661,10 @@ class PulseCLI:
 
                 if stats.get("kind") == "scalar":
                     try:
-                        scalar_val = float(to_numpy(val).reshape(-1)[0])
+                        # Same fix as the top-level scalar path above: reuse the
+                        # already-computed `stats` rather than re-converting `val`
+                        # independently, to avoid spurious NaN/inf false positives.
+                        scalar_val = float(stats.get("mean"))
                     except Exception:
                         hist = self.scalar_histories.setdefault(sub_name, [])
                         if not hist or not _values_equal(hist[-1], None):
@@ -1117,44 +1683,60 @@ class PulseCLI:
                         "base_name": var_name,
                         "stats": stats,
                     }
-                    matrix_lines.append((sub_name, stats, val, True))
+                    matrix_lines.append((sub_name, stats, val, var_state))
 
             self._matrix_cached_vars.add(var_name)
 
-        if probe_matrices:
+        if probe_track:
             self._last_matrix_probe = now
+        if probe_lotrack:
+            self._last_lotrack_probe = now
 
-        # Don't redraw the entire terminal if absolutely nothing visible changed.
-        # A matrix probe always redraws because its snapshot may have changed.
-        should_redraw = probe_matrices or any_scalar_changed or not self.scalar_histories
+        # Quiet by design: a scalar (loss, accuracy, whatever) is only ever
+        # printed when it's actually WRONG -- unreadable (None) or non-finite
+        # (NaN/inf). A healthy loss ticking along normally never shows up
+        # here; auto-intervention (below) is what's watching it, silently.
+        def _is_wrong(v):
+            return v is None or (isinstance(v, (int, float)) and not math.isfinite(v))
+
+        wrong_scalars = [(n, v) for n, v in scalar_lines if _is_wrong(v)]
+
+        # lotrack matrices/tensors NEVER print, under any circumstances --
+        # they're still probed and cached (so auto-intervention still sees
+        # nan/inf on them), just never surfaced in the terminal. Only
+        # 'track' variables get a tagging line, and only when freshly
+        # measured this probe.
+        track_matrix_lines = (
+            [t for t in matrix_lines if t[3] != "lotrack"] if probe_matrices else []
+        )
+
+        should_redraw = bool(wrong_scalars or track_matrix_lines)
 
         if should_redraw:
             sys.stdout.write("\033[2J\033[H")
             sys.stdout.flush()
             print(f"--- Pulse Live Debugger | Step {self.step} ---")
 
-            for sub_name, scalar_val in scalar_lines:
+            for sub_name, scalar_val in wrong_scalars:
                 hist = self.scalar_histories.get(sub_name, [])
                 if scalar_val is None:
                     print(f"  • {sub_name}: NoneType  ⚠ (unreadable this step)")
                 else:
-                    print(f"  • {sub_name}: {scalar_val:.6g}")
+                    print(f"  • {sub_name}: {scalar_val:.6g}  ⚠")
                 self._print_ascii_chart(sub_name, hist)
 
-            if probe_matrices:
-                # Print matrix statistics ONLY when they were freshly measured.
-                # Cached matrices are deliberately silent between probes.
-                for sub_name, stats, val, fresh in matrix_lines:
+            if track_matrix_lines:
+                def _fmt(v):
+                    try:
+                        return f"{v:.4f}"
+                    except (TypeError, ValueError):
+                        return "n/a"
+
+                for sub_name, stats, val, var_state in track_matrix_lines:
                     flag = ""
                     if stats.get("nan") or stats.get("inf"):
                         flag = f"  ⚠ nan={stats.get('nan')} inf={stats.get('inf')}"
                     mean_v, min_v, max_v = stats.get("mean"), stats.get("min"), stats.get("max")
-
-                    def _fmt(v):
-                        try:
-                            return f"{v:.4f}"
-                        except (TypeError, ValueError):
-                            return "n/a"
 
                     print(
                         f"  • Tagging '{sub_name}' "
@@ -1173,13 +1755,37 @@ class PulseCLI:
                         except Exception as exc:
                             print(f"    ↳ ⚠ failed to save PDF snapshot for '{sub_name}': {exc}")
 
-                # If the cache is already populated, show a tiny status line rather
-                # than reprinting every cached matrix on every training iteration.
                 if self._matrix_cache:
                     print(
                         f"  [matrices cached: {len(self._matrix_cache)} | "
-                        f"next probe ≤ {self.matrix_probe_interval:g}s]"
+                        f"next full probe ≤ {self.matrix_probe_interval:g}s | "
+                        f"next lotrack probe ≤ {self.lotrack_probe_interval:g}s]"
                     )
+
+        if self.auto_intervene:
+            problem = self._check_for_trouble()
+            if problem and problem != self._last_intervention_signature:
+                self._last_intervention_signature = problem
+                self.continuous = False  # force a stop even mid-continuous-run
+                print("\n" + "=" * 60)
+                print("[Pulse] ⚠ Auto-intervention: training looks like it's going bad. Pausing.")
+                print(f"[Pulse] Detected: {problem}")
+                print("=" * 60)
+                if self.agent_provider:
+                    question = (
+                        f"Pulse just auto-paused training because it detected a problem: {problem}\n"
+                        "Please diagnose the root cause and, if you can, fix it."
+                    )
+                    print("Pulse:")
+                    self.ask_agent(question, include_code=bool(self.code_text))
+                else:
+                    print("[Pulse] No AI agent is configured yet -- run /agent to set one up, then ask about this.")
+                print(
+                    "[Pulse] Training is paused here (Enter to single-step, /c to resume continuous "
+                    "running as-is). Note: if a fix was just applied to a file on disk, this already-"
+                    "running process is still executing the old code in memory -- you'll need to stop "
+                    "and re-run the script to pick it up.\n"
+                )
 
         if self.continuous:
             return
@@ -1188,8 +1794,9 @@ class PulseCLI:
         while True:
             try:
                 cmd = input(
-                    "\nPulse [Enter=step, /c=continuous, /add <var>, /edit <var>, "
-                    "/delete <var>, /deletepdf <var>, /agent, or ask AI] > "
+                    "\nPulse [Enter=step, /c=continuous, /add <var>, /track <var>, "
+                    "/lotrack <var>, /delete <var>, /deletepdf <var>, /autofix on|off, "
+                    "/agent, /code, or ask AI] > "
                 ).strip()
             except (EOFError, KeyboardInterrupt):
                 print("\nExiting Pulse...")
@@ -1208,8 +1815,14 @@ class PulseCLI:
                 self._cmd_add(cmd[5:].strip())
                 continue
 
-            if cmd.lower().startswith("/edit "):
-                self._cmd_edit(cmd[6:].strip())
+            if cmd.lower().startswith("/track "):
+                self._cmd_track(cmd[7:].strip())
+                continue
+            if cmd.lower().startswith("/lotrack "):
+                self._cmd_lotrack(cmd[9:].strip())
+                continue
+            if cmd.lower().startswith("/autofix"):
+                self._cmd_autofix(cmd[8:].strip())
                 continue
 
             if cmd.lower().startswith("/deletepdf "):
@@ -1229,15 +1842,19 @@ class PulseCLI:
 
             if cmd.lower() == "/tracked":
                 cfg_strs = [
-                    f"{v}({self.var_configs[v]})" if v in self.var_configs else v
+                    f"{v}({self.var_configs[v]})[{self._state_of(v)}]" if v in self.var_configs
+                    else f"{v}[{self._state_of(v)}]"
                     for v in self.tracked_vars
                 ]
                 print("Tracked:", ", ".join(cfg_strs) if cfg_strs else "(none)")
                 continue
 
-            print("Pulse AI > ", end="", flush=True)
-            answer = self.ask_agent(cmd, include_code=False)
-            print(answer)
+            if cmd.lower().startswith("/code"):
+                self._cmd_code(cmd[5:].strip())
+                continue
+
+            print("Pulse AI:")
+            self.ask_agent(cmd, include_code=self.include_code_default)
 
     def _print_ascii_chart(
         self,
