@@ -2928,7 +2928,7 @@ def _install_pulse_excepthook(session_id):
     sys.excepthook = _hook
 
 
-def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_root=None, mode="auto"):
+def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_root=None, mode="cli"):
     """
     Call this once before your training loop, optionally passing your
     training function for a one-off dry run that discovers shapes:
