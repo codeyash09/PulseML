@@ -30,7 +30,30 @@ from pulse.pulse_backend import (
 from pulse.pulse_pdf import generate_heatmap_pdf
 import litellm
 
+import builtins
 
+_io_lock = threading.Lock()
+_original_print = builtins.print
+_original_input = builtins.input
+
+def safe_print(*args, **kwargs):
+    with _io_lock:
+        # Move cursor to column 0 and clear line before printing background text
+        sys.stdout.write("\r\033[K")
+        _original_print(*args, **kwargs)
+
+def safe_input(prompt=""):
+    # Clear formatting and force prompt to a clean new line
+    sys.stdout.write("\033[0m\n\r\033[K")
+    sys.stdout.flush()
+    
+    # Hold the lock while waiting for user input
+    with _io_lock:
+        return _original_input(prompt)
+
+# Global overrides
+builtins.print = safe_print
+builtins.input = safe_input
 # Name-based heuristic for pre-flagging the loss/metric scalar -- same list
 # and same purpose as pulse.py's LOSS_NAME_HINTS/_looks_like_loss, kept as a
 # local copy so this module has no dependency on pulse.py (which pulls in
@@ -41,6 +64,83 @@ LOSS_NAME_HINTS = ("loss", "cost", "nll", "cross_entropy", "crossentropy", "obje
 def _looks_like_loss(name: str) -> bool:
     n = (name or "").lower()
     return any(hint in n for hint in LOSS_NAME_HINTS)
+
+
+def _enable_windows_ansi() -> None:
+    """Turn on ANSI escape processing in classic Windows consoles (Win10+
+    supports it, but it has to be switched on explicitly). No-op, and safe
+    to call, everywhere else."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        pass
+
+
+_enable_windows_ansi()
+
+# ---- minimal terminal styling ------------------------------------------
+# Kept deliberately small: "Pulse" is always orange, error/warning text is
+# always red, and code patches/diffs are always blue. Nothing else in the
+# CLI is colored.
+_COLOR_ENABLED = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+_ORANGE = "\033[38;5;208m"
+_RED = "\033[91m"
+_BLUE = "\033[94m"
+_RESET = "\033[0m"
+_PULSE_RE = re.compile(r"Pulse(?:\s(?:CLI|AI))?")
+
+
+def _highlight_pulse(text: str, base_color: Optional[str] = None) -> str:
+    """Color every occurrence of 'Pulse' (and 'Pulse CLI'/'Pulse AI') orange,
+    resuming `base_color` afterward so nesting inside a red/blue line works."""
+    if not _COLOR_ENABLED:
+        return text
+    resume = base_color or ""
+    return _PULSE_RE.sub(lambda m: f"{_ORANGE}{m.group(0)}{_RESET}{resume}", text)
+
+
+def cprint(text: str = "", color: Optional[str] = None) -> None:
+    """print() that always highlights 'Pulse' in orange and, if `color` is
+    given (_RED for errors/warnings, _BLUE for code patches), paints the
+    rest of the line in that color."""
+    text = str(text)
+    if not _COLOR_ENABLED:
+        print(text)
+        return
+    if color:
+        print(f"{color}{_highlight_pulse(text, base_color=color)}{_RESET}")
+    else:
+        print(_highlight_pulse(text))
+
+
+def _flush_stdin() -> None:
+    """Discard any input sitting unread in the terminal's input buffer.
+
+    Without this, keystrokes typed while output was streaming (spinner
+    frames, restart banners, training-step logs) sit in the OS-level tty
+    buffer and get delivered as soon as the next input() starts reading --
+    landing in the middle of that prompt's line instead of being ignored,
+    which is what makes a y/n prompt look "stuck" or uneditable. Called
+    right before every input() so each prompt always starts from a clean,
+    empty line.
+    """
+    try:
+        if os.name == "nt":
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getch()
+        else:
+            import termios
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:
+        pass  # not a real terminal (piped input, some IDEs, etc.) -- nothing to flush
 
 
 def _values_equal(a, b) -> bool:
@@ -383,7 +483,7 @@ class PulseCLI:
         """Intercept Ctrl+C during continuous execution to drop into the debugger."""
         if self.continuous:
             self.continuous = False
-            print("\n[Pulse] Intercepted Ctrl+C. Pausing at next step...")
+            cprint("\n[Pulse] Intercepted Ctrl+C. Pausing at next step...")
         else:
             # If already paused and user hits Ctrl+C again, restore original behavior and exit
             if self.original_sigint:
@@ -459,7 +559,7 @@ class PulseCLI:
             matches = [n for n in self.tracked_vars if var_name.lower() in n.lower()]
             if not matches:
                 if not quiet:
-                    print(f"[Pulse CLI] '{var_name}' is not currently tracked.")
+                    cprint(f"[Pulse CLI] '{var_name}' is not currently tracked.")
                 return None
             if len(matches) > 1:
                 if quiet:
@@ -468,9 +568,10 @@ class PulseCLI:
                 print("\nMatching tracked variables:")
                 for idx, name in enumerate(matches, 1):
                     print(f"  {idx}) {name}")
+                _flush_stdin()
                 choice = input("Select a number (Enter to cancel) > ").strip()
                 if not choice or not choice.isdigit() or not (0 < int(choice) <= len(matches)):
-                    print("[Pulse CLI] Cancelled.")
+                    cprint("[Pulse CLI] Cancelled.")
                     return None
                 target = matches[int(choice) - 1]
             else:
@@ -509,7 +610,7 @@ class PulseCLI:
             matches = [name for name in var_list if any(term in name.lower() for term in terms)]
 
             if not matches:
-                print(f"[Pulse CLI] No variables match '{var_name}'.")
+                cprint(f"[Pulse CLI] No variables match '{var_name}'.")
                 return
 
             if len(matches) > 1:
@@ -526,12 +627,13 @@ class PulseCLI:
                         except Exception:
                             info = "[trackable]"
                     print(f"  {idx}) {name} {info}{star}")
+                _flush_stdin()
                 choice = input("Select a number to add (Enter to cancel) > ").strip()
                 if not choice:
-                    print("[Pulse CLI] Add cancelled.")
+                    cprint("[Pulse CLI] Add cancelled.")
                     return
                 if not choice.isdigit() or not (0 < int(choice) <= len(matches)):
-                    print("[Pulse CLI] Invalid selection.")
+                    cprint("[Pulse CLI] Invalid selection.")
                     return
                 var_name = matches[int(choice) - 1]
             else:
@@ -566,6 +668,7 @@ class PulseCLI:
 
         shape_str = " ".join(str(s) for s in shape)
         print(f"Shape: {shape_str}")
+        _flush_stdin()
         config = input("Axes map (0=Fix at 0, 1=Show/Keep, 2=Iterate) > ").strip()
         if config:
             self.var_configs[var_name] = config
@@ -580,7 +683,7 @@ class PulseCLI:
 
         if var_name.lower() == "all":
             if not self.tracked_vars:
-                print("[Pulse CLI] No variables are currently tracked.")
+                cprint("[Pulse CLI] No variables are currently tracked.")
                 return
 
             removed = list(self.tracked_vars)
@@ -602,19 +705,20 @@ class PulseCLI:
             ]
 
             if not matches:
-                print(f"[Pulse CLI] '{var_name}' is not currently tracked.")
+                cprint(f"[Pulse CLI] '{var_name}' is not currently tracked.")
                 return
 
             if len(matches) > 1:
                 print("\nMatching tracked variables:")
                 for idx, name in enumerate(matches, 1):
                     print(f"  {idx}) {name}")
+                _flush_stdin()
                 choice = input("Select a number to delete (Enter to cancel) > ").strip()
                 if not choice:
-                    print("[Pulse CLI] Delete cancelled.")
+                    cprint("[Pulse CLI] Delete cancelled.")
                     return
                 if not choice.isdigit() or not (0 < int(choice) <= len(matches)):
-                    print("[Pulse CLI] Invalid selection.")
+                    cprint("[Pulse CLI] Invalid selection.")
                     return
                 target = matches[int(choice) - 1]
             else:
@@ -645,38 +749,40 @@ class PulseCLI:
 
         if var_name.lower() == "all":
             if not os.path.isdir(self.pdf_dir):
-                print(f"[Pulse CLI] No PDF output directory found at '{self.pdf_dir}'.")
+                cprint(f"[Pulse CLI] No PDF output directory found at '{self.pdf_dir}'.")
                 return
+            _flush_stdin()
             confirm = input(
                 f"Delete ALL heatmap snapshots under '{self.pdf_dir}'? This cannot be undone. (y/n) > "
             ).strip().lower()
             if confirm not in ("y", "yes"):
-                print("[Pulse CLI] Delete cancelled.")
+                cprint("[Pulse CLI] Delete cancelled.")
                 return
             try:
                 shutil.rmtree(self.pdf_dir)
                 print(f"✓ Deleted all heatmap snapshots under '{self.pdf_dir}'.")
             except Exception as exc:
-                print(f"[Pulse CLI] ⚠ Failed to delete '{self.pdf_dir}': {exc}")
+                cprint(f"[Pulse CLI] ⚠ Failed to delete '{self.pdf_dir}': {exc}", color=_RED)
             return
 
         safe_name = var_name.replace("[", "_").replace("]", "").replace(",", "_")
         target_dir = os.path.join(self.pdf_dir, safe_name)
         if not os.path.isdir(target_dir):
-            print(f"[Pulse CLI] No heatmap snapshots found for '{var_name}' (looked in '{target_dir}').")
+            cprint(f"[Pulse CLI] No heatmap snapshots found for '{var_name}' (looked in '{target_dir}').")
             return
 
+        _flush_stdin()
         confirm = input(
             f"Delete all heatmap snapshots for '{var_name}' in '{target_dir}'? (y/n) > "
         ).strip().lower()
         if confirm not in ("y", "yes"):
-            print("[Pulse CLI] Delete cancelled.")
+            cprint("[Pulse CLI] Delete cancelled.")
             return
         try:
             shutil.rmtree(target_dir)
             print(f"✓ Deleted heatmap snapshots for '{var_name}'.")
         except Exception as exc:
-            print(f"[Pulse CLI] ⚠ Failed to delete '{target_dir}': {exc}")
+            cprint(f"[Pulse CLI] ⚠ Failed to delete '{target_dir}': {exc}", color=_RED)
 
     def interactive_setup(self) -> None:
         """Zero-config, zero-noise CLI setup: silently track everything
@@ -688,7 +794,7 @@ class PulseCLI:
         """
         variables = self.discover_variables()
         if not variables:
-            print("[Pulse CLI] No trackable variables found in scope.")
+            cprint("[Pulse CLI] No trackable variables found in scope.")
             return
 
         var_list = sorted(variables.keys(), key=lambda n: (not _looks_like_loss(n), n))
@@ -730,12 +836,13 @@ class PulseCLI:
         )
 
         while True:
+            _flush_stdin()
             raw = input(prompt).strip()
             if not raw:
                 if initial:
-                    print("[Pulse CLI] AI agent disabled for this run.")
+                    cprint("[Pulse CLI] AI agent disabled for this run.")
                 else:
-                    print("[Pulse CLI] Agent switch cancelled.")
+                    cprint("[Pulse CLI] Agent switch cancelled.")
                 return False
             if raw.isdigit() and 1 <= int(raw) <= len(names):
                 chosen = names[int(raw) - 1]
@@ -744,7 +851,7 @@ class PulseCLI:
             if len(matches) == 1:
                 chosen = matches[0]
                 break
-            print("[Pulse CLI] Pick a valid agent number or provider name.")
+            cprint("[Pulse CLI] Pick a valid agent number or provider name.")
 
         info = PROVIDERS[chosen]
         env_var = info["env_key"]
@@ -752,6 +859,7 @@ class PulseCLI:
 
         print(f"\n✓ Agent selected: {chosen}")
         if existing:
+            _flush_stdin()
             use_existing = input(
                 f"An {env_var} is already set. Use it? (Y/n) > "
             ).strip().lower()
@@ -763,7 +871,7 @@ class PulseCLI:
             key = getpass.getpass("API key > ").strip()
 
         if not key:
-            print("[Pulse CLI] No API key entered. Agent unchanged.")
+            cprint("[Pulse CLI] No API key entered. Agent unchanged.")
             if initial:
                 self.agent_provider = None
             return False
@@ -801,14 +909,14 @@ class PulseCLI:
                 self.agent_provider = auto_provider
                 self.agent_key = key
                 self.agent_history = []
-                print(f"[Pulse] Resumed with agent {auto_provider} (auto-filled after restart).")
+                cprint(f"[Pulse] Resumed with agent {auto_provider} (auto-filled after restart).")
 
         if not self.agent_provider and not self._select_agent_provider_and_key(initial=True):
             return
 
         if self.pending_startup_error:
-            print("[Pulse] Your dry run raised an exception:")
-            print(self.pending_startup_error)
+            cprint("[Pulse] Your dry run raised an exception:", color=_RED)
+            cprint(self.pending_startup_error, color=_RED)
             question = (
                 f"My script just crashed with this uncaught exception:\n{self.pending_startup_error}\n"
                 "Please diagnose the root cause and, if you can, fix it."
@@ -830,7 +938,7 @@ class PulseCLI:
         """
         if self.agent_provider:
             os.environ["PULSE_AUTO_PROVIDER"] = self.agent_provider
-        print("\n[Pulse] Fix applied -- restarting the training loop to pick it up...\n")
+        cprint("\n[Pulse] Fix applied -- restarting the training loop to pick it up...\n")
         sys.stdout.flush()
         script_path = getattr(sys.modules.get('__main__'), '__file__', None)
                             
@@ -838,6 +946,19 @@ class PulseCLI:
                             
         
         # Spawn the new process safely using subprocess (which handles spaces on Windows)
+        # Just before os.execv or subprocess call:
+      
+        sys.stdout.write("\033c\033[0m") 
+        sys.stdout.flush()
+
+# Apply the correct terminal reset based on the operating system
+        if os.name == 'nt':
+            subprocess.run('cls', shell=True)
+        else:
+            # Windows: Clears the screen and resets the basic console buffer
+            # macOS/Linux: Resets raw terminal modes and clears the screen
+            subprocess.run('stty sane', shell=True)
+            subprocess.run('clear', shell=True)
         subprocess.Popen([sys.executable, script_path] + sys.argv[1:])
         sys.exit(0)
 
@@ -1129,7 +1250,17 @@ class PulseCLI:
         """Generic defensive JSON-object parser, used for the verify (pass
         4) and sweep (pass 5) responses -- same tolerance for stray code
         fences as _parse_code_fix, but without requiring any particular
-        fields."""
+        fields.
+
+        Models are told to respond with ONLY the JSON object, but often
+        don't -- a stray "Sure, here you go:" before it, a trailing
+        sentence after it, or a code fence that isn't stripped cleanly is
+        enough to make a naive "whole string must be exactly `{...}`"
+        check fail, which is why verification used to report "unparsable"
+        on almost every call. Instead, find the first balanced {...} span
+        anywhere in the text (respecting strings, so braces inside a
+        quoted "reason" don't throw off the count) and parse just that.
+        """
         text = (answer or "").strip()
         if not text:
             return None
@@ -1138,10 +1269,39 @@ class PulseCLI:
             if text.lower().startswith("json"):
                 text = text[4:]
             text = text.strip()
-        if not (text.startswith("{") and text.endswith("}")):
+
+        start = text.find("{")
+        if start == -1:
             return None
+
+        depth = 0
+        in_string = False
+        escape = False
+        end = -1
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end == -1:
+            return None
+
         try:
-            payload = json.loads(text)
+            payload = json.loads(text[start:end + 1])
         except (ValueError, TypeError):
             return None
         return payload if isinstance(payload, dict) else None
@@ -1165,7 +1325,7 @@ class PulseCLI:
             fix_desc = self._describe_fix(fix)
             with _Spinner("Checking the fix"):
                 verify_answer = self._call_model(
-                    _PASS4_VERIFY_TMPL.format(fix_desc=fix_desc), max_tokens=200
+                    _PASS4_VERIFY_TMPL.format(fix_desc=fix_desc), max_tokens=350
                 )
             verdict = self._parse_json_obj(verify_answer)
             if verdict is None:
@@ -1203,6 +1363,7 @@ class PulseCLI:
 
         print(f"\n[5] Full re-read found other possible issue(s):\n{summary}\n")
         try:
+            _flush_stdin()
             resp = input("Fix other errors? (y/n) > ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             return
@@ -1307,7 +1468,22 @@ class PulseCLI:
 
     @staticmethod
     def _parse_code_fix(answer: str) -> Optional[Dict[str, Any]]:
-        """If `answer` is a well-formed code-fix JSON payload, return it, else None."""
+        """If `answer` is a well-formed code-fix JSON payload, return it, else None.
+
+        Two shapes are accepted:
+        - The intended one: "old"/"new" are each a list with one entry per
+          change, where each entry is that change's full snippet (possibly
+          multi-line via embedded "\\n"), zipped index-by-index with an
+          optional "files" list of the same length.
+        - One some models fall into anyway: "old"/"new" are each a flat
+          list of individual source *lines* for a single whole-block
+          change, rather than one entry per change -- since the fix
+          usually adds or removes lines, "old" and "new" end up different
+          lengths and can't be zipped pairwise. There's no "files" list in
+          this shape either. Detected by the length mismatch and handled
+          by joining each list into one snippet and treating it as a
+          single change.
+        """
         text = (answer or "").strip()
         if not text:
             return None
@@ -1332,23 +1508,42 @@ class PulseCLI:
 
         old, new, explanation = payload.get("old"), payload.get("new"), payload.get("explanation")
         files = payload.get("files")
-        if not isinstance(old, list) or not isinstance(new, list):
+        explanation = explanation if isinstance(explanation, str) else ""
+
+        def _valid_str_list(lst):
+            return isinstance(lst, list) and bool(lst) and all(isinstance(x, str) for x in lst)
+
+        if not _valid_str_list(old) or not _valid_str_list(new):
             return None
-        if not old or len(old) != len(new):
+
+        if len(old) == len(new):
+            # Standard shape: one change per (old[i], new[i]) pair.
+            if files is not None:
+                if not isinstance(files, list) or len(files) != len(old):
+                    return None
+                if not all(f is None or isinstance(f, str) for f in files):
+                    return None
+            else:
+                files = [None] * len(old)
+
+            return {"old": old, "new": new, "files": files, "explanation": explanation}
+
+        # Fallback shape: "old"/"new" are flat line arrays for a single
+        # change -- join them back into one snippet each.
+        joined_old = "\n".join(old)
+        joined_new = "\n".join(new)
+        if not joined_old.strip() or joined_old == joined_new:
             return None
-        if not all(isinstance(x, str) for x in old) or not all(isinstance(x, str) for x in new):
-            return None
-        if files is not None:
-            if not isinstance(files, list) or len(files) != len(old):
-                return None
-            if not all(f is None or isinstance(f, str) for f in files):
-                return None
-        else:
-            files = [None] * len(old)
+
+        file_label = None
+        if isinstance(files, str):
+            file_label = files
+        elif isinstance(files, list) and files and isinstance(files[0], str):
+            file_label = files[0]
 
         return {
-            "old": old, "new": new, "files": files,
-            "explanation": explanation if isinstance(explanation, str) else "",
+            "old": [joined_old], "new": [joined_new], "files": [file_label],
+            "explanation": explanation,
         }
 
     def _apply_code_fix(self, fix: Dict[str, Any]) -> str:
@@ -1435,13 +1630,15 @@ class PulseCLI:
         for path, applied in applied_by_path.items():
             lines.append(f"\n✓ Applied {len(applied)} change(s) to '{os.path.basename(path)}':")
             for old, new in applied:
-                lines.append(f"  - replaced:\n      {old.splitlines()[0][:80]}...\n    with:\n      {new.splitlines()[0][:80]}...")
+                safe_old = old.splitlines()[0][:80] if old.splitlines() else "(empty)"
+                safe_new = new.splitlines()[0][:80] if new.splitlines() else "(empty)"
+                lines.append(f"  - replaced:\n      {safe_old}...\n    with:\n      {safe_new}...")
         if skipped:
             lines.append(f"\n⚠ Skipped {len(skipped)} proposed change(s) that didn't match cleanly:")
             for old, where, reason in skipped:
                 lines.append(f"  - [{os.path.basename(str(where))}] {reason}: {old.splitlines()[0][:80]}...")
 
-        print("\n".join(lines))
+        cprint("\n".join(lines), color=_BLUE)
 
         self._pending_revert_backups = dict(originals)  # path -> original content
         self._fix_applied_this_turn = True  # tells ask_agent's top-level call to restart afterward
@@ -1629,7 +1826,7 @@ class PulseCLI:
                         hist.append(None)
                         any_scalar_changed = True
                     scalar_lines.append((var_name, None))
-                    print(f"  ⚠ '{var_name}' could not be read this step: {type(exc).__name__}: {exc}")
+                    cprint(f"  ⚠ '{var_name}' could not be read this step: {type(exc).__name__}: {exc}", color=_RED)
                     continue
                 hist = self.scalar_histories.setdefault(var_name, [])
                 changed = not hist or not _values_equal(hist[-1], scalar_val)
@@ -1656,7 +1853,7 @@ class PulseCLI:
                 try:
                     stats = statistics(val)
                 except Exception as exc:
-                    print(f"  ⚠ '{sub_name}' could not be read this step: {type(exc).__name__}: {exc}")
+                    cprint(f"  ⚠ '{sub_name}' could not be read this step: {type(exc).__name__}: {exc}", color=_RED)
                     continue
 
                 if stats.get("kind") == "scalar":
@@ -1715,14 +1912,14 @@ class PulseCLI:
         if should_redraw:
             sys.stdout.write("\033[2J\033[H")
             sys.stdout.flush()
-            print(f"--- Pulse Live Debugger | Step {self.step} ---")
+            cprint(f"--- Pulse Live Debugger | Step {self.step} ---")
 
             for sub_name, scalar_val in wrong_scalars:
                 hist = self.scalar_histories.get(sub_name, [])
                 if scalar_val is None:
-                    print(f"  • {sub_name}: NoneType  ⚠ (unreadable this step)")
+                    cprint(f"  • {sub_name}: NoneType  ⚠ (unreadable this step)", color=_RED)
                 else:
-                    print(f"  • {sub_name}: {scalar_val:.6g}  ⚠")
+                    cprint(f"  • {sub_name}: {scalar_val:.6g}  ⚠", color=_RED)
                 self._print_ascii_chart(sub_name, hist)
 
             if track_matrix_lines:
@@ -1753,7 +1950,7 @@ class PulseCLI:
                             )
                             print(f"    ↳ saved snapshot: {pdf_path}")
                         except Exception as exc:
-                            print(f"    ↳ ⚠ failed to save PDF snapshot for '{sub_name}': {exc}")
+                            cprint(f"    ↳ ⚠ failed to save PDF snapshot for '{sub_name}': {exc}", color=_RED)
 
                 if self._matrix_cache:
                     print(
@@ -1768,19 +1965,19 @@ class PulseCLI:
                 self._last_intervention_signature = problem
                 self.continuous = False  # force a stop even mid-continuous-run
                 print("\n" + "=" * 60)
-                print("[Pulse] ⚠ Auto-intervention: training looks like it's going bad. Pausing.")
-                print(f"[Pulse] Detected: {problem}")
+                cprint("[Pulse] ⚠ Auto-intervention: training looks like it's going bad. Pausing.", color=_RED)
+                cprint(f"[Pulse] Detected: {problem}", color=_RED)
                 print("=" * 60)
                 if self.agent_provider:
                     question = (
                         f"Pulse just auto-paused training because it detected a problem: {problem}\n"
                         "Please diagnose the root cause and, if you can, fix it."
                     )
-                    print("Pulse:")
+                    cprint("Pulse:")
                     self.ask_agent(question, include_code=bool(self.code_text))
                 else:
-                    print("[Pulse] No AI agent is configured yet -- run /agent to set one up, then ask about this.")
-                print(
+                    cprint("[Pulse] No AI agent is configured yet -- run /agent to set one up, then ask about this.")
+                cprint(
                     "[Pulse] Training is paused here (Enter to single-step, /c to resume continuous "
                     "running as-is). Note: if a fix was just applied to a file on disk, this already-"
                     "running process is still executing the old code in memory -- you'll need to stop "
@@ -1793,13 +1990,16 @@ class PulseCLI:
         # Interactive Training Loop Prompt
         while True:
             try:
+                _flush_stdin()
                 cmd = input(
-                    "\nPulse [Enter=step, /c=continuous, /add <var>, /track <var>, "
-                    "/lotrack <var>, /delete <var>, /deletepdf <var>, /autofix on|off, "
-                    "/agent, /code, or ask AI] > "
+                    _highlight_pulse(
+                        "\nPulse [Enter=step, /c=continuous, /add <var>, /track <var>, "
+                        "/lotrack <var>, /delete <var>, /deletepdf <var>, /autofix on|off, "
+                        "/agent, /code, or ask AI] > "
+                    )
                 ).strip()
             except (EOFError, KeyboardInterrupt):
-                print("\nExiting Pulse...")
+                cprint("\nExiting Pulse...")
                 if self.original_sigint and callable(self.original_sigint):
                     signal.signal(signal.SIGINT, self.original_sigint)
                 raise KeyboardInterrupt
@@ -1853,7 +2053,7 @@ class PulseCLI:
                 self._cmd_code(cmd[5:].strip())
                 continue
 
-            print("Pulse AI:")
+            cprint("Pulse AI:")
             self.ask_agent(cmd, include_code=self.include_code_default)
 
     def _print_ascii_chart(
@@ -1880,7 +2080,7 @@ class PulseCLI:
         finite = [v for v in data if isinstance(v, (int, float)) and math.isfinite(v)]
 
         if not finite:
-            print(f"    [{name} | {len(history)} points] ⚠ no readable values (None/NaN/inf) -- nothing to chart")
+            cprint(f"    [{name} | {len(history)} points] ⚠ no readable values (None/NaN/inf) -- nothing to chart", color=_RED)
             return
 
         if len(data) == 1:
