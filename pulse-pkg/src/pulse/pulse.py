@@ -207,6 +207,28 @@ def _default_var_state(name, shape):
 import math as _math_module
 
 
+def _flush_stdin() -> None:
+    """Discard any input sitting unread in the terminal's input buffer.
+
+    Without this, keystrokes typed while output was streaming (a restart
+    banner, a traceback, training-step logs) sit in the OS-level tty
+    buffer and get delivered as soon as the next input() starts reading --
+    landing in the middle of that prompt's line instead of being ignored.
+    Called right before every input() so each prompt starts from a clean,
+    empty line. Mirrors the same helper in pulse_cli.py.
+    """
+    try:
+        if os.name == "nt":
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getch()
+        else:
+            import termios
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:
+        pass  # not a real terminal (piped input, some IDEs, etc.) -- nothing to flush
+
+
 def _safe_eval_math(expr: str):
     """Evaluate a plain arithmetic/math expression deterministically -- LLMs
     are unreliable at exact arithmetic, so the agent can hand off anything
@@ -1733,7 +1755,17 @@ class ChatPanel(tk.Frame):
     def _parse_json_obj(answer):
         """Generic defensive JSON-object parser for the verify (pass 4) and
         sweep (pass 5) responses -- same tolerance for stray code fences as
-        _parse_code_fix, but without requiring any particular fields."""
+        _parse_code_fix, but without requiring any particular fields.
+
+        Models are told to respond with ONLY the JSON object, but often
+        don't -- a stray "Sure, here you go:" before it, a trailing
+        sentence after it, or a code fence that isn't stripped cleanly is
+        enough to make a naive "whole string must be exactly `{...}`"
+        check fail, which is why verification used to report "unparsable"
+        on almost every call. Instead, find the first balanced {...} span
+        anywhere in the text (respecting strings, so braces inside a
+        quoted "reason" don't throw off the count) and parse just that.
+        """
         text = (answer or "").strip()
         if not text:
             return None
@@ -1742,10 +1774,39 @@ class ChatPanel(tk.Frame):
             if text.lower().startswith("json"):
                 text = text[4:]
             text = text.strip()
-        if not (text.startswith("{") and text.endswith("}")):
+
+        start = text.find("{")
+        if start == -1:
             return None
+
+        depth = 0
+        in_string = False
+        escape = False
+        end = -1
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end == -1:
+            return None
+
         try:
-            payload = json.loads(text)
+            payload = json.loads(text[start:end + 1])
         except (ValueError, TypeError):
             return None
         return payload if isinstance(payload, dict) else None
@@ -1768,7 +1829,7 @@ class ChatPanel(tk.Frame):
             fix_desc = self._describe_fix(fix)
             self.after(0, lambda: self._set_stage("Checking the fix"))
             verify_answer = self._call_model(
-                model_name, _PASS4_VERIFY_TMPL.format(fix_desc=fix_desc), max_tokens=200
+                model_name, _PASS4_VERIFY_TMPL.format(fix_desc=fix_desc), max_tokens=350
             )
             verdict = self._parse_json_obj(verify_answer)
             if verdict is None:
@@ -1913,7 +1974,22 @@ class ChatPanel(tk.Frame):
 
     @staticmethod
     def _parse_code_fix(answer):
-        """If `answer` is a well-formed code-fix JSON payload, return it, else None."""
+        """If `answer` is a well-formed code-fix JSON payload, return it, else None.
+
+        Two shapes are accepted:
+        - The intended one: "old"/"new" are each a list with one entry per
+          change, where each entry is that change's full snippet (possibly
+          multi-line via embedded "\\n"), zipped index-by-index with an
+          optional "files" list of the same length.
+        - One some models fall into anyway: "old"/"new" are each a flat
+          list of individual source *lines* for a single whole-block
+          change, rather than one entry per change -- since the fix
+          usually adds or removes lines, "old" and "new" end up different
+          lengths and can't be zipped pairwise. There's no "files" list in
+          this shape either. Detected by the length mismatch and handled
+          by joining each list into one snippet and treating it as a
+          single change.
+        """
         text = (answer or "").strip()
         if not text:
             return None
@@ -1938,23 +2014,42 @@ class ChatPanel(tk.Frame):
 
         old, new, explanation = payload.get("old"), payload.get("new"), payload.get("explanation")
         files = payload.get("files")
-        if not isinstance(old, list) or not isinstance(new, list):
+        explanation = explanation if isinstance(explanation, str) else ""
+
+        def _valid_str_list(lst):
+            return isinstance(lst, list) and bool(lst) and all(isinstance(x, str) for x in lst)
+
+        if not _valid_str_list(old) or not _valid_str_list(new):
             return None
-        if not old or len(old) != len(new):
+
+        if len(old) == len(new):
+            # Standard shape: one change per (old[i], new[i]) pair.
+            if files is not None:
+                if not isinstance(files, list) or len(files) != len(old):
+                    return None
+                if not all(f is None or isinstance(f, str) for f in files):
+                    return None
+            else:
+                files = [None] * len(old)
+
+            return {"old": old, "new": new, "files": files, "explanation": explanation}
+
+        # Fallback shape: "old"/"new" are flat line arrays for a single
+        # change -- join them back into one snippet each.
+        joined_old = "\n".join(old)
+        joined_new = "\n".join(new)
+        if not joined_old.strip() or joined_old == joined_new:
             return None
-        if not all(isinstance(x, str) for x in old) or not all(isinstance(x, str) for x in new):
-            return None
-        if files is not None:
-            if not isinstance(files, list) or len(files) != len(old):
-                return None
-            if not all(f is None or isinstance(f, str) for f in files):
-                return None
-        else:
-            files = [None] * len(old)
+
+        file_label = None
+        if isinstance(files, str):
+            file_label = files
+        elif isinstance(files, list) and files and isinstance(files[0], str):
+            file_label = files[0]
 
         return {
-            "old": old, "new": new, "files": files,
-            "explanation": explanation if isinstance(explanation, str) else "",
+            "old": [joined_old], "new": [joined_new], "files": [file_label],
+            "explanation": explanation,
         }
 
     def _resolve_fix_path(self, file_label):
@@ -2058,7 +2153,9 @@ class ChatPanel(tk.Frame):
         for path, applied in applied_by_path.items():
             lines.append(f"\n✓ Applied {len(applied)} change(s) to `{os.path.basename(path)}`:")
             for old, new in applied:
-                lines.append(f"  - replaced `{old.splitlines()[0][:80]}...` with `{new.splitlines()[0][:80]}...`")
+                safe_old = old.splitlines()[0][:80] if old.splitlines() else "(empty)"
+                safe_new = new.splitlines()[0][:80] if new.splitlines() else "(empty)"
+                lines.append(f"  - replaced `{safe_old}...` with `{safe_new}...`")
         if skipped:
             lines.append(f"\n⚠ Skipped {len(skipped)} proposed change(s) that didn't match cleanly:")
             for old, where, reason in skipped:
@@ -3135,6 +3232,16 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
                     
 
                     # Spawn the new process safely using subprocess (which handles spaces on Windows)
+                            # Just before os.execv or subprocess call:
+                    sys.stdout.write("\033c\033[0m") # Reset ANSI and clear screen
+                    sys.stdout.flush()
+                    if os.name == 'nt':
+                        subprocess.run('cls', shell=True)
+                    else:
+                        # Windows: Clears the screen and resets the basic console buffer
+                        # macOS/Linux: Resets raw terminal modes and clears the screen
+                        subprocess.run('stty sane', shell=True)
+                        subprocess.run('clear', shell=True)
                     subprocess.Popen([sys.executable, script_path] + sys.argv[1:])
                     sys.exit(0)
         # bad (NaN/inf, a loss spike) and asked training to hold here until
@@ -3202,6 +3309,7 @@ def _install_cli_excepthook(cli):
         print("\n[Pulse] Your script just crashed with the exception above.")
         try:
             if not cli.agent_provider:
+                _flush_stdin()
                 resp = input(
                     "[Pulse] Set up an AI agent now so Pulse can try to diagnose/fix it? (y/n) > "
                 ).strip().lower()
@@ -3210,6 +3318,7 @@ def _install_cli_excepthook(cli):
                 if not cli._select_agent_provider_and_key(initial=True):
                     return
             else:
+                _flush_stdin()
                 resp = input(
                     "[Pulse] Ask the agent to diagnose (and try to fix) this? (y/n) > "
                 ).strip().lower()
