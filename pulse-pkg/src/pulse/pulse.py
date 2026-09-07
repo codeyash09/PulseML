@@ -54,6 +54,7 @@ import time
 import uuid
 import tempfile
 import threading
+import queue as _queue
 import traceback
 import sysconfig
 import multiprocessing as mp
@@ -710,10 +711,82 @@ def _worker_main(queue, display_configs, session_id, var_states=None):
         _atomic_write_json(manifest_path, manifest)
 
 
+# ============================================================================
+# CPU-ONLY OBSERVATION MODE
+# ============================================================================
+# Pulse must never call .cpu(), .numpy(), .item(), .detach().cpu(), or backend
+# statistics on an accelerator tensor. There is no way for a CPU process to
+# read arbitrary GPU VRAM without a device-to-host transfer; that transfer is
+# itself a GPU/driver operation. In strict mode we therefore observe only CPU
+# resident values (including NumPy arrays and CPU tensors). If a training
+# program wants a GPU tensor visualized, it must expose an already-created CPU
+# mirror. Pulse will consume that mirror without touching the accelerator.
+PULSE_CPU_ONLY = os.environ.get("PULSE_CPU_ONLY", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _is_accelerator_value(value):
+    """Best-effort device check without importing or touching any ML backend."""
+    if value is None:
+        return False
+    try:
+        dev = getattr(value, "device", None)
+        if dev is not None and str(dev).lower() not in {"cpu", "none", ""}:
+            return True
+    except Exception:
+        pass
+    # CuPy exposes .device; TensorFlow/JAX/PyTorch expose device metadata in
+    # different forms. Avoid calling backend methods here: metadata only.
+    try:
+        dev = getattr(getattr(value, "array", None), "device", None)
+        if dev is not None and str(dev).lower() not in {"cpu", "none", ""}:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _cpu_resident(value):
+    """True only when Pulse can safely hand `value` to CPU-side code."""
+    if value is None:
+        return True
+    if _is_accelerator_value(value):
+        return False
+    if isinstance(value, np.ndarray):
+        return True
+    # Python scalars/lists/dicts are already host-side.
+    if isinstance(value, (int, float, complex, bool, str, bytes, list, tuple, dict)):
+        return True
+    # PyTorch CPU tensors and similar host tensors generally expose a CPU
+    # device. Do not call .cpu() or .numpy() here.
+    try:
+        dev = getattr(value, "device", None)
+        if dev is not None:
+            return str(dev).lower() == "cpu"
+    except Exception:
+        pass
+    # Unknown objects are NOT assumed safe: strict mode drops them.
+    return False
+
+
+def _mirror_name_candidates(name):
+    """Names commonly used by training code for an already-created CPU copy."""
+    return (
+        f"{name}_cpu", f"{name}_host", f"{name}_np", f"cpu_{name}", f"host_{name}",
+    )
+
+
 class HeatmapCreatorBG:
+    """CPU-only bridge between the training process and the renderer.
+
+    In strict CPU mode this object NEVER converts, synchronizes, copies, or
+    queries accelerator tensors. The training process can only submit values
+    that are already resident in host memory. This makes Pulse observational:
+    it cannot enqueue a CUDA copy, synchronize a CUDA stream, or execute GPU
+    statistics on behalf of the debugger.
+    """
     def __init__(self, display_configs, session_id, var_states=None):
         self.session_id = session_id
-        self.queue = mp.Queue()
+        self.queue = mp.Queue(maxsize=2)
         self.process = mp.Process(
             target=_worker_main,
             args=(self.queue, display_configs, session_id, var_states or {}),
@@ -722,16 +795,53 @@ class HeatmapCreatorBG:
         self.process.start()
 
     def log_matrix(self, var, matrix, config_override=None):
-        self.queue.put((var, matrix, config_override))
+        # Strictly reject accelerator values. No .cpu(), .numpy(), .item(),
+        # backend statistics, or other device operation occurs here.
+        if PULSE_CPU_ONLY and not _cpu_resident(matrix):
+            return False
+        item = (var, matrix, config_override)
+        try:
+            self.queue.put_nowait(item)
+            return True
+        except Exception:
+            # Visualization is lossy by design. Never wait for the renderer.
+            try:
+                self.queue.get_nowait()
+            except Exception:
+                pass
+            try:
+                self.queue.put_nowait(item)
+                return True
+            except Exception:
+                return False
+
+    def log_cpu_snapshot(self, var, cpu_value, config_override=None):
+        """Explicit API for an already-created CPU mirror.
+
+        The caller owns creation of the mirror. Pulse never creates it and
+        therefore never touches the accelerator.
+        """
+        if not _cpu_resident(cpu_value):
+            return False
+        return self.log_matrix(var, cpu_value, config_override)
 
     def update_state(self, var, new_state):
-        self.queue.put(("STATE", var, new_state))
+        try:
+            self.queue.put_nowait(("STATE", var, new_state))
+        except Exception:
+            pass
 
     def update_config(self, var, new_config):
-        self.queue.put(("CONFIG", var, new_config))
+        try:
+            self.queue.put_nowait(("CONFIG", var, new_config))
+        except Exception:
+            pass
 
     def shutdown(self):
-        self.queue.put(None)
+        try:
+            self.queue.put_nowait(None)
+        except Exception:
+            pass
         self.process.join(timeout=5)
 
 
@@ -2526,17 +2636,7 @@ class Dashboard:
         automatically hand the problem to the agent to diagnose and, if it
         can, fix -- without waiting for the user to notice and ask.
         """
-        self.is_paused = True
-        if self.control_queue is not None:
-            try:
-                self.control_queue.put(("PAUSE", None))
-            except Exception:
-                pass
-        self.pause_label.configure(
-            text=f"⚠ Auto-paused: {problem}"
-        )
-        if not self.pause_banner.winfo_ismapped():
-            self.pause_banner.pack(fill=tk.X, side=tk.TOP, before=self.canvas)
+        # Auto-diagnostics must never block the training process.
         self.chat_panel.report_training_trouble(problem)
 
     def _resume_training(self):
@@ -3186,7 +3286,38 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
     _install_pulse_excepthook(_session_id)
 
     last_logged = {}
+    last_scan = {"t": 0.0}
     paused = {"value": False}
+
+    # ------------------------------------------------------------------
+    # Windowed line tracing -- same fix as the CLI tracer (see
+    # _start_cli_tracker/cli_tracer for the full writeup of why this is
+    # needed: sys.settrace('line') armed for the whole run disables
+    # CPython's specializing interpreter and pays a callback on every
+    # bytecode line, which starves async GPU kernel dispatch).
+    #
+    # caller_frame (the user's training loop) is deliberately NOT windowed:
+    # its f_trace was set directly rather than opted into via a 'call'
+    # event, so it keeps receiving line events every step regardless of the
+    # window. That's what the Pause/Resume/Restart control-queue draining
+    # below relies on to stay responsive -- and it's cheap to always trace,
+    # since the loop's own statements are few compared to everything a
+    # forward/backward pass calls into. What IS windowed is (a) whether a
+    # *nested* call (attention/layernorm/MLP/etc. helpers -- the actual
+    # expensive, many-line frames) opts into line tracing at all, and (b)
+    # whether the locals-scan-and-log work runs on any given line event,
+    # including caller_frame's own.
+    _CAPTURE_SPAN = min(0.05, throttle_interval / 4 if throttle_interval > 0 else 0.05)
+    window = {"open": True}  # start open so initial discovery isn't starved
+
+    def _ticker():
+        while True:
+            time.sleep(throttle_interval)
+            window["open"] = True
+            time.sleep(_CAPTURE_SPAN)
+            window["open"] = False
+
+    threading.Thread(target=_ticker, daemon=True).start()
 
     def persistent_tracer(frame, event, arg):
         while True:
@@ -3242,8 +3373,58 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
                         # macOS/Linux: Resets raw terminal modes and clears the screen
                         subprocess.run('stty sane', shell=True)
                         subprocess.run('clear', shell=True)
-                    subprocess.Popen([sys.executable, script_path] + sys.argv[1:])
-                    sys.exit(0)
+                    # Retry the restart itself instead of falling back to
+                    # "keep running the old, already-in-memory process" on
+                    # a bad exit code. A nonzero exit almost always means
+                    # the replacement process crashed immediately (the
+                    # agent's fix didn't fully take, or introduced a new
+                    # bug) -- silently resuming the OLD code just means
+                    # the same already-broken run limps along unsupervised
+                    # with nobody watching. Retrying gives a transient
+                    # cause (a file/port briefly held by the exiting old
+                    # process, a flaky import) a real chance to clear.
+                    # Capped, not infinite, so a deterministically-broken
+                    # script can't spin forever burning compute unattended.
+                    MAX_RESTART_ATTEMPTS = 5
+                    RETRY_BACKOFF_SECONDS = 3
+
+                    restart_argv = [sys.executable, script_path] + sys.argv[1:]
+                    attempt = 0
+                    restarted_ok = False
+                    while attempt < MAX_RESTART_ATTEMPTS:
+                        attempt += 1
+                        try:
+                            restart_result = subprocess.run(
+                                restart_argv,
+                                capture_output=True,
+                                text=True,
+                            )
+                        except Exception as exc:
+                            print(f"[PULSE] Restart attempt {attempt}/{MAX_RESTART_ATTEMPTS} failed to launch ({exc}).")
+                            if attempt < MAX_RESTART_ATTEMPTS:
+                                time.sleep(min(RETRY_BACKOFF_SECONDS * attempt, 30))
+                            continue
+
+                        if restart_result.returncode == 0:
+                            restarted_ok = True
+                            break
+
+                        print(
+                            f"\n[PULSE] Replacement training process exited with code "
+                            f"{restart_result.returncode} (attempt {attempt}/{MAX_RESTART_ATTEMPTS})."
+                        )
+                        if restart_result.stderr:
+                            print("[PULSE] STDERR from failed run:\n", restart_result.stderr)
+                        if restart_result.stdout:
+                            print("[PULSE] STDOUT from failed run:\n", restart_result.stdout)
+                        if attempt < MAX_RESTART_ATTEMPTS:
+                            print("[PULSE] Retrying restart...")
+                            time.sleep(min(RETRY_BACKOFF_SECONDS * attempt, 30))
+
+                    if restarted_ok:
+                        sys.exit(0)
+
+                    print(f"[PULSE] ⚠ Giving up after {MAX_RESTART_ATTEMPTS} restart attempts -- continuing the current process.")
         # bad (NaN/inf, a loss spike) and asked training to hold here until
         # the user hits "Resume Training" -- or a fix gets applied and they
         # resume manually. Blocks this exact line from executing further,
@@ -3267,28 +3448,86 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
         if root and not os.path.normcase(os.path.abspath(filename)).startswith(root):
             return None
 
-        if event == "line":
-            now = time.time()
-            for name, val in frame.f_locals.items():
-                if name.startswith("__"):
+        is_caller = frame is caller_frame
+
+        if event == "call":
+            # Only let a nested call (the expensive, many-line frames --
+            # attention/layernorm/MLP/backward helpers) opt into line
+            # tracing while a snapshot window is open. caller_frame never
+            # reaches this branch since its f_trace was set directly below,
+            # not via a 'call' event.
+            return persistent_tracer if window["open"] else None
+
+        if event != "line":
+            return persistent_tracer
+
+        if not window["open"]:
+            if not is_caller:
+                # This nested frame's window closed while it was still
+                # running -- stop asking for further line events from it.
+                # A future window will re-trace it fresh via a new 'call'.
+                try:
+                    frame.f_trace_lines = False
+                except Exception:
+                    pass
+            # caller_frame keeps getting line events even with the window
+            # closed (cheap, and needed for Pause/Restart responsiveness --
+            # see the control-queue drain above), but skips the expensive
+            # locals scan below until the next window.
+            return persistent_tracer
+
+        now = time.time()
+        # Gate the whole locals scan (is_trackable on every local) behind
+        # throttle_interval, same fix as the CLI tracer -- this was
+        # previously running unthrottled on every line event and starving
+        # GPU dispatch on large models. Halved here since it's now also
+        # bounded by the window itself.
+        if now - last_scan["t"] <= throttle_interval * 0.5:
+            return persistent_tracer
+        last_scan["t"] = now
+        locals_now = frame.f_locals
+        for name, val in locals_now.items():
+            if name.startswith("__"):
+                continue
+            if auto_mode:
+                if not is_trackable(val):
                     continue
-                if auto_mode:
-                    if not is_trackable(val):
-                        continue
-                    tracked_vars.add(name)
-                elif name not in tracked_vars:
-                    continue
-                elif not is_trackable(val):
+                tracked_vars.add(name)
+            elif name not in tracked_vars:
+                continue
+            elif not is_trackable(val):
+                continue
+
+            # If the live value is on an accelerator, Pulse does not touch
+            # it. If the user's code already maintains a CPU mirror, use
+            # that mirror instead. Creating the mirror remains the user's
+            # responsibility and can therefore be scheduled however they
+            # choose (or omitted entirely).
+            observed_val = val
+            if PULSE_CPU_ONLY and not _cpu_resident(val):
+                observed_val = None
+                for mirror_name in _mirror_name_candidates(name):
+                    candidate = locals_now.get(mirror_name)
+                    if candidate is not None and _cpu_resident(candidate):
+                        observed_val = candidate
+                        break
+                if observed_val is None:
                     continue
 
-                if now - last_logged.get(name, 0) > throttle_interval:
-                    _debugger_bg.log_matrix(name, val)
+            if now - last_logged.get(name, 0) > throttle_interval:
+                # CPU-only observation: do not even enqueue accelerator
+                # objects. An mp.Queue cannot be used as a CUDA siphon.
+                # Pulse will observe an already-created CPU mirror instead.
+                if PULSE_CPU_ONLY and not _cpu_resident(val):
+                    continue
+                if _debugger_bg.log_matrix(name, observed_val):
                     last_logged[name] = now
 
         return persistent_tracer
 
     sys.settrace(persistent_tracer)
     caller_frame.f_trace = persistent_tracer
+    caller_frame.f_trace_lines = True
 
 
 def _install_cli_excepthook(cli):
@@ -3307,8 +3546,27 @@ def _install_cli_excepthook(cli):
             return
         tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
         print("\n[Pulse] Your script just crashed with the exception above.")
+        # handle_crash logs the traceback (same as the old direct
+        # log_traceback call did) AND does the signature/dedup bookkeeping
+        # that offer_known_fix below depends on -- without it, a bug
+        # Pulse already fixed once would go through the full ask-the-agent
+        # pipeline again from scratch every time it recurs, instead of
+        # just reapplying the known fix.
+        sig = cli.handle_crash(tb_text)
+        if cli.offer_known_fix(sig):
+            return  # already reapplied (and, if auto_intervene, already restarted)
+
         try:
             if not cli.agent_provider:
+                if cli.auto_intervene:
+                    # Auto-fix can't configure an agent on its own -- there's
+                    # no API key to use -- so this is the one crash-handling
+                    # case that genuinely can't proceed unattended. Say so
+                    # and move on rather than blocking on a prompt that (in
+                    # an unattended/non-interactive run) will never be
+                    # answered.
+                    print("[Pulse] Auto-fix is on, but no AI agent is configured -- run /agent to set one up.")
+                    return
                 _flush_stdin()
                 resp = input(
                     "[Pulse] Set up an AI agent now so Pulse can try to diagnose/fix it? (y/n) > "
@@ -3317,13 +3575,16 @@ def _install_cli_excepthook(cli):
                     return
                 if not cli._select_agent_provider_and_key(initial=True):
                     return
-            else:
+            elif not cli.auto_intervene:
                 _flush_stdin()
                 resp = input(
                     "[Pulse] Ask the agent to diagnose (and try to fix) this? (y/n) > "
                 ).strip().lower()
                 if resp not in ("y", "yes"):
                     return
+            # else: auto_intervene is on and an agent is configured --
+            # proceed straight to asking it, no prompt (see the module's
+            # "never block on a y/n when autofix is on" convention).
         except (EOFError, KeyboardInterrupt):
             return
 
@@ -3383,6 +3644,56 @@ def _start_cli_tracker(
     setup_done = {"value": False}
     last_logged = {"t": 0.0}
 
+    # ------------------------------------------------------------------
+    # Windowed line tracing.
+    #
+    # Previously `cli_tracer` was armed for 'line' events on every frame,
+    # for the entire run, and stayed armed forever (it always returned
+    # `cli_tracer`, never `None`, from a line event). That alone -- before
+    # any of the work inside the callback -- is expensive: CPython disables
+    # its specializing/adaptive interpreter for any code object under
+    # active line tracing, and pays a full Python callback dispatch on
+    # every bytecode line boundary. On a hand-written training loop (many
+    # small Python-level ops per step -- layernorm, attention, MLP, backward,
+    # each its own function/lines) this is a 10-50x slowdown of the Python
+    # side. Since cupy/GPU kernel launches are async, a Python side that
+    # slow can't issue launches fast enough to keep the GPU fed: VRAM stays
+    # full (weights/activations are already resident) but utilization
+    # collapses to single digits. Throttling the *work done inside* the
+    # callback (as before) doesn't fix this -- the callback still fires,
+    # and the interpreter deopt still applies, on every single line
+    # regardless.
+    #
+    # Fix: don't leave line tracing armed continuously. Only open a
+    # tracing "window" right when a snapshot is actually due (every
+    # `throttle_interval` seconds), keep it open just long enough to catch
+    # one step's worth of nested calls, then explicitly disable further
+    # line/call events via `frame.f_trace_lines` / returning None until the
+    # next window. Between windows, the training loop runs at native,
+    # untraced speed.
+    _CAPTURE_SPAN = min(0.05, throttle_interval / 4 if throttle_interval > 0 else 0.05)
+    window = {"open": True, "closes_at": 0.0}  # start open so setup can run immediately
+
+    def _close_window():
+        window["open"] = False
+        try:
+            caller_frame.f_trace_lines = False
+        except Exception:
+            pass
+
+    def _ticker():
+        while True:
+            time.sleep(throttle_interval)
+            window["open"] = True
+            window["closes_at"] = time.time() + _CAPTURE_SPAN
+            try:
+                caller_frame.f_trace_lines = True
+            except Exception:
+                pass
+            time.sleep(_CAPTURE_SPAN)
+            if window["open"]:
+                _close_window()
+
     def cli_tracer(frame, event, arg):
         filename = frame.f_code.co_filename
         if _is_library_frame(filename):
@@ -3390,7 +3701,24 @@ def _start_cli_tracker(
         if root and not os.path.normcase(os.path.abspath(filename)).startswith(root):
             return None
 
+        if event == "call":
+            # Don't opt a nested call into line tracing at all unless a
+            # snapshot window is currently open -- this is what keeps
+            # forward()/backward() helper calls at full speed between
+            # snapshots instead of paying the trace tax on every line
+            # inside them every single step.
+            return cli_tracer if window["open"] else None
+
         if event != "line":
+            return cli_tracer
+
+        if not window["open"]:
+            # Belt-and-braces: make sure this frame stops asking for line
+            # events even if it slipped in right as the window closed.
+            try:
+                frame.f_trace_lines = False
+            except Exception:
+                pass
             return cli_tracer
 
         local_vars = frame.f_locals
@@ -3400,7 +3728,8 @@ def _start_cli_tracker(
         # dry-run, just kept live instead of front-loaded into a single
         # pre-pass. If a variable was defaulted to 'lotrack' before its
         # shape was known and it turns out to actually be a scalar, upgrade
-        # it to full 'track' -- scalars are cheap regardless.
+        # it to full 'track' -- scalars are cheap regardless. This only
+        # runs while a window is open now, not on every line forever.
         for name, val in local_vars.items():
             if name in cli.discovered and cli.discovered.get(name) is None and is_trackable(val):
                 cli.discovered[name] = shape_of(val)
@@ -3420,31 +3749,45 @@ def _start_cli_tracker(
                 cli.watch_locals = local_vars
                 cli.interactive_setup()
                 setup_done["value"] = True
+                # Setup is interactive/blocking; once it's done, start the
+                # background ticker that opens/closes future windows. (Kept
+                # off until now so setup itself isn't racing a window close.)
+                threading.Thread(target=_ticker, daemon=True).start()
             return cli_tracer
 
         cli.watch_locals = local_vars
 
-        # Auto mode (the CLI's equivalent of the GUI's "track every matrix
-        # automatically" toggle): keep picking up newly-trackable locals as
-        # the loop runs, instead of being limited to what was chosen once
-        # at setup time.
-        if cli.auto_mode:
-            for name, val in local_vars.items():
-                if name.startswith("__"):
-                    continue
-                if is_trackable(val) and name not in cli.tracked_vars:
-                    cli.tracked_vars.append(name)
-                    cli.var_states[name] = cli._default_state_for(name, val)
-
         now = time.time()
-        if now - last_logged["t"] > throttle_interval:
-            cli.update()
+        if now - last_logged["t"] > throttle_interval * 0.5:
+            # Auto mode (the CLI's equivalent of the GUI's "track every
+            # matrix automatically" toggle): keep picking up newly-trackable
+            # locals as the loop runs, instead of being limited to what was
+            # chosen once at setup time. Still cheap now: this whole branch
+            # only runs during the brief open window, not on every line.
+            if cli.auto_mode:
+                for name, val in local_vars.items():
+                    if name.startswith("__") or name in cli.tracked_vars:
+                        continue
+                    if is_trackable(val):
+                        cli.tracked_vars.append(name)
+                        cli.var_states[name] = cli._default_state_for(name, val)
+
+            try:
+                cli.update()
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                print(
+                    f"[Pulse] Warning: debugger update failed ({type(exc).__name__}: {exc}); "
+                    "continuing training."
+                )
             last_logged["t"] = now
 
         return cli_tracer
 
     sys.settrace(cli_tracer)
     caller_frame.f_trace = cli_tracer
+    caller_frame.f_trace_lines = True
     # No routine "tracing started" print -- minimal UI stays silent unless
     # something's actually wrong (a read error, a crash, auto-intervention).
 
