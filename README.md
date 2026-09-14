@@ -1,34 +1,38 @@
 # PulseML
 
-### The live debugger for machine learning
+**Pulse** is a live ML training debugger for CLI and headless environments. It combines runtime observability, deterministic numerical checks, ML-specific linting, and an AI debugging agent to investigate failures while training is running.
 
-**Observe your tensors. Understand failures. Verify the math. Fix the code.**
+**Track → Diagnose → Verify → Patch**
 
-PulseML is a live debugging tool for machine-learning training loops. It monitors tensors, gradients, activations, losses, and other metrics while training is running, then presents the evidence through a GUI or a headless CLI. Its AI analyst can diagnose a failure, verify numerical reasoning with deterministic calculations, develop a concrete fix, and apply that fix when explicitly asked.
+[Dashboard](https://pulsedashb.netlify.app/) · [GitHub](https://github.com/codeyash09/PulseML) · [PyPI](https://pypi.org/project/pulseml/)
 
-[Website](https://pulsedb.netlify.app/) | [PyPI](https://pypi.org/project/pulseml/)
+---
 
-[![PyPI Downloads](https://static.pepy.tech/personalized-badge/pulseml?period=total&units=NONE&left_color=BLACK&right_color=GREY&left_text=downloads)](https://pepy.tech/projects/pulseml)
+## Installation
 
-## Why PulseML?
+Pulse is available on PyPI.
 
-Most ML debugging begins after training has already failed. PulseML makes the internal state of a model visible while it is changing:
+### Requirements
 
-```text
-TRACK -> VISUALIZE -> ANALYZE -> VERIFY -> FIX
-```
+- Python 3.9+
+- A supported backend: NumPy, PyTorch, TensorFlow, CuPy, or JAX
+- An API key for an AI provider if you want to use the AI debugging agent
 
-Instead of adding custom logging and plotting code throughout a project, place one call before the training loop and let Pulse discover monitorable values.
-
-## Quickstart
-
-Install PulseML from PyPI:
+### Install
 
 ```bash
 pip install pulseml
 ```
 
-Then call `auto_track()` immediately before your training loop. Keep the loop under a `__main__` guard, especially when using multiprocessing or a process-spawning environment.
+### Verify
+
+```bash
+python -c "import pulse; print('Pulse installed successfully')"
+```
+
+### Start Pulse
+
+Import `auto_track` and call it immediately before your training loop:
 
 ```python
 from pulse import auto_track
@@ -36,136 +40,21 @@ from pulse import auto_track
 if __name__ == "__main__":
     auto_track()
 
+    # Your training loop
     for epoch in range(num_epochs):
-        # Your training code
+        # Training logic here
         pass
 ```
 
-Pulse discovers numeric variables available to the training process and launches the appropriate debugging interface.
+The `__main__` guard is particularly important in multiprocessing or process-spawning environments.
 
-## What It Monitors
+Once the process is running, Pulse discovers numeric variables available to the training process and exposes them through the CLI.
 
-- Losses and other scalar metrics as live step charts
-- Accuracy, learning rate, gradient norms, and numerical diagnostics
-- Matrices, vectors, and higher-dimensional tensors
-- Tensor shapes, dtypes, devices, and summary statistics
-- NaN and infinity counts
-- Gradients and activations
-- Heatmaps in GUI mode
-- Optional labeled PDF snapshots in CLI mode
+### AI provider configuration
 
-Loss-like names such as `loss`, `cost`, `nll`, and `cross_entropy` are recognized automatically and prioritized during setup.
+Pulse supports cloud and local AI providers.
 
-## GUI
-
-The GUI provides an interactive workflow for selecting and inspecting variables:
-
-- **Matrix picker:** choose tensors to monitor while viewing their shapes.
-- **Live dashboard:** follow heatmaps, scalar charts, statistics, and updates together.
-- **AI analyst:** ask questions about the current training state from alongside the live data.
-
-## CLI and Headless Environments
-
-PulseML also works without a graphical display, making it suitable for Google Colab, SSH sessions, remote GPUs, containers, and headless servers.
-
-The CLI supports:
-
-- Live tensor statistics
-- ASCII scalar charts
-- Matrix and tensor tracking
-- Pause and resume during training
-- Adding, removing, or promoting variables while training
-- AI analysis from the terminal
-- Optional labeled heatmap PDFs
-- Automatic intervention when a tracked signal becomes non-finite or shows suspicious behavior
-
-Useful commands include:
-
-```text
-/help                 Show all commands
-/vars                 List discovered variables
-/tracked              List tracked variables
-/add <name>           Add a variable
-/track <name>         Promote a variable to full tracking
-/lotrack <name>       Use lightweight tracking
-/gputrack <name>      Opt into GPU-resident probing
-/gpuuntrack <name>    Stop GPU-resident probing
-/autofix on|off       Toggle automatic intervention
-/sensitivity          View or change detection sensitivity
-/code                 Toggle training-code context for agent questions
-/cloud                Show cloud and workspace status
-```
-
-PDF snapshots can be enabled for tracked variables and are written in this form:
-
-```text
-Pulse_Output/<variable_name>/step000001.pdf
-```
-
-## AI Analyst
-
-Pulse's agentic workflow is designed to move from observation to an actionable change:
-
-```text
-+-------------+       +-------------+       +-------------+
-|  DESCRIBE   | ----> |   DEVELOP   | ----> |  IMPLEMENT  |
-| Understand  |       | Build the   |       | Apply the   |
-| the problem |       | actual fix  |       | solution    |
-+-------------+       +-------------+       +-------------+
-```
-
-### Describe
-
-The agent reasons over the available code, tensor statistics, scalar histories, heatmaps, and training behavior to identify a likely root cause.
-
-### Develop
-
-It proposes a specific solution grounded in the observed values and the relevant code, rather than returning generic advice.
-
-### Implement
-
-When the user explicitly requests a fix, Pulse can apply a structured code change to the relevant file. Fixes are recorded so recurring failures can be recognized and re-applied, and the process can restart to run the updated code.
-
-Pulse can also inspect imported project files when they are available, which helps diagnose bugs that live outside the entry script.
-
-## Deterministic Math Verification
-
-LLMs can reason about math, but they should not be trusted to perform exact arithmetic unaided. Pulse provides a restricted mathematical evaluator for expressions such as:
-
-- Update magnitudes and ratios
-- Scaling factors and normalization values
-- Gradient relationships
-- Numerical thresholds
-
-The evaluator exposes numeric operations and the Python `math` module while disabling builtins and rejecting general code execution. The agent can delegate a calculation and use the exact result in its diagnosis.
-
-```text
-             AI AGENT
-             /      \
-            /        \
-      Reasoning    Math check
-            \        /
-             \      /
-             Verified result
-```
-
-## Universal Backend Support
-
-PulseML uses a shared backend abstraction so the same monitoring workflow can inspect arrays from different ML ecosystems.
-
-| Backend | Support |
-| --- | --- |
-| NumPy | Yes |
-| PyTorch | Yes |
-| TensorFlow | Yes |
-| CuPy | Yes |
-| JAX | Yes |
-
-Tracked values are converted to host-side NumPy data for inspection and rendering. GPU variables are not synchronized on every training step by default. GPU tracking is opt-in and uses a slower probe cadence because device-to-host reads can affect throughput.
-
-## AI Providers
-
-Cloud providers are accessed through LiteLLM. Configure the provider's environment variable before starting Pulse:
+Common provider environment variables include:
 
 ```text
 ANTHROPIC_API_KEY
@@ -176,86 +65,541 @@ MISTRAL_API_KEY
 OPENROUTER_API_KEY
 ```
 
-Pulse can also use local or self-hosted models, including Ollama and OpenAI-compatible servers such as LM Studio, vLLM, and TGI. Local providers use a model name and local API base instead of a cloud API key.
-
-For unattended runs, provider and runtime settings can be supplied through environment variables or a `pulse_config.json` file beside the training script. See the CLI prompts and `/help` for the available setup options.
-
-## Installation Notes
-
-The base package includes CLI support and the dependencies required for PDF snapshots.
-
-GUI mode requires `tkinter`, which is included with most Python installations. On Debian or Ubuntu:
+For example:
 
 ```bash
-sudo apt install python3-tk
+export GEMINI_API_KEY="your-api-key"
 ```
 
-## Performance Model
+On Windows PowerShell:
 
-Instrumentation should not become the bottleneck. PulseML reduces overhead through:
+```powershell
+$env:GEMINI_API_KEY="your-api-key"
+```
 
-- Selective tracking of monitored variables
-- Lightweight tracking for matrices and tensors by default
-- Separate cadences for full, lightweight, and GPU probes
-- Cached matrix statistics between probes
-- Host-side NumPy conversion only when inspection is needed
-- Thumbnail-sized rendering and reusable plotting paths
+Do not place API keys directly in source code or commit them to a repository.
 
-The objective is simple: **more visibility, less overhead**.
+---
 
-## Examples of Real Debugging Problems
+## Why Pulse
 
-### Vocabulary expansion and unstable training
+Machine-learning failures are often diagnosed from the wrong end of the problem:
 
-A custom language model became unstable after a 2.5x vocabulary increase. Pulse's diagnostics exposed a normalization error: residual growth was divided by `sqrt(num_layers)` instead of `num_layers`. The resulting activation growth eventually destabilized training and halted learning.
+```text
+Train
+  ↓
+Wait
+  ↓
+Training fails
+  ↓
+Read logs
+  ↓
+Guess
+  ↓
+Change code
+  ↓
+Train again
+```
 
-### Custom attention and NaN loss
+Pulse is designed to move the debugging process into the training run itself:
 
-In another run, a custom attention implementation produced a NaN loss. Pulse helped trace the failure to a missing infinity check before a division operation.
+```text
+Train
+  ↓
+Track
+  ↓
+Detect
+  ↓
+Measure
+  ↓
+Verify
+  ↓
+Diagnose
+  ↓
+Patch
+```
 
-## Cloud Workspaces and Privacy
+The useful evidence behind an ML failure may be a gradient change, activation distribution, tensor shape, normalization relationship, parameter update, or the exact point at which a numerical value began to diverge.
 
-Pulse can log debug sessions, agent conversations, tracebacks, telemetry, incidents, team membership, and repository metadata to a shared workspace dashboard. Cloud synchronization is best-effort and does not block training.
+Pulse gives the debugging agent access to that evidence instead of requiring it to reconstruct the run from logs alone.
 
-For sensitive projects, use a local provider and review cloud settings carefully: a local LLM keeps model requests on the machine, but enabled Pulse Cloud synchronization can still upload session logs and tracebacks. Telemetry can be disabled with:
+---
+
+## Benchmark
+
+Pulse was evaluated against Claude Code on a **28-case ML debugging benchmark** designed to test whether an AI coding agent could identify and repair injected ML faults.
+
+### Results
+
+| Agent | Model | Score |
+|---|---|---:|
+| **Pulse** | Gemini 3.5 Flash Lite | **15 / 28** |
+| **Claude Code** | Opus 5 | **18 / 28** |
+
+Pulse achieved **15/28**, compared with **18/28** for Claude Code.
+
+The benchmark was particularly informative because the task was not simply to generate code that ran. The agent needed to identify the injected mutation, determine whether it was actually responsible for the observed behavior, and apply the necessary correction.
+
+### What the benchmark exposed
+
+Pulse's largest weakness was **diagnostic precision**.
+
+In difficult cases, Pulse could recognize that something was wrong but fail to consistently:
+
+1. identify the exact mutation responsible for the failure;
+2. isolate the smallest relevant code region;
+3. distinguish the root cause from surrounding symptoms; or
+4. apply only the necessary fix instead of proposing a broader change.
+
+This matters because ML debugging is different from generic code generation.
+
+A debugger should not rewrite a training system simply because it can. It should be able to identify the specific value, argument, operation, or line responsible for the failure and make the smallest correct change.
+
+### How the benchmark changed Pulse
+
+The benchmark directly motivated upgrades to the debugging pipeline:
+
+- **Expanded `mllint`** with additional deterministic ML-specific checks.
+- **Minimal-fix-first behavior**, prioritizing single-line or small adjacent-line fixes before refactors.
+- **Whitespace-tolerant patch matching**, preventing valid fixes from being rejected because of formatting differences.
+- **Retry-on-mismatch patching**, allowing the agent to re-quote the exact current code when a proposed patch does not match.
+- **Stronger verification**, checking both logical correctness and whether the scope of the patch is unnecessarily broad.
+- **More agentic debugging workflows**, reducing the amount of manual investigation the underlying model has to perform.
+
+The benchmark is not presented as proof that Pulse is already better than general-purpose coding agents. It provides a measurable baseline, exposes a concrete failure mode, and gives Pulse a data-driven direction for improvement.
+
+---
+
+## Key Features
+
+### Live ML Training Monitoring
+
+Track losses, metrics, tensors, gradients, activations, weights, and other numerical values while training is running.
+
+Inspect:
+
+- shapes
+- dtypes
+- devices
+- norms
+- statistics
+- NaN / Inf counts
+- scalar histories
+- gradient information
+- activation information
+
+### CLI / Headless First
+
+Pulse is built for:
+
+- terminals
+- SSH sessions
+- Google Colab
+- containers
+- remote servers
+- long-running training jobs
+- cloud GPU machines
+
+No graphical interface is required.
+
+### CPU-First Tracking
+
+Pulse is intentionally conservative around GPU access.
+
+By default:
+
+```text
+TRACKING_MODE = CPU_DEFAULT
+GPU_TRACKING = OPT-IN
+DEFAULT_GPU_OVERHEAD = 0
+```
+
+If a variable already exists on a GPU, Pulse does not automatically copy it back to the CPU on every iteration.
+
+GPU tracking is explicitly requested:
+
+```text
+/gputrack <variable>
+```
+
+This can introduce device-to-host transfer overhead. That is expected when inspecting GPU-resident data.
+
+The design principle is:
+
+> **If nobody asks Pulse to touch the GPU, Pulse doesn't touch the GPU.**
+
+### Dynamic Variable Tracking
+
+Variables can be added, removed, promoted, or demoted while training is running.
+
+```text
+/vars
+/tracked
+/add <variable>
+/track <variable>
+/lotrack <variable>
+/gputrack <variable>
+/gpuuntrack <variable>
+/delete <variable>
+```
+
+### Deterministic Numerical Verification
+
+Pulse separates AI reasoning from exact numerical calculation.
+
+Instead of asking an AI model to estimate whether a gradient or update is unusually large, Pulse can calculate the relevant quantity directly.
+
+```text
+AI hypothesis
+      ↓
+Numerical calculation
+      ↓
+Exact result
+      ↓
+Evidence-backed diagnosis
+```
+
+This can be used for:
+
+- gradient/update ratios
+- scaling factors
+- normalization calculations
+- parameter changes
+- numerical thresholds
+- restricted mathematical expressions
+
+The AI reasons about what the numbers mean. Pulse provides deterministic measurements for the arithmetic.
+
+### ML Linting
+
+`mllint` provides deterministic, code-level checks for common ML failure patterns before an agent has to reason about them from scratch.
+
+Checks include patterns involving:
+
+- incompatible loss/metric combinations
+- redundant activation/loss combinations
+- `backward()` without the expected optimizer update
+- training/evaluation mode issues
+- suspicious learning-rate configurations
+- other ML-specific static patterns
+
+The goal is not to replace the debugging agent. It is to provide high-confidence evidence and eliminate classes of mistakes that do not require probabilistic reasoning.
+
+### Agentic Debugging
+
+Pulse can combine:
+
+- live training state
+- tensor statistics
+- scalar histories
+- gradients
+- activations
+- tracebacks
+- source code
+- deterministic numerical checks
+- static lint findings
+
+The goal is to move from:
+
+```text
+"What might be wrong?"
+```
+
+toward:
+
+```text
+"Here is the evidence.
+Here is the mutation.
+Here is why it caused the failure.
+Here is the smallest necessary fix."
+```
+
+### Minimal Fixes by Default
+
+Pulse's debugging pipeline is designed to prefer the **smallest correct change**.
+
+The agent should first consider:
+
+1. a single-line change;
+2. a small adjacent-line change;
+3. a larger edit only when the root cause genuinely requires it.
+
+Unrelated cleanup and refactoring should not be bundled into a debugging patch.
+
+This is especially important for ML debugging because broad changes can hide whether the actual fault was correctly identified.
+
+### Automatic Intervention
+
+With:
+
+```text
+/autofix on
+```
+
+Pulse can pause training when configured detection logic identifies serious numerical or training problems, allowing the debugging agent to investigate before additional compute is wasted.
+
+---
+
+## CLI
+
+Useful commands include:
+
+```text
+/help
+
+/vars
+/tracked
+
+/add <variable>
+/track <variable>
+/lotrack <variable>
+
+/gputrack <variable>
+/gpuuntrack <variable>
+
+/delete <variable>
+
+/autofix on|off
+
+/code
+/cloud
+```
+
+Pulse can pause training for investigation, allowing you to inspect the current state, add variables, ask the AI agent questions, and investigate a failure before continuing.
+
+---
+
+## Quickstart
+
+After installation, import `auto_track` immediately before your training loop:
+
+```python
+from pulse import auto_track
+
+if __name__ == "__main__":
+    auto_track()
+
+    # Your training loop
+    for epoch in range(num_epochs):
+        # Training logic here
+        pass
+```
+
+Pulse discovers numeric variables available to the training process and provides them through the CLI.
+
+You can then control tracking while the run is active:
+
+```text
+/vars
+/tracked
+/add <variable>
+/track <variable>
+/lotrack <variable>
+/gputrack <variable>
+/gpuuntrack <variable>
+/delete <variable>
+```
+
+---
+
+## Supported Backends
+
+| Backend | Support |
+|---|---|
+| NumPy | Yes |
+| PyTorch | Yes |
+| TensorFlow | Yes |
+| CuPy | Yes |
+| JAX | Yes |
+
+Pulse uses a shared backend abstraction so the debugging workflow can remain consistent across frameworks.
+
+---
+
+## Past Debugs
+
+Pulse has been used to investigate numerical failures in custom ML systems.
+
+### Residual normalization failure
+
+A custom LLM became unstable after a 2.5× vocabulary increase. Pulse helped identify a normalization issue in which residual growth was divided by `math.sqrt(num_layers)` rather than `num_layers`.
+
+The important part was not simply observing that training became unstable. The debugging process connected the observed activation behavior to the mathematical relationship causing the instability.
+
+### Attention numerical failure
+
+A custom attention implementation produced NaN loss. Pulse traced the failure to a missing infinity check before a division operation.
+
+These cases represent the intended workflow:
+
+**observe the behavior → inspect the evidence → verify the math → identify the actual failure**
+
+---
+
+## Performance
+
+A debugger should not become the training bottleneck.
+
+Pulse is designed around:
+
+- CPU-first inspection
+- opt-in GPU probing
+- selective variable tracking
+- lightweight tracking modes
+- separate probe cadences
+- cached statistics
+- host-side numerical processing where possible
+- minimal intervention in the training loop
+
+The objective is:
+
+```text
+MORE VISIBILITY
+      +
+LESS OVERHEAD
+```
+
+Rather than collecting everything continuously, Pulse lets you decide what information is worth monitoring.
+
+---
+
+## Cloud Workspaces
+
+Pulse can optionally synchronize debugging information through shared workspaces.
+
+Depending on configuration, a workspace can provide shared access to:
+
+- debugging sessions
+- training incidents
+- tracebacks
+- agent conversations
+- repository metadata
+- team membership
+- telemetry
+
+Workspaces can be given custom names and managed from the CLI. Members can leave a workspace, while workspace administrators can delete a workspace.
+
+Cloud synchronization is best-effort and is not intended to block the training loop.
+
+For sensitive projects, review your cloud and telemetry configuration carefully.
+
+Telemetry can be disabled with:
 
 ```text
 PULSE_TELEMETRY=off
 ```
 
-Do not place API keys in source files or commit them to a repository. Pulse stores provider configuration separately from its local account cache and does not store provider API keys in its profile.
+Using a local AI model keeps model requests local, but does not automatically disable separately enabled Pulse workspace synchronization.
+
+---
+
+## AI Providers
+
+Pulse can use supported cloud or local AI providers for its debugging agent.
+
+Common provider environment variables include:
+
+```text
+ANTHROPIC_API_KEY
+OPENAI_API_KEY
+GEMINI_API_KEY
+DEEPSEEK_API_KEY
+MISTRAL_API_KEY
+OPENROUTER_API_KEY
+```
+
+Local and self-hosted models can also be used where supported.
+
+Do not place API keys directly in source code or commit them to a repository.
+
+---
+
+## Why This Matters
+
+The central problem Pulse is trying to solve is not code generation.
+
+Modern coding agents are increasingly capable of writing large amounts of code. ML debugging has a different requirement: **causal precision**.
+
+A useful ML debugger needs to connect three things:
+
+```text
+CODE
+  ↕
+RUNTIME BEHAVIOR
+  ↕
+MATHEMATICS
+```
+
+If an agent only sees code, it can miss what actually happened during training.
+
+If it only sees runtime values, it may not know which source-level mutation produced them.
+
+If it only reasons probabilistically, it can make confident but numerically unsupported claims.
+
+Pulse is designed to put those pieces together.
+
+The benchmark results reinforce why that distinction matters. At the initial 28-case benchmark, Pulse scored 15/28 versus 18/28 for Claude Code with Opus 5. Rather than treating that gap as a dead end, the failures identified a concrete engineering problem: **the system needed to make the agent better at isolating the exact mutation and applying the smallest necessary fix.**
+
+That is the direction of Pulse's development.
+
+---
 
 ## Project Direction
 
-PulseML is being built toward a debugging workflow where observation, AI reasoning, and exact computation reinforce one another:
+Pulse is being built around a debugging stack in which runtime observation, deterministic computation, static ML analysis, and AI reasoning reinforce each other:
 
 ```text
 TRAINING
-   |
-   v
+   ↓
 OBSERVATION
-   |
-   +------------------+
-   |                  |
-   v                  v
-AI REASONING      EXACT MATH
-   |                  |
-   +--------+---------+
-            |
-            v
-        SOLUTION
-            |
-            v
-       DEVELOPMENT
-            |
-            v
-       IMPLEMENTATION
+   ↓
+STATIC ANALYSIS
+   ↓
+NUMERICAL EVIDENCE
+   ↓
+AI REASONING
+   ↓
+VERIFICATION
+   ↓
+MINIMAL PATCH
 ```
 
-The goal is not merely to report that a model is broken. PulseML should help determine why, verify the reasoning, develop the solution, and implement the fix.
+The goal is not simply to report:
+
+```text
+"Your training is broken."
+```
+
+It is to answer:
+
+```text
+What broke?
+
+Why did it break?
+
+When did it start?
+
+Can the numbers prove it?
+
+What exactly changed?
+
+What is the smallest correct fix?
+
+Can that fix be verified?
+```
+
+---
+
+## Links
+
+- [Dashboard](https://pulsedashb.netlify.app/)
+- [GitHub](https://github.com/codeyash09/PulseML)
+- [PyPI](https://pypi.org/project/pulseml/)
+
+---
 
 ## License
 
-Proprietary. See [LICENSE](/pulse-pkg/LICENSE).
+Proprietary. See `LICENSE`.
 
 Use of this software is governed by the terms in that file. Copying, redistribution, and reverse engineering are not permitted.
