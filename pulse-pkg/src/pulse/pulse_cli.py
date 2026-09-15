@@ -8,18 +8,27 @@ from __future__ import annotations
 import os
 import re
 import sys
+import io
+import ast
+import copy
 import json
 import time
 import math
+import uuid
 import shutil
 import signal
 import getpass
 import hashlib
 import difflib
+import inspect
+import importlib
+import traceback
 import itertools
 import subprocess
 import threading
+import tempfile
 import atexit
+import numpy as np
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +37,8 @@ from pulse.pulse_backend import (
     describe_tensor,
     detect_backend,
     is_trackable,
+    shape_of,
+    tensor_kind,
     statistics,
     to_numpy,
 )
@@ -35,24 +46,189 @@ from pulse.pulse_pdf import generate_heatmap_pdf
 from pulse import pulse_supabase as cloud
 try:
     import litellm
-    # Quiets litellm's own verbose provider-debug logging (request/response
-    # dumps) that would otherwise interleave with Pulse's own output on
-    # every single agent call -- this is a CLI tool, not a debug console
-    # for litellm itself. PULSE_LITELLM_DEBUG=1 re-enables it.
-    if os.environ.get("PULSE_LITELLM_DEBUG", "").strip() not in ("1", "true", "yes"):
+    # Quiets litellm's own verbose provider-runtime logging unless explicitly enabled.
+    if os.environ.get("PULSE_LITELLM_DEBUG", "").strip().lower() not in ("1", "true", "yes"):
         litellm.suppress_debug_info = True
 except ImportError:
-    # A fresh `pip install` of Pulse without its one non-stdlib runtime
-    # dependency is the single most likely first-run failure a brand new
-    # user hits -- and a bare ModuleNotFoundError traceback here, before
-    # any of Pulse's own error handling exists yet to catch it, is a bad
-    # first impression. Fail with one clear, actionable line instead.
     print(
         "\n[Pulse] Missing dependency: litellm (used to talk to AI providers).\n"
         "         Install it with:  pip install litellm\n",
         file=sys.stderr,
     )
     sys.exit(1)
+
+
+
+
+# ---------------------------------------------------------------------------
+# TEMPORARY DEBUG INSTRUMENTATION
+# Enable with PULSE_LOGGING=1 (default ON in this logging build).
+# Writes a low-volume trace to ./pulse.log without dumping tensor data.
+# ---------------------------------------------------------------------------
+_PULSE_LOGGING = os.environ.get("PULSE_LOGGING", "1").strip().lower() not in ("0", "off", "false", "no")
+_PULSE_LOG_FILE = os.path.abspath(os.environ.get("PULSE_LOG_FILE", "pulse.log"))
+try:
+    import tensorflow as tf
+except Exception:
+    tf = None
+
+if tf is not None:
+    class PulseKerasTracker(tf.keras.callbacks.Callback):
+        """
+        Internal Pulse -> Keras bridge.
+
+        Users do not need to add this callback themselves.
+        Pulse injects it automatically into Model.fit().
+        """
+
+        def __init__(self, pulse_instance):
+            super().__init__()
+            self.pulse = pulse_instance
+
+        def on_train_begin(self, logs=None):
+            if not hasattr(self.pulse, "epoch_scalar_histories"):
+                self.pulse.epoch_scalar_histories = {}
+
+            if not hasattr(self.pulse, "batch_scalar_histories"):
+                self.pulse.batch_scalar_histories = {}
+
+        def on_train_batch_end(self, batch, logs=None):
+            # Keep batch handling extremely cheap.
+            try:
+                self.pulse._record_keras_batch_logs(logs)
+            except Exception as exc:
+                if _PULSE_LOGGING:
+                    try:
+                        _pulse_log(
+                            "KERAS BATCH LOG ERROR "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    except Exception:
+                        pass
+
+        def on_epoch_end(self, epoch, logs=None):
+            try:
+                self.pulse._record_keras_logs(
+                    logs,
+                    epoch=epoch,
+                )
+            except Exception as exc:
+                if _PULSE_LOGGING:
+                    try:
+                        _pulse_log(
+                            "KERAS EPOCH LOG ERROR "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    except Exception:
+                        pass
+                return
+
+            # The epoch boundary is the correct point to run diagnosis.
+            # We do NOT run the expensive detector on every batch.
+            try:
+                if getattr(self.pulse, "auto_intervene", False):
+                    self.pulse.update()
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                if _PULSE_LOGGING:
+                    try:
+                        _pulse_log(
+                            "KERAS EPOCH UPDATE ERROR "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    except Exception:
+                        pass
+
+            if _PULSE_LOGGING:
+                try:
+                    histories = getattr(
+                        self.pulse,
+                        "epoch_scalar_histories",
+                        {},
+                    )
+
+                    summary = {
+                        k: v[-1]
+                        for k, v in histories.items()
+                        if v
+                    }
+
+                    _pulse_log(
+                        "KERAS TRACKER "
+                        f"epoch={epoch} "
+                        f"metrics={summary!r}"
+                    )
+                except Exception:
+                    pass
+
+        def on_train_end(self, logs=None):
+            if _PULSE_LOGGING:
+                try:
+                    histories = getattr(
+                        self.pulse,
+                        "epoch_scalar_histories",
+                        {},
+                    )
+
+                    summary = {
+                        k: len(v)
+                        for k, v in histories.items()
+                    }
+
+                    _pulse_log(
+                        "KERAS TRAIN END "
+                        f"histories={summary!r}"
+                    )
+                except Exception:
+                    pass
+_PULSE_KERAS_HOOK_INSTALLED = False
+_PULSE_ACTIVE_INSTANCE = None
+
+
+def _install_keras_pulse_hook(pulse_instance):
+    global _PULSE_KERAS_HOOK_INSTALLED
+    global _PULSE_ACTIVE_INSTANCE
+
+    _PULSE_ACTIVE_INSTANCE = pulse_instance
+
+    if _PULSE_KERAS_HOOK_INSTALLED:
+        return
+
+    import tensorflow as tf
+
+    original_fit = tf.keras.Model.fit
+
+    def pulse_fit(self, *args, **kwargs):
+        callbacks = kwargs.get("callbacks")
+
+        if callbacks is None:
+            callbacks = []
+        else:
+            callbacks = list(callbacks)
+
+        callbacks.append(
+            PulseKerasTracker(_PULSE_ACTIVE_INSTANCE)
+        )
+
+        kwargs["callbacks"] = callbacks
+
+        return original_fit(self, *args, **kwargs)
+
+    tf.keras.Model.fit = pulse_fit
+    _PULSE_KERAS_HOOK_INSTALLED = True
+
+    _pulse_log("KERAS FIT HOOK installed")
+def _pulse_log(message: str, *, console: bool = False) -> None:
+    if not _PULSE_LOGGING:
+        return
+    line = f"[{time.strftime('%H:%M:%S')}] {message}"
+    try:
+        with open(_PULSE_LOG_FILE, "a", encoding="utf-8") as _f:
+            _f.write(line + "\n")
+    except Exception:
+        pass
+    
 
 import builtins
 
@@ -80,6 +256,8 @@ def safe_input(prompt=""):
 # Global overrides
 builtins.print = safe_print
 builtins.input = safe_input
+
+
 # Name-based heuristic for pre-flagging the loss/metric scalar -- same list
 # and same purpose as pulse.py's LOSS_NAME_HINTS/_looks_like_loss, kept as a
 # local copy so this module has no dependency on pulse.py (which pulls in
@@ -146,10 +324,28 @@ def _pulse_cpu_mirror_candidates(name: str):
 
 LOSS_NAME_HINTS = ("loss", "cost", "nll", "cross_entropy", "crossentropy", "objective", "err")
 
+METRIC_NAME_HINTS = (
+    "acc", "accuracy", "precision", "recall", "f1", "auc", "iou", "dice",
+    "score", "bleu", "rouge", "map", "psnr", "ssim",
+)
+
 
 def _looks_like_loss(name: str) -> bool:
     n = (name or "").lower()
     return any(hint in n for hint in LOSS_NAME_HINTS)
+
+
+def _looks_like_metric(name: str) -> bool:
+    """Accuracy/precision/recall/F1/AUC/etc-style variables -- distinct
+    from loss-like ones (see LOSS_NAME_HINTS) because a metric is
+    normally expected to trend UP, not down, but the same "hasn't moved
+    in a long time" stagnation shape is just as worth flagging either
+    way: an accuracy stuck dead flat for hundreds of steps is at least as
+    strong a signal as a loss that's stopped improving, and previously
+    had NO automatic check at all since _check_for_trouble only ever
+    looked at loss-like names."""
+    n = (name or "").lower()
+    return any(hint in n for hint in METRIC_NAME_HINTS)
 
 
 def _enable_windows_ansi() -> None:
@@ -178,6 +374,7 @@ _enable_windows_ansi()
 _COLOR_ENABLED = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 _ORANGE = "\033[38;5;208m"
 _RED = "\033[91m"
+_GREEN = "\033[92m"
 _BLUE = "\033[94m"
 _RESET = "\033[0m"
 _YELLOW = "\033[93m"
@@ -368,8 +565,91 @@ SYSTEM_PROMPT = (
     "random-policy baseline), send it here so Pulse can catch a real explosion from step one "
     "instead of waiting for history to accumulate. Only estimate what you can actually justify "
     "from the code -- omit a variable (or send 'none') rather than guess.\n"
-    "  Put CALC:/PROMOTE:/GPUTRACK:/GPUUNTRACK:/SENSITIVITY:/NORMAL_START: lines anywhere in your Reasoning, not in the "
-    "Diagnosis or Fix.\n\n"
+    "  GREP: <pattern>\n"
+    "    You don't need to ask for a whole file to check one detail. Search every tracked project "
+    "file for a pattern (a plain word/phrase, or a regex) and get back each match with a line of "
+    "context on either side -- e.g. 'GREP: learning_rate' or 'GREP: def forward'. Use this to "
+    "locate where something is defined/used before deciding whether you need the full surrounding "
+    "block via VIEW. Capped to a modest number of matches; narrow the pattern if it's truncated.\n"
+    "  VIEW: <file>:<start>-<end>\n"
+    "    Pull an exact line range from a specific file (the file label is whatever header you were "
+    "shown, e.g. 'model.py'; omit '<file>:' to default to the main script), e.g. 'VIEW: "
+    "model.py:40-75' or 'VIEW: 120-160'. Use this after a GREP hit (or a line number from a "
+    "traceback/diagnosis) to see the exact surrounding code before proposing a fix, instead of "
+    "relying on a possibly-stale full-file dump from earlier in the conversation. Capped to a few "
+    "hundred lines per call -- issue more than one VIEW if you need a wider span.\n"
+    "  Put CALC:/PROMOTE:/GPUTRACK:/GPUUNTRACK:/SENSITIVITY:/NORMAL_START:/GREP:/VIEW: lines "
+    "anywhere in your Reasoning, not in the Diagnosis or Fix. GREP/VIEW results come back as a new "
+    "message before your next turn -- if what you get back changes your diagnosis, say so.\n\n"
+
+    "MORE TOOLS -- the same idea taken further: anything Pulse can just compute or look up for you "
+    "beats you reasoning your way to a guess. Use these the same way as above (own line, anywhere in "
+    "Reasoning); each returns a result as a new message before your next turn.\n"
+    "  Execution (the single biggest lever -- no amount of reasoning substitutes for actually running "
+    "code; these run against the current tracked-variable snapshot in the live process):\n"
+    "    REPL: <expr> -- evaluate an expression against the LIVE tracked variables right now, "
+    "instead of reasoning from a context dump that may already be stale.\n"
+    "    DRYRUN: <function_or_method_call> -- actually execute a specific call (e.g. "
+    "'DRYRUN: model.forward(x)') and get back the real output, exception, and traceback. Turns 'I "
+    "think this will raise a shape error' into an actual answer.\n"
+    "    SHAPETRACE: [optional model variable name] -- run one real forward pass with a live tracked "
+    "tensor and dump every submodule's input/output shape. PyTorch only.\n"
+    "    GRADCHECK: <param_name> -- numerical finite-difference gradient check on a tracked "
+    "parameter, deterministic pass/fail against its real .grad. Needs a zero-arg `loss_fn` callable "
+    "among tracked variables that recomputes the current loss -- if none exists, Pulse will say so.\n"
+    "    REPLAY: <n_steps> -- replay the last n_steps from an isolated checkpoint (with a zero-arg "
+    "`train_step` callable you define) and report the resulting loss curve, then restore live state.\n"
+    "  Code intelligence beyond GREP/VIEW (structure, not text search):\n"
+    "    DEFOF: <symbol> -- AST-based jump-to-definition across every tracked file.\n"
+    "    CALLERS: <symbol> -- every call site of a function/class.\n"
+    "    DEPGRAPH: -- the import graph between tracked local files.\n"
+    "  Statistics over a variable's whole recorded history (scalars only), not eyeballing a chart:\n"
+    "    CORR: <var1> <var2> -- real correlation coefficient between two histories.\n"
+    "    OUTLIER: <var> -- deterministic z-score anomaly detection, flags exact points.\n"
+    "    DIFFSTATS: <var> <index_a> <index_b> -- exact delta between two recorded points.\n"
+    "    HISTOGRAM: <var> -- actual bucketed distribution counts.\n"
+    "  Grounding (lookup beats memorized/stale recall):\n"
+    "    DOCLOOKUP: <library>.<symbol> -- real signature/docstring for an installed library function.\n"
+    "    CHANGELOG: -- diff of what's actually changed in tracked files since the last checkpoint.\n"
+    "    PASTFIX: <symbol_or_region> -- search prior fixes for the same area, both this project's own "
+    "local log AND (when team history is loaded) every fix any teammate has applied on this repo/team.\n"
+    "  Multi-GPU:\n"
+    "    GPUSTATUS: -- real per-device memory/utilization for every visible GPU. If this run is one "
+    "rank of a multi-process, one-rank-per-GPU launch (torchrun/etc.), this aggregates every rank's "
+    "GPU status instead of just this one (other ranks run headless, so this chat is always rank 0).\n"
+    "  Safety net:\n"
+    "    ROLLBACK: <commit_id, or 'last'> -- deterministically revert the workspace to a prior state "
+    "via Pulse's own persistent change log (see /log), instead of trying to manually reconstruct old "
+    "code from memory. Note: if a fix you just applied causes repeated restart failures, Pulse already "
+    "rolls back to the pre-fix state automatically -- you don't need to invoke this for that case, only "
+    "for a deliberate revert mid-conversation.\n"
+    "  ML health/anti-patterns (heuristic -- worth double-checking, not guaranteed):\n"
+    "    MLLINT: -- a handful of AST-detectable ML anti-patterns: metric/loss mismatches in either "
+    "direction (e.g. 'accuracy' against a regression loss, or 'mae' against a classification loss), "
+    "double-softmax/double-sigmoid into a loss that already applies one, plain Softmax feeding NLLLoss "
+    "(which expects log-probabilities), missing zero_grad(), backward()+zero_grad() with no optimizer "
+    "step() ever taken, suspiciously high literal learning rates, eval-looking functions missing "
+    "no_grad()/.eval(). This already runs automatically once at the very start of every run (see "
+    "'Start-of-run ML anti-pattern check') and auto-triggers a diagnosis if it finds something -- "
+    "calling it again yourself is for re-checking after a fix.\n"
+    "    LAYERSTATS: [optional model var] -- per-layer gradient-norm/weight-norm ratio for a tracked "
+    "torch model, right after backward(). Flags likely dead (near-zero ratio) or exploding (large "
+    "ratio) layers individually, instead of only seeing an aggregate gradient norm.\n"
+    "    HARDEXAMPLES: [optional N, default 10] -- per-example loss for the current batch, surfacing "
+    "the highest-loss samples. Needs a zero-arg `per_example_losses_fn` callable among tracked "
+    "variables (a reduction='none' loss call). Often the fastest way to spot label noise.\n"
+    "    AMPSTATUS: [optional GradScaler var] -- current mixed-precision scale factor/skip state, for "
+    "spotting fp16 numerical instability.\n"
+    "  Reliability/reproducibility:\n"
+    "    SEEDCHECK: -- RNG fingerprint (Python/NumPy/PyTorch) vs the last recorded fingerprint for this "
+    "project. A mismatch isn't automatically wrong (more steps, an intentional reseed, a new shuffle "
+    "order all cause it too) but worth confirming when two runs were meant to be identical.\n"
+    "    RANKDIVERGE: <var> -- under a multi-rank launch, compares this rank's latest value of a "
+    "tracked scalar against every other rank's. A rank whose value has drifted from the rest signals "
+    "something rank-specific gone wrong (unsynced BatchNorm, a corrupted shard, stale weights).\n"
+    "    RUNCOMPARE: -- this run's current scalar values vs the most recent previous run recorded for "
+    "this project, so a regression against last time is visible without anyone remembering the numbers.\n"
+    "    COST: -- running token/cost usage for this chat session's agent calls so far.\n\n"
     "PERIODIC GPU CHECK-IN:\n"
     "Every 15 minutes after Pulse starts, if you have an AI provider configured, Pulse will send "
     "you an automated check-in message asking whether you still want any variables GPU-tracked. "
@@ -380,7 +660,17 @@ SYSTEM_PROMPT = (
     "CODE FIXES:\n"
     "If, and only if, the user explicitly asks you to fix, edit, patch, or change the code "
     "(not just diagnose it), respond with ONLY a single JSON object and nothing else -- no prose "
-    "before or after it, no markdown code fences. The JSON object must have exactly these fields:\n"
+    "before or after it, no markdown code fences.\n"
+    "PREFER THE SMALLEST FIX THAT ADDRESSES THE ROOT CAUSE: a single changed line, a changed argument, "
+    "a swapped function call, or a few adjacent lines is almost always the right size for a bug fix. "
+    "Do not rewrite a function, restructure a class, reformat unrelated code, or 'clean up' anything "
+    "you weren't asked to touch, even if you notice something else that could be improved -- mention "
+    "that separately in explanation/PASS 5 instead of folding it into this fix. Prefer one small old/"
+    "new pair over one large one; only use several old/new pairs, or a large replacement block, when "
+    "the root cause genuinely cannot be fixed with a smaller change (e.g. a bug that requires touching "
+    "several call sites, or a block where the broken logic is inherently multi-line and can't be "
+    "isolated to less). When in doubt, fix less, not more.\n"
+    "The JSON object must have exactly these fields:\n"
     "  old: a list of code snippets to find, each copied EXACTLY from the line-numbered code "
     "shown to you, including original indentation and whitespace, but WITHOUT the line-number "
     "prefix ('  12 | ') itself.\n"
@@ -391,7 +681,9 @@ SYSTEM_PROMPT = (
     "  explanation: a short, concise text description of what changed and why.\n"
     "Rules for old/new:\n"
     "  - Each snippet in old must appear VERBATIM and exactly ONCE in its target file. Include "
-    "enough surrounding lines (not just the single changed line) so the match is unambiguous.\n"
+    "enough surrounding lines (not just the single changed line) so the match is unambiguous -- but "
+    "no more than that; a snippet padded with unrelated unchanged lines just to 'be safe' is still a "
+    "larger fix than necessary and makes the change harder to review.\n"
     "  - Each new[i] is the complete replacement block for old[i] -- to add a line, copy old[i] and "
     "append the new line(s) to it; to remove a line, copy old[i] and omit it.\n"
     "  - Never use placeholders like '...' or '# unchanged' inside old or new; both must be literal, "
@@ -485,6 +777,11 @@ PROVIDERS = {
         "model_hint": "the model name your local server is serving it as",
         "litellm_prefix": "openai",
     },
+    # Sentinel entry: picking this prompts for a raw litellm model string
+    # (e.g. "openai/gpt-6-astra") plus an optional env var for its key,
+    # then dynamically registers a real PROVIDERS entry for it -- see
+    # _select_agent_provider_and_key's "custom" branch.
+    "Custom (enter provider/model manually)": {"custom": True},
 }
 
 
@@ -563,8 +860,10 @@ class _Spinner:
 _PASS1_LOCATE = (
     "PASS 1 -- LOCATE: Read through everything you were given (stats, code, history) and identify "
     "the specific region(s) where the problem likely originates -- file/line numbers, variable "
-    "names, or code sections. Respond with ONLY a short bullet list of the suspect location(s). "
-    "No diagnosis, no fix yet."
+    "names, or code sections. Aim for the smallest region that could plausibly contain the root "
+    "cause (often a single line or a few adjacent lines), not a whole function or file, unless the "
+    "evidence genuinely doesn't narrow further than that. Respond with ONLY a short bullet list of "
+    "the suspect location(s). No diagnosis, no fix yet."
 )
 _PASS2_ANALYZE_TMPL = (
     "Suspect region(s) from your first read:\n{regions}\n\n"
@@ -575,24 +874,30 @@ _PASS2_ANALYZE_TMPL = (
 )
 _PASS3_FIX_TEXT = (
     "PASS 3 -- DEVELOP: Give the Fix: a concrete, concise change (not generic advice), in 1-3 "
-    "sentences."
+    "sentences. Describe the smallest change that fixes the root cause -- a changed value, argument, "
+    "or line -- not a broader rewrite."
 )
 _PASS3_IMPLEMENT = (
-    "PASS 3 -- DEVELOP & IMPLEMENT: The user wants this fix applied to their code. Respond with "
-    "ONLY the code-fix JSON object described in your instructions (old/new/explanation) -- no "
-    "prose, no markdown fences."
+    "PASS 3 -- DEVELOP & IMPLEMENT: The user wants this fix applied to their code. Default to the "
+    "smallest possible change -- a single line or a few adjacent lines -- and only widen the edit if "
+    "the root cause genuinely can't be fixed that narrowly. Do not refactor, restructure, or rewrite "
+    "code beyond what's needed to fix the diagnosed root cause. Respond with ONLY the code-fix JSON "
+    "object described in your instructions (old/new/explanation) -- no prose, no markdown fences."
 )
 _PASS4_VERIFY_TMPL = (
     "The fix you are about to apply:\n{fix_desc}\n\n"
     "PASS 4 -- VERIFY: Carefully check the math/logic of this fix against the numbers and code you "
-    'were given. Respond with ONLY a JSON object of the form {{"passes": true or false, "reason": '
-    '"one sentence"}}. passes=true only if the fix is logically/numerically correct and actually '
-    "addresses the diagnosed root cause."
+    'were given. Also check its SCOPE: does it change only what\'s needed to fix the diagnosed root '
+    "cause, or does it also rewrite/restructure/reformat code that didn't need to change? Respond "
+    'with ONLY a JSON object of the form {{"passes": true or false, "reason": "one sentence"}}. '
+    "passes=true only if the fix is logically/numerically correct, actually addresses the diagnosed "
+    "root cause, AND is no larger than necessary to do so."
 )
 _PASS4_REVISE_TMPL = (
     "Your proposed fix did not pass verification: {reason}\n\n"
-    "Revise it. Respond with ONLY the corrected code-fix JSON object (old/new/explanation) -- no "
-    "prose, no markdown fences."
+    "Revise it -- if the issue was scope (too large a change), narrow it down to the smallest edit "
+    "that still fixes the root cause. Respond with ONLY the corrected code-fix JSON object (old/new/"
+    "explanation) -- no prose, no markdown fences."
 )
 _PASS5_SWEEP = (
     "PASS 5 -- FULL RE-READ: Re-read the ENTIRE code/context again -- not just the region you just "
@@ -603,8 +908,568 @@ _PASS5_SWEEP = (
 _IMPLEMENT_KEYWORDS = ("fix", "edit", "patch", "change the code", "apply", "implement")
 _MAX_VERIFY_ATTEMPTS = 3
 
+_COMMENT_EXT_MAP = {
+    ".js": "//", ".ts": "//", ".jsx": "//", ".tsx": "//", ".java": "//",
+    ".c": "//", ".cpp": "//", ".h": "//", ".hpp": "//", ".cs": "//",
+    ".go": "//", ".rs": "//", ".swift": "//", ".kt": "//",
+}
+
+
+def _comment_char_for(path: str) -> str:
+    return _COMMENT_EXT_MAP.get(os.path.splitext(path)[1].lower(), "#")
+
+
+def _normalize_ws_for_match(s: str) -> str:
+    """Collapse each line's leading/trailing whitespace and drop blank
+    lines -- see the matching, more heavily-commented copy in pulse.py.
+    A lenient equality check used only to LOCATE a snippet that doesn't
+    match verbatim, never to decide what gets written."""
+    lines = [ln.strip() for ln in s.splitlines()]
+    return "\n".join(ln for ln in lines if ln)
+
+
+def _find_fuzzy_snippet_span(content: str, old: str):
+    """Whitespace-tolerant fallback snippet locator -- see the matching
+    copy in pulse.py. Returns (start, end) char offsets of the single
+    unambiguous match, or None."""
+    target = _normalize_ws_for_match(old)
+    if not target:
+        return None
+
+    content_lines = content.splitlines(keepends=True)
+    meaningful = [(i, ln.strip()) for i, ln in enumerate(content_lines) if ln.strip()]
+    target_lines = target.split("\n")
+    n = len(target_lines)
+    if n == 0 or len(meaningful) < n:
+        return None
+
+    matches = []
+    for start in range(len(meaningful) - n + 1):
+        window = [meaningful[start + k][1] for k in range(n)]
+        if window == target_lines:
+            first_line_idx = meaningful[start][0]
+            last_line_idx = meaningful[start + n - 1][0]
+            matches.append((first_line_idx, last_line_idx))
+
+    if len(matches) != 1:
+        return None
+
+    first_line_idx, last_line_idx = matches[0]
+    start_offset = sum(len(l) for l in content_lines[:first_line_idx])
+    end_offset = sum(len(l) for l in content_lines[:last_line_idx + 1])
+    return start_offset, end_offset
+
+
+def _banner_wrap_fix(old: str, new: str, path: str) -> str:
+    """Wrap a code-fix replacement so the OLD code stays visible, commented
+    out, directly above the NEW (live) code -- instead of silently
+    swapping one for the other with no trace in the file itself. Written
+    directly into the file content saved to disk, so it shows up the next
+    time the file is opened, not just in Pulse's own console output.
+    """
+    c = _comment_char_for(path)
+    old_commented = "\n".join(f"{c} {line}" if line.strip() else c for line in old.splitlines())
+    return f"{c} =====Pulse Change====\n{c} Old\n{old_commented}\n{c} New\n{new}"
+
+
+def _format_exc_short(exc_text: str, max_lines: int = 25) -> str:
+    """Trim a traceback.format_exc() string to the exception-chain header
+    plus the tail (the actual raising frame + message) -- almost always
+    what matters, and a full traceback of a deep training loop can be
+    huge."""
+    lines = (exc_text or "").strip().splitlines()
+    if len(lines) > max_lines:
+        lines = lines[:3] + ["    ... (truncated) ..."] + lines[-max_lines:]
+    return "\n".join(lines)
+
+
+def _describe_exec_value(value: Any) -> str:
+    desc = repr(value)
+    if len(desc) > 800:
+        desc = desc[:800] + "... (truncated)"
+    extra = ""
+    try:
+        if is_trackable(value):
+            extra = f"  shape={shape_of(value)} kind={tensor_kind(value)}"
+    except Exception:
+        pass
+    return f"{desc}{extra}"
+
+
+# ----------------------------------------------------------------------
+# Multi-GPU status (see the matching, more heavily-commented copy in
+# pulse.py -- the actual per-rank status FILES are written by that
+# module's auto_track()/_rank_status_ticker regardless of whether this
+# process ends up running in GUI or CLI mode; PulseCLI here only needs to
+# read them back for the GPUSTATUS directive).
+# ----------------------------------------------------------------------
+def _gpu_status_snapshot() -> List[Dict[str, Any]]:
+    devices: Dict[int, Dict[str, Any]] = {}
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0:
+            for line in out.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) != 5:
+                    continue
+                idx, name, mem_total, mem_used, util = parts
+                try:
+                    devices[int(idx)] = {
+                        "index": int(idx), "name": name,
+                        "mem_total_mb": float(mem_total), "mem_used_mb": float(mem_used),
+                        "util_pct": float(util),
+                    }
+                except ValueError:
+                    continue
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                entry = devices.setdefault(i, {"index": i, "name": torch.cuda.get_device_name(i)})
+                try:
+                    entry["this_process_alloc_mb"] = torch.cuda.memory_allocated(i) / (1024 ** 2)
+                    entry["this_process_reserved_mb"] = torch.cuda.memory_reserved(i) / (1024 ** 2)
+                    if "mem_total_mb" not in entry:
+                        entry["mem_total_mb"] = torch.cuda.get_device_properties(i).total_memory / (1024 ** 2)
+                except Exception:
+                    continue
+    except ImportError:
+        pass
+    return [devices[i] for i in sorted(devices)]
+
+
+def _format_gpu_status(devices: List[Dict[str, Any]], label: Optional[str] = None) -> str:
+    suffix = f" ({label})" if label else ""
+    if not devices:
+        return f"GPUSTATUS{suffix}: no CUDA devices detected (no nvidia-smi on PATH and/or torch.cuda unavailable)."
+    lines = []
+    for d in devices:
+        parts = [f"cuda:{d['index']}"]
+        if d.get("name"):
+            parts.append(d["name"])
+        if "mem_used_mb" in d and "mem_total_mb" in d:
+            parts.append(f"{d['mem_used_mb']:.0f}/{d['mem_total_mb']:.0f} MB")
+        elif "mem_total_mb" in d:
+            parts.append(f"{d['mem_total_mb']:.0f} MB total")
+        if "util_pct" in d:
+            parts.append(f"{d['util_pct']:.0f}% util")
+        if "this_process_alloc_mb" in d:
+            parts.append(f"this process: {d['this_process_alloc_mb']:.0f} MB allocated")
+        lines.append("  " + ", ".join(parts))
+    return f"GPUSTATUS{suffix}: {len(devices)} device(s)\n" + "\n".join(lines)
+
+
+def _rank_status_dir(session_key: str) -> str:
+    d = os.path.join(tempfile.gettempdir(), "pulse_cache", "ranks", session_key)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _write_rank_status(session_key: str, rank: int, local_rank: int, world_size: int, extra: Optional[Dict[str, Any]] = None) -> None:
+    """Enrich this rank's status file (already being written by pulse.py's
+    auto_track()/_rank_status_ticker, which runs regardless of GUI/CLI
+    mode) with CLI-only data -- currently, this rank's latest tracked
+    scalar values, for RANKDIVERGE. Merges rather than overwrites the GPU
+    fields that ticker already wrote, so both writers' data survives."""
+    path = os.path.join(_rank_status_dir(session_key), f"rank_{rank}.json")
+    existing: Dict[str, Any] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        pass
+    try:
+        import socket
+        hostname = socket.gethostname()
+    except Exception:
+        hostname = existing.get("hostname", "unknown-host")
+    payload = dict(existing)
+    payload.update({
+        "rank": rank, "local_rank": local_rank, "world_size": world_size,
+        "pid": os.getpid(), "hostname": hostname, "updated": time.time(),
+    })
+    if extra:
+        payload.update(extra)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except OSError:
+        pass
+
+
+def _read_all_rank_status(session_key: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    try:
+        names = os.listdir(_rank_status_dir(session_key))
+    except OSError:
+        return out
+    for name in sorted(names):
+        if not (name.startswith("rank_") and name.endswith(".json")):
+            continue
+        try:
+            with open(os.path.join(_rank_status_dir(session_key), name), "r", encoding="utf-8") as f:
+                out.append(json.load(f))
+        except (OSError, json.JSONDecodeError):
+            continue
+    out.sort(key=lambda p: p.get("rank", 0))
+    return out
+
+
+def _format_multi_rank_gpu_status(session_key: str, this_rank: int) -> str:
+    statuses = _read_all_rank_status(session_key)
+    if not statuses:
+        return f"GPUSTATUS (rank {this_rank}, distributed): no rank status files found yet -- other ranks may not have started reporting."
+    now = time.time()
+    lines = []
+    for s in statuses:
+        age = now - s.get("updated", 0)
+        staleness = "" if age < 15 else f"  [STALE, last update {age:.0f}s ago]"
+        tag = f"rank {s.get('rank')}" + (" (this process)" if s.get("rank") == this_rank else "")
+        lines.append(f"{tag} on {s.get('hostname', '?')} (pid {s.get('pid', '?')}){staleness}:")
+        devices = s.get("gpus") or []
+        if not devices:
+            lines.append("    no GPU status reported")
+        else:
+            for d in devices:
+                parts = [f"cuda:{d.get('index')}"]
+                if d.get("name"):
+                    parts.append(d["name"])
+                if "mem_used_mb" in d and "mem_total_mb" in d:
+                    parts.append(f"{d['mem_used_mb']:.0f}/{d['mem_total_mb']:.0f} MB")
+                if "util_pct" in d:
+                    parts.append(f"{d['util_pct']:.0f}% util")
+                if "this_process_alloc_mb" in d:
+                    parts.append(f"this process: {d['this_process_alloc_mb']:.0f} MB allocated")
+                lines.append("    " + ", ".join(parts))
+        if s.get("error"):
+            lines.append(f"    \u26a0 this rank crashed: {_format_exc_short(s['error'], max_lines=6)}")
+    world_size = statuses[0].get("world_size") if statuses else "?"
+    return f"GPUSTATUS: {len(statuses)}/{world_size} rank(s) reporting\n" + "\n".join(lines)
+
+
+def _run_history_path(script_path: Optional[str]) -> str:
+    base = os.path.dirname(script_path) if script_path else "."
+    return os.path.join(base, ".pulse_run_history.json")
+
+
+def _load_run_history(script_path: Optional[str]) -> List[Dict[str, Any]]:
+    try:
+        with open(_run_history_path(script_path), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _seed_fingerprint() -> Dict[str, Any]:
+    """Best-effort, deterministic fingerprint of every RNG this process
+    can introspect. NumPy/stdlib `random` don't expose the ORIGINAL seed
+    once reseeded, only their large internal generator state -- still
+    useful as a "did anything about RNG state change" fingerprint even
+    though it's not a human-readable seed number. PyTorch's
+    initial_seed() IS the real recoverable seed value, when available."""
+    info: Dict[str, Any] = {}
+    try:
+        import random as _random
+        info["python_random_state_hash"] = hashlib.sha256(repr(_random.getstate()).encode()).hexdigest()[:16]
+    except Exception:
+        pass
+    try:
+        state = np.random.get_state()
+        info["numpy_state_hash"] = hashlib.sha256(repr(state).encode()).hexdigest()[:16]
+    except Exception:
+        pass
+    try:
+        import torch
+        info["torch_initial_seed"] = torch.initial_seed()
+        if torch.cuda.is_available():
+            info["torch_cuda_initial_seed"] = torch.cuda.initial_seed()
+    except Exception:
+        pass
+    info["PYTHONHASHSEED"] = os.environ.get("PYTHONHASHSEED")
+    return info
+
+
+def _seed_history_path(script_path: Optional[str]) -> str:
+    base = os.path.dirname(script_path) if script_path else "."
+    return os.path.join(base, ".pulse_seed_history.json")
+
+
+# ----------------------------------------------------------------------
+# ML anti-pattern static checks (MLLINT) -- see the matching, more
+# heavily-commented copy in pulse.py. Deliberately a small, high-
+# confidence set of AST-detectable patterns worded as things "worth
+# double-checking," not certainties.
+# ----------------------------------------------------------------------
+_MLLINT_REGRESSION_LOSSES = {
+    "mse", "mae", "mean_squared_error", "mean_absolute_error", "msle",
+    "mean_squared_logarithmic_error", "huber", "huber_loss", "logcosh",
+}
+_MLLINT_ACCURACY_METRICS = {
+    "accuracy", "acc", "categorical_accuracy", "binary_accuracy",
+    "sparse_categorical_accuracy", "top_k_categorical_accuracy",
+}
+_MLLINT_OPTIMIZER_NAMES = {"Adam", "SGD", "RMSprop", "Adagrad", "AdamW", "Adadelta", "NAdam", "RAdam"}
+_MLLINT_CLASSIFICATION_LOSSES = {
+    "categorical_crossentropy", "sparse_categorical_crossentropy",
+    "binary_crossentropy", "crossentropy", "hinge", "categorical_hinge",
+    "kld", "kullback_leibler_divergence",
+}
+_MLLINT_REGRESSION_METRICS = {
+    "mae", "mse", "mean_absolute_error", "mean_squared_error", "rmse",
+    "r2", "r2_score", "msle", "mean_squared_logarithmic_error",
+}
+
+
+def _mllint_const_str(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _mllint_list_of_str(node):
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [s for s in (_mllint_const_str(e) for e in node.elts) if s is not None]
+    return []
+
+
+def _mllint_scan(trees) -> List[tuple]:
+    """trees: iterable of (label, path, text, tree). Returns a list of
+    (label, lineno, message) findings."""
+    findings = []
+    softmax_loc = crossentropy_loc = sigmoid_loc = bce_logits_loc = None
+    softmax_module_loc = nllloss_loc = None
+    trees = list(trees)
+
+    for label, _path, _text, tree in trees:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            fname = func.attr if isinstance(func, ast.Attribute) else (func.id if isinstance(func, ast.Name) else None)
+            if fname is None:
+                continue
+
+            if fname == "compile":
+                loss_val, metrics_val = None, None
+                for kw in node.keywords:
+                    if kw.arg == "loss":
+                        loss_val = _mllint_const_str(kw.value)
+                    elif kw.arg == "metrics":
+                        metrics_val = _mllint_list_of_str(kw.value)
+                if loss_val and metrics_val and loss_val.lower() in _MLLINT_REGRESSION_LOSSES:
+                    if any(m.lower() in _MLLINT_ACCURACY_METRICS for m in metrics_val):
+                        findings.append((label, node.lineno,
+                            f"model.compile(loss='{loss_val}', metrics={metrics_val}): '{loss_val}' is a "
+                            "regression loss, but an accuracy-style metric was also requested. Accuracy is "
+                            "an exact-match classification metric and is typically meaningless (often "
+                            "silently stuck at 0.0 for the whole run) against a continuous target -- worth "
+                            "double-checking mae/rmse/r2 or similar is what's actually meant to be watched."))
+
+                if loss_val and metrics_val and loss_val.lower() in _MLLINT_CLASSIFICATION_LOSSES:
+                    bad_metrics = [m for m in metrics_val if m.lower() in _MLLINT_REGRESSION_METRICS]
+                    if bad_metrics:
+                        findings.append((label, node.lineno,
+                            f"model.compile(loss='{loss_val}', metrics={metrics_val}): '{loss_val}' is a "
+                            f"classification loss, but {bad_metrics} is a regression-only metric. mae/mse/r2 "
+                            "compare continuous values and are typically meaningless against class labels -- "
+                            "worth double-checking accuracy or similar is what's actually meant to be watched."))
+
+            if fname in ("Softmax", "LogSoftmax", "softmax", "log_softmax") and softmax_loc is None:
+                softmax_loc = (label, node.lineno)
+            if fname in ("CrossEntropyLoss", "cross_entropy") and crossentropy_loc is None:
+                crossentropy_loc = (label, node.lineno)
+            if fname in ("Sigmoid", "sigmoid") and sigmoid_loc is None:
+                sigmoid_loc = (label, node.lineno)
+            if fname == "BCEWithLogitsLoss" and bce_logits_loc is None:
+                bce_logits_loc = (label, node.lineno)
+            if fname == "Softmax" and softmax_module_loc is None:
+                softmax_module_loc = (label, node.lineno)
+            if fname == "NLLLoss" and nllloss_loc is None:
+                nllloss_loc = (label, node.lineno)
+
+            if fname in _MLLINT_OPTIMIZER_NAMES:
+                lr_node = None
+                for kw in node.keywords:
+                    if kw.arg == "lr":
+                        lr_node = kw.value
+                if lr_node is None and node.args:
+                    lr_node = node.args[-1] if len(node.args) >= 2 else None
+                if isinstance(lr_node, ast.Constant) and isinstance(lr_node.value, (int, float)):
+                    if lr_node.value > 1.0:
+                        findings.append((label, node.lineno,
+                            f"{fname}(..., lr={lr_node.value}): a learning rate above 1.0 is unusually high "
+                            "for almost any optimizer/architecture combination and often causes immediate "
+                            "divergence -- worth double-checking this wasn't meant to be a smaller value "
+                            "(e.g. missing an extra leading zero or an accidental e2/e-2 typo)."))
+
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            has_backward, has_zero_grad, has_step, backward_line = False, False, False, None
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
+                    if inner.func.attr == "backward":
+                        has_backward = True
+                        backward_line = backward_line or inner.lineno
+                    if inner.func.attr == "zero_grad":
+                        has_zero_grad = True
+                    if inner.func.attr == "step":
+                        has_step = True
+            if has_backward and not has_zero_grad:
+                findings.append((label, backward_line,
+                    f"function '{node.name}' calls .backward() but no .zero_grad() appears anywhere in "
+                    "it -- worth double-checking gradients are being cleared each step somewhere else in "
+                    "the call chain, since silently accumulating them across steps is a common, subtle bug."))
+            if has_backward and has_zero_grad and not has_step:
+                findings.append((label, backward_line,
+                    f"function '{node.name}' calls .backward() and .zero_grad() but no .step() appears "
+                    "anywhere in it -- worth double-checking an optimizer step is actually being taken "
+                    "somewhere else in the call chain, since without it gradients are computed and "
+                    "cleared but the weights never update (loss can look like it's training while the "
+                    "model silently never learns anything)."))
+
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            lname = node.name.lower()
+            if not any(k in lname for k in ("eval", "valid", "test")):
+                continue
+            has_no_grad = any(
+                isinstance(inner, ast.withitem) and isinstance(inner.context_expr, ast.Call)
+                and isinstance(inner.context_expr.func, ast.Attribute) and inner.context_expr.func.attr == "no_grad"
+                for inner in ast.walk(node)
+            )
+            has_eval_call = any(
+                isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute) and inner.func.attr == "eval"
+                for inner in ast.walk(node)
+            )
+            calls_something = any(isinstance(inner, ast.Call) for inner in ast.walk(node))
+            if calls_something and not has_no_grad and not has_eval_call:
+                findings.append((label, node.lineno,
+                    f"function '{node.name}' looks like an evaluation/validation function by name but has "
+                    "no `with torch.no_grad():` block and no `.eval()` call anywhere in it -- worth "
+                    "double-checking dropout/batchnorm are in eval mode and gradients aren't being tracked "
+                    "unnecessarily during evaluation (this is a naming heuristic, so it may be a false "
+                    "positive for a function that isn't actually doing torch evaluation)."))
+
+    if softmax_loc and crossentropy_loc:
+        findings.append((softmax_loc[0], softmax_loc[1],
+            f"a Softmax/LogSoftmax call here, combined with CrossEntropyLoss/cross_entropy at "
+            f"{crossentropy_loc[0]}:{crossentropy_loc[1]} -- CrossEntropyLoss already applies "
+            "log_softmax internally, so feeding it already-softmaxed logits (a 'double softmax') "
+            "typically flattens gradients and hurts convergence. Worth double-checking the softmax "
+            "layer is only used for inference-time probabilities, not fed into this loss."))
+    if sigmoid_loc and bce_logits_loc:
+        findings.append((sigmoid_loc[0], sigmoid_loc[1],
+            f"a Sigmoid call here, combined with BCEWithLogitsLoss at "
+            f"{bce_logits_loc[0]}:{bce_logits_loc[1]} -- BCEWithLogitsLoss already applies sigmoid "
+            "internally for numerical stability, so a 'double sigmoid' here is the likely equivalent "
+            "of the CrossEntropyLoss case above."))
+    if softmax_module_loc and nllloss_loc:
+        findings.append((softmax_module_loc[0], softmax_module_loc[1],
+            f"a plain Softmax call here, combined with NLLLoss at "
+            f"{nllloss_loc[0]}:{nllloss_loc[1]} -- NLLLoss expects log-probabilities as input, but a "
+            "plain Softmax produces raw probabilities (not log-probabilities), so this silently trains "
+            "with the wrong gradient scale instead of erroring. Worth double-checking this should be "
+            "LogSoftmax instead, or the loss should be CrossEntropyLoss on raw logits."))
+
+    return findings
 
 class PulseCLI:
+    def _try_keras_history(var_name: str, watch_locals: Dict[str, Any]) -> Optional[float]:
+        """When a tracked variable is None in the outer frame (typically because
+        it's set inside a Keras callback from `logs.get(...)` and that metric
+        doesn't exist in logs for this task), try to read the latest value from
+        the Keras model's own `.history.history` dict, which IS accessible in
+        the outer frame via the tracked `model` variable and is always
+        up-to-date after each epoch. This handles the extremely common case of
+        a user tracking `train_acc`, `val_acc`, `train_mape`, etc. that are
+        assigned inside callbacks but whose real values live in model.history.
+
+        Name mapping: strips 'train_' / 'val_' prefix, then tries both with and
+        without 'val_' prefix in model.history. E.g.:
+            train_acc   -> history['accuracy'][-1]  or history['acc'][-1]
+            val_acc     -> history['val_accuracy'][-1]
+            train_loss  -> history['loss'][-1]
+            val_mape    -> history['val_mean_absolute_percentage_error'][-1] etc.
+        """
+        # Find any Keras model in scope
+        model = None
+        for candidate_name in ("model", "clf", "net", "network", "estimator"):
+            candidate = watch_locals.get(candidate_name)
+            if candidate is not None and hasattr(candidate, "history") and hasattr(candidate.history, "history"):
+                model = candidate
+                break
+        if model is None:
+            # Also scan for any object with a .history.history attribute
+            for val in watch_locals.values():
+                if val is not None and hasattr(val, "history") and hasattr(val.history, "history"):
+                    model = val
+                    break
+        if model is None:
+            return None
+
+        hist = model.history.history
+        if not hist:
+            return None
+
+        name_lower = var_name.lower()
+        is_val = name_lower.startswith("val_")
+        # Strip known prefixes to get the bare metric name
+        bare = name_lower
+        for prefix in ("train_", "val_", "tr_", "training_"):
+            if bare.startswith(prefix):
+                bare = bare[len(prefix):]
+                break
+
+        # Build candidate keys to try in model.history.history
+        candidates = []
+        if is_val:
+            candidates += [f"val_{bare}", f"val_{bare.replace('_', '')}"]
+            # Common Keras metric name expansions
+            expansions = {
+                "acc": ["val_accuracy", "val_acc"],
+                "accuracy": ["val_accuracy", "val_acc"],
+                "mse": ["val_mean_squared_error", "val_mse"],
+                "mae": ["val_mean_absolute_error", "val_mae"],
+                "mape": ["val_mean_absolute_percentage_error", "val_mape"],
+                "rmse": ["val_root_mean_squared_error", "val_rmse"],
+                "loss": ["val_loss"],
+            }
+            candidates += expansions.get(bare, [])
+        else:
+            candidates += [bare, bare.replace("_", "")]
+            expansions = {
+                "acc": ["accuracy", "acc"],
+                "accuracy": ["accuracy", "acc"],
+                "mse": ["mean_squared_error", "mse"],
+                "mae": ["mean_absolute_error", "mae"],
+                "mape": ["mean_absolute_percentage_error", "mape"],
+                "rmse": ["root_mean_squared_error", "rmse"],
+                "loss": ["loss"],
+            }
+            candidates += expansions.get(bare, [])
+
+        for key in candidates:
+            values = hist.get(key)
+            if values:
+                try:
+                    v = float(values[-1])
+                    if math.isfinite(v):
+                        return v
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+
+
     def __init__(
         self,
         watch_locals: Optional[Dict[str, Any]] = None,
@@ -612,6 +1477,41 @@ class PulseCLI:
         discovered: Optional[Dict[str, Optional[tuple]]] = None,
     ):
         self.watch_locals = watch_locals or {}
+        # Lazily-initialized {path: text} snapshot for CHANGELOG, and a
+        # rolling ring buffer of state_dict checkpoints for REPLAY -- see
+        # _run_changelog / _replay_maybe_checkpoint.
+        self._changelog_baseline = None
+        self._replay_checkpoints: List[tuple] = []
+        self._replay_step_counter = itertools.count()
+        # id of the most recently recorded .pulse_history commit -- lets
+        # _restart_process() know exactly what to roll back to if the
+        # fix that triggered a restart keeps crashing (see
+        # _auto_rollback_after_failed_restarts).
+        self._last_commit_id: Optional[str] = None
+        # (rank, local_rank, world_size, session_key) -- set by
+        # _start_cli_tracker when running under a multi-GPU/multi-process
+        # launch; defaults to "not distributed".
+        self.dist_info = (0, 0, 1, None)
+        # Per-process id used to identify "this run" in the local
+        # run-history file -- see _run_runcompare.
+        self._run_id = str(uuid.uuid4())[:8]
+        # Running token/cost accounting across every agent call this
+        # session -- see _record_usage / _run_cost.
+        self._token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0, "cost_usd": 0.0}
+        # Decoded cross-session history (see _load_history_context) --
+        # defaults empty so PASTFIX works whether or not cloud history
+        # ever successfully loaded (no team, offline, fetch failed, ...).
+        self._history_sessions: List[Dict[str, Any]] = []
+        # Background retry queue for transient failures (agent rate
+        # limits/timeouts, restart-launch hiccups) -- see
+        # _queue_agent_retry/_queue_restart_retry and _ensure_retry_ticker.
+        # Training/the run itself is never blocked on any of this; a
+        # pending retry just gets picked back up automatically later.
+        self._last_call_failed_transiently = False
+        self._pending_agent_retry: Optional[Dict[str, Any]] = None
+        self._pending_restart_retry: Optional[Dict[str, Any]] = None
+        self._retry_ticker_started = False
+        self._retry_ticker_lock = threading.RLock()
         self.discovered: Dict[str, Optional[tuple]] = dict(discovered or {})
         self.tracked_vars: List[str] = []
         self.var_configs: Dict[str, str] = {}  # Axis layout mapping e.g. {"A": "0211"}
@@ -668,6 +1568,13 @@ class PulseCLI:
         # disk during the current top-level ask_agent() call. Checked once,
         # at the end of that call, to decide whether to restart the process.
         self._fix_applied_this_turn: bool = False
+        # Set by _restart_process while it's feeding a failed restart's
+        # crash output back to the agent for another fix pass -- prevents
+        # that nested call from triggering its own recursive
+        # _restart_process() (see _ask_agent_impl's trigger at the end);
+        # the retry loop already in flight relaunches the re-patched
+        # script directly instead.
+        self._suppress_auto_restart: bool = False
 
         # Matrix/tensor probing is intentionally decoupled from the training loop.
         # statistics() on GPU arrays can force a device->host synchronization, so
@@ -738,6 +1645,7 @@ class PulseCLI:
         # agent for this automatically, once, before the first step.
         self._normal_start_baselines: Dict[str, float] = {}
         self._start_primed: bool = False   # _prime_at_start runs at most once per process
+        self._start_primed_with_agent: bool = False  # MLLINT+fix re-runs once when agent first becomes available
         self._last_intervention_signature: Optional[str] = None
         # /code is on by default -- every manually-asked question includes
         # the training code (and any cross-file context) unless turned off.
@@ -745,6 +1653,11 @@ class PulseCLI:
 
         # Interactive Mode & Interrupt Handling
         self.continuous = False
+        # Separate interrupt latch. Do not use `continuous` itself as the
+        # interrupt state: other code (notably auto-intervention and /c) can
+        # legitimately change `continuous` while a SIGINT is being delivered.
+        # The latch guarantees Ctrl+C survives until the next safe boundary.
+        self._stop_requested = False
         self.original_sigint = signal.getsignal(signal.SIGINT)
         try:
             signal.signal(signal.SIGINT, self._sigint_handler)
@@ -898,6 +1811,7 @@ class PulseCLI:
         self._history_context: str = ""
         self._known_fixes: Dict[str, Dict[str, Any]] = {}  # signature -> fix dict
         self._last_applied_fix: Optional[Dict[str, Any]] = None
+        self._last_apply_skipped: List[tuple] = []
         # Dedup bookkeeping so one recurring bug doesn't get treated as N
         # separate incidents within a single run.
         self._traceback_signatures_seen: Dict[str, int] = {}
@@ -906,15 +1820,25 @@ class PulseCLI:
 
 
     def _sigint_handler(self, sig, frame):
-        """Intercept Ctrl+C during continuous execution to drop into the debugger."""
-        if self.continuous:
+        """Turn Ctrl+C into a request to pause at the next Pulse boundary.
+
+        The signal handler itself must stay tiny. In particular, it must not
+        call input(), touch queues, or raise KeyboardInterrupt on the first
+        press: the user's training code may be between Python instructions
+        (for example inside a long GPU/framework call). We latch the request
+        and let update() consume it at a safe point.
+        """
+        if not self._stop_requested:
+            self._stop_requested = True
             self.continuous = False
-            cprint("\n[Pulse] Intercepted Ctrl+C. Pausing at next step...")
-        else:
-            # If already paused and user hits Ctrl+C again, restore original behavior and exit
-            if self.original_sigint:
-                signal.signal(signal.SIGINT, self.original_sigint)
-            raise KeyboardInterrupt
+            cprint("\n[Pulse] Ctrl+C received. Pausing after the current training step...")
+            return
+
+        # A second Ctrl+C while already paused keeps the old hard-exit
+        # behavior, which is useful if the user really wants to terminate.
+        if self.original_sigint:
+            signal.signal(signal.SIGINT, self.original_sigint)
+        raise KeyboardInterrupt
 
     def print_banner(self) -> None:
         pass  # minimal UI: no banner -- setup only asks for a provider/API key below
@@ -1954,12 +2878,16 @@ class PulseCLI:
 
     @staticmethod
     def _describe_workspace(team: Dict[str, Any], user_id: Optional[str]) -> str:
-        """Human-readable label for a workspace menu entry -- Teams has no
-        dedicated 'name' column, so this falls back to the repo (if set)
-        or a generic label built from the join code, plus an admin tag.
+        """Human-readable label for a workspace menu entry -- prefers an
+        explicit name (see cloud.update_team_name) if the team has one,
+        then falls back to the repo basename, then a generic label built
+        from the join code, plus an admin tag.
         """
+        custom_name = (team.get("name") or "").strip()
         repo = team.get("repo")
-        if repo and repo != "unknown":
+        if custom_name:
+            label = custom_name
+        elif repo and repo != "unknown":
             label = repo.rstrip("/").rsplit("/", 1)[-1]
             if label.endswith(".git"):
                 label = label[:-4]
@@ -2026,8 +2954,9 @@ class PulseCLI:
                 repo = self._config_text("repo", "repository")
                 if not repo and workspace_options:
                     repo = str(workspace_options.get("repo") or "").strip()
+                new_name = str(workspace_options.get("new_name") or "").strip() if workspace_options else ""
                 try:
-                    team = cloud.create_team(self.user_id, repo=repo or None, cwd=self._repo_cwd)
+                    team = cloud.create_team(self.user_id, repo=repo or None, cwd=self._repo_cwd, name=new_name or None)
                     self.team_id = team["team_id"]
                     self.team_join_code = team.get("join_code")
                     self.team_admin_ids = list(team.get("admin_ids") or [])
@@ -2093,6 +3022,7 @@ class PulseCLI:
 
         while True:
             _flush_stdin()
+            existing = cloud.find_teams_for_user(self.user_id)  # re-fetch so rename/delete/leave are reflected immediately
             cprint("\n--- Pulse Workspace ---")
             default_choice = None
             for i, team in enumerate(existing, start=1):
@@ -2103,6 +3033,10 @@ class PulseCLI:
                 print(f"  {i}) {self._describe_workspace(team, self.user_id)}{marker}")
             print("  j) Join a new Workspace")
             print("  c) Create a new Workspace")
+            if existing:
+                print("  r) Rename a Workspace")
+                print("  l) Leave a Workspace")
+                print("  d) Delete a Workspace (admins only)")
 
             suffix = f" (Enter = {default_choice})" if default_choice else ""
             resp = input(f"[Pulse] Select a workspace{suffix} > ").strip().lower()
@@ -2121,6 +3055,8 @@ class PulseCLI:
                 return
 
             if resp in ("c", "create"):
+                _flush_stdin()
+                name_input = input("Workspace name (optional, Enter to skip) > ").strip()
                 detected = cloud.git_remote_url(self._repo_cwd)
                 _flush_stdin()
                 prompt = (
@@ -2130,11 +3066,14 @@ class PulseCLI:
                 )
                 repo_input = input(prompt).strip()
                 try:
-                    team = cloud.create_team(self.user_id, repo=repo_input or detected)
+                    team = cloud.create_team(self.user_id, repo=repo_input or detected, name=name_input or None)
                     self.team_id = team["team_id"]
                     self.team_join_code = team["join_code"]
                     self.team_admin_ids = list(team.get("admin_ids") or [])
-                    cprint(f"[Pulse] ✓ Workspace created. Share this join code with teammates: {self.team_join_code}")
+                    label = (team.get("name") or "").strip() or "(no name set)"
+                    cprint(f"[Pulse] ✓ Workspace '{label}' created. Share this join code with teammates: {self.team_join_code}")
+                    if name_input and not team.get("name"):
+                        cprint("[Pulse]   ⚠ Name couldn't be saved (this deployment's Teams table doesn't have a 'name' column yet) -- the workspace still works, just unnamed.", color=_YELLOW)
                     cprint(f"[Pulse]   Repo: {team.get('repo')}")
                     cloud.save_cached_credentials(self.user_id, self.email, self.team_id)
                     return
@@ -2160,8 +3099,88 @@ class PulseCLI:
                 except cloud.SupabaseError as exc:
                     cprint(f"[Pulse] ⚠ Could not join workspace: {exc}", color=_RED)
 
+            elif resp in ("r", "rename") and existing:
+                _flush_stdin()
+                idx = self._pick_workspace_index(existing, "Rename which workspace")
+                if idx is None:
+                    continue
+                target = existing[idx]
+                _flush_stdin()
+                new_name = input("New workspace name > ").strip()
+                if not new_name:
+                    cprint("[Pulse] Name cannot be blank.", color=_RED)
+                    continue
+                try:
+                    saved = cloud.update_team_name(target["team_id"], new_name)
+                    if saved:
+                        cprint(f"[Pulse] ✓ Renamed to '{new_name[:80]}'.")
+                    else:
+                        cprint("[Pulse] ⚠ This deployment's Teams table doesn't have a 'name' column yet -- couldn't save the name.", color=_YELLOW)
+                except cloud.SupabaseError as exc:
+                    cprint(f"[Pulse] ⚠ Could not rename workspace: {exc}", color=_RED)
+
+            elif resp in ("l", "leave") and existing:
+                _flush_stdin()
+                idx = self._pick_workspace_index(existing, "Leave which workspace")
+                if idx is None:
+                    continue
+                target = existing[idx]
+                confirm = input(f"Leave '{self._describe_workspace(target, self.user_id)}'? (y/n) > ").strip().lower()
+                if confirm not in ("y", "yes"):
+                    continue
+                try:
+                    cloud.leave_team(target["team_id"], self.user_id)
+                    cprint("[Pulse] ✓ Left the workspace.")
+                    if self.team_id == target["team_id"]:
+                        self.team_id = None
+                        self.team_join_code = None
+                        self.team_admin_ids = []
+                except cloud.SupabaseError as exc:
+                    cprint(f"[Pulse] ⚠ Could not leave workspace: {exc}", color=_RED)
+
+            elif resp in ("d", "delete") and existing:
+                _flush_stdin()
+                idx = self._pick_workspace_index(existing, "Delete which workspace")
+                if idx is None:
+                    continue
+                target = existing[idx]
+                if not cloud.is_team_admin(target, self.user_id):
+                    cprint("[Pulse] ⚠ Only an admin of that workspace can delete it.", color=_RED)
+                    continue
+                member_count = len(target.get("members") or [])
+                warn = "" if member_count <= 1 else f" -- this removes all {member_count} member(s) from it, not just you"
+                confirm = input(f"Permanently delete '{self._describe_workspace(target, self.user_id)}'{warn}? Type DELETE to confirm > ").strip()
+                if confirm != "DELETE":
+                    cprint("[Pulse] Cancelled -- deletion requires typing DELETE exactly.")
+                    continue
+                try:
+                    cloud.delete_team(target["team_id"], self.user_id)
+                    cprint("[Pulse] ✓ Workspace deleted.")
+                    if self.team_id == target["team_id"]:
+                        self.team_id = None
+                        self.team_join_code = None
+                        self.team_admin_ids = []
+                except cloud.SupabaseError as exc:
+                    cprint(f"[Pulse] ⚠ Could not delete workspace: {exc}", color=_RED)
+
             else:
                 cprint("[Pulse] Invalid option.")
+
+    def _pick_workspace_index(self, existing: List[Dict[str, Any]], prompt_label: str) -> Optional[int]:
+        """Shared sub-picker for the rename/leave/delete menu actions --
+        lists the same workspaces again so the number always matches what
+        the user just saw, and returns the chosen 0-based index or None if
+        they cancelled/entered something invalid."""
+        for i, team in enumerate(existing, start=1):
+            print(f"  {i}) {self._describe_workspace(team, self.user_id)}")
+        _flush_stdin()
+        resp = input(f"{prompt_label} (number, or Enter to cancel) > ").strip()
+        if not resp:
+            return None
+        if resp.isdigit() and 1 <= int(resp) <= len(existing):
+            return int(resp) - 1
+        cprint("[Pulse] Invalid selection.", color=_RED)
+        return None
 
     def _cmd_admin(self, arg: str) -> None:
         """/admin add <email> | /admin remove <email> | /admin list
@@ -2705,6 +3724,7 @@ class PulseCLI:
                 ("/gputrack <var> / /gpuuntrack <var>", "track a GPU-resident tensor directly (slower, more precise)"),
                 ("/delete <var> / /deletepdf <var>", "stop tracking / delete saved heatmap PDFs"),
                 ("/vars / /tracked", "list all seen variables / currently tracked ones"),
+                ("/chart [var]", "ASCII loss/metric curve for a tracked scalar (defaults to the main loss)"),
             ]),
             ("Auto-fix & sensitivity", [
                 ("/autofix on|off", f"toggle auto-intervention (currently {'ON' if self.auto_intervene else 'OFF'})"),
@@ -2832,6 +3852,13 @@ class PulseCLI:
         # (and the only ordering available at all in the fallback path).
         sessions.sort(key=_last_activity, reverse=True)
 
+        # Retained (not just used transiently above) so PASTFIX can search
+        # every teammate's applied fixes across every session on this
+        # team, not just this local machine's own fix-log -- workspace-
+        # shared fix knowledge, for free, off infrastructure that already
+        # existed for the crash-recovery "known fixes" index above.
+        self._history_sessions = sessions
+
         for s in sessions:
             for entry in (s.get("agent_logs") or []):
                 if not isinstance(entry, dict):
@@ -2863,6 +3890,22 @@ class PulseCLI:
             cprint(f"[Pulse] Loaded context from {len(sessions)} previous session(s) "
                    f"({len(self._known_fixes)} known fix(es)).")
 
+    _TB_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+)')
+
+    def _last_user_frame(self, tb_text: str):
+        """Return (file, line) of the deepest traceback frame that belongs
+        to the tracked script, so a crash report can lead with 'line N'
+        instead of making the user hunt through the whole traceback for
+        it. Falls back to the deepest frame overall if none match."""
+        matches = self._TB_FRAME_RE.findall(tb_text)
+        if not matches:
+            return None
+        if self.script_path:
+            own = [m for m in matches if os.path.abspath(m[0]) == os.path.abspath(self.script_path)]
+            if own:
+                return own[-1]
+        return matches[-1]
+
     @staticmethod
     def _traceback_signature(tb_text: str) -> str:
         """A stable-ish fingerprint for 'is this the same bug' -- the
@@ -2886,9 +3929,14 @@ class PulseCLI:
         self.log_traceback(tb_text)
         sig = self._traceback_signature(tb_text)
         self._traceback_signatures_seen[sig] = self._traceback_signatures_seen.get(sig, 0) + 1
+        frame_info = self._last_user_frame(tb_text)
+        if frame_info:
+            cprint(f"[Pulse] ⚠ Error at {os.path.basename(frame_info[0])}, line {frame_info[1]}", color=_RED)
         self._log_incident(
             "crash", tb_text.strip().splitlines()[-1] if tb_text.strip() else "(empty traceback)",
             signature=sig, occurrence=self._traceback_signatures_seen[sig],
+            file=frame_info[0] if frame_info else None,
+            line=int(frame_info[1]) if frame_info else None,
         )
         return sig
 
@@ -2965,6 +4013,24 @@ class PulseCLI:
                 return False
             configured_agent = self._config_value("agent", "provider", default=None)
             want = str(configured_agent).strip() if configured_agent is not None else os.environ.get("PULSE_PROVIDER", "").strip()
+            # A raw "provider/model" string that doesn't match any named
+            # entry is treated as a custom model directly -- mirrors the
+            # interactive "Custom" branch below, just without the prompts.
+            if want and "/" in want and not any(n.lower() == want.lower() for n in names):
+                env_var = self._config_text("api_key_env", "env_key") or os.environ.get("PULSE_API_KEY_ENV", "").strip() or None
+                key = self._config_text("api_key", "key") or (os.environ.get(env_var, "").strip() if env_var else "")
+                label = f"Custom: {want}"
+                PROVIDERS[label] = {"model": want, "env_key": env_var}
+                self.agent_provider = label
+                self.agent_key = key or "local"
+                self.agent_model_string = None
+                self.agent_api_base = None
+                self.agent_history = []
+                if env_var and key:
+                    os.environ[env_var] = key
+                cloud.save_cached_profile(agent_provider=label, agent_env_key=env_var)
+                cprint(f"[Pulse] Non-interactive mode -- custom agent set to {want}.")
+                return True
             if want.isdigit() and 1 <= int(want) <= len(names):
                 candidates = [names[int(want) - 1]]
             elif want:
@@ -3011,6 +4077,8 @@ class PulseCLI:
         cached_provider = cloud.load_cached_profile().get("agent_provider") if not self.agent_provider else None
         for i, name in enumerate(names, 1):
             local_tag = "  [local -- no data leaves this machine]" if PROVIDERS[name].get("local") else ""
+            if PROVIDERS[name].get("custom"):
+                local_tag = "  [type any provider/model string]"
             marker = "  (current)" if name == self.agent_provider else ("  (last used)" if name == cached_provider else "")
             print(f"  {i}) {name}{local_tag}{marker}")
 
@@ -3039,6 +4107,39 @@ class PulseCLI:
             cprint("[Pulse CLI] Pick a valid agent number or provider name.")
 
         info = PROVIDERS[chosen]
+
+        if info.get("custom"):
+            _flush_stdin()
+            model_string = input("Model string (e.g. openai/gpt-6-astra, ollama_chat/llama3.1) > ").strip()
+            if not model_string:
+                cprint("[Pulse CLI] No model string entered. Agent unchanged.")
+                if initial:
+                    self.agent_provider = None
+                return False
+            env_var = input("Env var name for the API key (optional, Enter to skip) > ").strip() or None
+            key = "local"
+            if env_var:
+                existing = os.environ.get(env_var, "").strip()
+                if existing and input(f"An {env_var} is already set. Use it? (Y/n) > ").strip().lower() in ("", "y", "yes"):
+                    key = existing
+                else:
+                    key = getpass.getpass("API key > ").strip()
+                if not key:
+                    cprint("[Pulse CLI] No API key entered. Agent unchanged.")
+                    if initial:
+                        self.agent_provider = None
+                    return False
+                os.environ[env_var] = key
+            label = f"Custom: {model_string}"
+            PROVIDERS[label] = {"model": model_string, "env_key": env_var}
+            self.agent_provider = label
+            self.agent_key = key
+            self.agent_model_string = None
+            self.agent_api_base = None
+            self.agent_history = []
+            cloud.save_cached_profile(agent_provider=label, agent_env_key=env_var)
+            print(f"✓ Custom agent set: {model_string}")
+            return True
 
         if info.get("local"):
             print(f"\n✓ Agent selected: {chosen} -- runs on your own infrastructure, no API key needed.")
@@ -3101,6 +4202,11 @@ class PulseCLI:
             print(f"✓ API key accepted for {self.agent_provider}.")
         else:
             print(f"✓ Switched to {self.agent_provider}. Conversation history reset for the new agent.")
+
+        # If there were queued auto-interventions or unfired MLLINT findings
+        # from before the agent was configured, fire them now rather than
+        # waiting for the next update() call (which could be an epoch away).
+        self._prime_with_agent_if_needed()
         return True
 
     def _set_local_agent(self, provider_name: str, api_base: str, model_name: str) -> None:
@@ -3147,11 +4253,19 @@ class PulseCLI:
         _restart_process), PULSE_AUTO_PROVIDER carries the provider that
         was active before the restart -- its API key is already sitting in
         os.environ (set right before the restart happened), so both get
-        auto-filled here instead of prompting the user all over again.
+        auto-filled here instead of prompting the user all over again. A
+        dynamically-registered "Custom: ..." provider only ever lived in
+        the PROVIDERS dict of the process that created it, so its model
+        string/env var are carried separately via PULSE_AUTO_CUSTOM_MODEL/
+        PULSE_AUTO_CUSTOM_ENV_KEY and re-registered here before lookup.
         """
         auto_provider = os.environ.pop("PULSE_AUTO_PROVIDER", None)
         auto_api_base = os.environ.pop("PULSE_AUTO_API_BASE", None)
         auto_model = os.environ.pop("PULSE_AUTO_MODEL", None)
+        auto_custom_model = os.environ.pop("PULSE_AUTO_CUSTOM_MODEL", None)
+        auto_custom_env_key = os.environ.pop("PULSE_AUTO_CUSTOM_ENV_KEY", None)
+        if auto_provider and auto_provider not in PROVIDERS and auto_custom_model:
+            PROVIDERS[auto_provider] = {"model": auto_custom_model, "env_key": auto_custom_env_key or None}
         if auto_provider and auto_provider in PROVIDERS:
             info = PROVIDERS[auto_provider]
             if info.get("local"):
@@ -3159,8 +4273,8 @@ class PulseCLI:
                     self._set_local_agent(auto_provider, auto_api_base, auto_model)
                     cprint(f"[Pulse] Resumed with agent {auto_provider} (auto-filled after restart).")
             else:
-                env_var = info["env_key"]
-                key = os.environ.get(env_var, "").strip()
+                env_var = info.get("env_key")
+                key = os.environ.get(env_var, "").strip() if env_var else "local"
                 if key:
                     self.agent_provider = auto_provider
                     self.agent_key = key
@@ -3220,6 +4334,12 @@ class PulseCLI:
         calls sys.exit() once a replacement process has actually been
         spawned to take over.
         """
+        # Captured now (before the retry loop below can apply further
+        # fixes of its own) -- this is "the fix that triggered this
+        # restart chain", i.e. what _auto_rollback_after_failed_restarts
+        # rolls back to if every retry in this chain still crashes.
+        chain_start_commit_id = self._last_commit_id
+
         # Finalize the pending agent-downtime timer (if any) and log the
         # incident now, before doing anything else below -- a successful
         # restart replaces this process via subprocess.run + sys.exit
@@ -3282,6 +4402,17 @@ class PulseCLI:
                 # Strip the litellm prefix back off -- _set_local_agent adds
                 # it back on the other side of the restart.
                 os.environ["PULSE_AUTO_MODEL"] = self.agent_model_string.split("/", 1)[-1]
+            # A dynamically-registered "Custom: ..." provider only exists in
+            # THIS process's PROVIDERS dict -- carry its model string/env var
+            # separately so _agent_setup can re-register it in the fresh
+            # process before looking it up (see that method's docstring).
+            # Harmless no-op for a normal named cloud provider, which already
+            # has a static entry the fresh process can look up on its own.
+            provider_info = PROVIDERS.get(self.agent_provider, {})
+            if "model" in provider_info and not provider_info.get("local"):
+                os.environ["PULSE_AUTO_CUSTOM_MODEL"] = provider_info["model"]
+                if provider_info.get("env_key"):
+                    os.environ["PULSE_AUTO_CUSTOM_ENV_KEY"] = provider_info["env_key"]
 
         if self.debug_session_id:
             # Carry the SAME Debug_Sessions row (and where its counters
@@ -3366,8 +4497,10 @@ class PulseCLI:
         while True:
             attempt += 1
             try:
-                # Synchronous run keeps stdin attached and handles spaces in paths correctly on Windows
-                result = subprocess.run(argv)
+                # capture_output=True so a failure's stdout/stderr can be
+                # fed back to the agent below -- printed after the fact
+                # either way, so nothing is hidden, just no longer live.
+                result = subprocess.run(argv, capture_output=True, text=True)
             except Exception as exc:
                 cprint(f"[Pulse] ⚠ Restart attempt {attempt}/{MAX_RESTART_ATTEMPTS} failed to launch ({exc}).", color=_RED)
                 if attempt >= MAX_RESTART_ATTEMPTS:
@@ -3377,6 +4510,7 @@ class PulseCLI:
                         color=_RED,
                     )
                     self._log_incident("restart_failed", f"Could not launch replacement process after {attempt} attempts: {exc}")
+                    self._queue_restart_retry()
                     return
                 time.sleep(min(RETRY_BACKOFF_SECONDS * attempt, 30))
                 continue
@@ -3384,7 +4518,10 @@ class PulseCLI:
             if result.returncode == 0:
                 sys.exit(0)
 
+            sys.stdout.write(result.stdout or "")
+            sys.stderr.write(result.stderr or "")
             message = f"Replacement training process exited with code {result.returncode} (attempt {attempt}/{MAX_RESTART_ATTEMPTS})"
+
             if attempt >= MAX_RESTART_ATTEMPTS:
                 cprint(
                     f"[Pulse] ⚠ {message}. Giving up after {MAX_RESTART_ATTEMPTS} attempts -- "
@@ -3392,10 +4529,48 @@ class PulseCLI:
                     color=_RED,
                 )
                 self._log_incident("restart_failed", message)
+                # "Automatic rollback offered rather than requiring the
+                # model to reason its way to 'maybe I should revert'" --
+                # every retry in this chain still crashed, so restore the
+                # workspace to right before the fix that started it,
+                # using the same .pulse_history mechanism /revert uses.
+                # Nothing is destroyed: the failed chain stays fully
+                # recoverable afterward via /log + /revert.
+                self._auto_rollback_after_failed_restarts(chain_start_commit_id)
                 return
 
-            cprint(f"[Pulse] ⚠ {message}. Retrying restart...", color=_YELLOW)
-            time.sleep(min(RETRY_BACKOFF_SECONDS * attempt, 30))
+            # A nonzero exit almost always means the agent's own fix didn't
+            # fully take, or introduced a new bug -- hand the failure
+            # straight back to it to patch the CURRENT (already-fixed-once)
+            # code, instead of blindly relaunching the exact same broken
+            # code or reverting and starting the diagnosis over from
+            # scratch. _suppress_auto_restart keeps this nested call from
+            # triggering its own recursive _restart_process() -- if it
+            # applies a new fix, this loop's own next iteration relaunches
+            # the (now re-patched) script_path directly.
+            if self.agent_provider and self.agent_key:
+                cprint(f"[Pulse] ⚠ {message}. Feeding the failure back to the agent to fix the CURRENT code (not from scratch)...", color=_YELLOW)
+                try:
+                    with open(script_path, "r", encoding="utf-8") as f:
+                        self.code_text = f.read()
+                except OSError:
+                    pass
+                failure_question = (
+                    f"The fix you just applied caused the restarted training process to crash "
+                    f"immediately with exit code {result.returncode}. Its output:\n\n"
+                    f"STDOUT:\n{result.stdout or '(empty)'}\n\nSTDERR:\n{result.stderr or '(empty)'}\n\n"
+                    "This is the same bug context as before -- fix the CURRENT code shown below "
+                    "directly. Do not start the diagnosis over from scratch, and do not reintroduce "
+                    "whatever change just failed."
+                )
+                self._suppress_auto_restart = True
+                try:
+                    self._ask_agent_impl(failure_question, include_code=True, _depth=0)
+                finally:
+                    self._suppress_auto_restart = False
+            else:
+                cprint(f"[Pulse] ⚠ {message}. Retrying restart...", color=_YELLOW)
+                time.sleep(min(RETRY_BACKOFF_SECONDS * attempt, 30))
 
     def _print_variable_summary(self) -> None:
         variables = self.discover_variables()
@@ -3738,6 +4913,7 @@ class PulseCLI:
                 content = (response.choices[0].message.content or "").strip()
                 if not content:
                     raise AgentRequestFailed("the provider returned an empty response")
+                self._record_usage(response)
                 return content
             except AgentRequestFailed:
                 raise
@@ -3763,20 +4939,21 @@ class PulseCLI:
     _GPUUNTRACK_RE = re.compile(r"^\s*GPUUNTRACK:\s*(.+)$", re.MULTILINE)
     _SENSITIVITY_RE = re.compile(r"^\s*SENSITIVITY:\s*(.+)$", re.MULTILINE)
     _NORMAL_START_RE = re.compile(r"^\s*NORMAL_START:\s*(.+)$", re.MULTILINE)
+    _GREP_RE = re.compile(r"^\s*GREP:\s*(.+)$", re.MULTILINE)
+    _VIEW_RE = re.compile(r"^\s*VIEW:\s*(.+)$", re.MULTILINE)
 
     @classmethod
     def _extract_directives(cls, text: str):
         """Pull CALC:/PROMOTE:/GPUTRACK:/GPUUNTRACK:/SENSITIVITY:/
-        NORMAL_START: lines out of an agent response, returning
+        NORMAL_START:/GREP:/VIEW: lines out of an agent response, returning
         (cleaned_text, calc_exprs, promote_names, gputrack_names,
-        gpuuntrack_names, sensitivity_args, normal_start_args). Cleaned
-        text has those lines stripped so they don't clutter what's
-        printed/stored. A bare 'none' value (as instructed for the
-        periodic GPU check-in reply format) is dropped rather than
-        treated as a variable name. sensitivity_args/normal_start_args
-        are lists of raw argument strings (usually 0 or 1) -- applied via
-        _cmd_sensitivity(..., quiet=True) / the NORMAL_START parsing in
-        _apply_directives, same as a manual /sensitivity.
+        gpuuntrack_names, sensitivity_args, normal_start_args,
+        grep_patterns, view_requests). Cleaned text has those lines
+        stripped so they don't clutter what's printed/stored. A bare
+        'none' value (as instructed for the periodic GPU check-in reply
+        format) is dropped rather than treated as a variable name.
+        sensitivity_args/normal_start_args/grep_patterns/view_requests are
+        lists of raw argument strings -- applied via _apply_directives.
         """
         calc_exprs = [m.strip() for m in cls._CALC_RE.findall(text) if m.strip()]
         promote_names = []
@@ -3794,6 +4971,8 @@ class PulseCLI:
             )
         sensitivity_args = [m.strip() for m in cls._SENSITIVITY_RE.findall(text) if m.strip()]
         normal_start_args = [m.strip() for m in cls._NORMAL_START_RE.findall(text) if m.strip()]
+        grep_patterns = [m.strip() for m in cls._GREP_RE.findall(text) if m.strip()]
+        view_requests = [m.strip() for m in cls._VIEW_RE.findall(text) if m.strip()]
 
         cleaned = cls._CALC_RE.sub("", text)
         cleaned = cls._PROMOTE_RE.sub("", cleaned)
@@ -3801,8 +4980,1281 @@ class PulseCLI:
         cleaned = cls._GPUUNTRACK_RE.sub("", cleaned)
         cleaned = cls._SENSITIVITY_RE.sub("", cleaned)
         cleaned = cls._NORMAL_START_RE.sub("", cleaned)
+        cleaned = cls._GREP_RE.sub("", cleaned)
+        cleaned = cls._VIEW_RE.sub("", cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-        return cleaned, calc_exprs, promote_names, gputrack_names, gpuuntrack_names, sensitivity_args, normal_start_args
+        return (
+            cleaned, calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
+            sensitivity_args, normal_start_args, grep_patterns, view_requests,
+        )
+
+    # Hard caps on GREP/VIEW output so a broad pattern or a huge range
+    # request can't blow up the agent's context the same way dumping every
+    # file in full would -- the whole point of these tools is to let the
+    # agent pull a *narrow* slice instead of everything every turn.
+    _GREP_MAX_MATCHES = 40
+    _GREP_CONTEXT_LINES = 1
+    _VIEW_MAX_LINES = 400
+
+    def _iter_searchable_files(self):
+        """(label, path, text) for every file the agent can GREP/VIEW --
+        the entry script plus any local project files Pulse already knows
+        about (see pulse.py's auto_track -> _discover_project_files).
+        Reuses the same label scheme as code-fix "files" targeting, so a
+        GREP/VIEW result's file label matches what a later fix's "file"
+        field should say.
+        """
+        self._build_file_labels()
+        if self.script_path and self.code_text is not None:
+            label = self._label_for_path.get(self.script_path, os.path.basename(self.script_path))
+            yield label, self.script_path, self.code_text
+        for path, text in self.extra_files.items():
+            label = self._label_for_path.get(path, os.path.basename(path))
+            yield label, path, text
+
+    def _run_grep(self, pattern: str) -> str:
+        """Case-insensitive regex search across every known project file,
+        returning matches as 'label:line: text' with a line of context on
+        each side, capped at _GREP_MAX_MATCHES total. Falls back to a
+        literal substring search if `pattern` isn't valid regex, so a
+        plain word/phrase still works without the agent needing to escape
+        anything.
+        """
+        try:
+            rx = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            rx = re.compile(re.escape(pattern), re.IGNORECASE)
+
+        blocks = []
+        total = 0
+        for label, _path, text in self._iter_searchable_files():
+            if total >= self._GREP_MAX_MATCHES:
+                break
+            lines = text.splitlines()
+            for i, line in enumerate(lines):
+                if total >= self._GREP_MAX_MATCHES:
+                    break
+                if not rx.search(line):
+                    continue
+                lo = max(0, i - self._GREP_CONTEXT_LINES)
+                hi = min(len(lines), i + self._GREP_CONTEXT_LINES + 1)
+                snippet = "\n".join(
+                    f"    {n + 1:>4} | {lines[n]}" for n in range(lo, hi)
+                )
+                blocks.append(f"  {label}, line {i + 1}:\n{snippet}")
+                total += 1
+
+        if not blocks:
+            return f"GREP '{pattern}': no matches in any tracked file."
+        truncated_note = " (truncated -- narrow the pattern for more)" if total >= self._GREP_MAX_MATCHES else ""
+        return f"GREP '{pattern}': {total} match(es){truncated_note}\n" + "\n".join(blocks)
+
+    _VIEW_ARG_RE = re.compile(r"^(?:([^:]+):)?\s*(\d+)\s*-\s*(\d+)\s*$")
+
+    def _run_view(self, arg: str) -> str:
+        """Exact line range from a known project file, in the same
+        numbered format used for full-file context (`{n:>4} | {line}`), so
+        the agent can zoom into one region instead of needing the whole
+        file re-sent. `arg` is '<file>:<start>-<end>' (file label optional
+        -- omitting it defaults to the main script), e.g. 'model.py:40-75'
+        or '120-160'. Range is capped at _VIEW_MAX_LINES.
+        """
+        m = self._VIEW_ARG_RE.match(arg.strip())
+        if not m:
+            return f"VIEW '{arg}': could not parse -- expected '<file>:<start>-<end>' or '<start>-<end>'."
+        file_label, start_str, end_str = m.groups()
+        start, end = int(start_str), int(end_str)
+        if end < start:
+            start, end = end, start
+
+        # Build/refresh the label<->path map before resolving -- VIEW can
+        # be sent on its own, without a preceding GREP or 'Send Code' this
+        # turn, so _path_for_label may otherwise still be empty or stale.
+        self._build_file_labels()
+        path = self._resolve_fix_path(file_label) if file_label else self.script_path
+        if not path:
+            return f"VIEW '{arg}': could not resolve file '{file_label}'."
+
+        text = self.code_text if path == self.script_path else self.extra_files.get(path)
+        if text is None:
+            return f"VIEW '{arg}': no source text available for '{file_label or os.path.basename(path)}'."
+
+        lines = text.splitlines()
+        end = min(end, len(lines))
+        start = max(1, start)
+        if end - start + 1 > self._VIEW_MAX_LINES:
+            end = start + self._VIEW_MAX_LINES - 1
+        if start > len(lines):
+            return f"VIEW '{arg}': file only has {len(lines)} lines."
+
+        label = self._label_for_path.get(path, os.path.basename(path))
+        numbered = "\n".join(f"    {n:>4} | {lines[n - 1]}" for n in range(start, end + 1))
+        return f"VIEW {label}:{start}-{end}\n{numbered}"
+
+    # ------------------------------------------------------------------
+    # Extended toolset: execution, code-intelligence, statistics, and
+    # grounding directives. A separate dict-based extractor/applier so
+    # none of the CALC/PROMOTE/GPUTRACK/... positional-tuple call sites
+    # above need to change shape.
+    # ------------------------------------------------------------------
+    _NEW_DIRECTIVE_RES = {
+        "defof": re.compile(r"^\s*DEFOF:\s*(.+)$", re.MULTILINE),
+        "callers": re.compile(r"^\s*CALLERS:\s*(.+)$", re.MULTILINE),
+        "depgraph": re.compile(r"^\s*DEPGRAPH:\s*(.*)$", re.MULTILINE),
+        "corr": re.compile(r"^\s*CORR:\s*(.+)$", re.MULTILINE),
+        "outlier": re.compile(r"^\s*OUTLIER:\s*(.+)$", re.MULTILINE),
+        "diffstats": re.compile(r"^\s*DIFFSTATS:\s*(.+)$", re.MULTILINE),
+        "histogram": re.compile(r"^\s*HISTOGRAM:\s*(.+)$", re.MULTILINE),
+        "doclookup": re.compile(r"^\s*DOCLOOKUP:\s*(.+)$", re.MULTILINE),
+        "changelog": re.compile(r"^\s*CHANGELOG:\s*(.*)$", re.MULTILINE),
+        "pastfix": re.compile(r"^\s*PASTFIX:\s*(.+)$", re.MULTILINE),
+        "dryrun": re.compile(r"^\s*DRYRUN:\s*(.+)$", re.MULTILINE),
+        "repl": re.compile(r"^\s*REPL:\s*(.+)$", re.MULTILINE),
+        "replay": re.compile(r"^\s*REPLAY:\s*(.+)$", re.MULTILINE),
+        "gradcheck": re.compile(r"^\s*GRADCHECK:\s*(.+)$", re.MULTILINE),
+        "shapetrace": re.compile(r"^\s*SHAPETRACE:\s*(.*)$", re.MULTILINE),
+        "gpustatus": re.compile(r"^\s*GPUSTATUS:\s*(.*)$", re.MULTILINE),
+        "rollback": re.compile(r"^\s*ROLLBACK:\s*(.+)$", re.MULTILINE),
+        "mllint": re.compile(r"^\s*MLLINT:\s*(.*)$", re.MULTILINE),
+        "layerstats": re.compile(r"^\s*LAYERSTATS:\s*(.*)$", re.MULTILINE),
+        "hardexamples": re.compile(r"^\s*HARDEXAMPLES:\s*(.*)$", re.MULTILINE),
+        "ampstatus": re.compile(r"^\s*AMPSTATUS:\s*(.*)$", re.MULTILINE),
+        "seedcheck": re.compile(r"^\s*SEEDCHECK:\s*(.*)$", re.MULTILINE),
+        "rankdiverge": re.compile(r"^\s*RANKDIVERGE:\s*(.+)$", re.MULTILINE),
+        "runcompare": re.compile(r"^\s*RUNCOMPARE:\s*(.*)$", re.MULTILINE),
+        "cost": re.compile(r"^\s*COST:\s*(.*)$", re.MULTILINE),
+    }
+    _FLAG_STYLE_DIRECTIVES = {"depgraph", "changelog", "shapetrace", "gpustatus", "mllint", "layerstats", "hardexamples", "ampstatus", "seedcheck", "runcompare", "cost"}
+
+    @classmethod
+    def _extract_new_directives(cls, text: str):
+        """Pull the extended toolset's directive lines out of an agent
+        response. Returns (cleaned_text, requests) where requests is
+        {directive_name: [arg, ...]} for every directive that appeared --
+        a flag-style directive with no argument (DEPGRAPH/CHANGELOG/bare
+        SHAPETRACE) still shows up as [''] so callers can just check
+        truthiness/`in`."""
+        requests: Dict[str, List[str]] = {}
+        cleaned = text
+        for key, rx in cls._NEW_DIRECTIVE_RES.items():
+            raw = [m.strip() for m in rx.findall(text)]
+            if key in cls._FLAG_STYLE_DIRECTIVES:
+                if raw:
+                    requests[key] = raw
+            else:
+                raw = [m for m in raw if m]
+                if raw:
+                    requests[key] = raw
+            cleaned = rx.sub("", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return cleaned, requests
+
+    def _iter_ast_trees(self):
+        """(label, path, text, tree) for every known project file that
+        parses as valid Python."""
+        for label, path, text in self._iter_searchable_files():
+            try:
+                tree = ast.parse(text, filename=path)
+            except (SyntaxError, ValueError):
+                continue
+            yield label, path, text, tree
+
+    def _run_defof(self, symbol: str) -> str:
+        """DEFOF: <symbol> -- AST-based jump-to-definition across every
+        tracked file, not text search."""
+        symbol = symbol.strip()
+        hits = []
+        for label, _path, text, tree in self._iter_ast_trees():
+            lines = text.splitlines()
+            for node in ast.walk(tree):
+                kind, name = None, None
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == symbol:
+                    name = node.name
+                    kind = "class" if isinstance(node, ast.ClassDef) else "function"
+                elif isinstance(node, ast.Assign):
+                    for t in node.targets:
+                        if isinstance(t, ast.Name) and t.id == symbol:
+                            name, kind = symbol, "assignment"
+                            break
+                if name is None:
+                    continue
+                start = node.lineno
+                end = min(start + 4, len(lines))
+                snippet = "\n".join(f"    {n:>4} | {lines[n - 1]}" for n in range(start, end + 1) if n <= len(lines))
+                hits.append(f"  {label}:{start} ({kind} {symbol})\n{snippet}")
+        if not hits:
+            return f"DEFOF '{symbol}': no definition found in any tracked file."
+        return f"DEFOF '{symbol}': {len(hits)} definition(s)\n" + "\n\n".join(hits)
+
+    def _run_callers(self, symbol: str) -> str:
+        """CALLERS: <symbol> -- every call site of a function/class."""
+        symbol = symbol.strip()
+        hits = []
+        for label, _path, text, tree in self._iter_ast_trees():
+            lines = text.splitlines()
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                called_name = func.id if isinstance(func, ast.Name) else (func.attr if isinstance(func, ast.Attribute) else None)
+                if called_name != symbol:
+                    continue
+                lineno = node.lineno
+                line = lines[lineno - 1].strip() if lineno <= len(lines) else ""
+                hits.append(f"  {label}, line {lineno}: {line}")
+        if not hits:
+            return f"CALLERS '{symbol}': no call sites found in any tracked file."
+        capped = hits[:60]
+        suffix = f" (truncated, showing first {len(capped)})" if len(hits) > len(capped) else ""
+        return f"CALLERS '{symbol}': {len(hits)} call site(s){suffix}\n" + "\n".join(capped)
+
+    def _run_depgraph(self) -> str:
+        """DEPGRAPH: -- the import graph between tracked local files."""
+        trees = list(self._iter_ast_trees())
+        label_by_modname = {os.path.splitext(os.path.basename(path))[0]: label for label, path, _t, _tr in trees}
+        edges = []
+        for label, _path, _text, tree in trees:
+            deps = set()
+            for node in ast.walk(tree):
+                mods = []
+                if isinstance(node, ast.Import):
+                    mods = [alias.name.split(".")[0] for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    mods = [node.module.split(".")[0]]
+                for m in mods:
+                    other = label_by_modname.get(m)
+                    if other and other != label:
+                        deps.add(other)
+            if deps:
+                edges.append(f"  {label} -> {', '.join(sorted(deps))}")
+        if not edges:
+            return "DEPGRAPH: no import relationships found between tracked local files."
+        return "DEPGRAPH (import graph between tracked local files):\n" + "\n".join(edges)
+
+    def _scalar_history(self, name: str):
+        """Resolve `name` against self.scalar_histories (exact, else a
+        unique case-insensitive substring match) and return
+        (resolved_name, [value, ...] or None). Unlike the GUI's manifest,
+        this is a flat value list in logging order (deduplicated on
+        change), not (step, value) pairs -- DIFFSTATS indices below count
+        into that list."""
+        hist = self.scalar_histories.get(name)
+        if hist is None:
+            matches = [k for k in self.scalar_histories if name.lower() in k.lower()]
+            if len(matches) == 1:
+                name, hist = matches[0], self.scalar_histories[matches[0]]
+        return name, (list(hist) if hist else None)
+
+    def _run_corr(self, arg: str) -> str:
+        """CORR: <var1> <var2> -- real correlation coefficient between two
+        tracked scalar histories."""
+        parts = arg.split()
+        if len(parts) != 2:
+            return f"CORR '{arg}': expected two variable names, e.g. 'CORR: loss grad_norm'."
+        name1, v1 = self._scalar_history(parts[0])
+        name2, v2 = self._scalar_history(parts[1])
+        if not v1 or not v2:
+            missing = parts[0] if not v1 else parts[1]
+            return f"CORR '{arg}': no numeric history for '{missing}' -- only scalar-tracked variables have one."
+        n = min(len(v1), len(v2))
+        if n < 3:
+            return f"CORR '{name1}' vs '{name2}': not enough overlapping data points yet ({n})."
+        v1, v2 = v1[-n:], v2[-n:]
+        mean1, mean2 = sum(v1) / n, sum(v2) / n
+        cov = sum((a - mean1) * (b - mean2) for a, b in zip(v1, v2))
+        var1 = sum((a - mean1) ** 2 for a in v1)
+        var2 = sum((b - mean2) ** 2 for b in v2)
+        if var1 == 0 or var2 == 0:
+            return f"CORR '{name1}' vs '{name2}': one series is constant over these {n} points -- correlation undefined."
+        r = cov / math.sqrt(var1 * var2)
+        return f"CORR '{name1}' vs '{name2}' (last {n} points): r = {r:.4f}"
+
+    def _run_outlier(self, var: str) -> str:
+        """OUTLIER: <var> -- deterministic z-score anomaly detection."""
+        name, values = self._scalar_history(var)
+        if not values:
+            return f"OUTLIER '{var}': no numeric history available."
+        if len(values) < 4:
+            return f"OUTLIER '{name}': not enough data points yet ({len(values)})."
+        mean = sum(values) / len(values)
+        variance = sum((v - mean) ** 2 for v in values) / len(values)
+        std = math.sqrt(variance)
+        if std == 0:
+            return f"OUTLIER '{name}': series is constant -- no outliers."
+        flagged = [(i, v, (v - mean) / std) for i, v in enumerate(values) if abs((v - mean) / std) > 3]
+        if not flagged:
+            return f"OUTLIER '{name}': no points with |z| > 3 over {len(values)} points (mean={mean:.4g}, std={std:.4g})."
+        lines = "\n".join(f"  history idx {i}: {v:.6g} (z={z:.2f})" for i, v, z in flagged[-20:])
+        return f"OUTLIER '{name}': {len(flagged)} outlier point(s) (mean={mean:.4g}, std={std:.4g})\n{lines}"
+
+    _DIFFSTATS_ARG_RE = re.compile(r"^\s*(\S+)\s+(-?\d+)\s+(-?\d+)\s*$")
+
+    def _run_diffstats(self, arg: str) -> str:
+        """DIFFSTATS: <var> <index_a> <index_b> -- exact delta between two
+        recorded points (indices count into that variable's own history,
+        negative counts from the end)."""
+        m = self._DIFFSTATS_ARG_RE.match(arg.strip())
+        if not m:
+            return f"DIFFSTATS '{arg}': expected '<var> <index_a> <index_b>', e.g. 'DIFFSTATS: loss 10 40'."
+        var, a_str, b_str = m.groups()
+        name, values = self._scalar_history(var)
+        if not values:
+            return f"DIFFSTATS '{var}': no numeric history available."
+        try:
+            va, vb = values[int(a_str)], values[int(b_str)]
+        except IndexError:
+            return f"DIFFSTATS '{name}': index out of range (history has {len(values)} point(s))."
+        delta = vb - va
+        pct = f" ({delta / va * 100:+.2f}%)" if va else ""
+        return f"DIFFSTATS '{name}' [{a_str}] -> [{b_str}]: {va:.6g} -> {vb:.6g}, delta = {delta:+.6g}{pct}"
+
+    def _run_histogram(self, var: str, buckets: int = 10) -> str:
+        """HISTOGRAM: <var> -- actual bucketed distribution counts."""
+        name, values = self._scalar_history(var)
+        if not values:
+            return f"HISTOGRAM '{var}': no numeric history available."
+        if len(values) < 2:
+            return f"HISTOGRAM '{name}': not enough data points yet ({len(values)})."
+        lo, hi = min(values), max(values)
+        if lo == hi:
+            return f"HISTOGRAM '{name}': all {len(values)} point(s) equal {lo:.6g}."
+        width = (hi - lo) / buckets
+        counts = [0] * buckets
+        for v in values:
+            counts[min(buckets - 1, int((v - lo) / width))] += 1
+        peak = max(counts) or 1
+        lines = []
+        for i, c in enumerate(counts):
+            b_lo, b_hi = lo + i * width, lo + (i + 1) * width
+            bar = "#" * max(1, int(40 * c / peak)) if c else ""
+            lines.append(f"  [{b_lo:>10.4g}, {b_hi:>10.4g}): {c:>5}  {bar}")
+        return f"HISTOGRAM '{name}' ({len(values)} points, range [{lo:.4g}, {hi:.4g}]):\n" + "\n".join(lines)
+
+    def _run_doclookup(self, arg: str) -> str:
+        """DOCLOOKUP: <library>.<symbol> -- real signature/docstring for an
+        already-installed library function."""
+        arg = arg.strip()
+        parts = arg.split(".")
+        if len(parts) < 2:
+            return f"DOCLOOKUP '{arg}': expected '<library>.<symbol>', e.g. 'DOCLOOKUP: torch.nn.functional.cross_entropy'."
+        root = parts[0]
+        try:
+            obj = importlib.import_module(root)
+        except Exception as exc:
+            return f"DOCLOOKUP '{arg}': could not import '{root}' ({type(exc).__name__}: {exc}) -- it may not be installed in this environment."
+        resolved = [root]
+        for attr in parts[1:]:
+            try:
+                obj = getattr(obj, attr)
+            except AttributeError:
+                try:
+                    obj = importlib.import_module(".".join(resolved + [attr]))
+                except Exception:
+                    return f"DOCLOOKUP '{arg}': '{'.'.join(resolved)}' has no attribute '{attr}'."
+            resolved.append(attr)
+        try:
+            sig = str(inspect.signature(obj))
+        except (TypeError, ValueError):
+            sig = ""
+        doc = inspect.getdoc(obj) or "(no docstring)"
+        if len(doc) > 1200:
+            doc = doc[:1200] + "\n... (truncated)"
+        return f"DOCLOOKUP '{arg}': {'.'.join(resolved)}{sig}\n{doc}"
+
+    def _run_changelog(self) -> str:
+        """CHANGELOG: -- diff of what's changed in tracked files since the
+        last checkpoint. Baseline starts at this session's code and
+        advances to 'now' every call, so a second CHANGELOG only shows
+        what's changed since the first."""
+        self._build_file_labels()
+        current = dict(self.extra_files)
+        if self.script_path and self.code_text is not None:
+            current[self.script_path] = self.code_text
+
+        baseline = getattr(self, "_changelog_baseline", None)
+        if baseline is None:
+            self._changelog_baseline = current
+            return "CHANGELOG: no prior checkpoint yet -- this turn's code is now the baseline for future CHANGELOG calls."
+
+        diffs = []
+        for path, new_text in current.items():
+            old_text = baseline.get(path, "")
+            if old_text == new_text:
+                continue
+            label = self._label_for_path.get(path, os.path.basename(path))
+            diff = "\n".join(difflib.unified_diff(
+                old_text.splitlines(), new_text.splitlines(),
+                fromfile=f"{label} (last checkpoint)", tofile=f"{label} (now)", lineterm="", n=2,
+            ))
+            if diff:
+                diffs.append(diff)
+
+        self._changelog_baseline = current
+        if not diffs:
+            return "CHANGELOG: no changes since the last checkpoint."
+        body = "\n\n".join(diffs)
+        if len(body) > 4000:
+            body = body[:4000] + "\n... (truncated)"
+        return f"CHANGELOG (since last checkpoint):\n{body}"
+
+    def _fixlog_path(self) -> str:
+        base = os.path.dirname(self.script_path) if self.script_path else "."
+        return os.path.join(base, ".pulse_fixlog.json")
+
+    def _load_fixlog(self) -> List[Dict[str, Any]]:
+        try:
+            with open(self._fixlog_path(), "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return []
+
+    def _append_fixlog(self, path: str, old: str, new: str, explanation: str) -> None:
+        """Persist every applied code fix to a project-level fix-log so
+        PASTFIX can search it later."""
+        log = self._load_fixlog()
+        log.append({"time": time.time(), "path": path, "old": old, "new": new, "explanation": explanation})
+        log = log[-200:]
+        try:
+            with open(self._fixlog_path(), "w", encoding="utf-8") as f:
+                json.dump(log, f)
+        except OSError:
+            pass
+
+    def _run_pastfix(self, query: str) -> str:
+        """PASTFIX: <symbol_or_region> -- search this project's own local
+        fix-log AND, when signed in with team history loaded (see
+        _load_history_context), every fix any teammate has applied across
+        every session on this repo/team, for prior fixes touching the
+        same function/region. Local and shared hits are labeled
+        separately since a shared hit came from someone else's machine/
+        session, not necessarily this one's current code state."""
+        query_l = query.strip().lower()
+
+        local_hits = []
+        for entry in reversed(self._load_fixlog()):
+            haystack = " ".join([
+                str(entry.get("explanation", "")), str(entry.get("old", "")),
+                str(entry.get("new", "")), str(entry.get("path", "")),
+            ]).lower()
+            if query_l in haystack:
+                local_hits.append(entry)
+            if len(local_hits) >= 5:
+                break
+
+        shared_hits = []
+        for s in self._history_sessions:
+            sha = (s.get("git_commit_sha") or "unknown")[:10]
+            for entry in (s.get("agent_logs") or []):
+                if not isinstance(entry, dict):
+                    continue
+                fix = entry.get("fix_applied")
+                if not fix:
+                    continue
+                fix_files = fix.get("files") if isinstance(fix, dict) else None
+                haystack = " ".join([
+                    str(fix.get("explanation", "") if isinstance(fix, dict) else fix),
+                    str(fix_files or ""),
+                ]).lower()
+                if query_l in haystack:
+                    shared_hits.append((sha, entry.get("t"), fix))
+                if len(shared_hits) >= 5:
+                    break
+            if len(shared_hits) >= 5:
+                break
+
+        if not local_hits and not shared_hits:
+            return f"PASTFIX '{query}': no prior fix (local or team-shared) mentions that."
+
+        lines = []
+        for e in local_hits:
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(e.get("time", 0)))
+            lines.append(f"  [local, {ts}] {os.path.basename(str(e.get('path', '?')))}: {e.get('explanation', '(no explanation)')}")
+        for sha, t, fix in shared_hits:
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(t)) if t else "unknown time"
+            explanation = fix.get("explanation", "(no explanation)") if isinstance(fix, dict) else str(fix)
+            lines.append(f"  [team-shared, commit {sha}, {ts}]: {explanation}")
+        return f"PASTFIX '{query}': {len(local_hits) + len(shared_hits)} prior fix(es) ({len(local_hits)} local, {len(shared_hits)} team-shared)\n" + "\n".join(lines)
+
+    def _lint_check(self, content: str, path: str):
+        """Automatic, non-model-invoked gate: syntax/AST validation, then
+        pyflakes (if importable), run on the FULL proposed file content
+        before it's ever written to disk. Returns (ok, messages)."""
+        if os.path.splitext(path)[1] != ".py":
+            return True, []
+        try:
+            compile(content, path, "exec")
+        except SyntaxError as exc:
+            return False, [f"SyntaxError: {exc.msg} (line {exc.lineno})"]
+        try:
+            import pyflakes.api as _pyflakes_api
+            import pyflakes.reporter as _pyflakes_reporter
+        except ImportError:
+            return True, []
+        out, err = io.StringIO(), io.StringIO()
+        _pyflakes_api.check(content, path, _pyflakes_reporter.Reporter(out, err))
+        messages = [l for l in (out.getvalue() + err.getvalue()).splitlines() if l.strip()]
+        blocking = [m for m in messages if "undefined name" in m.lower() or "syntaxerror" in m.lower()]
+        return (len(blocking) == 0), messages
+
+    # ------------------------------------------------------------------
+    # Execution tooling. Pulse CLI runs the agent conversation in the SAME
+    # process as training (unlike the GUI, which talks to a separate
+    # process over queues), so these act directly on self.watch_locals --
+    # a live, periodically-refreshed {name: value} snapshot of every
+    # tracked variable. That's a real, but bounded, limitation: only
+    # tracked-variable names are visible here, not arbitrary
+    # locals/globals or a live frame object.
+    # ------------------------------------------------------------------
+    def _exec_namespace(self) -> Dict[str, Any]:
+        return dict(self.watch_locals)
+
+    def _run_exec_repl(self, expr: str) -> str:
+        """REPL: <expr> -- evaluate against the current tracked-variable
+        snapshot right now, instead of reasoning from a context dump that
+        may already be stale."""
+        ns = self._exec_namespace()
+        try:
+            value = eval(expr, {"__builtins__": __builtins__, "math": math}, ns)
+        except Exception:
+            return f"REPL '{expr}': raised\n{_format_exc_short(traceback.format_exc())}"
+        return f"REPL '{expr}' = {_describe_exec_value(value)}"
+
+    def _run_exec_dryrun(self, call_expr: str) -> str:
+        """DRYRUN: <function>(<args>) -- execute a specific call against
+        the current tracked-variable snapshot and return the real output,
+        exception, and traceback."""
+        ns = self._exec_namespace()
+        result: Dict[str, Any] = {}
+
+        def _run():
+            try:
+                result["value"] = eval(call_expr, {"__builtins__": __builtins__, "math": math}, ns)
+            except Exception:
+                result["error"] = traceback.format_exc()
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(timeout=10.0)
+        if t.is_alive():
+            return f"DRYRUN '{call_expr}': still running after 10s -- not waiting further (it keeps running in the background)."
+        if "error" in result:
+            return f"DRYRUN '{call_expr}': raised\n{_format_exc_short(result['error'])}"
+        return f"DRYRUN '{call_expr}' -> {_describe_exec_value(result.get('value'))}"
+
+    def _run_exec_shapetrace(self, arg: str) -> str:
+        """SHAPETRACE: [optional model var name] -- forward pass with a
+        live tensor already tracked, dumping every submodule's shape via
+        forward hooks. PyTorch only; only sees tracked variables."""
+        try:
+            import torch
+            import torch.nn as nn
+        except ImportError:
+            return "SHAPETRACE: requires PyTorch to be importable; none found."
+        ns = self._exec_namespace()
+        model = None
+        arg = (arg or "").strip()
+        if arg and arg in ns and isinstance(ns[arg], nn.Module):
+            model = ns[arg]
+        if model is None:
+            for v in ns.values():
+                if isinstance(v, nn.Module):
+                    model = v
+                    break
+        if model is None:
+            return "SHAPETRACE: no torch.nn.Module found among tracked variables."
+        sample = None
+        for name in ("x", "inputs", "input", "batch", "images", "data"):
+            if name in ns and torch.is_tensor(ns[name]):
+                sample = ns[name]
+                break
+        if sample is None:
+            for v in ns.values():
+                if torch.is_tensor(v):
+                    sample = v
+                    break
+        if sample is None:
+            return "SHAPETRACE: no tensor found among tracked variables to use as a synthetic input."
+
+        records = []
+        hooks = []
+
+        def _make_hook(name):
+            def _fn(module, inp, out):
+                in_shapes = [tuple(t.shape) for t in inp if torch.is_tensor(t)]
+                out_list = out if isinstance(out, (tuple, list)) else [out]
+                out_shapes = [tuple(o.shape) for o in out_list if torch.is_tensor(o)]
+                records.append(f"  {name} ({type(module).__name__}): in={in_shapes} out={out_shapes}")
+            return _fn
+
+        for name, module in model.named_modules():
+            if name:
+                hooks.append(module.register_forward_hook(_make_hook(name)))
+        try:
+            was_training = model.training
+            model.eval()
+            with torch.no_grad():
+                model(sample.clone())
+            model.train(was_training)
+        except Exception:
+            return f"SHAPETRACE: forward pass raised\n{_format_exc_short(traceback.format_exc())}"
+        finally:
+            for h in hooks:
+                h.remove()
+        if not records:
+            return "SHAPETRACE: forward pass ran but no submodule shapes were captured."
+        return f"SHAPETRACE (forward pass, synthetic input shape {tuple(sample.shape)}):\n" + "\n".join(records)
+
+    def _run_exec_gradcheck(self, param_name: str) -> str:
+        """GRADCHECK: <param> -- numerical finite-difference gradient
+        check on a tracked parameter, deterministic pass/fail against its
+        .grad. Requires a zero-arg `loss_fn` among tracked variables that
+        recomputes the current scalar loss."""
+        try:
+            import torch
+        except ImportError:
+            return "GRADCHECK: requires PyTorch to be importable; none found."
+        ns = self._exec_namespace()
+        param_name = param_name.strip()
+        param = ns.get(param_name)
+        if param is None or not torch.is_tensor(param):
+            param = None
+            for v in ns.values():
+                named_parameters = getattr(v, "named_parameters", None)
+                if not callable(named_parameters):
+                    continue
+                try:
+                    for pname, p in v.named_parameters():
+                        if pname == param_name or pname.endswith("." + param_name):
+                            param = p
+                            break
+                except Exception:
+                    continue
+                if param is not None:
+                    break
+        if param is None or not hasattr(param, "grad"):
+            return f"GRADCHECK '{param_name}': couldn't find a tracked tensor parameter with a .grad by that name."
+        if param.grad is None:
+            return f"GRADCHECK '{param_name}': has no .grad yet -- call backward() at least once first."
+        loss_fn = ns.get("loss_fn")
+        if not callable(loss_fn):
+            return (
+                f"GRADCHECK '{param_name}': needs a zero-argument callable named `loss_fn` among tracked "
+                "variables that recomputes and returns the current scalar loss -- define one and resend GRADCHECK."
+            )
+        eps = 1e-3
+        flat = param.data.view(-1)
+        grad_flat = param.grad.view(-1)
+        n_check = min(5, flat.numel())
+        if n_check == 0:
+            return f"GRADCHECK '{param_name}': parameter is empty."
+        idxs = sorted({int(i) for i in torch.linspace(0, flat.numel() - 1, n_check).tolist()})
+        lines, max_rel_err = [], 0.0
+        try:
+            with torch.no_grad():
+                for idx in idxs:
+                    orig = flat[idx].item()
+                    flat[idx] = orig + eps
+                    loss_plus = float(loss_fn())
+                    flat[idx] = orig - eps
+                    loss_minus = float(loss_fn())
+                    flat[idx] = orig
+                    numeric = (loss_plus - loss_minus) / (2 * eps)
+                    analytic = grad_flat[idx].item()
+                    denom = max(abs(numeric), abs(analytic), 1e-8)
+                    rel_err = abs(numeric - analytic) / denom
+                    max_rel_err = max(max_rel_err, rel_err)
+                    lines.append(f"  idx {idx}: analytic={analytic:.6g} numeric={numeric:.6g} rel_err={rel_err:.2e}")
+        except Exception:
+            return f"GRADCHECK '{param_name}': loss_fn() raised while probing\n{_format_exc_short(traceback.format_exc())}"
+        verdict = "PASS" if max_rel_err < 1e-2 else "FAIL"
+        header = f"GRADCHECK '{param_name}': {verdict} (max rel_err={max_rel_err:.2e} over {n_check} sampled entries)\n"
+        return header + "\n".join(lines)
+
+    def _replay_maybe_checkpoint(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            return
+        ns = self._exec_namespace()
+        snap = {}
+        for name, v in ns.items():
+            state_dict_fn = getattr(v, "state_dict", None)
+            if not callable(state_dict_fn):
+                continue
+            try:
+                buf = io.BytesIO()
+                torch.save(v.state_dict(), buf)
+                snap[name] = buf.getvalue()
+            except Exception:
+                continue
+        if snap:
+            checkpoints = getattr(self, "_replay_checkpoints", None)
+            if checkpoints is None:
+                checkpoints = []
+                self._replay_checkpoints = checkpoints
+            step = next(getattr(self, "_replay_step_counter", itertools.count()))
+            self._replay_step_counter = getattr(self, "_replay_step_counter", itertools.count(step + 1))
+            checkpoints.append((step, snap))
+            del checkpoints[:-20]
+
+    def _run_exec_replay(self, arg: str) -> str:
+        """REPLAY: <n_steps> -- from the last checkpoint at least n_steps
+        back, restore a copy of tracked state and replay n_steps via a
+        zero-argument `train_step` tracked callable, reporting the
+        resulting loss curve, then restore live state."""
+        try:
+            n_steps = int(str(arg).strip())
+        except ValueError:
+            return f"REPLAY '{arg}': expected an integer number of steps, e.g. 'REPLAY: 5'."
+        checkpoints = getattr(self, "_replay_checkpoints", None)
+        if not checkpoints:
+            return (
+                "REPLAY: no checkpoints captured yet -- Pulse periodically snapshots any tracked variable "
+                "with a state_dict() (model/optimizer); wait for at least one snapshot after training starts."
+            )
+        try:
+            import torch
+        except ImportError:
+            return "REPLAY: requires PyTorch to be importable; none found."
+        if n_steps >= len(checkpoints):
+            step, snap = checkpoints[0]
+        else:
+            step, snap = checkpoints[-1 - n_steps]
+
+        ns = self._exec_namespace()
+        train_step = ns.get("train_step")
+        if not callable(train_step):
+            return (
+                "REPLAY: needs a zero-argument callable named `train_step` among tracked variables that "
+                "performs one optimizer step on the live model and returns the step's loss."
+            )
+        restored, originals = [], {}
+        for name, blob in snap.items():
+            obj = ns.get(name)
+            if obj is None or not hasattr(obj, "load_state_dict"):
+                continue
+            try:
+                originals[name] = copy.deepcopy(obj.state_dict())
+                obj.load_state_dict(torch.load(io.BytesIO(blob)))
+                restored.append(name)
+            except Exception:
+                continue
+        if not restored:
+            return "REPLAY: had a checkpoint but couldn't restore it into any live object (state_dict shape mismatch?)."
+
+        def _restore_live():
+            for name in restored:
+                try:
+                    ns[name].load_state_dict(originals[name])
+                except Exception:
+                    pass
+
+        losses = []
+        try:
+            for _ in range(max(1, n_steps)):
+                losses.append(float(train_step()))
+        except Exception:
+            _restore_live()
+            return f"REPLAY: patched replay raised\n{_format_exc_short(traceback.format_exc())}"
+        _restore_live()
+        curve = ", ".join(f"{l:.6g}" for l in losses)
+        return (
+            f"REPLAY: replayed {len(losses)} step(s) from a checkpoint at step {step} on an isolated copy "
+            f"of tracked state, then restored live values back. Resulting loss curve: [{curve}]"
+        )
+
+    def _run_gpustatus(self) -> str:
+        """GPUSTATUS: -- real per-device GPU memory/utilization. Under a
+        multi-GPU/multi-rank launch, aggregates every rank's status
+        (published periodically by pulse.py's auto_track) into one report
+        instead of just this process's own device(s)."""
+        rank, _local_rank, world_size, session_key = self.dist_info
+        if world_size > 1 and session_key:
+            return _format_multi_rank_gpu_status(session_key, rank)
+        return _format_gpu_status(_gpu_status_snapshot())
+
+    def _run_rollback(self, arg: str) -> str:
+        """ROLLBACK: <commit_id, or 'last'> -- deterministically revert
+        the workspace via the same .pulse_history mechanism /revert uses,
+        instead of the agent trying to manually reconstruct old code from
+        memory of the conversation. 'last' undoes the most recent commit;
+        otherwise `arg` is matched as a commit id (see /log)."""
+        entries = self._load_fix_log()
+        if not entries:
+            return "ROLLBACK: no recorded Pulse code changes to revert."
+        arg = arg.strip()
+        if not arg or arg.lower() == "last":
+            target_idx = len(entries) - 2
+            target_label = f"before commit {entries[-1].get('id', '?')} (most recent)"
+        else:
+            target_idx = None
+            target_label = ""
+            for i, e in enumerate(entries):
+                eid = e.get("id", "")
+                if eid == arg or eid.startswith(arg):
+                    target_idx = i
+                    target_label = f"commit {eid}"
+                    break
+            if target_idx is None:
+                return f"ROLLBACK '{arg}': no commit matches that id -- send LOG (or /log interactively) to see recorded commits."
+        restored, failed, new_commit = self._perform_revert(entries, target_idx, target_label)
+        if not restored and not failed:
+            return f"ROLLBACK '{arg}': workspace already matches that state -- nothing to revert."
+        parts = []
+        if restored:
+            parts.append(f"ROLLBACK: reverted to state {target_label} -- {len(restored)} file(s) restored: " + ", ".join(os.path.basename(p) for p in restored) + (f" (logged as commit {new_commit})" if new_commit else ""))
+        if failed:
+            parts.append(f"ROLLBACK: failed to restore {len(failed)} file(s): " + ", ".join(f"{os.path.basename(p)} ({err})" for p, err in failed))
+        return "\n".join(parts)
+
+    def _run_mllint(self) -> str:
+        """MLLINT: -- a small set of high-confidence, AST-detectable ML
+        anti-patterns across every tracked file. Heuristics about ML
+        *semantics*, worded as things worth double-checking, not
+        certainties the way the syntax LINT gate's findings are."""
+        findings = _mllint_scan(self._iter_ast_trees())
+        if not findings:
+            return "MLLINT: no anti-patterns found in this heuristic check across the tracked files (this doesn't guarantee correctness, just that none of Pulse's known patterns matched)."
+        lines = [f"  {label}:{lineno}: {msg}" for label, lineno, msg in findings]
+        return f"MLLINT: {len(findings)} finding(s) worth double-checking\n" + "\n\n".join(lines)
+
+    def _run_exec_layerstats(self, arg: str) -> str:
+        """LAYERSTATS: [optional model variable name] -- per-layer
+        gradient-norm/weight-norm ratio for every parameter of a tracked
+        torch.nn.Module, right after backward() has populated .grad."""
+        try:
+            import torch
+            import torch.nn as nn
+        except ImportError:
+            return "LAYERSTATS: requires PyTorch to be importable; none found."
+        ns = self._exec_namespace()
+        arg = (arg or "").strip()
+        model = ns.get(arg) if arg and isinstance(ns.get(arg), nn.Module) else None
+        if model is None:
+            model = next((v for v in ns.values() if isinstance(v, nn.Module)), None)
+        if model is None:
+            return "LAYERSTATS: no torch.nn.Module found among tracked variables."
+
+        rows = []
+        any_grad = False
+        for name, param in model.named_parameters():
+            if param.grad is None:
+                rows.append((name, tuple(param.shape), None, None, None))
+                continue
+            any_grad = True
+            with torch.no_grad():
+                w_norm = float(param.data.norm().item())
+                g_norm = float(param.grad.norm().item())
+            ratio = g_norm / (w_norm + 1e-12)
+            rows.append((name, tuple(param.shape), w_norm, g_norm, ratio))
+        if not any_grad:
+            return "LAYERSTATS: found the model but no parameter has a .grad yet -- call backward() at least once first."
+
+        scored = [r for r in rows if r[4] is not None]
+        scored.sort(key=lambda r: r[4])
+        lines = []
+        for name, shape, w_norm, g_norm, ratio in scored:
+            flag = ""
+            if ratio < 1e-6:
+                flag = "  <- near-zero, possible dead/vanishing layer"
+            elif ratio > 1.0:
+                flag = "  <- large, possible exploding layer"
+            lines.append(f"  {name} {shape}: weight_norm={w_norm:.4g} grad_norm={g_norm:.4g} ratio={ratio:.2e}{flag}")
+        no_grad_names = [name for name, _s, w, g, r in rows if r is None]
+        footer = f"\n  ({len(no_grad_names)} parameter(s) with no .grad, not shown: {', '.join(no_grad_names[:5])}{'...' if len(no_grad_names) > 5 else ''})" if no_grad_names else ""
+        return f"LAYERSTATS ({len(scored)} parameter(s) with gradients, sorted low->high ratio):\n" + "\n".join(lines) + footer
+
+    def _run_exec_hardexamples(self, arg: str) -> str:
+        """HARDEXAMPLES: [optional N, default 10] -- per-example loss for
+        the current batch via a zero-arg `per_example_losses_fn` tracked
+        callable, surfacing the highest-loss samples."""
+        ns = self._exec_namespace()
+        fn = ns.get("per_example_losses_fn")
+        if not callable(fn):
+            return (
+                "HARDEXAMPLES: needs a zero-argument callable named `per_example_losses_fn` among "
+                "tracked variables that returns a per-sample loss array for the current batch (e.g. "
+                "`per_example_losses_fn = lambda: F.cross_entropy(model(x), y, reduction='none')`)."
+            )
+        try:
+            losses = fn()
+        except Exception:
+            return f"HARDEXAMPLES: per_example_losses_fn() raised\n{_format_exc_short(traceback.format_exc())}"
+        try:
+            import torch
+            if torch.is_tensor(losses):
+                losses = losses.detach().cpu().numpy()
+        except ImportError:
+            pass
+        try:
+            losses = np.asarray(losses, dtype=float).reshape(-1)
+        except Exception:
+            return f"HARDEXAMPLES: per_example_losses_fn() returned something that isn't a flat numeric array ({type(losses)})."
+
+        n = 10
+        arg = (arg or "").strip()
+        if arg:
+            try:
+                n = max(1, int(arg))
+            except ValueError:
+                return f"HARDEXAMPLES '{arg}': expected an integer N, e.g. 'HARDEXAMPLES: 20'."
+
+        ids = ns.get("sample_ids", ns.get("indices"))
+        id_arr = None
+        if ids is not None:
+            try:
+                import torch
+                if torch.is_tensor(ids):
+                    ids = ids.detach().cpu().numpy()
+            except ImportError:
+                pass
+            try:
+                id_arr = np.asarray(ids).reshape(-1)
+                if len(id_arr) != len(losses):
+                    id_arr = None
+            except Exception:
+                id_arr = None
+
+        order = np.argsort(-losses)[:n]
+        lines = []
+        for rank_i, idx in enumerate(order, 1):
+            label = f"id={id_arr[idx]}" if id_arr is not None else f"batch-position {idx}"
+            lines.append(f"  #{rank_i}: {label}, loss={losses[idx]:.6g}")
+        mean, std = float(losses.mean()), float(losses.std())
+        return (
+            f"HARDEXAMPLES: top {len(order)} of {len(losses)} example(s) by loss "
+            f"(batch mean={mean:.4g}, std={std:.4g}):\n" + "\n".join(lines)
+        )
+
+    def _run_exec_ampstatus(self, arg: str) -> str:
+        """AMPSTATUS: [optional GradScaler variable name] -- current
+        mixed-precision (torch.cuda.amp.GradScaler) scale/skip state."""
+        ns = self._exec_namespace()
+        arg = (arg or "").strip()
+        scaler = ns.get(arg) if arg else None
+        if scaler is None:
+            scaler = next((v for v in ns.values() if type(v).__name__ == "GradScaler"), None)
+        if scaler is None:
+            return "AMPSTATUS: no GradScaler found among tracked variables (this run may not be using AMP)."
+        try:
+            scale = float(scaler.get_scale())
+        except Exception:
+            scale = None
+        skips = None
+        try:
+            state = scaler.state_dict()
+            skips = state.get("_growth_tracker")
+        except Exception:
+            pass
+        parts = []
+        if scale is not None:
+            parts.append(f"current scale factor: {scale:.6g}")
+        if skips is not None:
+            parts.append(f"growth tracker (consecutive non-skipped steps at current scale): {skips}")
+        if not parts:
+            return "AMPSTATUS: found a GradScaler but couldn't read its internal state (API may have changed)."
+        return "AMPSTATUS:\n  " + "\n  ".join(parts)
+
+    def _run_exec_seedcheck(self, arg: str) -> str:
+        """SEEDCHECK: -- a reproducibility fingerprint of every RNG this
+        process can see, compared against the fingerprint from the last
+        time SEEDCHECK ran on this project."""
+        current = _seed_fingerprint()
+        path = _seed_history_path(self.script_path)
+        previous = None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                previous = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            pass
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(current, f)
+        except OSError:
+            pass
+        lines = [f"  {k}: {v}" for k, v in current.items() if v is not None]
+        header = "SEEDCHECK: current RNG fingerprint\n" + "\n".join(lines)
+        if previous is None:
+            return header + "\n\n(no prior fingerprint recorded for this project -- this is now the baseline for future SEEDCHECK calls.)"
+        diffs = [k for k in current if current.get(k) != previous.get(k)]
+        if not diffs:
+            return header + "\n\nMatches the last recorded fingerprint for this project exactly."
+        diff_lines = [f"  {k}: was {previous.get(k)!r}, now {current.get(k)!r}" for k in diffs]
+        return (
+            header + "\n\nDIFFERS from the last recorded fingerprint in:\n" + "\n".join(diff_lines) +
+            "\n(this alone doesn't mean anything is wrong -- more steps run, an intentional reseed, or a "
+            "different data shuffle order would all cause this too -- but worth confirming it's expected.)"
+        )
+
+    def _run_rankdiverge(self, var: str) -> str:
+        """RANKDIVERGE: <var> -- compares this rank's latest value of a
+        tracked scalar against every other rank's latest value."""
+        rank, _local_rank, world_size, session_key = self.dist_info
+        if world_size <= 1 or not session_key:
+            return "RANKDIVERGE: this process isn't part of a multi-rank launch (world_size == 1)."
+        statuses = _read_all_rank_status(session_key)
+        if not statuses:
+            return "RANKDIVERGE: no rank status files found yet."
+        values = {}
+        for s in statuses:
+            scalars = s.get("scalars") or {}
+            if var in scalars and scalars[var] is not None:
+                values[s.get("rank")] = scalars[var]
+        if len(values) < 2:
+            return f"RANKDIVERGE '{var}': fewer than 2 ranks currently report this variable ({len(values)} found)."
+        mean = sum(values.values()) / len(values)
+        lines = [f"  rank {r}{' (this process)' if r == rank else ''}: {v:.6g}  (delta from mean: {v - mean:+.4g})" for r, v in sorted(values.items())]
+        spread = max(values.values()) - min(values.values())
+        verdict = "large spread across ranks -- worth investigating" if spread > abs(mean) * 0.1 + 1e-9 else "spread looks tight"
+        return f"RANKDIVERGE '{var}' across {len(values)}/{world_size} rank(s), mean={mean:.6g}, spread={spread:.4g} ({verdict}):\n" + "\n".join(lines)
+
+    def _run_runcompare(self) -> str:
+        """RUNCOMPARE: -- this run's current scalar values vs the most
+        recent previous run recorded for this project. Local file, plus
+        (when this project's team history is available -- see
+        _load_history_context) a note about the most recent *shared*
+        session's outcome too."""
+        current_scalars = {name: (v[-1] if v else None) for name, v in self.scalar_histories.items() if v}
+        current_scalars = {k: v for k, v in current_scalars.items() if v is not None}
+        if not current_scalars:
+            return "RUNCOMPARE: no scalar values recorded yet this run."
+
+        history = _load_run_history(self.script_path)
+        run_id = getattr(self, "_run_id", None)
+        previous = next((r for r in reversed(history) if r.get("run_id") != run_id), None)
+
+        this_entry = next((r for r in history if r.get("run_id") == run_id), None)
+        if this_entry is None:
+            this_entry = {"run_id": run_id, "started": time.time()}
+            history.append(this_entry)
+        this_entry["updated"] = time.time()
+        this_entry["scalars"] = current_scalars
+        history = history[-10:]
+        try:
+            with open(_run_history_path(self.script_path), "w", encoding="utf-8") as f:
+                json.dump(history, f)
+        except OSError:
+            pass
+
+        if previous is None:
+            return "RUNCOMPARE: no prior run recorded for this project yet -- this run is now the baseline for future RUNCOMPARE calls."
+
+        prev_scalars = previous.get("scalars", {})
+        lines = []
+        for name, cur_val in current_scalars.items():
+            prev_val = prev_scalars.get(name)
+            if prev_val is None or cur_val is None:
+                continue
+            delta = cur_val - prev_val
+            pct = f" ({delta / prev_val * 100:+.2f}%)" if prev_val else ""
+            lname = name.lower()
+            got_worse = (("loss" in lname or "err" in lname) and delta > 0) or ("acc" in lname and delta < 0)
+            flag = "  <- worse than last run" if got_worse else ""
+            lines.append(f"  {name}: {prev_val:.6g} -> {cur_val:.6g}  (delta {delta:+.6g}{pct}){flag}")
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(previous.get("updated", previous.get("started", 0))))
+        if not lines:
+            return f"RUNCOMPARE: found a previous run (last updated {when}) but no overlapping scalar names to compare."
+        return f"RUNCOMPARE vs previous run (last updated {when}):\n" + "\n".join(lines)
+
+    def _record_usage(self, response) -> None:
+        """Best-effort token/cost accounting for the COST directive --
+        never let a usage-accounting hiccup affect the actual chat
+        response. Cost is litellm's own estimate where it has pricing
+        data for the model; otherwise only token counts are available."""
+        try:
+            usage = getattr(response, "usage", None)
+            if usage:
+                self._token_usage["prompt_tokens"] += getattr(usage, "prompt_tokens", 0) or 0
+                self._token_usage["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
+                self._token_usage["total_tokens"] += getattr(usage, "total_tokens", 0) or 0
+            self._token_usage["calls"] += 1
+            try:
+                self._token_usage["cost_usd"] += float(litellm.completion_cost(completion_response=response) or 0.0)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _ensure_retry_ticker(self) -> None:
+        """Starts the one background thread that periodically retries
+        whatever's in self._pending_agent_retry / self._pending_restart_retry,
+        if anything. Lazily started on first need rather than always
+        running, and idempotent -- safe to call every time something gets
+        queued."""
+        if self._retry_ticker_started:
+            return
+        self._retry_ticker_started = True
+
+        def _loop():
+            while True:
+                time.sleep(15.0)
+                # Blocking acquire (with a timeout) rather than skip-if-busy:
+                # _retry_ticker_lock is an RLock also held for the duration
+                # of every real ask_agent() call (see ask_agent), so this
+                # just waits for whatever the user is doing right now to
+                # finish rather than racing it -- and since ask_agent()
+                # itself re-enters this same lock reentrantly, calling it
+                # from inside this `with` block below is safe, not a
+                # deadlock.
+                if not self._retry_ticker_lock.acquire(timeout=120.0):
+                    continue
+                try:
+                    pending = self._pending_agent_retry
+                    if pending and time.time() >= pending["next_attempt"]:
+                        cprint(
+                            "\n[Pulse] retrying an earlier diagnosis/fix request that hit a rate limit/"
+                            "transient error -- training was not interrupted while waiting.",
+                            color=_YELLOW,
+                        )
+                        try:
+                            self.ask_agent(pending["question"], pending["include_code"], traceback_signature=pending.get("traceback_signature"))
+                        except Exception:
+                            pass  # _ask_agent_impl already handles/re-queues its own failures
+                    pending_restart = self._pending_restart_retry
+                    if pending_restart and time.time() >= pending_restart["next_attempt"]:
+                        cprint("\n[Pulse] retrying an earlier restart that failed to launch...", color=_YELLOW)
+                        try:
+                            self._restart_process()  # does not return on success
+                        except Exception:
+                            pass
+                finally:
+                    self._retry_ticker_lock.release()
+
+        threading.Thread(target=_loop, daemon=True).start()
+
+    def _queue_agent_retry(self, question: str, include_code: bool, traceback_signature: Optional[str]) -> None:
+        """Called when a top-level ask_agent() call failed only because
+        of a transient agent-side error (rate limit, timeout, provider
+        blip -- see _is_retryable_model_error) after exhausting its
+        immediate in-call retries. Rather than losing that diagnosis/fix
+        attempt for good, it's kept and retried again later on a backoff,
+        while the run itself keeps going untouched in the meantime."""
+        existing = self._pending_agent_retry
+        backoff = 60.0
+        if existing and existing.get("question") == question:
+            backoff = min(existing.get("backoff", 60.0) * 2, 600.0)
+        self._pending_agent_retry = {
+            "question": question, "include_code": include_code,
+            "traceback_signature": traceback_signature,
+            "next_attempt": time.time() + backoff, "backoff": backoff,
+        }
+        cprint(
+            f"[Pulse] will retry this request again in ~{backoff:.0f}s (agent request hit a rate limit/"
+            "transient error) -- the run continues unaffected in the meantime.",
+            color=_YELLOW,
+        )
+        self._ensure_retry_ticker()
+
+    def _queue_restart_retry(self) -> None:
+        """Called when _restart_process gave up after MAX_RESTART_ATTEMPTS
+        because it couldn't even LAUNCH the replacement process (an OS/
+        environment-level failure, not the training script itself
+        crashing -- that second case already triggers an auto-rollback
+        instead, since it means the fix itself is the problem, and
+        retrying a demonstrably-broken fix forever isn't safe). A launch
+        failure has nothing to do with whether the fix is good, so it's
+        legitimately worth trying again later."""
+        existing = self._pending_restart_retry
+        backoff = 60.0
+        if existing:
+            backoff = min(existing.get("backoff", 60.0) * 2, 600.0)
+        self._pending_restart_retry = {"next_attempt": time.time() + backoff, "backoff": backoff}
+        cprint(f"[Pulse] will retry launching the replacement process again in ~{backoff:.0f}s.", color=_YELLOW)
+        self._ensure_retry_ticker()
+
+    def _run_cost(self) -> str:
+        """COST: -- running token/cost usage for this chat session's
+        agent calls, accumulated across every pipeline pass."""
+        u = getattr(self, "_token_usage", None)
+        if not u or u["calls"] == 0:
+            return "COST: no agent calls recorded yet this session."
+        lines = [
+            f"  agent calls: {u['calls']}",
+            f"  prompt tokens: {u['prompt_tokens']:,}",
+            f"  completion tokens: {u['completion_tokens']:,}",
+            f"  total tokens: {u['total_tokens']:,}",
+        ]
+        if u["cost_usd"] > 0:
+            lines.append(f"  estimated cost: ${u['cost_usd']:.4f}")
+        else:
+            lines.append("  estimated cost: unavailable (no pricing data for this model/provider)")
+        return "COST (this session so far):\n" + "\n".join(lines)
+
+    def _echo_directives(self, requests: Dict[str, List[str]]) -> None:
+        """Print a visible '-> /NAME arg' line for every directive the
+        agent actually invoked, before any of its results are shown --
+        so it's never a black box whether Pulse genuinely ran a real
+        check (GREP'd the file, executed LINT, called out to the live
+        process, ...) versus the agent merely claiming it did. Covers
+        both the original CALC/PROMOTE/GREP/VIEW/... directives (see the
+        call in _apply_directives) and the extended toolset (see
+        _apply_new_directives)."""
+        for name, args in requests.items():
+            if not args:
+                cprint(f"  -> /{name}", color=_YELLOW)
+                continue
+            for arg in args:
+                label = f"/{name} {arg}" if arg else f"/{name}"
+                cprint(f"  -> {label}", color=_YELLOW)
+
+    def _apply_new_directives(self, requests: Dict[str, List[str]]) -> str:
+        """Deterministically service the extended toolset the same way
+        _apply_directives handles CALC/PROMOTE/GREP/VIEW."""
+        self._echo_directives(requests)
+        notes = []
+        for symbol in requests.get("defof", []):
+            notes.append(self._run_defof(symbol))
+        for symbol in requests.get("callers", []):
+            notes.append(self._run_callers(symbol))
+        if "depgraph" in requests:
+            notes.append(self._run_depgraph())
+        for arg in requests.get("corr", []):
+            notes.append(self._run_corr(arg))
+        for var in requests.get("outlier", []):
+            notes.append(self._run_outlier(var))
+        for arg in requests.get("diffstats", []):
+            notes.append(self._run_diffstats(arg))
+        for var in requests.get("histogram", []):
+            notes.append(self._run_histogram(var))
+        for arg in requests.get("doclookup", []):
+            notes.append(self._run_doclookup(arg))
+        if "changelog" in requests:
+            notes.append(self._run_changelog())
+        if "gpustatus" in requests:
+            notes.append(self._run_gpustatus())
+        for arg in requests.get("rollback", []):
+            notes.append(self._run_rollback(arg))
+        for query in requests.get("pastfix", []):
+            notes.append(self._run_pastfix(query))
+        for arg in requests.get("dryrun", []):
+            notes.append(self._run_exec_dryrun(arg))
+        for arg in requests.get("repl", []):
+            notes.append(self._run_exec_repl(arg))
+        for arg in requests.get("replay", []):
+            notes.append(self._run_exec_replay(arg))
+        for arg in requests.get("gradcheck", []):
+            notes.append(self._run_exec_gradcheck(arg))
+        if "shapetrace" in requests:
+            for arg in requests["shapetrace"]:
+                notes.append(self._run_exec_shapetrace(arg))
+        if "mllint" in requests:
+            notes.append(self._run_mllint())
+        for arg in requests.get("layerstats", []):
+            notes.append(self._run_exec_layerstats(arg))
+        for arg in requests.get("hardexamples", []):
+            notes.append(self._run_exec_hardexamples(arg))
+        for arg in requests.get("ampstatus", []):
+            notes.append(self._run_exec_ampstatus(arg))
+        if "seedcheck" in requests:
+            for arg in requests["seedcheck"]:
+                notes.append(self._run_exec_seedcheck(arg))
+        for var in requests.get("rankdiverge", []):
+            notes.append(self._run_rankdiverge(var))
+        if "runcompare" in requests:
+            notes.append(self._run_runcompare())
+        if "cost" in requests:
+            notes.append(self._run_cost())
+        return "\n\n".join(n for n in notes if n)
 
     def _apply_directives(
         self,
@@ -3812,14 +6264,21 @@ class PulseCLI:
         gpuuntrack_names: Optional[List[str]] = None,
         sensitivity_args: Optional[List[str]] = None,
         normal_start_args: Optional[List[str]] = None,
+        grep_patterns: Optional[List[str]] = None,
+        view_requests: Optional[List[str]] = None,
     ) -> str:
         """Deterministically compute any CALC: expressions and apply any
-        PROMOTE:/GPUTRACK:/GPUUNTRACK:/SENSITIVITY:/NORMAL_START: requests,
-        returning a short human-readable summary to print and to feed
-        back into the agent's own history (so it sees the verified
-        numbers/state on the next turn instead of trusting its own
-        arithmetic or memory).
+        PROMOTE:/GPUTRACK:/GPUUNTRACK:/SENSITIVITY:/NORMAL_START:/GREP:/
+        VIEW: requests, returning a short human-readable summary to print
+        and to feed back into the agent's own history (so it sees the
+        verified numbers/state/code on the next turn instead of trusting
+        its own arithmetic, memory, or a stale full-file dump).
         """
+        self._echo_directives({k: v for k, v in {
+            "calc": calc_exprs, "promote": promote_names, "gputrack": gputrack_names,
+            "gpuuntrack": gpuuntrack_names, "sensitivity": sensitivity_args,
+            "normal_start": normal_start_args, "grep": grep_patterns, "view": view_requests,
+        }.items() if v})
         notes = []
 
         if calc_exprs:
@@ -3898,6 +6357,18 @@ class PulseCLI:
                     "genuine explosion in the first few steps can still be caught."
                 )
 
+        if grep_patterns:
+            for pattern in grep_patterns:
+                result = self._run_grep(pattern)
+                print(f"  🔎 {result.splitlines()[0]}")
+                notes.append(result)
+
+        if view_requests:
+            for arg in view_requests:
+                result = self._run_view(arg)
+                print(f"  📄 {result.splitlines()[0]}")
+                notes.append(result)
+
         return "\n\n".join(notes)
 
     _GPU_CHECKIN_PROMPT = (
@@ -3945,7 +6416,7 @@ class PulseCLI:
             # and try again at the next interval.
             cprint(f"[Pulse] ⚠ GPU check-in skipped (agent request failed: {exc})", color=_RED)
             return
-        _, _calc, _promote, gputrack_names, gpuuntrack_names, _sens, _norm = self._extract_directives(answer)
+        _, _calc, _promote, gputrack_names, gpuuntrack_names, _sens, _norm, _grep, _view = self._extract_directives(answer)
         summary = self._apply_directives([], [], gputrack_names, gpuuntrack_names)
         if summary:
             self.agent_history.append({"role": "user", "content": prompt})
@@ -4104,19 +6575,27 @@ class PulseCLI:
         that to recognize and re-fix the same bug in a later session
         without a full re-diagnosis.
         """
-        if _depth == 0:
-            self._last_applied_fix = None
-        answer = self._ask_agent_impl(question, include_code=include_code, _depth=_depth)
-        if _depth == 0:
-            self._sync_agent_turn(
-                question, answer,
-                traceback_signature=traceback_signature,
-                fix_applied=self._last_applied_fix,
-            )
-            if traceback_signature and self._last_applied_fix:
-                self._known_fixes[traceback_signature] = self._last_applied_fix
-                self._resolved_signatures.add(traceback_signature)
-        return answer
+        with self._retry_ticker_lock:
+            if _depth == 0:
+                self._last_applied_fix = None
+            answer = self._ask_agent_impl(question, include_code=include_code, _depth=_depth)
+            if _depth == 0:
+                if self._last_call_failed_transiently:
+                    self._queue_agent_retry(question, include_code, traceback_signature)
+                elif self._pending_agent_retry and self._pending_agent_retry.get("question") == question:
+                    # This exact question just succeeded (either a fresh ask,
+                    # or the retry ticker below re-asking it) -- nothing left
+                    # to retry.
+                    self._pending_agent_retry = None
+                self._sync_agent_turn(
+                    question, answer,
+                    traceback_signature=traceback_signature,
+                    fix_applied=self._last_applied_fix,
+                )
+                if traceback_signature and self._last_applied_fix:
+                    self._known_fixes[traceback_signature] = self._last_applied_fix
+                    self._resolved_signatures.add(traceback_signature)
+            return answer
 
     def _ask_agent_impl(self, question: str, include_code: bool = False, _depth: int = 0) -> str:
         """Runs the question through an adaptive multi-pass pipeline
@@ -4128,8 +6607,7 @@ class PulseCLI:
           2. ANALYZE -- focused second read of those regions; diagnosis + reasoning.
           3. DEVELOP -- develop and implement the fix (code-fix JSON, if requested).
           4. VERIFY  -- check the fix's math/logic; revise and re-check on failure.
-          5. SWEEP   -- re-read everything for OTHER errors; ask the user y/n.
-          6.         -- if yes, recurse through 1-5 for the new issue(s).
+          5. SWEEP   -- re-read everything for OTHER errors; ask the user y/n.          6.         -- if yes, recurse through 1-5 for the new issue(s).
 
         Each pass prints as soon as it's ready, with a small spinner shown
         while it's in flight. Only the top-level call (_depth == 0)
@@ -4138,6 +6616,28 @@ class PulseCLI:
         """
         if _depth == 0:
             self._fix_applied_this_turn = False
+            self._last_call_failed_transiently = False
+
+        # Cheap best-effort snapshot for REPLAY: <n_steps> -- see
+        # _replay_maybe_checkpoint. Runs once per top-level question
+        # rather than continuously, since (unlike the GUI) there's no
+        # separate always-on ticker thread here.
+        if _depth == 0:
+            try:
+                self._replay_maybe_checkpoint()
+            except Exception:
+                pass
+
+        # Same cadence: enrich this rank's status file with current
+        # scalar values, for RANKDIVERGE, under a multi-rank launch.
+        if _depth == 0:
+            rank, local_rank, world_size, session_key = self.dist_info
+            if world_size > 1 and session_key:
+                try:
+                    scalars = {name: v[-1] for name, v in self.scalar_histories.items() if v}
+                    _write_rank_status(session_key, rank, local_rank, world_size, extra={"scalars": scalars} if scalars else None)
+                except Exception:
+                    pass
 
         if not self.agent_provider or not self.agent_key:
             return "(AI agent is not enabled. Run setup again or set the API key.)"
@@ -4163,11 +6663,23 @@ class PulseCLI:
                 raw_analysis = self._call_model(
                     _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=700
                 )
-            analysis, calc_exprs, promote_names, gputrack_names, gpuuntrack_names, sensitivity_args, normal_start_args = self._extract_directives(raw_analysis)
+            (
+                analysis, calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
+                sensitivity_args, normal_start_args, grep_patterns, view_requests,
+            ) = self._extract_directives(raw_analysis)
+            analysis, new_requests = self._extract_new_directives(analysis)
             print(f"[2] Diagnosis & reasoning\n{analysis}\n")
-            directive_note = self._apply_directives(calc_exprs, promote_names, gputrack_names, gpuuntrack_names, sensitivity_args, normal_start_args)
+            directive_note = self._apply_directives(
+                calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
+                sensitivity_args, normal_start_args, grep_patterns, view_requests,
+            )
             if directive_note:
                 self.agent_history.append({"role": "user", "content": directive_note})
+            if new_requests:
+                new_note = self._apply_new_directives(new_requests)
+                if new_note:
+                    print(f"[tool results]\n{new_note}\n")
+                    self.agent_history.append({"role": "user", "content": new_note})
 
             full_answer = f"{regions}\n\n{analysis}"
 
@@ -4199,6 +6711,22 @@ class PulseCLI:
 
             self.agent_history.append({"role": "assistant", "content": full_answer})
             apply_result = self._apply_code_fix(fix)
+            first_pass_landed = self._fix_applied_this_turn
+
+            # If any snippet failed to match (verbatim or fuzzy), give the
+            # model ONE chance to re-quote it exactly before accepting the
+            # miss -- see the matching logic in pulse.py's _ask.
+            if self._last_apply_skipped:
+                retry_fix = self._request_corrected_snippets(fix, self._last_apply_skipped)
+                if retry_fix is not None:
+                    self._fix_applied_this_turn = False
+                    retry_result = self._apply_code_fix(retry_fix)
+                    retry_landed = self._fix_applied_this_turn
+                    self._fix_applied_this_turn = first_pass_landed or retry_landed
+                    if retry_landed:
+                        note = "additional" if first_pass_landed else "retry after correcting a snippet mismatch --"
+                        apply_result = apply_result + f"\n\n({note} change applied)\n" + retry_result
+
             result = f"{full_answer}\n\n{apply_result}"
 
             # Pass 5 (+ 6): only worth a full re-read if a fix actually landed.
@@ -4214,9 +6742,11 @@ class PulseCLI:
             msg = f"⚠ AI agent request failed: {exc}"
             print(f"\n{msg}\n")
             self.agent_history.append({"role": "assistant", "content": msg})
+            if _depth == 0:
+                self._last_call_failed_transiently = True
             return msg
 
-        if _depth == 0 and self._fix_applied_this_turn:
+        if _depth == 0 and self._fix_applied_this_turn and not self._suppress_auto_restart:
             self._restart_process()  # does not return
 
         return result
@@ -4459,37 +6989,14 @@ class PulseCLI:
             "or /revert with no id to undo the most recent one."
         )
 
-    def _cmd_revert(self, arg: str) -> None:
-        """/revert [commit_id] -- restore the workspace to exactly how it
-        looked right after a given Pulse commit (or, with no id given,
-        undo the single most recent one). Reads the persistent
-        .pulse_history log, so this works even if Pulse -- or the whole
-        machine -- was restarted since the fix was applied, unlike the
-        old in-memory-only _pending_revert_backups. The revert itself is
-        logged as a new commit too, so it can be undone the same way.
-        """
-        entries = self._load_fix_log()
-        if not entries:
-            cprint("[Pulse CLI] No recorded Pulse code changes to revert.")
-            return
-
-        arg = arg.strip()
-        if not arg:
-            target_idx = len(entries) - 2  # state right before the last commit
-            target_label = f"before commit {entries[-1].get('id', '?')} (most recent)"
-        else:
-            target_idx = None
-            target_label = ""
-            for i, e in enumerate(entries):
-                eid = e.get("id", "")
-                if eid == arg or (arg and eid.startswith(arg)):
-                    target_idx = i
-                    target_label = f"commit {eid}"
-                    break
-            if target_idx is None:
-                cprint(f"[Pulse CLI] No commit matches '{arg}'. Use /log to see recorded commits.")
-                return
-
+    def _perform_revert(self, entries: List[Dict[str, Any]], target_idx: int, target_label: str):
+        """Core of /revert, factored out so it can also be invoked
+        automatically (see _auto_rollback_after_failed_restarts) without
+        going through interactive arg-parsing. Restores every file the
+        changelog has ever touched to its state as of `target_idx`
+        (`-1` meaning "before the very first recorded commit"), logs the
+        revert itself as a new commit, and returns (restored_paths,
+        failed_paths, new_commit_id)."""
         all_paths = sorted({fc["path"] for e in entries for fc in e.get("files", [])})
         asof = self._fix_log_state_asof(entries, target_idx)
 
@@ -4523,19 +7030,58 @@ class PulseCLI:
             elif fpath in self.extra_files:
                 self.extra_files[fpath] = content
 
+        new_commit = None
         if restored:
-            cprint(f"[Pulse CLI] ✓ Reverted to state {target_label} -- {len(restored)} file(s) restored:", color=_BLUE)
-            for p in restored:
-                print(f"    - {os.path.basename(p)}")
             new_commit = self._record_fix_commit(
                 revert_files, f"Reverted to state {target_label}", kind="revert"
             )
             if new_commit:
-                cprint(f"[Pulse CLI] 📝 Logged as commit {new_commit}.")
+                self._last_commit_id = new_commit
                 self._log_incident(
                     "revert", f"Reverted to state {target_label}",
                     commit_id=new_commit, files=[os.path.basename(p) for p in restored],
                 )
+        return restored, failed, new_commit
+
+    def _cmd_revert(self, arg: str) -> None:
+        """/revert [commit_id] -- restore the workspace to exactly how it
+        looked right after a given Pulse commit (or, with no id given,
+        undo the single most recent one). Reads the persistent
+        .pulse_history log, so this works even if Pulse -- or the whole
+        machine -- was restarted since the fix was applied, unlike the
+        old in-memory-only _pending_revert_backups. The revert itself is
+        logged as a new commit too, so it can be undone the same way.
+        """
+        entries = self._load_fix_log()
+        if not entries:
+            cprint("[Pulse CLI] No recorded Pulse code changes to revert.")
+            return
+
+        arg = arg.strip()
+        if not arg:
+            target_idx = len(entries) - 2  # state right before the last commit
+            target_label = f"before commit {entries[-1].get('id', '?')} (most recent)"
+        else:
+            target_idx = None
+            target_label = ""
+            for i, e in enumerate(entries):
+                eid = e.get("id", "")
+                if eid == arg or (arg and eid.startswith(arg)):
+                    target_idx = i
+                    target_label = f"commit {eid}"
+                    break
+            if target_idx is None:
+                cprint(f"[Pulse CLI] No commit matches '{arg}'. Use /log to see recorded commits.")
+                return
+
+        restored, failed, new_commit = self._perform_revert(entries, target_idx, target_label)
+
+        if restored:
+            cprint(f"[Pulse CLI] ✓ Reverted to state {target_label} -- {len(restored)} file(s) restored:", color=_BLUE)
+            for p in restored:
+                print(f"    - {os.path.basename(p)}")
+            if new_commit:
+                cprint(f"[Pulse CLI] 📝 Logged as commit {new_commit}.")
             cprint(
                 "[Pulse CLI] Note: if this script is already running, it's still executing the old "
                 "code in memory -- stop and re-run it to pick up the reverted version.",
@@ -4547,6 +7093,63 @@ class PulseCLI:
                 print(f"    - {os.path.basename(p)}: {err}")
         if not restored and not failed:
             cprint("[Pulse CLI] Workspace already matches that state -- nothing to revert.")
+
+    def _auto_rollback_after_failed_restarts(self, chain_start_commit_id: Optional[str]) -> bool:
+        """Automatic safety net for the auto-fix/auto-restart loop: called
+        when a restarted process keeps crashing until MAX_RESTART_ATTEMPTS
+        is exhausted (see _restart_process). Rather than leaving a
+        known-broken fix sitting on disk indefinitely and just telling a
+        possibly-nobody-is-watching unattended run to go run /revert
+        itself, this automatically restores the workspace to its state
+        right BEFORE the fix that started this failing chain -- using the
+        exact same persistent .pulse_history mechanism /revert uses, so
+        nothing is silently lost (the failed chain is still fully
+        recoverable via /log + /revert afterward). Returns True if
+        anything was actually restored.
+        """
+        entries = self._load_fix_log()
+        if not entries or not chain_start_commit_id:
+            cprint(
+                "[Pulse CLI] ⚠ Could not automatically roll back (no recorded pre-fix state found) -- "
+                "use /log and /revert <id> to inspect and restore manually.",
+                color=_RED,
+            )
+            return False
+
+        chain_start_idx = None
+        for i, e in enumerate(entries):
+            if e.get("id") == chain_start_commit_id:
+                chain_start_idx = i
+                break
+        if chain_start_idx is None:
+            cprint(
+                f"[Pulse CLI] ⚠ Could not find commit {chain_start_commit_id} in the change log to roll "
+                "back from -- use /log and /revert <id> to inspect and restore manually.",
+                color=_RED,
+            )
+            return False
+
+        target_idx = chain_start_idx - 1
+        target_label = f"before commit {chain_start_commit_id} (auto-rollback after repeated restart failures)"
+        restored, failed, new_commit = self._perform_revert(entries, target_idx, target_label)
+
+        if restored:
+            cprint(
+                f"[Pulse CLI] 🛟 Automatic rollback: the fix chain starting at commit "
+                f"{chain_start_commit_id} kept crashing after every retry, so Pulse restored "
+                f"{len(restored)} file(s) to their state right before that fix -- instead of leaving "
+                "known-broken code on disk for an unattended run.",
+                color=_YELLOW,
+            )
+            for p in restored:
+                print(f"    - {os.path.basename(p)}")
+            if new_commit:
+                cprint(f"[Pulse CLI] 📝 Logged as commit {new_commit}. Use /log + /revert to undo this rollback if it wasn't wanted.")
+        if failed:
+            cprint(f"[Pulse CLI] ⚠ Automatic rollback failed to restore {len(failed)} file(s):", color=_RED)
+            for p, err in failed:
+                print(f"    - {os.path.basename(p)}: {err}")
+        return bool(restored)
 
     def _git_autostash(self) -> Optional[str]:
         """Best-effort git-level safety net, on top of (not instead of)
@@ -4640,15 +7243,42 @@ class PulseCLI:
             for old, new in pairs:
                 count = content.count(old)
                 if count == 1:
-                    content = content.replace(old, new, 1)
+                    content = content.replace(old, _banner_wrap_fix(old, new, path), 1)
                     applied.append((old, new))
-                elif count == 0:
-                    skipped.append((old, path, "no exact match found in the file"))
+                    continue
+                if count == 0:
+                    # Fallback: tolerate a snippet that's right except for
+                    # indentation/blank-line differences -- see the
+                    # matching comment in pulse.py's _write_code_fix. Only
+                    # taken when it's unambiguous.
+                    span = _find_fuzzy_snippet_span(content, old)
+                    if span is not None:
+                        start, end = span
+                        actual_old = content[start:end]
+                        content = content[:start] + _banner_wrap_fix(actual_old, new, path) + content[end:]
+                        applied.append((actual_old, new))
+                    else:
+                        skipped.append((old, path, "no exact match found in the file"))
                 else:
                     skipped.append((old, path, f"matched {count} times (ambiguous), skipped for safety"))
 
             if not applied:
                 continue
+
+            # Automatic gate -- NOT model-invoked, runs regardless of what
+            # directives the model used. Syntax/AST validation (always)
+            # plus a real lint pass (pyflakes, if importable) on the FULL
+            # proposed file content, before anything touches disk.
+            cprint(f"  -> /lint {os.path.basename(path)}", color=_YELLOW)
+            lint_ok, lint_messages = self._lint_check(content, path)
+            if not lint_ok:
+                cprint(f"     lint FAILED -- fix will not be written:\n     " + "\n     ".join(lint_messages), color=_RED)
+                lines.append(
+                    f"⚠ Fix for '{path}' failed the automatic syntax/lint gate and was NOT written:\n"
+                    + "\n".join(lint_messages)
+                )
+                continue
+            cprint("     lint passed", color=_YELLOW)
 
             try:
                 with open(path, "w", encoding="utf-8") as f:
@@ -4660,6 +7290,8 @@ class PulseCLI:
             originals[path] = original_content
             applied_by_path[path] = applied
             after_by_path[path] = content
+            for old, new in applied:
+                self._append_fixlog(path, old, new, fix.get("explanation", ""))
             if path == self.script_path:
                 self.code_text = content
             elif path in self.extra_files:
@@ -4683,6 +7315,7 @@ class PulseCLI:
             lines.append("\n⚠ No changes were applied -- none of the proposed snippets matched cleanly:")
             for old, where, reason in skipped:
                 lines.append(f"  - [{os.path.basename(str(where))}] {reason}: {old.splitlines()[0][:80]}...")
+            self._last_apply_skipped = skipped
             return "\n".join(lines)
 
         for path, applied in applied_by_path.items():
@@ -4699,6 +7332,7 @@ class PulseCLI:
         commit_files = {p: (originals[p], after_by_path[p]) for p in applied_by_path}
         commit_id = self._record_fix_commit(commit_files, fix.get("explanation") or "(no explanation given)")
         if commit_id:
+            self._last_commit_id = commit_id
             lines.append(f"\n📝 Logged as commit {commit_id} in .pulse_history/ -- /revert {commit_id} to undo, or /log to see history.")
             self._log_incident(
                 "fix_applied", fix.get("explanation") or "(no explanation given)",
@@ -4715,8 +7349,59 @@ class PulseCLI:
         self._pending_revert_backups = dict(originals)  # path -> original content
         self._fix_applied_this_turn = True  # tells ask_agent's top-level call to restart afterward
         self._last_applied_fix = fix  # structured old/new/files/explanation, for cross-session reuse
+        self._last_apply_skipped = skipped
 
         return "\n".join(lines)
+
+    def _request_corrected_snippets(self, fix: Dict[str, Any], skipped: List[tuple]) -> Optional[Dict[str, Any]]:
+        """One bounded retry for snippets that failed to match (verbatim
+        or fuzzy) in _apply_code_fix -- see the matching, more heavily
+        commented copy in pulse.py's ChatPanel. Shows the model the
+        actual current content of each affected file plus exactly which
+        of its own snippets didn't match, and asks ONLY for corrected
+        old/new pairs -- not a full re-diagnosis. Returns a fix dict for
+        just the corrected entries, or None if nothing is recoverable."""
+        if not skipped:
+            return None
+
+        retryable = [(old, label) for old, label, reason in skipped if "no exact match" in reason]
+        if not retryable:
+            return None
+
+        file_blocks = []
+        seen_paths = set()
+        for old, label in retryable:
+            path = self._resolve_fix_path(label)
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    file_blocks.append(f"--- current content of {os.path.basename(path)} ---\n{f.read()}")
+            except OSError:
+                continue
+
+        if not file_blocks:
+            return None
+
+        mismatch_lines = "\n".join(
+            f"- targeting '{label or self.script_path}': your snippet did not match anywhere in that "
+            f"file's current content:\n{old}"
+            for old, label in retryable
+        )
+        prompt = (
+            "CORRECTION: some of the exact snippets you proposed did not match the file's actual "
+            "current content (below), so nothing was changed for them. This is almost always a "
+            "quoting mistake (wrong indentation, a missing/extra blank line, or slightly different "
+            "text) rather than a wrong diagnosis -- do NOT change what the fix does, just re-quote "
+            "the 'old' text EXACTLY as it appears in the file content shown below.\n\n"
+            + "\n\n".join(file_blocks)
+            + f"\n\nSnippets that didn't match:\n{mismatch_lines}\n\n"
+            "Respond with ONLY a corrected code-fix JSON object (old/new/files/explanation) covering "
+            "just these snippets -- no prose, no markdown fences."
+        )
+        answer = self._call_model(prompt, max_tokens=4000)
+        return self._parse_code_fix(answer)
 
     def _cmd_code(self, arg: str) -> None:
         """Toggle whether questions include the training code (and any
@@ -4831,7 +7516,17 @@ class PulseCLI:
             # improvement over that window counts as "still improving".
             # Tight (s=1): needs only 150 steps, and demands a full 8%
             # improvement before it stops flagging.
-            "stagnation_window": round(500 - 350 * s),
+            # But cap the window at 30% of actual history so the check
+            # fires in time on short runs (e.g. 50 epochs × 9 batches =
+            # 450 steps -- a 395-step window means it never triggers
+            # until there's almost no data left to act on).
+            "stagnation_window": min(
+                round(500 - 350 * s),
+                max(10, round(len(max(
+                    (self.scalar_histories.get(v) or [] for v in self.tracked_vars),
+                    key=lambda h: len(h), default=[]
+                )) * 0.30))
+            ),
             "stagnation_frac": (
                 self.stagnation_frac if self.stagnation_frac is not None
                 else 0.003 + 0.077 * s
@@ -4922,123 +7617,528 @@ class PulseCLI:
             return msg
         print(msg)
         return None
-
+    
     def _check_for_trouble(self) -> Optional[str]:
+        """
+        Deterministic runtime training-health detector.
+
+        The detector intentionally separates:
+        1. Hard failures: NaN / inf
+        2. Sudden numerical failures: loss spikes
+        3. Validation regression: val_loss consistently worsening
+        4. Train/validation divergence: training improves while validation worsens
+        5. Loss stagnation / plateau
+        6. Strong loss oscillation
+        7. Metric stagnation
+        8. Matrix/tensor NaN / inf
+
+        Important:
+        - Do NOT require 10+ epochs to detect validation regression.
+        - Do NOT compare identical early/late windows.
+        - Do NOT trigger on None values alone. None generally means the
+            variable simply wasn't readable from the current scope.
+        - Histories are sparse by design, so detection works with whatever
+            scalar observations are actually available.
+        """
+
         reasons = []
         th = self._sensitivity_thresholds()
 
+        # ------------------------------------------------------------
+        # Helpers
+        # ------------------------------------------------------------
+
+        def _finite(values):
+            return [
+                v for v in values
+                if v is not None
+                and isinstance(v, (int, float))
+                and math.isfinite(v)
+            ]
+
+        def _history(name):
+            return _finite(self.scalar_histories.get(name, []))
+
+        def _find_history(*names):
+            """
+            Find the first useful history among exact names and then
+            fall back to case-insensitive matching.
+            """
+            for name in names:
+                values = _history(name)
+                if values:
+                    return name, values
+
+            wanted = {n.lower() for n in names}
+
+            for actual_name in self.scalar_histories:
+                if actual_name.lower() in wanted:
+                    values = _history(actual_name)
+                    if values:
+                        return actual_name, values
+
+            return None, []
+
+        def _is_loss_name(name):
+            return _looks_like_loss(name)
+
+        def _is_validation_name(name):
+            lower = name.lower()
+            return any(
+                token in lower
+                for token in (
+                    "val",
+                    "valid",
+                    "validation",
+                    "test",
+                    "eval",
+                )
+            )
+
+        def _is_train_loss_name(name):
+            lower = name.lower()
+            return (
+                _is_loss_name(name)
+                and not _is_validation_name(name)
+            )
+
+        # ------------------------------------------------------------
+        # 1. Inspect individual tracked scalar histories
+        # ------------------------------------------------------------
+
         for var_name in self.tracked_vars:
-            hist = self.scalar_histories.get(var_name)
+            hist = self._history_for_detector(var_name)
             if not hist:
                 continue
-            latest = hist[-1]
-            if latest is not None and isinstance(latest, (int, float)) and not math.isfinite(latest):
-                reasons.append(f"'{var_name}' just went non-finite (NaN/inf): {latest}")
+
+            latest_raw = hist[-1]
+
+            # --------------------------------------------------------
+            # Hard numerical failure
+            # --------------------------------------------------------
+
+            if (
+                latest_raw is not None
+                and isinstance(latest_raw, (int, float))
+                and not math.isfinite(latest_raw)
+            ):
+                reasons.append(
+                    f"'{var_name}' just went non-finite (NaN/inf): {latest_raw}"
+                )
                 continue
 
-            if _looks_like_loss(var_name) and latest is not None:
-                finite_recent = [v for v in hist[-50:] if v is not None and math.isfinite(v)]
+            # None means Pulse could not currently read the value.
+            #
+            # DO NOT treat this as a training failure. A huge number of
+            # statically discovered variables are legitimately inaccessible
+            # from the current runtime scope.
+            if latest_raw is None:
+                continue
 
-                # Explosion detection. Normally needs a few real finite
-                # points to compute a "recent minimum" baseline -- which
-                # meant a genuine explosion in the first few steps of
-                # training could never be caught, since there just wasn't
-                # enough history yet to compare against. If the agent has
-                # seeded an expected starting value for this variable from
-                # reading the code (a NORMAL_START: directive, sent
-                # automatically once at the start of training -- see
-                # _apply_directives / _prime_at_start), fold it into the
-                # baseline pool so a step-1 blow-up has something real to
-                # compare against too.
-                seed = self._normal_start_baselines.get(var_name)
-                baseline_pool = finite_recent[:-1] if len(finite_recent) >= 5 else []
-                if seed is not None:
-                    baseline_pool = baseline_pool + [seed]
-                if baseline_pool:
-                    baseline = min(baseline_pool)
-                    if baseline > 0 and latest > baseline * th["explosion_multiplier"]:
-                        basis = (
-                            "its expected starting value (estimated from the code)"
-                            if not finite_recent[:-1] else "its recent minimum"
-                        )
-                        reasons.append(
-                            f"'{var_name}' spiked to {latest:.4g}, "
-                            f"{latest / baseline:.1f}x {basis} ({baseline:.4g})"
-                        )
+            hist_values = _finite(hist)
 
-                if len(finite_recent) >= 20:
-                    recent_window = finite_recent[-20:]
+            if not hist_values:
+                continue
 
-                    deltas = [recent_window[i] - recent_window[i-1] for i in range(1, len(recent_window))]
+            latest = hist_values[-1]
 
-                    # Scale the plateau/oscillation thresholds off the
-                    # window's own typical magnitude (mean |value| across
-                    # all 20 points), not off `latest` alone. `latest` is
-                    # a single sample that can itself land at a momentary
-                    # peak, trough, or near-zero crossing of the very
-                    # curve being judged -- using it as the sole scale
-                    # reference made both checks unreliable: too
-                    # trigger-happy right as a curve crossed zero, too lax
-                    # whenever `latest` happened to be sitting at a local
-                    # extreme instead of a typical value.
-                    scale = sum(abs(v) for v in recent_window) / len(recent_window)
+            # --------------------------------------------------------
+            # Loss-specific checks
+            # --------------------------------------------------------
+
+            if _is_loss_name(var_name):
+
+                # ====================================================
+                # A. Sudden loss explosion
+                # ====================================================
+
+                recent = hist_values[-50:]
+
+                if len(recent) >= 2:
+                    previous = recent[:-1]
+
+                    if previous:
+                        baseline = min(previous)
+
+                        seed = self._normal_start_baselines.get(var_name)
+                        if seed is not None and math.isfinite(seed):
+                            baseline_candidates = [baseline, seed]
+                            baseline = min(baseline_candidates)
+
+                        if (
+                            baseline > 0
+                            and latest > baseline * th["explosion_multiplier"]
+                        ):
+                            reasons.append(
+                                f"'{var_name}' spiked to {latest:.4g}, "
+                                f"{latest / baseline:.1f}x its recent minimum "
+                                f"({baseline:.4g})"
+                            )
+
+                # ====================================================
+                # B. Short-term plateau
+                # ====================================================
+
+                if len(hist_values) >= 8:
+                    plateau_window = hist_values[-20:]
+
+                    scale = (
+                        sum(abs(v) for v in plateau_window)
+                        / len(plateau_window)
+                    )
+
                     if scale == 0:
-                        scale = abs(latest)  # degenerate all-zero window; fall back rather than lose the check entirely
+                        scale = max(abs(latest), 1e-12)
 
-                    window_range = max(recent_window) - min(recent_window)
-                    if window_range == 0:
-                        # Identical value for 20 straight steps (dead
-                        # gradient, lr=0, a frozen model) is the most
-                        # extreme plateau there is, not an edge case to
-                        # skip. The old `window_range > 0` guard here
-                        # excluded exactly this, so a totally frozen loss
-                        # -- arguably the easiest plateau to catch -- was
-                        # the one case that could never be flagged.
-                        reasons.append(f"'{var_name}' has completely frozen (identical value for the last 20 steps).")
-                    elif window_range < (scale * th["plateau_range_frac"]):
-                        reasons.append(f"'{var_name}' has plateaued (range across last 20 steps is {window_range:.2e}).")
+                    window_range = (
+                        max(plateau_window)
+                        - min(plateau_window)
+                    )
 
-                    sign_flips = sum(1 for i in range(1, len(deltas)) if (deltas[i] * deltas[i-1]) < 0)
-                    avg_delta_mag = sum(abs(d) for d in deltas) / len(deltas)
+                    plateau_threshold = (
+                        scale * th["plateau_range_frac"]
+                    )
 
-                    if sign_flips >= th["oscillation_flip_threshold"] and avg_delta_mag > (scale * th["oscillation_delta_frac"]):
-                        reasons.append(f"'{var_name}' is heavily oscillating ({sign_flips} directional reversals in the last 20 steps).")
-
-                # Long-horizon stagnation check -- deliberately separate
-                # from the plateau check above, and computed from its own
-                # independently-sized slice of `hist` (not finite_recent,
-                # which stays capped at 50 so it doesn't change the
-                # explosion baseline's "recent minimum" into a
-                # much-older, possibly stale minimum). Plateau looks at
-                # the *range* of just the last 20 steps, so a loss
-                # bouncing around by completely normal per-step noise
-                # (e.g. +/-0.02 every step, never trending down) will
-                # never look "flat enough" to trip it, no matter how many
-                # hundreds of steps go by with zero real progress --
-                # which is exactly what a loss stuck oscillating in a
-                # narrow band around the same value for 1000+ steps looks
-                # like. This instead compares the mean of the first
-                # quarter of a long window against the mean of the last
-                # quarter, so per-step noise averages out and only
-                # genuine lack of improvement is left standing.
-                window = int(th["stagnation_window"])
-                long_window_raw = [v for v in hist[-window:] if v is not None and math.isfinite(v)]
-                if len(long_window_raw) >= window:
-                    quarter = max(1, window // 4)
-                    early_mean = sum(long_window_raw[:quarter]) / quarter
-                    late_mean = sum(long_window_raw[-quarter:]) / quarter
-                    if early_mean != 0 and abs(early_mean - late_mean) < abs(early_mean) * th["stagnation_frac"]:
+                    if window_range <= plateau_threshold:
                         reasons.append(
-                            f"'{var_name}' hasn't meaningfully improved over the last {window} steps "
-                            f"(from {early_mean:.4g} to {late_mean:.4g}, despite normal step-to-step noise)."
+                            f"'{var_name}' has plateaued: "
+                            f"range over the last {len(plateau_window)} "
+                            f"observations is {window_range:.3g}"
                         )
+
+                # ====================================================
+                # C. Oscillation
+                # ====================================================
+
+                if len(hist_values) >= 8:
+                    oscillation_window = hist_values[-20:]
+
+                    deltas = [
+                        oscillation_window[i]
+                        - oscillation_window[i - 1]
+                        for i in range(1, len(oscillation_window))
+                    ]
+
+                    sign_flips = sum(
+                        1
+                        for i in range(1, len(deltas))
+                        if deltas[i] != 0
+                        and deltas[i - 1] != 0
+                        and (
+                            (deltas[i] > 0 and deltas[i - 1] < 0)
+                            or
+                            (deltas[i] < 0 and deltas[i - 1] > 0)
+                        )
+                    )
+
+                    if deltas:
+                        scale = (
+                            sum(abs(v) for v in oscillation_window)
+                            / len(oscillation_window)
+                        )
+
+                        avg_delta = (
+                            sum(abs(d) for d in deltas)
+                            / len(deltas)
+                        )
+
+                        if (
+                            sign_flips
+                            >= th["oscillation_flip_threshold"]
+                            and scale > 0
+                            and avg_delta
+                            > scale * th["oscillation_delta_frac"]
+                        ):
+                            reasons.append(
+                                f"'{var_name}' is heavily oscillating "
+                                f"({sign_flips} directional reversals in the "
+                                f"last {len(oscillation_window)} observations)"
+                            )
+
+                # ====================================================
+                # D. Long-term stagnation
+                # ====================================================
+
+                stagnation_window = max(
+                    8,
+                    int(th["stagnation_window"])
+                )
+
+                if len(hist_values) >= stagnation_window:
+                    long_window = hist_values[-stagnation_window:]
+
+                    quarter = max(
+                        2,
+                        len(long_window) // 4
+                    )
+
+                    early = long_window[:quarter]
+                    late = long_window[-quarter:]
+
+                    early_mean = sum(early) / len(early)
+                    late_mean = sum(late) / len(late)
+
+                    if early_mean != 0:
+                        relative_change = (
+                            abs(late_mean - early_mean)
+                            / abs(early_mean)
+                        )
+
+                        if relative_change < th["stagnation_frac"]:
+                            reasons.append(
+                                f"'{var_name}' hasn't meaningfully improved "
+                                f"over the last {stagnation_window} observations "
+                                f"({early_mean:.4g} → {late_mean:.4g})"
+                            )
+
+                # ====================================================
+                # E. Validation-loss regression
+                #
+                # This is the important fix.
+                #
+                # val_loss is often sampled once per epoch, so requiring
+                # 10 observations is unnecessarily slow. Five observations
+                # are enough to detect a persistent monotonic regression.
+                # ====================================================
+
+                if _is_validation_name(var_name) and len(hist_values) >= 5:
+
+                    trend = hist_values[-5:]
+
+                    worsening_steps = sum(
+                        trend[i] > trend[i - 1]
+                        for i in range(1, len(trend))
+                    )
+
+                    first = trend[0]
+                    last = trend[-1]
+
+                    if (
+                        worsening_steps >= 4
+                        and first > 0
+                        and last > first
+                    ):
+                        pct = (
+                            (last - first)
+                            / abs(first)
+                            * 100.0
+                        )
+
+                        reasons.append(
+                            f"'{var_name}' has consistently worsened "
+                            f"({first:.4g} → {last:.4g}, +{pct:.1f}% "
+                            f"over the last {len(trend)} observations)"
+                        )
+
+                # ====================================================
+                # F. Validation regression even when noisy
+                #
+                # A monotonic sequence isn't required. Compare the first
+                # and second half of a recent window.
+                # ====================================================
+
+                if _is_validation_name(var_name) and len(hist_values) >= 8:
+
+                    trend_window = hist_values[-8:]
+
+                    half = len(trend_window) // 2
+
+                    early = trend_window[:half]
+                    late = trend_window[half:]
+
+                    early_mean = sum(early) / len(early)
+                    late_mean = sum(late) / len(late)
+
+                    if (
+                        early_mean > 0
+                        and late_mean > early_mean
+                        * (1.0 + th["stagnation_frac"])
+                    ):
+                        pct = (
+                            (late_mean - early_mean)
+                            / abs(early_mean)
+                            * 100.0
+                        )
+
+                        reasons.append(
+                            f"'{var_name}' is trending worse: "
+                            f"recent average increased from "
+                            f"{early_mean:.4g} to {late_mean:.4g} "
+                            f"(+{pct:.1f}%)"
+                        )
+
+            # --------------------------------------------------------
+            # Metric checks
+            # --------------------------------------------------------
+
+            elif _looks_like_metric(var_name):
+
+                metric_window = max(
+                    8,
+                    int(th["stagnation_window"])
+                )
+
+                if len(hist_values) >= metric_window:
+
+                    values = hist_values[-metric_window:]
+
+                    quarter = max(
+                        2,
+                        len(values) // 4
+                    )
+
+                    early = values[:quarter]
+                    late = values[-quarter:]
+
+                    early_mean = sum(early) / len(early)
+                    late_mean = sum(late) / len(late)
+
+                    denom = max(abs(early_mean), 1e-12)
+
+                    if (
+                        abs(late_mean - early_mean)
+                        / denom
+                        < th["stagnation_frac"]
+                    ):
+                        reasons.append(
+                            f"'{var_name}' has barely moved over the last "
+                            f"{metric_window} observations "
+                            f"({early_mean:.4g} → {late_mean:.4g})"
+                        )
+
+        # ------------------------------------------------------------
+        # 2. Cross-variable train/validation divergence
+        #
+        # This is stronger than looking at val_loss alone.
+        # ------------------------------------------------------------
+
+        train_loss_name, train_loss = _find_history(
+            "train_loss",
+            "loss",
+        )
+
+        val_loss_name, val_loss = _find_history(
+            "val_loss",
+            "validation_loss",
+            "valid_loss",
+            "test_loss",
+        )
+
+        if (
+            train_loss
+            and val_loss
+            and len(train_loss) >= 5
+            and len(val_loss) >= 5
+        ):
+            n = min(
+                len(train_loss),
+                len(val_loss),
+                8,
+            )
+
+            train_recent = train_loss[-n:]
+            val_recent = val_loss[-n:]
+
+            train_first = train_recent[0]
+            train_last = train_recent[-1]
+
+            val_first = val_recent[0]
+            val_last = val_recent[-1]
+
+            train_change = train_last - train_first
+            val_change = val_last - val_first
+
+            train_relative = (
+                train_change / abs(train_first)
+                if train_first != 0
+                else 0.0
+            )
+
+            val_relative = (
+                val_change / abs(val_first)
+                if val_first != 0
+                else 0.0
+            )
+
+            # Validation clearly worsens while training loss is flat
+            # or improving.
+            if (
+                val_change > 0
+                and val_relative >= max(
+                    0.05,
+                    th["stagnation_frac"]
+                )
+                and train_relative <= 0.02
+            ):
+                reasons.append(
+                    "train/validation loss divergence detected: "
+                    f"{train_loss_name} changed "
+                    f"{train_first:.4g} → {train_last:.4g}, while "
+                    f"{val_loss_name} changed "
+                    f"{val_first:.4g} → {val_last:.4g}. "
+                    "Training loss is not translating into improving "
+                    "validation performance."
+                )
+
+        # ------------------------------------------------------------
+        # 3. Matrix/tensor numerical failures
+        # ------------------------------------------------------------
 
         for sub_name, entry in self._matrix_cache.items():
-            stats = entry.get("stats", {})
-            if stats.get("nan") or stats.get("inf"):
-                reasons.append(f"'{sub_name}' has nan={stats.get('nan')} inf={stats.get('inf')}")
 
-        return "; ".join(reasons) if reasons else None
+            stats = entry.get("stats", {})
+
+            nan_count = stats.get("nan", 0) or 0
+            inf_count = stats.get("inf", 0) or 0
+
+            if nan_count or inf_count:
+                reasons.append(
+                    f"'{sub_name}' has nan={nan_count} inf={inf_count}"
+                )
+
+        # ------------------------------------------------------------
+        # 4. Deduplicate reasons
+        #
+        # The same underlying problem can be detected by several checks.
+        # Keep the first occurrence so the agent receives a clean signal.
+        # ------------------------------------------------------------
+
+        deduped = []
+
+        seen = set()
+
+        for reason in reasons:
+            normalized = reason.strip().lower()
+
+            if normalized in seen:
+                continue
+
+            seen.add(normalized)
+            deduped.append(reason)
+
+        result = "; ".join(deduped) if deduped else None
+
+        # ------------------------------------------------------------
+        # Debugging
+        # ------------------------------------------------------------
+
+        if _PULSE_LOGGING:
+            try:
+                history_lengths = {
+                    k: len(v)
+                    for k, v in self.scalar_histories.items()
+                }
+
+                _pulse_log(
+                    f"DETECTOR result={result!r} "
+                    f"tracked={self.tracked_vars!r} "
+                    f"histories={history_lengths!r}",
+                )
+            except Exception:
+                pass
+
+        return result
+
     _START_PRIME_PROMPT = (
         "[Automatic start-of-run check -- sent once, automatically, before the first training step, "
         "so this is your only chance to set these from the code alone, before any real data exists] "
@@ -5064,34 +8164,199 @@ class PulseCLI:
         "GPUTRACK: <comma-separated variable names to track closely from the start, or 'none'>"
     )
 
+    def _mllint_auto_fix(self, findings: List[tuple]) -> bool:
+        """Attempt deterministic, agent-free AST fixes for the clearest
+        anti-patterns -- no LLM needed for e.g. replacing 'accuracy' with
+        'mae' in a regression compile() call. Returns True if any file was
+        patched so the caller knows to record it in the fix log.
+
+        Falls back to the agent pipeline (ask_agent with an explicit
+        'fix it' instruction) for anything not covered here, or when the
+        deterministic patch fails. Either way, this is a genuine auto-
+        intervention that applies the fix -- not just a diagnosis prompt
+        that asks the model to 'confirm and propose' something.
+        """
+        patched_any = False
+
+        # Group findings by the type of pattern so we know which
+        # deterministic paths are safe to apply.
+        for label, lineno, msg in findings:
+            # Find the actual file path this label corresponds to.
+            path = None
+            for lbl, fpath, _text, _tree in self._iter_ast_trees():
+                if lbl == label:
+                    path = fpath
+                    break
+            if path is None:
+                continue
+
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    src = f.read()
+            except OSError:
+                continue
+
+            new_src = src
+            patched_this = False
+
+            # Pattern 1: regression loss + accuracy metric in
+            # model.compile(). Replace accuracy-type metrics with 'mae'
+            # which is appropriate for any regression loss.
+            if "regression loss" in msg and "accuracy" in msg:
+                import re
+                # Match metrics=[...] or metrics='accuracy' inside
+                # compile() -- replace every accuracy-type name with 'mae'
+                def replace_metric(m):
+                    inner = m.group(1)
+                    for acc_name in sorted(_MLLINT_ACCURACY_METRICS, key=len, reverse=True):
+                        inner = re.sub(
+                            r"""(['"])""" + re.escape(acc_name) + r"""(['"])""",
+                            r"\1mae\2", inner, flags=re.IGNORECASE
+                        )
+                    return f"metrics={inner}"
+
+                new_src = re.sub(
+                    r"metrics=(\[[^\]]*\]|'[^']*'|\"[^\"]*\")",
+                    replace_metric, src
+                )
+                patched_this = new_src != src
+
+            # Pattern 1b: classification loss + regression-only metric --
+            # the inverse of Pattern 1. Replace regression-metric names
+            # with 'accuracy', appropriate for any classification loss.
+            elif "classification loss" in msg and "regression-only metric" in msg:
+                import re
+                def replace_metric_inverse(m):
+                    inner = m.group(1)
+                    for reg_name in sorted(_MLLINT_REGRESSION_METRICS, key=len, reverse=True):
+                        inner = re.sub(
+                            r"""(['"])""" + re.escape(reg_name) + r"""(['"])""",
+                            r"\1accuracy\2", inner, flags=re.IGNORECASE
+                        )
+                    return f"metrics={inner}"
+
+                new_src = re.sub(
+                    r"metrics=(\[[^\]]*\]|'[^']*'|\"[^\"]*\")",
+                    replace_metric_inverse, src
+                )
+                patched_this = new_src != src
+
+            # Pattern 2: double-softmax -- remove Softmax() from the
+            # model definition (the model's final layer) when it's
+            # immediately paired with CrossEntropyLoss.
+            elif "double softmax" in msg.lower() or "double-softmax" in msg.lower():
+                import re
+                # Remove Softmax() / nn.Softmax() as a standalone layer
+                new_src = re.sub(
+                    r"\bmodel\.add\(.*?[Ss]oftmax\s*\(.*?\)\s*\)\s*\n",
+                    "", src
+                )
+                patched_this = new_src != src
+
+            if not patched_this:
+                continue
+
+            # Run lint gate before writing -- same check as _apply_code_fix.
+            lint_ok, lint_msgs = self._lint_check(new_src, path)
+            if not lint_ok:
+                cprint(
+                    f"[Pulse] MLLINT auto-fix for '{label}' failed lint check "
+                    f"(won't write): {'; '.join(lint_msgs)}", color=_YELLOW
+                )
+                continue
+
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(new_src)
+            except OSError as exc:
+                cprint(f"[Pulse] MLLINT auto-fix couldn't write '{path}': {exc}", color=_YELLOW)
+                continue
+
+            self._append_fixlog(
+                path, src, new_src,
+                f"Automatic MLLINT fix (start-of-run): {msg[:200]}"
+            )
+            cprint(
+                f"[Pulse] ✓ Auto-fixed '{label}' at line {lineno}: {msg[:120]}",
+                color=_GREEN
+            )
+            patched_any = True
+
+        return patched_any
+
     def _prime_at_start(self) -> None:
-        """Ask the agent, once, automatically, before the very first
-        training step, to (a) set a sensitivity appropriate to this run's
-        code, (b) estimate a starting-value baseline for loss-like tracked
-        variables by reading the code alone (a NORMAL_START: directive --
-        see _apply_directives), and (c) flag any variables worth GPU-level
-        tracking from step one (a GPUTRACK: directive).
+        """Runs once, automatically, before the very first training step.
 
-        All three of these used to only ever happen reactively: sensitivity
-        only got tuned once the agent had already seen live data (e.g. a
-        GPU check-in or a manual /ask), GPU-tracking only ever got turned
-        on after something had already looked suspicious enough to ask
-        about, and there was no mechanism at all for seeding a starting
-        baseline -- which meant an explosion in the first few steps of
-        training, before 5 real data points existed, could never be
-        caught (see _check_for_trouble). Doing all three once up front,
-        from the code alone, closes those gaps before training even
-        starts.
+        (0) Static MLLINT pass -- pure AST, no agent needed. For any
+        finding that has a deterministic fix (regression+accuracy mismatch,
+        double-softmax, ...) the fix is applied immediately to the file,
+        the same as any other Pulse auto-intervention, before training has
+        taken a single step. For findings without a deterministic path,
+        the agent pipeline is triggered with an explicit 'diagnose AND fix'
+        instruction -- not 'confirm and propose'. Either way, a finding
+        always produces an actual fix attempt, not a suggestion.
 
-        Best-effort and silent on failure -- this must never be the thing
-        that makes a training run fail to start. Runs at most once per
-        process (guarded by self._start_primed), and only if an agent
-        provider/key is actually configured and the training code was
-        made available via set_code_text.
+        (1) If an agent is configured: asks it to set sensitivity, seed a
+        starting-value baseline (NORMAL_START:) and flag GPU-track
+        variables (GPUTRACK:) from code alone.
         """
         if self._start_primed:
             return
         self._start_primed = True
+
+        mllint_findings = []
+        if self.code_text:
+            try:
+                mllint_findings = _mllint_scan(self._iter_ast_trees())
+            except Exception:
+                mllint_findings = []
+            if not mllint_findings:
+                cprint("[Pulse] ✓ Start-of-run ML anti-pattern check: no issues found in the code.", color=_YELLOW)
+
+        if mllint_findings:
+            lines = [f"  {label}:{lineno}: {msg}" for label, lineno, msg in mllint_findings]
+            cprint(
+                f"\n[Pulse] ⚠ Start-of-run ML anti-pattern check found "
+                f"{len(mllint_findings)} problem(s) -- auto-fixing before training starts:\n"
+                + "\n\n".join(lines) + "\n",
+                color=_RED,
+            )
+
+            # Deterministic fix first (no agent, no LLM cost, zero latency).
+            fixed_deterministically = self._mllint_auto_fix(mllint_findings)
+
+            # Always trigger the full agent fix pipeline too -- for
+            # patterns without a deterministic path the agent IS the fix;
+            # for ones that were patched it verifies correctness and
+            # catches anything the regex missed.
+            if self.agent_provider and self.agent_key and self.code_text:
+                finding_summary = "; ".join(
+                    f"{label}:{lineno}: {msg}" for label, lineno, msg in mllint_findings[:3]
+                )
+                fix_note = (
+                    " Pulse has already applied a deterministic mechanical fix to the file; "
+                    "verify it is correct and fix anything remaining."
+                    if fixed_deterministically else
+                    " Pulse could not apply a deterministic fix -- diagnose AND fix this now."
+                )
+                cprint(
+                    "[Pulse] Auto-intervention: agent fixing "
+                    f"({'verifying deterministic patch' if fixed_deterministically else 'no deterministic fix available'})...",
+                    color=_RED,
+                )
+                self.ask_agent(
+                    f"Pulse's automatic start-of-run ML anti-pattern check found: {finding_summary}."
+                    f"{fix_note} Use the full fix pipeline (diagnose, write a code fix, apply it).",
+                    include_code=True,
+                )
+            elif not fixed_deterministically:
+                cprint(
+                    "[Pulse] ⚠ No agent configured -- cannot auto-fix. "
+                    "Please fix it manually before continuing.",
+                    color=_RED,
+                )
+
+        # Sensitivity / baseline / GPU-track priming (independent of MLLINT).
         if not self.agent_provider or not self.agent_key or not self.code_text:
             return
         try:
@@ -5099,139 +8364,527 @@ class PulseCLI:
             answer = self._call_model(f"{context}\n\n{self._START_PRIME_PROMPT}", max_tokens=300)
         except AgentRequestFailed as exc:
             cprint(f"[Pulse] ⚠ Start-of-run sensitivity check skipped (agent request failed: {exc})", color=_YELLOW)
-            return
-        _, _calc, _promote, gputrack_names, _gpuu, sensitivity_args, normal_start_args = self._extract_directives(answer)
-        summary = self._apply_directives([], [], gputrack_names, None, sensitivity_args, normal_start_args)
-        if summary:
-            cprint(f"[Pulse] Start-of-run check: {summary}", color=_YELLOW)
+            answer = None
+        if answer is not None:
+            _, _calc, _promote, gputrack_names, _gpuu, sensitivity_args, normal_start_args, _grep, _view = self._extract_directives(answer)
+            summary = self._apply_directives([], [], gputrack_names, None, sensitivity_args, normal_start_args)
+            if summary:
+                cprint(f"[Pulse] Start-of-run check: {summary}", color=_YELLOW)
 
-    def update(self, step: Optional[int] = None, generate_pdfs: Optional[bool] = None) -> None:
-        """Called at every training step/checkpoint.
-
-        The global step counter only advances when the loss/metric scalar
-        (the first tracked variable that looks like a loss) actually
-        changes value -- calling update() every micro-iteration of a loop
-        that only updates loss occasionally no longer inflates the step
-        count. If no loss-like variable is tracked, the step counter just
-        falls back to incrementing on every call, same as before.
-
-        Matrix/tensor statistics are expensive (especially on GPU), so they
-        are probed on a schedule -- but the schedule now depends on each
-        variable's state: fully-'track'ed variables use matrix_probe_interval
-        (and, if enabled, get PDF snapshots); 'lotrack' variables use the
-        much slower lotrack_probe_interval, never get PDFs, and are printed
-        as a single condensed stats line instead of the full tagging line.
-        Between probes, Pulse does not even slice or call statistics() on a
-        variable; it only uses the cached result.
-
-        Individual variables that are currently None, NaN-only, or otherwise
-        unreadable are reported as such (rather than raising) so one bad
-        variable never takes down the whole debugger mid-training.
+    def _prime_with_agent_if_needed(self) -> None:
+        """Called every update() once an agent is confirmed available.
+        Handles the case where the user configured the agent AFTER the
+        first update() call (the normal interactive flow) -- by which
+        time _prime_at_start had already run without an agent and couldn't
+        fix anything. Runs exactly once, guarded by _start_primed_with_agent.
         """
-        loss_var = next((v for v in self.tracked_vars if _looks_like_loss(v)), None)
+        if self._start_primed_with_agent:
+            return
+        if not self.agent_provider or not self.agent_key:
+            return
+        self._start_primed_with_agent = True
+
+        # Re-run MLLINT now that we have an agent. We already ran it in
+        # _prime_at_start (without an agent), applied any deterministic
+        # fixes, and printed the findings -- but couldn't kick off the
+        # agent fix pipeline then. Do it now.
+        mllint_findings = []
+        if self.code_text:
+            try:
+                mllint_findings = _mllint_scan(self._iter_ast_trees())
+            except Exception:
+                mllint_findings = []
+            if not mllint_findings:
+                cprint("[Pulse] ✓ Start-of-run ML anti-pattern check: no issues found in the code.", color=_YELLOW)
+
+        if mllint_findings:
+            fixed_deterministically = self._mllint_auto_fix(mllint_findings)
+            finding_summary = "; ".join(
+                f"{label}:{lineno}: {msg}" for label, lineno, msg in mllint_findings[:3]
+            )
+            fix_note = (
+                " Pulse has already applied a deterministic mechanical fix; verify it and fix anything remaining."
+                if fixed_deterministically else
+                " Pulse could not apply a deterministic fix -- diagnose AND fix this now."
+            )
+            cprint(
+                f"\n[Pulse] ⚠ Re-running ML anti-pattern fix now that agent is configured "
+                f"({'verifying deterministic patch' if fixed_deterministically else 'agent fix required'})...",
+                color=_RED,
+            )
+            self.ask_agent(
+                f"Pulse's start-of-run ML anti-pattern check found: {finding_summary}."
+                f"{fix_note} Use the full fix pipeline (diagnose, write a code fix, apply it).",
+                include_code=True,
+            )
+
+        # Also run sensitivity/baseline priming now that we have an agent,
+        # only if the first call didn't get to do it.
+        if not mllint_findings and self.code_text:
+            try:
+                context = self._build_agent_context(include_code=True)
+                answer = self._call_model(f"{context}\n\n{self._START_PRIME_PROMPT}", max_tokens=300)
+                _, _calc, _promote, gputrack_names, _gpuu, sensitivity_args, normal_start_args, _grep, _view = self._extract_directives(answer)
+                summary = self._apply_directives([], [], gputrack_names, None, sensitivity_args, normal_start_args)
+                if summary:
+                    cprint(f"[Pulse] Start-of-run check (deferred, agent now available): {summary}", color=_YELLOW)
+            except AgentRequestFailed:
+                pass
+
+        # Drain any problems that were detected before the agent was
+        # configured -- these were queued rather than dropped so they
+        # don't silently vanish just because the user hadn't run /agent
+        # yet when they fired.
+        queued = getattr(self, "_queued_interventions", [])
+        if queued:
+            self._queued_interventions = []
+            for problem in queued:
+                cprint(
+                    f"\n[Pulse] ⚠ Diagnosing queued auto-intervention (detected earlier, "
+                    f"agent now available): {problem}",
+                    color=_RED,
+                )
+                self.ask_agent(
+                    f"Pulse detected this problem during training (before the agent was configured): {problem}\n"
+                    "Please diagnose the root cause and fix it.",
+                    include_code=bool(self.code_text),
+                )
+    def _record_keras_logs(self, logs=None, epoch=None):
+        """
+        Capture metrics emitted by Keras callbacks.
+
+        Keras does not expose loss/validation loss as normal Python locals in
+        the user's training frame. Instead, they arrive through callback `logs`.
+
+        Epoch metrics are kept separately from normal scalar histories so that
+        the auto-intervention detector can reason about actual epoch-to-epoch
+        training behavior rather than a mixture of batch and epoch values.
+        """
+        if not logs:
+            return
+
+        if not hasattr(self, "epoch_scalar_histories"):
+            self.epoch_scalar_histories = {}
+
+        recorded = {}
+
+        for name, value in logs.items():
+            if value is None:
+                continue
+
+            try:
+                # TensorFlow / NumPy scalar -> Python float
+                if hasattr(value, "numpy"):
+                    value = value.numpy()
+
+                value = float(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+
+            # Preserve NaN / inf.
+            # The detector needs to see these instead of silently losing them.
+            hist = self.epoch_scalar_histories.setdefault(name, [])
+            hist.append(value)
+
+            if len(hist) > 2000:
+                del hist[:-2000]
+
+            recorded[name] = value
+
+        # Keras calls the training loss simply "loss".
+        # Pulse also understands "train_loss", so maintain an alias.
+        if "loss" in logs:
+            try:
+                value = logs["loss"]
+
+                if hasattr(value, "numpy"):
+                    value = value.numpy()
+
+                value = float(value)
+
+                hist = self.epoch_scalar_histories.setdefault(
+                    "train_loss", []
+                )
+                hist.append(value)
+
+                if len(hist) > 2000:
+                    del hist[:-2000]
+
+                recorded["train_loss"] = value
+
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+        # Keep scalar_histories aware of the latest epoch values too.
+        # This makes existing CLI commands such as /chart and /tracked
+        # continue to work without forcing the detector to use mixed
+        # batch/epoch histories.
+        for name, value in recorded.items():
+            hist = self.scalar_histories.setdefault(name, [])
+
+            if not hist or not _values_equal(hist[-1], value):
+                hist.append(value)
+
+            if len(hist) > 2000:
+                del hist[:-2000]
+
+        if _PULSE_LOGGING:
+            try:
+                history_lengths = {
+                    k: len(v)
+                    for k, v in self.epoch_scalar_histories.items()
+                }
+
+                _pulse_log(
+                    "KERAS EPOCH LOGS "
+                    f"epoch={epoch!r} "
+                    f"values={recorded!r} "
+                    f"history_lengths={history_lengths!r}",
+                )
+            except Exception:
+                pass
+
+
+    def _record_keras_batch_logs(self, logs=None):
+        """
+        Lightweight batch-level Keras metric capture.
+
+        This intentionally does NOT put batch metrics into
+        epoch_scalar_histories. Batch loss and epoch loss have different
+        semantics and must not be mixed for trend detection.
+        """
+        if not logs:
+            return
+
+        if not hasattr(self, "batch_scalar_histories"):
+            self.batch_scalar_histories = {}
+
+        for name, value in logs.items():
+            if value is None:
+                continue
+
+            try:
+                if hasattr(value, "numpy"):
+                    value = value.numpy()
+
+                value = float(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+
+            hist = self.batch_scalar_histories.setdefault(name, [])
+            hist.append(value)
+
+            if len(hist) > 2000:
+                del hist[:-2000]
+
+
+    def _history_for_detector(self, name):
+        """
+        Return the correct history for auto-diagnosis.
+
+        Loss/validation metrics prefer epoch-level Keras history.
+        Other scalar variables continue using normal Pulse histories.
+        """
+        epoch_histories = getattr(self, "epoch_scalar_histories", {})
+
+        if name in epoch_histories and epoch_histories[name]:
+            return epoch_histories[name]
+
+        if name == "train_loss":
+            loss_hist = epoch_histories.get("loss")
+            if loss_hist:
+                return loss_hist
+
+        return self.scalar_histories.get(name, [])
+
+
+    def update(self, step: Optional[int] = None,
+            generate_pdfs: Optional[bool] = None) -> None:
+        """Called at every training step/checkpoint."""
+
+        # ------------------------------------------------------------
+        # SIGINT / CTRL-C
+        # ------------------------------------------------------------
+        if self._stop_requested:
+            self.continuous = False
+
+        if _PULSE_LOGGING:
+            try:
+                _pulse_log(
+                    "UPDATE ENTER "
+                    f"step_arg={step!r} "
+                    f"continuous={self.continuous} "
+                    f"auto_intervene={self.auto_intervene} "
+                    f"tracked={self.tracked_vars!r} "
+                    f"watch_locals={sorted(k for k in self.watch_locals if not k.startswith('__'))!r}"
+                )
+
+            except Exception as _exc:
+                try:
+                    _pulse_log(
+                        f"UPDATE DEBUG ERROR: "
+                        f"{type(_exc).__name__}: {_exc}"
+                    )
+                except Exception:
+                    pass
+
+        # ------------------------------------------------------------
+        # FIND LOSS VARIABLE
+        # ------------------------------------------------------------
+        loss_var = next(
+            (
+                v for v in self.tracked_vars
+                if _looks_like_loss(v)
+            ),
+            None,
+        )
+
         new_loss_value: Optional[float] = None
 
+        # ------------------------------------------------------------
+        # STARTUP
+        # ------------------------------------------------------------
         self._prime_at_start()
+        self._prime_with_agent_if_needed()
 
-        # Uptime: wall-clock time since the *previous* update() call handed
-        # control back to the training loop, i.e. time actually spent in
-        # the user's own training code (forward/backward/optimizer step).
-        # Excludes any agent downtime and any interactive-prompt wait from
-        # that previous call, since both are marked separately/excluded
-        # below -- see _last_update_end_ts.
+        # ------------------------------------------------------------
+        # UPTIME
+        # ------------------------------------------------------------
         _update_start_ts = time.monotonic()
+
         if self._last_update_end_ts is not None:
             gap = _update_start_ts - self._last_update_end_ts
+
             if gap > 0:
                 self._uptime_seconds += gap
                 self._cloud_dirty_fields.add("uptime_seconds")
 
-        # Independent of the 10-minute telemetry batch timer (and of
-        # whether telemetry is enabled at all) -- see uptime_flush_interval's
-        # docstring in __init__ for why these two get their own, much
-        # shorter cadence.
         if (
             self.debug_session_id
-            and {"uptime_seconds", "downtime_seconds"} & self._cloud_dirty_fields
-            and (_update_start_ts - self._last_uptime_flush) >= self.uptime_flush_interval
+            and {
+                "uptime_seconds",
+                "downtime_seconds",
+            } & self._cloud_dirty_fields
+            and (
+                _update_start_ts - self._last_uptime_flush
+            ) >= self.uptime_flush_interval
         ):
             self._last_uptime_flush = _update_start_ts
             self._maybe_flush_cloud(force=True)
 
+        # ------------------------------------------------------------
+        # TRY TO GET LOSS FROM NORMAL PYTHON LOCALS
+        # ------------------------------------------------------------
         if loss_var is not None and loss_var in self.watch_locals:
-            raw = self._cpu_observation(loss_var, self.watch_locals[loss_var])
+            raw = self._cpu_observation(
+                loss_var,
+                self.watch_locals[loss_var],
+            )
+
             if raw is not None and is_trackable(raw):
                 try:
                     if describe_tensor(raw).kind == "scalar":
-                        new_loss_value = float(statistics(raw).get("mean"))
+                        stats = statistics(raw)
+                        value = stats.get("mean")
+
+                        if value is not None:
+                            new_loss_value = float(value)
+
                 except Exception:
                     new_loss_value = None
 
+        # ------------------------------------------------------------
+        # KERAS FALLBACK
+        #
+        # If loss isn't visible in Python locals, use the epoch history
+        # populated by the Keras callback bridge.
+        # ------------------------------------------------------------
+        if new_loss_value is None:
+            epoch_histories = getattr(
+                self,
+                "epoch_scalar_histories",
+                {},
+            )
+
+            keras_loss = epoch_histories.get("loss")
+
+            if keras_loss:
+                try:
+                    new_loss_value = float(keras_loss[-1])
+                except (TypeError, ValueError):
+                    new_loss_value = None
+
+        # ------------------------------------------------------------
+        # STEP COUNTER
+        # ------------------------------------------------------------
         if step is not None:
             self.step = step
-        elif loss_var is None:
-            # No loss-like variable tracked -- nothing to gate on, so fall
-            # back to the old "advance every call" behavior.
+
+        elif loss_var is None and new_loss_value is None:
             self.step += 1
-        else:
-            if not _values_equal(self._last_loss_value, new_loss_value):
-                self.step += 1
+
+        elif not _values_equal(
+            self._last_loss_value,
+            new_loss_value,
+        ):
+            self.step += 1
+
+        if new_loss_value is not None:
             self._last_loss_value = new_loss_value
 
-        want_pdfs = self.generate_pdfs if generate_pdfs is None else generate_pdfs
+        # ------------------------------------------------------------
+        # PDF / GPU / MATRIX PROBES
+        # ------------------------------------------------------------
+        want_pdfs = (
+            self.generate_pdfs
+            if generate_pdfs is None
+            else generate_pdfs
+        )
+
         now = time.monotonic()
 
-        # 1. Check if the global GPU probe cadence is due
-        # (Assuming self._last_gpu_probe is initialized to 0.0 in __init__)
-        gpu_ready = (now - getattr(self, "_last_gpu_probe", 0.0)) >= getattr(self, "gpu_probe_interval", 1.0)
+        gpu_ready = (
+            now - getattr(
+                self,
+                "_last_gpu_probe",
+                0.0,
+            )
+        ) >= getattr(
+            self,
+            "gpu_probe_interval",
+            1.0,
+        )
 
-        # 2. Gate the matrix probes: they only trigger if BOTH their specific 
-        # cadence (matrix_probe_interval/lotrack_probe_interval) AND the global 
-        # gpu_ready gate permit it (or if it's the very first un-cached pass).
         probe_track = (
             not self._matrix_cache
-            or (gpu_ready and (now - self._last_matrix_probe) >= self.matrix_probe_interval)
-            or any(v not in self._matrix_cached_vars for v in self.tracked_vars if self._state_of(v) == "track")
+            or (
+                gpu_ready
+                and (
+                    now - self._last_matrix_probe
+                ) >= self.matrix_probe_interval
+            )
+            or any(
+                v not in self._matrix_cached_vars
+                for v in self.tracked_vars
+                if self._state_of(v) == "track"
+            )
         )
-        
+
         probe_lotrack = (
-            (gpu_ready and (now - self._last_lotrack_probe) >= self.lotrack_probe_interval)
-            or any(v not in self._matrix_cached_vars for v in self.tracked_vars if self._state_of(v) == "lotrack")
+            (
+                gpu_ready
+                and (
+                    now - self._last_lotrack_probe
+                ) >= self.lotrack_probe_interval
+            )
+            or any(
+                v not in self._matrix_cached_vars
+                for v in self.tracked_vars
+                if self._state_of(v) == "lotrack"
+            )
         )
-        
+
         probe_matrices = probe_track or probe_lotrack
 
-        # 3. Update the global GPU probe timestamp if a matrix probe is actually firing
         if probe_matrices and self._matrix_cache:
             self._last_gpu_probe = now
-            
-        scalar_lines: List[tuple[str, Optional[float]]] = []
-        # (sub_name, stats, val, state)
-        matrix_lines: List[tuple[str, Dict[str, Any], Any, str]] = []
+
+        scalar_lines: List[
+            tuple[str, Optional[float]]
+        ] = []
+
+        matrix_lines: List[
+            tuple[str, Dict[str, Any], Any, str]
+        ] = []
+
         any_scalar_changed = False
-        # Fast path: discover/process scalars every step. Do NOT call
-        # _yield_slices() for matrices unless a probe for that variable's
-        # state is actually due this call.
+
+        # ------------------------------------------------------------
+        # NORMAL PULSE VARIABLE TRACKING
+        # ------------------------------------------------------------
         for var_name in self.tracked_vars:
+
             if var_name not in self.watch_locals:
                 continue
 
-            orig_val = self._cpu_observation(var_name, self.watch_locals[var_name])
-            var_state = self._state_of(var_name)
-            if orig_val is None and self.watch_locals[var_name] is not None:
-                if _pulse_is_accelerator_value(self.watch_locals[var_name]):
-                    if var_name not in self._cpu_only_warned:
-                        cprint(f"  • '{var_name}' is accelerator-resident; Pulse will not touch it. Maintain a CPU mirror named '{var_name}_cpu' (or '{var_name}_np') to visualize it.", color=_YELLOW)
-                        self._cpu_only_warned.add(var_name)
-                    continue
-            due_this_var = probe_track if var_state == "track" else probe_lotrack
+            raw_local = self.watch_locals[var_name]
 
+            orig_val = self._cpu_observation(
+                var_name,
+                raw_local,
+            )
+
+            var_state = self._state_of(var_name)
+
+            if (
+                orig_val is None
+                and raw_local is not None
+                and _pulse_is_accelerator_value(raw_local)
+            ):
+                if var_name not in self._cpu_only_warned:
+                    cprint(
+                        f"  • '{var_name}' is accelerator-resident; "
+                        f"Pulse will not touch it. Maintain a CPU mirror "
+                        f"named '{var_name}_cpu' (or '{var_name}_np') "
+                        f"to visualize it.",
+                        color=_YELLOW,
+                    )
+
+                    self._cpu_only_warned.add(var_name)
+
+                continue
+
+            due_this_var = (
+                probe_track
+                if var_state == "track"
+                else probe_lotrack
+            )
+
+            if _PULSE_LOGGING:
+                try:
+                    _pulse_log(
+                        f"OBSERVE name={var_name!r} "
+                        f"state={var_state!r} "
+                        f"raw_type={type(orig_val).__name__} "
+                        f"raw_none={orig_val is None} "
+                        f"history_len="
+                        f"{len(self.scalar_histories.get(var_name, []))}",
+                    )
+                except Exception:
+                    pass
+
+            # --------------------------------------------------------
+            # KERAS HISTORY FALLBACK FOR INDIVIDUAL METRICS
+            # --------------------------------------------------------
             if orig_val is None:
-                hist = self.scalar_histories.setdefault(var_name, [])
-                if not hist or not _values_equal(hist[-1], None):
+                keras_val = _try_keras_history(
+                    var_name,
+                    self.watch_locals,
+                )
+
+                if keras_val is not None:
+                    orig_val = keras_val
+
+            # --------------------------------------------------------
+            # UNREADABLE VARIABLE
+            # --------------------------------------------------------
+            if orig_val is None:
+                hist = self.scalar_histories.setdefault(
+                    var_name,
+                    [],
+                )
+
+                if (
+                    not hist
+                    or not _values_equal(hist[-1], None)
+                ):
                     hist.append(None)
                     any_scalar_changed = True
-                scalar_lines.append((var_name, None))
+
+                scalar_lines.append(
+                    (var_name, None)
+                )
+
                 continue
 
             if not is_trackable(orig_val):
@@ -5242,320 +8895,746 @@ class PulseCLI:
             except Exception:
                 kind = None
 
+            # --------------------------------------------------------
+            # SCALAR
+            # --------------------------------------------------------
             if kind == "scalar":
                 try:
                     stats = statistics(orig_val)
-                    # Derive scalar_val from the SAME statistics() call that produced
-                    # the nan/inf flags, rather than converting the tensor a second,
-                    # independent time via to_numpy(). Two separate conversions of a
-                    # live (possibly GPU/async) tensor can disagree -- e.g. the second
-                    # read racing an in-flight op -- which was causing normal, finite
-                    # loss values to get flagged as NaN/inf. For a true scalar, mean
-                    # over its single element is just that element, so this stays
-                    # perfectly consistent with stats['nan']/stats['inf'].
-                    scalar_val = float(stats.get("mean"))
+                    scalar_val = float(
+                        stats.get("mean")
+                    )
+
                 except Exception as exc:
-                    hist = self.scalar_histories.setdefault(var_name, [])
-                    if not hist or not _values_equal(hist[-1], None):
+                    hist = self.scalar_histories.setdefault(
+                        var_name,
+                        [],
+                    )
+
+                    if (
+                        not hist
+                        or not _values_equal(
+                            hist[-1],
+                            None,
+                        )
+                    ):
                         hist.append(None)
                         any_scalar_changed = True
-                    scalar_lines.append((var_name, None))
-                    cprint(f"  ⚠ '{var_name}' could not be read this step: {type(exc).__name__}: {exc}", color=_RED)
+
+                    scalar_lines.append(
+                        (var_name, None)
+                    )
+
+                    cprint(
+                        f"  ⚠ '{var_name}' could not be read "
+                        f"this step: "
+                        f"{type(exc).__name__}: {exc}",
+                        color=_RED,
+                    )
+
                     continue
-                hist = self.scalar_histories.setdefault(var_name, [])
-                changed = not hist or not _values_equal(hist[-1], scalar_val)
+
+                hist = self.scalar_histories.setdefault(
+                    var_name,
+                    [],
+                )
+
+                changed = (
+                    not hist
+                    or not _values_equal(
+                        hist[-1],
+                        scalar_val,
+                    )
+                )
+
                 if changed:
                     hist.append(scalar_val)
                     any_scalar_changed = True
-                scalar_lines.append((var_name, scalar_val))
+
+                if len(hist) > 2000:
+                    del hist[:-2000]
+
+                scalar_lines.append(
+                    (var_name, scalar_val)
+                )
+
                 continue
 
-            # Matrix/tensor path. No slicing, no statistics(), and no GPU->CPU
-            # copy at all unless this variable's own probe cadence is due.
+            # --------------------------------------------------------
+            # MATRIX / TENSOR
+            # --------------------------------------------------------
             if not due_this_var:
                 continue
 
-            for sub_name, val in self._yield_slices(var_name, orig_val):
+            for sub_name, val in self._yield_slices(
+                var_name,
+                orig_val,
+            ):
                 if val is None:
-                    hist = self.scalar_histories.setdefault(sub_name, [])
-                    if not hist or not _values_equal(hist[-1], None):
+                    hist = self.scalar_histories.setdefault(
+                        sub_name,
+                        [],
+                    )
+
+                    if (
+                        not hist
+                        or not _values_equal(
+                            hist[-1],
+                            None,
+                        )
+                    ):
                         hist.append(None)
                         any_scalar_changed = True
-                    scalar_lines.append((sub_name, None))
+
+                    scalar_lines.append(
+                        (sub_name, None)
+                    )
+
                     continue
 
                 try:
                     stats = statistics(val)
+
                 except Exception as exc:
-                    cprint(f"  ⚠ '{sub_name}' could not be read this step: {type(exc).__name__}: {exc}", color=_RED)
+                    cprint(
+                        f"  ⚠ '{sub_name}' could not be read "
+                        f"this step: "
+                        f"{type(exc).__name__}: {exc}",
+                        color=_RED,
+                    )
                     continue
 
                 if stats.get("kind") == "scalar":
                     try:
-                        # Same fix as the top-level scalar path above: reuse the
-                        # already-computed `stats` rather than re-converting `val`
-                        # independently, to avoid spurious NaN/inf false positives.
-                        scalar_val = float(stats.get("mean"))
+                        scalar_val = float(
+                            stats.get("mean")
+                        )
+
                     except Exception:
-                        hist = self.scalar_histories.setdefault(sub_name, [])
-                        if not hist or not _values_equal(hist[-1], None):
+                        hist = self.scalar_histories.setdefault(
+                            sub_name,
+                            [],
+                        )
+
+                        if (
+                            not hist
+                            or not _values_equal(
+                                hist[-1],
+                                None,
+                            )
+                        ):
                             hist.append(None)
                             any_scalar_changed = True
-                        scalar_lines.append((sub_name, None))
+
+                        scalar_lines.append(
+                            (sub_name, None)
+                        )
+
                         continue
-                    hist = self.scalar_histories.setdefault(sub_name, [])
-                    changed = not hist or not _values_equal(hist[-1], scalar_val)
+
+                    hist = self.scalar_histories.setdefault(
+                        sub_name,
+                        [],
+                    )
+
+                    changed = (
+                        not hist
+                        or not _values_equal(
+                            hist[-1],
+                            scalar_val,
+                        )
+                    )
+
                     if changed:
                         hist.append(scalar_val)
                         any_scalar_changed = True
-                    scalar_lines.append((sub_name, scalar_val))
+
+                    if len(hist) > 2000:
+                        del hist[:-2000]
+
+                    scalar_lines.append(
+                        (sub_name, scalar_val)
+                    )
+
                 else:
                     self._matrix_cache[sub_name] = {
                         "base_name": var_name,
                         "stats": stats,
                     }
-                    matrix_lines.append((sub_name, stats, val, var_state))
+
+                    matrix_lines.append(
+                        (
+                            sub_name,
+                            stats,
+                            val,
+                            var_state,
+                        )
+                    )
 
             self._matrix_cached_vars.add(var_name)
 
+        # ------------------------------------------------------------
+        # PROBE TIMESTAMPS
+        # ------------------------------------------------------------
         if probe_track:
             self._last_matrix_probe = now
+
         if probe_lotrack:
             self._last_lotrack_probe = now
 
-        # Quiet by design: a scalar (loss, accuracy, whatever) is only ever
-        # printed when it's actually WRONG -- unreadable (None) or non-finite
-        # (NaN/inf). A healthy loss ticking along normally never shows up
-        # here; auto-intervention (below) is what's watching it, silently.
+        # ------------------------------------------------------------
+        # TERMINAL DISPLAY
+        # ------------------------------------------------------------
         def _is_wrong(v):
-            return v is None or (isinstance(v, (int, float)) and not math.isfinite(v))
+            return (
+                v is None
+                or (
+                    isinstance(v, (int, float))
+                    and not math.isfinite(v)
+                )
+            )
 
-        wrong_scalars = [(n, v) for n, v in scalar_lines if _is_wrong(v)]
+        wrong_scalars = [
+            (n, v)
+            for n, v in scalar_lines
+            if _is_wrong(v)
+        ]
 
-        # lotrack matrices/tensors NEVER print, under any circumstances --
-        # they're still probed and cached (so auto-intervention still sees
-        # nan/inf on them), just never surfaced in the terminal. Only
-        # 'track' variables get a tagging line, and only when freshly
-        # measured this probe.
         track_matrix_lines = (
-            [t for t in matrix_lines if t[3] != "lotrack"] if probe_matrices else []
+            [
+                t for t in matrix_lines
+                if t[3] != "lotrack"
+            ]
+            if probe_matrices
+            else []
         )
 
-        should_redraw = bool(wrong_scalars or track_matrix_lines)
+        should_redraw = bool(
+            wrong_scalars
+            or track_matrix_lines
+        )
 
         if should_redraw:
-            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.write(
+                "\033[2J\033[H"
+            )
             sys.stdout.flush()
-            cprint(f"--- Pulse Live Debugger | Step {self.step} ---")
+
+            cprint(
+                f"--- Pulse Live Debugger | Step {self.step} ---"
+            )
 
             for sub_name, scalar_val in wrong_scalars:
-                hist = self.scalar_histories.get(sub_name, [])
+                hist = self.scalar_histories.get(
+                    sub_name,
+                    [],
+                )
+
                 if scalar_val is None:
-                    cprint(f"  • {sub_name}: NoneType  ⚠ (unreadable this step)", color=_RED)
+                    cprint(
+                        f"  • {sub_name}: NoneType "
+                        f"⚠ (unreadable this step)",
+                        color=_RED,
+                    )
                 else:
-                    cprint(f"  • {sub_name}: {scalar_val:.6g}  ⚠", color=_RED)
-                self._print_ascii_chart(sub_name, hist)
+                    cprint(
+                        f"  • {sub_name}: "
+                        f"{scalar_val:.6g} ⚠",
+                        color=_RED,
+                    )
+
+                self._print_ascii_chart(
+                    sub_name,
+                    hist,
+                )
 
             if track_matrix_lines:
+
                 def _fmt(v):
                     try:
                         return f"{v:.4f}"
-                    except (TypeError, ValueError):
+                    except (
+                        TypeError,
+                        ValueError,
+                    ):
                         return "n/a"
 
-                for sub_name, stats, val, var_state in track_matrix_lines:
+                for (
+                    sub_name,
+                    stats,
+                    val,
+                    var_state,
+                ) in track_matrix_lines:
+
                     flag = ""
-                    if stats.get("nan") or stats.get("inf"):
-                        flag = f"  ⚠ nan={stats.get('nan')} inf={stats.get('inf')}"
-                    mean_v, min_v, max_v = stats.get("mean"), stats.get("min"), stats.get("max")
+
+                    if (
+                        stats.get("nan")
+                        or stats.get("inf")
+                    ):
+                        flag = (
+                            f"  ⚠ nan={stats.get('nan')} "
+                            f"inf={stats.get('inf')}"
+                        )
+
+                    mean_v = stats.get("mean")
+                    min_v = stats.get("min")
+                    max_v = stats.get("max")
 
                     print(
                         f"  • Tagging '{sub_name}' "
-                        f"[{stats.get('backend')} {stats.get('kind')} {stats.get('shape')}] "
-                        f"| mean={_fmt(mean_v)} min={_fmt(min_v)} "
-                        f"max={_fmt(max_v)}{flag}"
+                        f"[{stats.get('backend')} "
+                        f"{stats.get('kind')} "
+                        f"{stats.get('shape')}] "
+                        f"| mean={_fmt(mean_v)} "
+                        f"min={_fmt(min_v)} "
+                        f"max={_fmt(max_v)}"
+                        f"{flag}"
                     )
 
-                    if want_pdfs and val is not None:
-                        safe_name = sub_name.replace("[", "_").replace("]", "").replace(",", "_")
+                    if (
+                        want_pdfs
+                        and val is not None
+                    ):
+                        safe_name = (
+                            sub_name
+                            .replace("[", "_")
+                            .replace("]", "")
+                            .replace(",", "_")
+                        )
+
                         try:
                             pdf_path = generate_heatmap_pdf(
-                                safe_name, val, self.step, output_dir=self.pdf_dir
+                                safe_name,
+                                val,
+                                self.step,
+                                output_dir=self.pdf_dir,
                             )
-                            print(f"    ↳ saved snapshot: {pdf_path}")
+
+                            print(
+                                f"    ↳ saved snapshot: "
+                                f"{pdf_path}"
+                            )
+
                         except Exception as exc:
-                            cprint(f"    ↳ ⚠ failed to save PDF snapshot for '{sub_name}': {exc}", color=_RED)
+                            cprint(
+                                f"    ↳ ⚠ failed to save PDF "
+                                f"snapshot for '{sub_name}': {exc}",
+                                color=_RED,
+                            )
 
                 if self._matrix_cache:
                     print(
-                        f"  [matrices cached: {len(self._matrix_cache)} | "
-                        f"next full probe ≤ {self.matrix_probe_interval:g}s | "
-                        f"next lotrack probe ≤ {self.lotrack_probe_interval:g}s]"
+                        f"  [matrices cached: "
+                        f"{len(self._matrix_cache)} | "
+                        f"next full probe ≤ "
+                        f"{self.matrix_probe_interval:g}s | "
+                        f"next lotrack probe ≤ "
+                        f"{self.lotrack_probe_interval:g}s]"
                     )
 
-        self._maybe_collect_telemetry(scalar_lines, matrix_lines)
+        # ------------------------------------------------------------
+        # TELEMETRY / GPU
+        # ------------------------------------------------------------
+        self._maybe_collect_telemetry(
+            scalar_lines,
+            matrix_lines,
+        )
+
         self._maybe_gpu_checkin()
 
+        # ------------------------------------------------------------
+        # AUTO-INTERVENTION
+        #
+        # This is completely independent of CTRL-C.
+        # The Keras callback has already populated epoch histories,
+        # so the detector can now actually see loss / val_loss.
+        # ------------------------------------------------------------
         if self.auto_intervene:
+
             problem = self._check_for_trouble()
-            if problem and problem != self._last_intervention_signature:
+
+            if _PULSE_LOGGING:
+                try:
+                    detector_histories = {
+                        k: len(v)
+                        for k, v in getattr(
+                            self,
+                            "epoch_scalar_histories",
+                            {},
+                        ).items()
+                    }
+
+                    _pulse_log(
+                        "DETECTOR "
+                        f"result={problem!r} "
+                        f"epoch_histories="
+                        f"{detector_histories!r}",
+                    )
+
+                except Exception:
+                    pass
+
+            if (
+                problem
+                and problem != self._last_intervention_signature
+            ):
                 self._last_intervention_signature = problem
                 self.continuous = True
-                print("\n" + "=" * 60)
-                cprint("[Pulse] ⚠ Auto-intervention: training looks like it's going bad. Diagnosing while preserving the loop.", color=_RED)
-                cprint(f"[Pulse] Detected: {problem}", color=_RED)
-                print("=" * 60)
-                if self.agent_provider:
-                    question = (
-                        f"Pulse just auto-paused training because it detected a problem: {problem}\n"
-                        "Please diagnose the root cause and, if you can, fix it."
-                    )
-                    cprint("Pulse:")
-                    self._pending_agent_start_ts = time.monotonic()
-                    self._pending_agent_problem = problem
-                    self.ask_agent(question, include_code=bool(self.code_text))
-                    # No-op if a fix inside ask_agent() already triggered a
-                    # restart and _restart_process() finalized this first.
-                    self._finalize_agent_downtime()
-                else:
-                    cprint("[Pulse] No AI agent is configured yet -- run /agent to set one up, then ask about this.")
-                    self._log_incident("auto_intervention", problem, downtime_seconds=0.0, fix_applied=False)
-                cprint("[Pulse] Continuing training automatically.")
 
-        # Mark the automated portion of this update() call as finished
-        # here -- before the interactive human-wait prompt below -- so
-        # that wait time is counted as neither uptime nor agent downtime;
-        # it's a paused-for-a-human period, not training or agent work.
+                print("\n" + "=" * 60)
+
+                cprint(
+                    "[Pulse] ⚠ Auto-intervention: "
+                    "training looks like it's going bad. "
+                    "Diagnosing while preserving the loop.",
+                    color=_RED,
+                )
+
+                cprint(
+                    f"[Pulse] Detected: {problem}",
+                    color=_RED,
+                )
+
+                print("=" * 60)
+
+                if (
+                    self.agent_provider
+                    and self.agent_key
+                ):
+                    question = (
+                        "Pulse just auto-paused training because "
+                        f"it detected a problem: {problem}\n"
+                        "Please diagnose the root cause and, "
+                        "if you can, fix it."
+                    )
+
+                    cprint("Pulse:")
+
+                    self._pending_agent_start_ts = (
+                        time.monotonic()
+                    )
+
+                    self._pending_agent_problem = problem
+
+                    self.ask_agent(
+                        question,
+                        include_code=bool(
+                            self.code_text
+                        ),
+                    )
+
+                    self._finalize_agent_downtime()
+
+                else:
+                    cprint(
+                        "[Pulse] No AI agent is configured yet "
+                        "-- problem queued. Run /agent to set one "
+                        "up and it will be diagnosed immediately.",
+                        color=_YELLOW,
+                    )
+
+                    self._log_incident(
+                        "auto_intervention",
+                        problem,
+                        downtime_seconds=0.0,
+                        fix_applied=False,
+                    )
+
+                    if not hasattr(
+                        self,
+                        "_queued_interventions",
+                    ):
+                        self._queued_interventions = []
+
+                    if (
+                        problem
+                        not in self._queued_interventions
+                    ):
+                        self._queued_interventions.append(
+                            problem
+                        )
+
+                cprint(
+                    "[Pulse] Continuing training automatically."
+                )
+
+        # ------------------------------------------------------------
+        # UPDATE FINISHED
+        # ------------------------------------------------------------
         self._last_update_end_ts = time.monotonic()
+
+        if self._stop_requested:
+            self.continuous = False
+            self._stop_requested = False
 
         if self.continuous:
             return
 
-        # Interactive Training Loop Prompt
+        # ------------------------------------------------------------
+        # INTERACTIVE PROMPT
+        # ------------------------------------------------------------
         while True:
             try:
                 _flush_stdin()
+
                 cmd = input(
                     _highlight_pulse(
-                        "\nPulse [Enter=step, /c=continuous, /help, or ask AI] > "
+                        "\nPulse "
+                        "[Enter=step, /c=continuous, "
+                        "/help, or ask AI] > "
                     )
                 ).strip()
-            except (EOFError, KeyboardInterrupt):
+
+            except (
+                EOFError,
+                KeyboardInterrupt,
+            ):
                 cprint("\nExiting Pulse...")
-                if self.original_sigint and callable(self.original_sigint):
-                    signal.signal(signal.SIGINT, self.original_sigint)
+
+                if (
+                    self.original_sigint
+                    and callable(self.original_sigint)
+                ):
+                    signal.signal(
+                        signal.SIGINT,
+                        self.original_sigint,
+                    )
+
                 raise KeyboardInterrupt
 
             if not cmd:
                 break
 
-            if cmd.lower() in ("/c", "/continue", "c"):
+            cmd_lower = cmd.lower()
+
+            if cmd_lower in (
+                "/c",
+                "/continue",
+                "c",
+            ):
                 self.continuous = True
                 break
 
-            if cmd.lower() in ("/help", "/h", "?", "/commands"):
+            if cmd_lower in (
+                "/help",
+                "/h",
+                "?",
+                "/commands",
+            ):
                 self._cmd_help(cmd)
                 continue
 
-            if cmd.lower().startswith("/add "):
+            if cmd_lower.startswith("/add "):
                 self._cmd_add(cmd[5:].strip())
                 continue
 
-            if cmd.lower().startswith("/track "):
+            if cmd_lower.startswith("/track "):
                 self._cmd_track(cmd[7:].strip())
                 continue
-            if cmd.lower().startswith("/lotrack "):
+
+            if cmd_lower.startswith("/lotrack "):
                 self._cmd_lotrack(cmd[9:].strip())
                 continue
-            if cmd.lower().startswith("/gputrack "):
+
+            if cmd_lower.startswith("/gputrack "):
                 self._cmd_gputrack(cmd[10:].strip())
                 continue
-            if cmd.lower().startswith("/gpuuntrack "):
+
+            if cmd_lower.startswith("/gpuuntrack "):
                 self._cmd_gpuuntrack(cmd[12:].strip())
                 continue
-            if cmd.lower().startswith("/autofix"):
-                self._cmd_autofix(cmd[8:].strip())
-                continue
-            if cmd.lower().startswith("/sensitivity"):
-                self._cmd_sensitivity(cmd[len("/sensitivity"):].strip())
-                continue
-            if cmd.lower().startswith("/telemetry"):
-                self._cmd_telemetry(cmd[len("/telemetry"):].strip())
+
+            if cmd_lower.startswith("/autofix"):
+                self._cmd_autofix(
+                    cmd[8:].strip()
+                )
                 continue
 
-            if cmd.lower().startswith("/deletepdf "):
-                self._cmd_delete_pdfs(cmd[11:].strip())
-                continue
-            if cmd.lower().startswith("/delete "):
-                self._cmd_delete(cmd[8:].strip())
-                continue
-
-            if cmd.lower() == "/agent":
-                self._select_agent_provider_and_key(initial=False)
+            if cmd_lower.startswith("/sensitivity"):
+                self._cmd_sensitivity(
+                    cmd[len("/sensitivity"):].strip()
+                )
                 continue
 
-            if cmd.lower() == "/cloud":
+            if cmd_lower.startswith("/telemetry"):
+                self._cmd_telemetry(
+                    cmd[len("/telemetry"):].strip()
+                )
+                continue
+
+            if cmd_lower.startswith("/deletepdf "):
+                self._cmd_delete_pdfs(
+                    cmd[11:].strip()
+                )
+                continue
+
+            if cmd_lower.startswith("/delete "):
+                self._cmd_delete(
+                    cmd[8:].strip()
+                )
+                continue
+
+            if cmd_lower == "/agent":
+                self._select_agent_provider_and_key(
+                    initial=False
+                )
+                continue
+
+            if cmd_lower == "/cloud":
                 self._print_cloud_status()
                 continue
 
-            if cmd.lower() == "/cloud flush":
-                self._maybe_flush_cloud(force=True)
-                cprint("[Pulse] Cloud sync flushed.")
+            if cmd_lower == "/cloud flush":
+                self._maybe_flush_cloud(
+                    force=True
+                )
+                cprint(
+                    "[Pulse] Cloud sync flushed."
+                )
                 continue
 
-            if cmd.lower().startswith("/repo"):
-                self._cmd_repo(cmd[5:].strip())
+            if cmd_lower.startswith("/repo"):
+                self._cmd_repo(
+                    cmd[5:].strip()
+                )
                 continue
 
-            if cmd.lower() == "/vars":
+            if cmd_lower == "/vars":
                 self._print_variable_summary()
                 continue
 
-            if cmd.lower() == "/tracked":
+            if (
+                cmd_lower == "/chart"
+                or cmd_lower.startswith("/chart ")
+            ):
+                self._cmd_chart(
+                    cmd[6:].strip()
+                )
+                continue
+
+            if cmd_lower == "/tracked":
                 cfg_strs = [
-                    f"{v}({self.var_configs[v]})[{self._state_of(v)}]" if v in self.var_configs
-                    else f"{v}[{self._state_of(v)}]"
+                    (
+                        f"{v}({self.var_configs[v]})"
+                        f"[{self._state_of(v)}]"
+                    )
+                    if v in self.var_configs
+                    else (
+                        f"{v}"
+                        f"[{self._state_of(v)}]"
+                    )
                     for v in self.tracked_vars
                 ]
-                print("Tracked:", ", ".join(cfg_strs) if cfg_strs else "(none)")
+
+                print(
+                    "Tracked:",
+                    (
+                        ", ".join(cfg_strs)
+                        if cfg_strs
+                        else "(none)"
+                    ),
+                )
+
                 continue
 
-            if cmd.lower().startswith("/code"):
-                self._cmd_code(cmd[5:].strip())
+            if cmd_lower.startswith("/code"):
+                self._cmd_code(
+                    cmd[5:].strip()
+                )
                 continue
 
-            if cmd.lower() == "/log":
+            if cmd_lower == "/log":
                 self._cmd_log("")
                 continue
 
-            if cmd.lower().startswith("/admin"):
-                self._cmd_admin(cmd[6:].strip())
-                continue
-            if cmd.lower().startswith("/webhook"):
-                self._cmd_webhook(cmd[8:].strip())
-                continue
-            if cmd.lower().startswith("/password"):
-                self._cmd_password(cmd[9:].strip())
-                continue
-            if cmd.lower().startswith("/recover"):
-                self._cmd_recover(cmd[8:].strip())
-                continue
-            if cmd.lower().startswith("/deleteaccount"):
-                self._cmd_deleteaccount(cmd[14:].strip())
-                continue
-            if cmd.lower() == "/logout":
-                self._cmd_logout("")
-                continue
-            if cmd.lower().startswith("/commit"):
-                self._cmd_commit(cmd[7:].strip())
+            if cmd_lower.startswith("/admin"):
+                self._cmd_admin(
+                    cmd[6:].strip()
+                )
                 continue
 
-            if cmd.lower().startswith("/revert"):
-                self._cmd_revert(cmd[7:].strip())
+            if cmd_lower.startswith("/webhook"):
+                self._cmd_webhook(
+                    cmd[8:].strip()
+                )
+                continue
+
+            if cmd_lower.startswith("/password"):
+                self._cmd_password(
+                    cmd[9:].strip()
+                )
+                continue
+
+            if cmd_lower.startswith("/recover"):
+                self._cmd_recover(
+                    cmd[8:].strip()
+                )
+                continue
+
+            if cmd_lower.startswith("/deleteaccount"):
+                self._cmd_deleteaccount(
+                    cmd[14:].strip()
+                )
+                continue
+
+            if cmd_lower == "/logout":
+                self._cmd_logout("")
+                continue
+
+            if cmd_lower.startswith("/commit"):
+                self._cmd_commit(
+                    cmd[7:].strip()
+                )
+                continue
+
+            if cmd_lower.startswith("/revert"):
+                self._cmd_revert(
+                    cmd[7:].strip()
+                )
                 continue
 
             cprint("Pulse AI:")
-            self.ask_agent(cmd, include_code=self.include_code_default)
+            self.ask_agent(
+                cmd,
+                include_code=self.include_code_default,
+            )
+
+
+    # ================================================================
+    # KERAS TRACKER / CALLBACK BRIDGE
+    # ================================================================
+
+   
+
+    
+
+    def _cmd_chart(self, arg: str) -> None:
+        """/chart [var] -- render the ASCII loss/metric curve for any
+        tracked scalar on demand, not just when it's already flagged
+        unhealthy (_print_ascii_chart below is otherwise only invoked
+        automatically for that case, as part of the anomaly redraw).
+        Defaults to the most loss-like tracked scalar (see
+        LOSS_NAME_HINTS) when no name is given, so plain '/chart' just
+        works for the common case of "show me the loss curve"."""
+        name = arg.strip()
+        if not name:
+            candidates = [n for n in self.scalar_histories if any(h in n.lower() for h in LOSS_NAME_HINTS)]
+            name = candidates[0] if candidates else next(iter(self.scalar_histories), None)
+            if name is None:
+                cprint("[Pulse] no scalar history recorded yet.", color=_RED)
+                return
+        hist = self.scalar_histories.get(name)
+        if hist is None:
+            matches = [k for k in self.scalar_histories if name.lower() in k.lower()]
+            if len(matches) == 1:
+                name, hist = matches[0], self.scalar_histories[matches[0]]
+        if not hist:
+            known = ", ".join(sorted(self.scalar_histories)) or "(none yet)"
+            cprint(f"[Pulse] no scalar history recorded yet for '{name}'. Known scalars: {known}", color=_RED)
+            return
+        cprint(f"--- {name} ({len(hist)} point(s)) ---")
+        self._print_ascii_chart(name, hist)
 
     def _print_ascii_chart(
         self,

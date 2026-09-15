@@ -4,6 +4,7 @@ Pulse — a live ML training debugger, GUI or CLI, any backend.
     from pulse import auto_track
     auto_track(train_step)   # pass your training function for shape discovery
 
+
 GUI mode: opens a matrix picker with live shapes, then a live dashboard --
 heatmap grid on the left (click a tile to enlarge, right-click to reconfigure
 axes), AI chat on the right that's briefed on its role and can optionally see
@@ -61,8 +62,15 @@ import multiprocessing as mp
 import ast
 import base64
 import math
+import copy
+import difflib
+import hashlib
+import itertools
+import inspect
+import importlib
 import __main__
 import subprocess
+from  pulse.pulse_cli import _install_keras_pulse_hook
 
 import numpy as np
 import matplotlib
@@ -82,6 +90,29 @@ from pulse.pulse_backend import (
 import multiprocessing as mp
 
 import litellm
+
+
+
+
+# ---------------------------------------------------------------------------
+# TEMPORARY DEBUG INSTRUMENTATION
+# Enable with PULSE_LOGGING=1 (default ON in this logging build).
+# Writes a low-volume trace to ./pulse.log without dumping tensor data.
+# ---------------------------------------------------------------------------
+_PULSE_LOGGING = os.environ.get("PULSE_LOGGING", "1").strip().lower() not in ("0", "off", "false", "no")
+_PULSE_LOG_FILE = os.path.abspath(os.environ.get("PULSE_LOG_FILE", "pulse.log"))
+
+
+def _pulse_log(message: str, *, console: bool = False) -> None:
+    if not _PULSE_LOGGING:
+        return
+    line = f"[{time.strftime('%H:%M:%S')}] {message}"
+    try:
+        with open(_PULSE_LOG_FILE, "a", encoding="utf-8") as _f:
+            _f.write(line + "\n")
+    except Exception:
+        pass
+   
 
 
 # ============================================================================
@@ -279,6 +310,10 @@ CMAP = LinearSegmentedColormap.from_list("Heat", _COLORS)
 # into a single rendered frame, since a 2.2x2.2in/80dpi thumbnail can't
 # usefully show more than a few hundred points anyway.
 TARGET_SCALAR_DISPLAY_POINTS = 120
+# Cap on how many (step, value) points of a scalar's full history are kept
+# in the manifest JSON for the CORR/OUTLIER/DIFFSTATS/HISTOGRAM chat tools
+# -- bounded so a long run's manifest file doesn't grow without limit.
+_SCALAR_HISTORY_CAP = 2000
 
 # Render figures at roughly the size they'll actually be displayed at
 # (dashboard thumbnails are ~170x170) instead of rendering large and then
@@ -669,6 +704,13 @@ def _worker_main(queue, display_configs, session_id, var_states=None):
                 stats["updated"] = time.time()
                 stats["latest_value"] = value
                 stats["recent"] = list(recent_values[var])
+                # Full (step, value) history, bounded so the manifest JSON
+                # doesn't grow unbounded over a long run -- this is what
+                # backs the CORR/OUTLIER/DIFFSTATS/HISTOGRAM chat
+                # directives (see ChatPanel._scalar_history), which need
+                # real step-aligned data rather than just the last few
+                # values in `recent`.
+                stats["history"] = hist[-_SCALAR_HISTORY_CAP:]
                 manifest[var] = stats
 
             else:
@@ -768,11 +810,228 @@ def _cpu_resident(value):
     return False
 
 
+class AgentRequestFailed(Exception):
+    """Raised by _call_model once its in-call retries are exhausted, with
+    a short, classified, user-facing reason (see _classify_model_error)
+    -- never returned as a plain string, which would risk getting parsed
+    downstream as if it were a real diagnosis/fix. Caught at exactly one
+    place, ChatPanel._ask's top-level try/except, which stops the
+    pipeline cleanly and queues the request for a later background retry
+    -- see _queue_agent_retry."""
+    pass
+
+
 def _mirror_name_candidates(name):
     """Names commonly used by training code for an already-created CPU copy."""
     return (
         f"{name}_cpu", f"{name}_host", f"{name}_np", f"cpu_{name}", f"host_{name}",
     )
+
+
+# ============================================================================
+# Multi-GPU support: (a) real per-device status (memory/utilization) via
+# nvidia-smi + torch.cuda, framework-agnostic and independent of
+# PULSE_CPU_ONLY (querying device *metadata* -- not tensor values -- isn't
+# the accelerator read that strict mode is about); (b) distributed-launch
+# awareness (torchrun/torch.distributed.launch/OpenMPI/Slurm) so a
+# multi-process, one-rank-per-GPU job gets exactly one Pulse UI (rank 0)
+# instead of one per process, while every rank's GPU status/crash state is
+# still visible to that one UI via small per-rank status files.
+# ============================================================================
+def _distributed_info():
+    """Best-effort detection of a multi-process, one-rank-per-GPU launch,
+    purely from environment variables -- no torch import required. Returns
+    (rank, local_rank, world_size, session_key). session_key is a value
+    shared by every rank of the same job (so they agree on where to write
+    their status files) -- None when not running distributed. Falls back
+    to (0, 0, 1, None) for an ordinary single-process run, so every call
+    site can treat world_size == 1 as "not distributed" without a separate
+    check.
+    """
+    def _int_env(*names, default=None):
+        for n in names:
+            v = os.environ.get(n)
+            if v is not None:
+                try:
+                    return int(v)
+                except ValueError:
+                    continue
+        return default
+
+    rank = _int_env("RANK", "OMPI_COMM_WORLD_RANK", "SLURM_PROCID", default=0)
+    local_rank = _int_env("LOCAL_RANK", "OMPI_COMM_WORLD_LOCAL_RANK", "SLURM_LOCALID", default=rank)
+    world_size = _int_env("WORLD_SIZE", "OMPI_COMM_WORLD_SIZE", "SLURM_NTASKS", default=1)
+
+    session_key = None
+    if world_size > 1:
+        session_key = (
+            os.environ.get("PULSE_SESSION_ID")
+            or os.environ.get("TORCHELASTIC_RUN_ID")
+            or f"{os.environ.get('MASTER_ADDR', 'local')}:{os.environ.get('MASTER_PORT', '0')}"
+        )
+    return rank, local_rank, world_size, session_key
+
+
+def _gpu_status_snapshot():
+    """Real per-device GPU status visible to THIS process: name/total
+    memory/utilization (via `nvidia-smi`, if present on PATH) merged with
+    this process's own allocated/reserved memory (via torch.cuda, if
+    importable) -- deterministic numbers instead of a model guessing about
+    'the GPU'. Framework-agnostic: works even when the training code
+    doesn't use torch, as long as nvidia-smi is available. Returns a list
+    of per-device dicts (possibly empty if nothing detectable), sorted by
+    device index.
+    """
+    devices = {}
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0:
+            for line in out.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) != 5:
+                    continue
+                idx, name, mem_total, mem_used, util = parts
+                try:
+                    devices[int(idx)] = {
+                        "index": int(idx), "name": name,
+                        "mem_total_mb": float(mem_total), "mem_used_mb": float(mem_used),
+                        "util_pct": float(util),
+                    }
+                except ValueError:
+                    continue
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                entry = devices.setdefault(i, {"index": i, "name": torch.cuda.get_device_name(i)})
+                try:
+                    entry["this_process_alloc_mb"] = torch.cuda.memory_allocated(i) / (1024 ** 2)
+                    entry["this_process_reserved_mb"] = torch.cuda.memory_reserved(i) / (1024 ** 2)
+                    if "mem_total_mb" not in entry:
+                        entry["mem_total_mb"] = torch.cuda.get_device_properties(i).total_memory / (1024 ** 2)
+                except Exception:
+                    continue
+    except ImportError:
+        pass
+
+    return [devices[i] for i in sorted(devices)]
+
+
+def _format_gpu_status(devices, label=None):
+    suffix = f" ({label})" if label else ""
+    if not devices:
+        return f"GPUSTATUS{suffix}: no CUDA devices detected (no nvidia-smi on PATH and/or torch.cuda unavailable)."
+    lines = []
+    for d in devices:
+        parts = [f"cuda:{d['index']}"]
+        if d.get("name"):
+            parts.append(d["name"])
+        if "mem_used_mb" in d and "mem_total_mb" in d:
+            parts.append(f"{d['mem_used_mb']:.0f}/{d['mem_total_mb']:.0f} MB")
+        elif "mem_total_mb" in d:
+            parts.append(f"{d['mem_total_mb']:.0f} MB total")
+        if "util_pct" in d:
+            parts.append(f"{d['util_pct']:.0f}% util")
+        if "this_process_alloc_mb" in d:
+            parts.append(f"this process: {d['this_process_alloc_mb']:.0f} MB allocated")
+        lines.append("  " + ", ".join(parts))
+    return f"GPUSTATUS{suffix}: {len(devices)} device(s)\n" + "\n".join(lines)
+
+
+def _rank_status_dir(session_key):
+    d = os.path.join(tempfile.gettempdir(), "pulse_cache", "ranks", session_key)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _write_rank_status(session_key, rank, local_rank, world_size, extra=None):
+    """Persist this rank's GPU status (and, via `extra`, a crash traceback
+    if it has one) to a small per-rank JSON file so rank 0's Pulse UI can
+    aggregate a multi-GPU/multi-rank view without any direct IPC between
+    ranks -- just a shared directory on a shared filesystem, the same
+    trust model the rest of Pulse already uses for crash-file handoff."""
+    path = os.path.join(_rank_status_dir(session_key), f"rank_{rank}.json")
+    try:
+        import socket
+        hostname = socket.gethostname()
+    except Exception:
+        hostname = "unknown-host"
+    payload = {
+        "rank": rank, "local_rank": local_rank, "world_size": world_size,
+        "pid": os.getpid(), "hostname": hostname, "updated": time.time(),
+        "gpus": _gpu_status_snapshot(),
+    }
+    if extra:
+        payload.update(extra)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except OSError:
+        pass
+
+
+def _read_all_rank_status(session_key):
+    """All ranks' latest status payloads (see _write_rank_status), sorted
+    by rank. A rank that hasn't written yet (or whose file vanished) is
+    just absent rather than raising."""
+    out = []
+    try:
+        names = os.listdir(_rank_status_dir(session_key))
+    except OSError:
+        return out
+    for name in sorted(names):
+        if not (name.startswith("rank_") and name.endswith(".json")):
+            continue
+        try:
+            with open(os.path.join(_rank_status_dir(session_key), name), "r", encoding="utf-8") as f:
+                out.append(json.load(f))
+        except (OSError, json.JSONDecodeError):
+            continue
+    out.sort(key=lambda p: p.get("rank", 0))
+    return out
+
+
+def _format_multi_rank_gpu_status(session_key, this_rank):
+    statuses = _read_all_rank_status(session_key)
+    if not statuses:
+        return f"GPUSTATUS (rank {this_rank}, distributed): no rank status files found yet -- other ranks may not have started reporting."
+    now = time.time()
+    lines = []
+    for s in statuses:
+        age = now - s.get("updated", 0)
+        staleness = "" if age < 15 else f"  [STALE, last update {age:.0f}s ago]"
+        tag = f"rank {s.get('rank')}" + (" (this process)" if s.get("rank") == this_rank else "")
+        lines.append(f"{tag} on {s.get('hostname', '?')} (pid {s.get('pid', '?')}){staleness}:")
+        devices = s.get("gpus") or []
+        if not devices:
+            lines.append("    no GPU status reported")
+        else:
+            for d in devices:
+                parts = [f"cuda:{d.get('index')}"]
+                if d.get("name"):
+                    parts.append(d["name"])
+                if "mem_used_mb" in d and "mem_total_mb" in d:
+                    parts.append(f"{d['mem_used_mb']:.0f}/{d['mem_total_mb']:.0f} MB")
+                if "util_pct" in d:
+                    parts.append(f"{d['util_pct']:.0f}% util")
+                if "this_process_alloc_mb" in d:
+                    parts.append(f"this process: {d['this_process_alloc_mb']:.0f} MB allocated")
+                lines.append("    " + ", ".join(parts))
+        scalars = s.get("scalars") or {}
+        if scalars:
+            shown = ", ".join(f"{k}={v:.6g}" if isinstance(v, (int, float)) else f"{k}={v}" for k, v in list(scalars.items())[:6])
+            lines.append(f"    scalars: {shown}")
+        if s.get("error"):
+            lines.append(f"    ⚠ this rank crashed: {_format_exc_short(s['error'], max_lines=6)}")
+    world_size = statuses[0].get("world_size") if statuses else "?"
+    return f"GPUSTATUS: {len(statuses)}/{world_size} rank(s) reporting\n" + "\n".join(lines)
 
 
 class HeatmapCreatorBG:
@@ -989,7 +1248,7 @@ class AgentSetupDialog:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Pulse")
-        self.root.geometry("420x260")
+        self.root.geometry("420x400")
         apply_dark_theme(self.root)
         _header_bar(self.root, "Set up your AI agent")
 
@@ -1010,10 +1269,27 @@ class AgentSetupDialog:
         entry.pack(fill=tk.X, pady=(4, 4))
 
         self.existing_note = ttk.Label(body, text="", style="Dim.TLabel", wraplength=370)
-        self.existing_note.pack(anchor="w", pady=(0, 14))
+        self.existing_note.pack(anchor="w", pady=(0, 10))
+
+        # Only relevant when PROVIDER is set to the "Custom" sentinel --
+        # left empty/disabled otherwise, and ignored by submit() for every
+        # other provider.
+        ttk.Label(body, text="MODEL STRING (Custom only)", style="Faint.TLabel").pack(anchor="w")
+        self.custom_model_var = tk.StringVar()
+        custom_model_entry = ttk.Entry(body, textvariable=self.custom_model_var)
+        custom_model_entry.pack(fill=tk.X, pady=(4, 2))
+        ttk.Label(body, text="e.g. openai/gpt-6-astra, ollama_chat/llama3.1", style="Faint.TLabel").pack(anchor="w", pady=(0, 10))
+
+        ttk.Label(body, text="ENV VAR FOR KEY (Custom only, optional)", style="Faint.TLabel").pack(anchor="w")
+        self.custom_env_var = tk.StringVar()
+        ttk.Entry(body, textvariable=self.custom_env_var).pack(fill=tk.X, pady=(4, 4))
 
         def _check_existing(*_):
-            env_var = PROVIDERS[self.provider_var.get()]["env_key"]
+            info = PROVIDERS[self.provider_var.get()]
+            if info.get("custom"):
+                self.existing_note.config(text="")
+                return
+            env_var = info["env_key"]
             if os.environ.get(env_var):
                 self.existing_note.config(text=f"{env_var} is already set -- leave blank to use it.")
             else:
@@ -1026,6 +1302,25 @@ class AgentSetupDialog:
 
         def submit():
             provider = self.provider_var.get()
+
+            if PROVIDERS[provider].get("custom"):
+                model_string = self.custom_model_var.get().strip()
+                if not model_string or "/" not in model_string:
+                    messagebox.showerror("Model string required", "Enter a full model string, e.g. openai/gpt-6-astra")
+                    return
+                env_var = self.custom_env_var.get().strip() or None
+                key = self.key_var.get().strip() or (os.environ.get(env_var, "").strip() if env_var else "local")
+                if env_var and not key:
+                    messagebox.showerror("API key required", f"Enter an API key, or set {env_var} first.")
+                    return
+                label = f"Custom: {model_string}"
+                PROVIDERS[label] = {"model": model_string, "env_key": env_var}
+                if env_var and key and key != "local":
+                    os.environ[env_var] = key
+                self.result = (label, key or "local")
+                self.root.destroy()
+                return
+
             key = self.key_var.get().strip()
             env_var = PROVIDERS[provider]["env_key"]
             if not key:
@@ -1199,13 +1494,105 @@ SYSTEM_PROMPT = (
     "    Some tracked matrices/tensors are in lightweight 'lotrack' mode (intermittent sampling, "
     "stats only, no heatmap) -- each variable's stats include its state. If one of them looks like "
     "it needs a closer look (heatmap + full stats), name it here and Pulse will switch it to full "
-    "tracking. Only promote variables that are currently lotrack.\n\n"
+    "tracking. Only promote variables that are currently lotrack.\n"
+    "  GREP: <pattern>\n"
+    "    You don't need the whole file to check one detail. Search every tracked project file for a "
+    "pattern (a plain word/phrase, or a regex) and get back each match with a line of context on "
+    "either side -- e.g. 'GREP: learning_rate' or 'GREP: def forward'. Works even if 'Send Code' "
+    "isn't checked this turn. Use this to locate something before deciding whether you need the "
+    "full surrounding block via VIEW. Capped to a modest number of matches; narrow the pattern if "
+    "truncated.\n"
+    "  VIEW: <file>:<start>-<end>\n"
+    "    Pull an exact line range from a specific file (the file label is whatever header you were "
+    "shown, e.g. 'model.py'; omit '<file>:' to default to the main script), e.g. 'VIEW: "
+    "model.py:40-75' or 'VIEW: 120-160'. Use this after a GREP hit to see the exact surrounding code "
+    "before proposing a fix. Capped to a few hundred lines per call.\n"
+    "  Put CALC:/PROMOTE:/GREP:/VIEW: lines anywhere in your Reasoning, not in the Diagnosis or Fix. "
+    "GREP/VIEW results come back as a new message before your next turn -- if what you get back "
+    "changes your diagnosis, say so.\n\n"
+
+    "MORE TOOLS -- the same idea taken further: anything Pulse can just compute or look up for you "
+    "beats you reasoning your way to a guess. Use these the same way as above (own line, anywhere in "
+    "Reasoning); each returns a result as a new message before your next turn.\n"
+    "  Execution (the single biggest lever -- no amount of reasoning substitutes for actually running "
+    "code):\n"
+    "    REPL: <expr> -- evaluate an expression against the LIVE training process's current "
+    "globals/locals right now, instead of reasoning from a context dump that may already be stale.\n"
+    "    DRYRUN: <function_or_method_call> -- actually execute a specific call (e.g. "
+    "'DRYRUN: model.forward(x)') in the live process and get back the real output, exception, and "
+    "traceback. Turns 'I think this will raise a shape error' into an actual answer.\n"
+    "    SHAPETRACE: [optional model variable name] -- run one real forward pass with a live tensor "
+    "already in scope and dump every submodule's input/output shape. Eliminates shape-mismatch "
+    "guessing entirely. PyTorch only.\n"
+    "    GRADCHECK: <param_name> -- numerical finite-difference gradient check on a specific "
+    "parameter, deterministic pass/fail against its real .grad. Needs a zero-arg `loss_fn` callable "
+    "in scope that recomputes the current loss -- if none exists, Pulse will tell you to define one.\n"
+    "    REPLAY: <n_steps> -- replay the last n_steps from an isolated checkpoint (with a zero-arg "
+    "`train_step` callable you define) and diff the resulting loss curve, then restores live state -- "
+    "a real empirical check instead of restarting the whole process and hoping.\n"
+    "    These run in the actual training process; if none is available this session Pulse will say so "
+    "rather than fabricating a result.\n"
+    "  Code intelligence beyond GREP/VIEW (structure, not text search):\n"
+    "    DEFOF: <symbol> -- AST-based jump-to-definition across every tracked file.\n"
+    "    CALLERS: <symbol> -- every call site of a function/class.\n"
+    "    DEPGRAPH: -- the import graph between tracked local files.\n"
+    "  Statistics over a variable's whole recorded history (scalars only -- loss/accuracy/lr/custom "
+    "logged values), not eyeballing a chart:\n"
+    "    CORR: <var1> <var2> -- real correlation coefficient between two histories.\n"
+    "    OUTLIER: <var> -- deterministic z-score anomaly detection, flags exact points.\n"
+    "    DIFFSTATS: <var> <index_a> <index_b> -- exact delta between two recorded points.\n"
+    "    HISTOGRAM: <var> -- actual bucketed distribution counts.\n"
+    "  Grounding (lookup beats memorized/stale recall):\n"
+    "    DOCLOOKUP: <library>.<symbol> -- real signature/docstring for an installed library function.\n"
+    "    CHANGELOG: -- diff of what's actually changed in tracked files since the last checkpoint.\n"
+    "    PASTFIX: <symbol_or_region> -- search this project's own log of prior fixes for the same area.\n"
+    "  Multi-GPU:\n"
+    "    GPUSTATUS: -- real per-device memory/utilization for every visible GPU. If this run is one "
+    "rank of a multi-process, one-rank-per-GPU launch (torchrun/torch.distributed.launch/etc.), this "
+    "aggregates every rank's GPU status instead of just the one this chat is attached to (which is "
+    "always rank 0 -- other ranks run headless).\n"
+    "  ML health/anti-patterns (heuristic -- worth double-checking, not guaranteed):\n"
+    "    MLLINT: -- a handful of AST-detectable ML anti-patterns: metric/loss mismatches in either "
+    "direction (e.g. 'accuracy' against a regression loss, or 'mae' against a classification loss), "
+    "double-softmax/double-sigmoid into a loss that already applies one, plain Softmax feeding NLLLoss "
+    "(which expects log-probabilities), missing zero_grad(), backward()+zero_grad() with no optimizer "
+    "step() ever taken, suspiciously high literal learning rates, eval-looking functions missing "
+    "no_grad()/.eval(). Cheap to run any time; worth running proactively after a fix, not just when "
+    "something looks wrong.\n"
+    "    LAYERSTATS: [optional model var] -- per-layer gradient-norm/weight-norm ratio for a live "
+    "torch model, right after backward(). Flags likely dead (near-zero ratio) or exploding (large "
+    "ratio) layers individually, instead of only seeing an aggregate gradient norm.\n"
+    "    HARDEXAMPLES: [optional N, default 10] -- per-example loss for the current batch, surfacing "
+    "the highest-loss samples. Needs a zero-arg `per_example_losses_fn` callable in scope (a "
+    "reduction='none' loss call). Often the fastest way to spot label noise.\n"
+    "    AMPSTATUS: [optional GradScaler var] -- current mixed-precision scale factor/skip state, for "
+    "spotting fp16 numerical instability.\n"
+    "  Reliability/reproducibility:\n"
+    "    SEEDCHECK: -- RNG fingerprint (Python/NumPy/PyTorch) vs the last recorded fingerprint for this "
+    "project. A mismatch isn't automatically wrong (more steps, an intentional reseed, a new shuffle "
+    "order all cause it too) but worth confirming when two runs were meant to be identical.\n"
+    "    RANKDIVERGE: <var> -- under a multi-rank launch, compares this rank's latest value of a "
+    "tracked scalar against every other rank's. A rank whose value has drifted from the rest signals "
+    "something rank-specific gone wrong (unsynced BatchNorm, a corrupted shard, stale weights).\n"
+    "    RUNCOMPARE: -- this run's current scalar values vs the most recent previous run recorded for "
+    "this project, so a regression against last time is visible without anyone remembering the numbers.\n"
+    "    COST: -- running token/cost usage for this chat session's agent calls so far.\n\n"
 
     "CODE FIXES:\n"
     "If, and only if, the user explicitly asks you to fix, edit, patch, or change the code (not just "
     "diagnose it) AND training code has been sent this turn, respond with ONLY a single JSON object "
     "and nothing else -- no prose before or after it, no markdown code fences, no Diagnosis/Reasoning/"
-    "Fix sections. The JSON object must have exactly these fields:\n"
+    "Fix sections.\n"
+    "PREFER THE SMALLEST FIX THAT ADDRESSES THE ROOT CAUSE: a single changed line, a changed argument, "
+    "a swapped function call, or a few adjacent lines is almost always the right size for a bug fix. "
+    "Do not rewrite a function, restructure a class, reformat unrelated code, or 'clean up' anything "
+    "you weren't asked to touch, even if you notice something else that could be improved -- mention "
+    "that separately in explanation/PASS 5 instead of folding it into this fix. Prefer one small old/"
+    "new pair over one large one; only use several old/new pairs, or a large replacement block, when "
+    "the root cause genuinely cannot be fixed with a smaller change (e.g. a bug that requires touching "
+    "several call sites, or a block where the broken logic is inherently multi-line and can't be "
+    "isolated to less). When in doubt, fix less, not more.\n"
+    "The JSON object must have exactly these fields:\n"
     "  old: a list of code snippets to find, each copied EXACTLY from the line-numbered code shown "
     "to you, including original indentation and whitespace, but WITHOUT the line-number prefix "
     "('  12 | ') itself.\n"
@@ -1216,7 +1603,9 @@ SYSTEM_PROMPT = (
     "  explanation: a short, concise text description of what changed and why.\n"
     "Rules for old/new:\n"
     "  - Each snippet in old must appear VERBATIM and exactly ONCE in its target file. Include "
-    "enough surrounding lines (not just the single changed line) so the match is unambiguous.\n"
+    "enough surrounding lines (not just the single changed line) so the match is unambiguous -- but "
+    "no more than that; a snippet padded with unrelated unchanged lines just to 'be safe' is still a "
+    "larger fix than necessary and makes the change harder to review.\n"
     "  - Each new[i] is the complete replacement block for old[i] -- to add a line, copy old[i] and "
     "append the new line(s) to it; to remove a line, copy old[i] and omit it.\n"
     "  - Never use placeholders like '...' or '# unchanged' inside old or new; both must be literal, "
@@ -1313,6 +1702,12 @@ PROVIDERS = {
         "prompt_title": "OpenRouter API Key Required",
         "prompt_msg": "Please enter your OpenRouter API Key (sk-or-...):"
     },
+    # Sentinel entry: picking this prompts for a raw litellm model string
+    # (e.g. "openai/gpt-6-astra", "ollama_chat/llama3.1") plus an optional
+    # env var for its key, then dynamically registers a real PROVIDERS
+    # entry for it -- see AgentSetupDialog.submit() and
+    # ChatPanel._on_provider_change(), the two places this is handled.
+    "Custom (enter provider/model manually)": {"custom": True},
 }
 
 class _SpinnerLabel:
@@ -1380,8 +1775,10 @@ class _SpinnerLabel:
 _PASS1_LOCATE = (
     "PASS 1 -- LOCATE: Read through everything you were given (stats, image, code, history) and "
     "identify the specific region(s) where the problem likely originates -- file/line numbers, "
-    "variable names, or code sections. Respond with ONLY a short bullet list of the suspect "
-    "location(s). No diagnosis, no fix yet."
+    "variable names, or code sections. Aim for the smallest region that could plausibly contain the "
+    "root cause (often a single line or a few adjacent lines), not a whole function or file, unless "
+    "the evidence genuinely doesn't narrow further than that. Respond with ONLY a short bullet list "
+    "of the suspect location(s). No diagnosis, no fix yet."
 )
 _PASS2_ANALYZE_TMPL = (
     "Suspect region(s) from your first read:\n{regions}\n\n"
@@ -1392,24 +1789,30 @@ _PASS2_ANALYZE_TMPL = (
 )
 _PASS3_FIX_TEXT = (
     "PASS 3 -- DEVELOP: Give the Fix: a concrete, concise change (not generic advice), in 1-3 "
-    "sentences."
+    "sentences. Describe the smallest change that fixes the root cause -- a changed value, argument, "
+    "or line -- not a broader rewrite."
 )
 _PASS3_IMPLEMENT = (
-    "PASS 3 -- DEVELOP & IMPLEMENT: The user wants this fix applied to their code. Respond with "
-    "ONLY the code-fix JSON object described in your instructions (old/new/explanation) -- no "
-    "prose, no markdown fences."
+    "PASS 3 -- DEVELOP & IMPLEMENT: The user wants this fix applied to their code. Default to the "
+    "smallest possible change -- a single line or a few adjacent lines -- and only widen the edit if "
+    "the root cause genuinely can't be fixed that narrowly. Do not refactor, restructure, or rewrite "
+    "code beyond what's needed to fix the diagnosed root cause. Respond with ONLY the code-fix JSON "
+    "object described in your instructions (old/new/explanation) -- no prose, no markdown fences."
 )
 _PASS4_VERIFY_TMPL = (
     "The fix you are about to apply:\n{fix_desc}\n\n"
     "PASS 4 -- VERIFY: Carefully check the math/logic of this fix against the numbers and code you "
-    'were given. Respond with ONLY a JSON object of the form {{"passes": true or false, "reason": '
-    '"one sentence"}}. passes=true only if the fix is logically/numerically correct and actually '
-    "addresses the diagnosed root cause."
+    'were given. Also check its SCOPE: does it change only what\'s needed to fix the diagnosed root '
+    "cause, or does it also rewrite/restructure/reformat code that didn't need to change? Respond "
+    'with ONLY a JSON object of the form {{"passes": true or false, "reason": "one sentence"}}. '
+    "passes=true only if the fix is logically/numerically correct, actually addresses the diagnosed "
+    "root cause, AND is no larger than necessary to do so."
 )
 _PASS4_REVISE_TMPL = (
     "Your proposed fix did not pass verification: {reason}\n\n"
-    "Revise it. Respond with ONLY the corrected code-fix JSON object (old/new/explanation) -- no "
-    "prose, no markdown fences."
+    "Revise it -- if the issue was scope (too large a change), narrow it down to the smallest edit "
+    "that still fixes the root cause. Respond with ONLY the corrected code-fix JSON object (old/new/"
+    "explanation) -- no prose, no markdown fences."
 )
 _PASS5_SWEEP = (
     "PASS 5 -- FULL RE-READ: Re-read the ENTIRE code/context again -- not just the region you just "
@@ -1422,26 +1825,1206 @@ _MAX_VERIFY_ATTEMPTS = 3
 
 _CALC_RE = re.compile(r"^\s*CALC:\s*(.+)$", re.MULTILINE)
 _PROMOTE_RE = re.compile(r"^\s*PROMOTE:\s*(.+)$", re.MULTILINE)
+_GREP_RE = re.compile(r"^\s*GREP:\s*(.+)$", re.MULTILINE)
+_VIEW_RE = re.compile(r"^\s*VIEW:\s*(.+)$", re.MULTILINE)
 
 
 def _extract_directives(text):
-    """Pull CALC:/PROMOTE: lines out of an agent response, returning
-    (cleaned_text, calc_exprs, promote_names). Cleaned text has those lines
-    stripped so they don't clutter what's shown in the transcript.
+    """Pull CALC:/PROMOTE:/GREP:/VIEW: lines out of an agent response,
+    returning (cleaned_text, calc_exprs, promote_names, grep_patterns,
+    view_requests). Cleaned text has those lines stripped so they don't
+    clutter what's shown in the transcript.
     """
     calc_exprs = [m.strip() for m in _CALC_RE.findall(text) if m.strip()]
     promote_names = []
     for m in _PROMOTE_RE.findall(text):
         promote_names.extend(n.strip() for n in m.split(",") if n.strip())
+    grep_patterns = [m.strip() for m in _GREP_RE.findall(text) if m.strip()]
+    view_requests = [m.strip() for m in _VIEW_RE.findall(text) if m.strip()]
 
     cleaned = _CALC_RE.sub("", text)
     cleaned = _PROMOTE_RE.sub("", cleaned)
+    cleaned = _GREP_RE.sub("", cleaned)
+    cleaned = _VIEW_RE.sub("", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-    return cleaned, calc_exprs, promote_names
+    return cleaned, calc_exprs, promote_names, grep_patterns, view_requests
+
+
+# ----------------------------------------------------------------------
+# Extended toolset: execution, code-intelligence, statistics, and
+# grounding directives. Kept in a separate dict-based extractor/applier
+# (_extract_new_directives/_apply_new_directives on ChatPanel) rather than
+# folded into _extract_directives/_apply_directives above, so none of that
+# function's existing positional-tuple call sites need to change shape.
+# ----------------------------------------------------------------------
+_NEW_DIRECTIVE_RES = {
+    "defof": re.compile(r"^\s*DEFOF:\s*(.+)$", re.MULTILINE),
+    "callers": re.compile(r"^\s*CALLERS:\s*(.+)$", re.MULTILINE),
+    "depgraph": re.compile(r"^\s*DEPGRAPH:\s*(.*)$", re.MULTILINE),
+    "corr": re.compile(r"^\s*CORR:\s*(.+)$", re.MULTILINE),
+    "outlier": re.compile(r"^\s*OUTLIER:\s*(.+)$", re.MULTILINE),
+    "diffstats": re.compile(r"^\s*DIFFSTATS:\s*(.+)$", re.MULTILINE),
+    "histogram": re.compile(r"^\s*HISTOGRAM:\s*(.+)$", re.MULTILINE),
+    "doclookup": re.compile(r"^\s*DOCLOOKUP:\s*(.+)$", re.MULTILINE),
+    "changelog": re.compile(r"^\s*CHANGELOG:\s*(.*)$", re.MULTILINE),
+    "pastfix": re.compile(r"^\s*PASTFIX:\s*(.+)$", re.MULTILINE),
+    "dryrun": re.compile(r"^\s*DRYRUN:\s*(.+)$", re.MULTILINE),
+    "repl": re.compile(r"^\s*REPL:\s*(.+)$", re.MULTILINE),
+    "replay": re.compile(r"^\s*REPLAY:\s*(.+)$", re.MULTILINE),
+    "gradcheck": re.compile(r"^\s*GRADCHECK:\s*(.+)$", re.MULTILINE),
+    "shapetrace": re.compile(r"^\s*SHAPETRACE:\s*(.*)$", re.MULTILINE),
+    "gpustatus": re.compile(r"^\s*GPUSTATUS:\s*(.*)$", re.MULTILINE),
+    "rollback": re.compile(r"^\s*ROLLBACK:\s*(.+)$", re.MULTILINE),
+    "mllint": re.compile(r"^\s*MLLINT:\s*(.*)$", re.MULTILINE),
+    "layerstats": re.compile(r"^\s*LAYERSTATS:\s*(.*)$", re.MULTILINE),
+    "hardexamples": re.compile(r"^\s*HARDEXAMPLES:\s*(.*)$", re.MULTILINE),
+    "ampstatus": re.compile(r"^\s*AMPSTATUS:\s*(.*)$", re.MULTILINE),
+    "seedcheck": re.compile(r"^\s*SEEDCHECK:\s*(.*)$", re.MULTILINE),
+    "rankdiverge": re.compile(r"^\s*RANKDIVERGE:\s*(.+)$", re.MULTILINE),
+    "runcompare": re.compile(r"^\s*RUNCOMPARE:\s*(.*)$", re.MULTILINE),
+    "cost": re.compile(r"^\s*COST:\s*(.*)$", re.MULTILINE),
+}
+# Directives that are meaningful with no argument at all (DEPGRAPH,
+# CHANGELOG, bare SHAPETRACE) -- a bare match still counts as a request.
+_FLAG_STYLE_DIRECTIVES = {"depgraph", "changelog", "shapetrace", "gpustatus", "mllint", "layerstats", "hardexamples", "ampstatus", "seedcheck", "runcompare", "cost"}
+
+
+def _extract_new_directives(text):
+    """Pull the extended toolset's directive lines out of an agent
+    response. Returns (cleaned_text, requests) where requests is
+    {directive_name: [arg, ...]} for every directive that actually
+    appeared -- a flag-style directive with no argument still shows up
+    as [''] so callers can just check truthiness/`in`.
+    """
+    requests = {}
+    cleaned = text
+    for key, rx in _NEW_DIRECTIVE_RES.items():
+        raw = [m.strip() for m in rx.findall(text)]
+        if key in _FLAG_STYLE_DIRECTIVES:
+            if raw:
+                requests[key] = raw
+        else:
+            raw = [m for m in raw if m]
+            if raw:
+                requests[key] = raw
+        cleaned = rx.sub("", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, requests
+
+
+def _format_exc_short(exc_text, max_lines=25):
+    """Trim a traceback.format_exc() string down to something worth
+    putting in a chat transcript / feeding back into an agent's context --
+    keep the first few lines (exception chain header) and the tail (the
+    actual raising frame + message), since that's almost always what
+    matters and a full traceback of a deep training loop can be huge.
+    """
+    lines = (exc_text or "").strip().splitlines()
+    if len(lines) > max_lines:
+        lines = lines[:3] + ["    ... (truncated) ..."] + lines[-max_lines:]
+    return "\n".join(lines)
+
+
+def _exec_namespace(frame):
+    """Build an eval/exec namespace out of a live frame -- globals first,
+    then locals on top (locals shadow globals, same precedence Python
+    itself uses when resolving a bare name inside that frame). This is a
+    NAMESPACE-level snapshot, not full OS-process isolation: pickling a
+    live CUDA/GPU tensor across a real subprocess boundary is unreliable
+    (see the CPU-only-observation notes elsewhere in this file), so
+    REPL/DRYRUN/etc. run directly against copies of the live objects
+    instead. Mutating an object reached this way (e.g. calling a method
+    with side effects) does affect the real, live training process --
+    directives here are for real, in-place introspection, not a
+    consequence-free sandbox.
+    """
+    ns = dict(frame.f_globals)
+    ns.update(frame.f_locals)
+    return ns
+
+
+def _exec_eval(expr, ns):
+    return eval(expr, {"__builtins__": __builtins__, "math": math}, ns)
+
+
+def _describe_exec_value(value):
+    desc = repr(value)
+    if len(desc) > 800:
+        desc = desc[:800] + "... (truncated)"
+    extra = ""
+    try:
+        if is_trackable(value):
+            extra = f"  shape={shape_of(value)} kind={tensor_kind(value)}"
+    except Exception:
+        pass
+    return f"{desc}{extra}"
+
+
+def _exec_repl(frame, expr):
+    """REPL: <expr> -- evaluate a sandboxed expression against the live
+    process's CURRENT globals/locals, instead of reasoning from a context
+    dump that may already be stale."""
+    ns = _exec_namespace(frame)
+    try:
+        value = _exec_eval(expr, ns)
+    except Exception:
+        return f"REPL '{expr}': raised\n{_format_exc_short(traceback.format_exc())}"
+    return f"REPL '{expr}' = {_describe_exec_value(value)}"
+
+
+def _exec_dryrun(frame, call_expr):
+    """DRYRUN: <function>(<args>) -- execute a specific function/method
+    call against the live process's current namespace and return the real
+    output, exception, and traceback. Runs on a bounded-timeout thread so
+    a hang doesn't block the training process's control-queue drain
+    forever; if it's still running after the timeout, it keeps running in
+    the background rather than being (unsafely) killed mid-call."""
+    ns = _exec_namespace(frame)
+    result = {}
+
+    def _run():
+        try:
+            result["value"] = _exec_eval(call_expr, ns)
+        except Exception:
+            result["error"] = traceback.format_exc()
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=10.0)
+    if t.is_alive():
+        return f"DRYRUN '{call_expr}': still running after 10s -- not waiting further (it keeps running in the background)."
+    if "error" in result:
+        return f"DRYRUN '{call_expr}': raised\n{_format_exc_short(result['error'])}"
+    return f"DRYRUN '{call_expr}' -> {_describe_exec_value(result.get('value'))}"
+
+
+def _exec_shapetrace(frame, arg):
+    """SHAPETRACE: [optional model var name] -- run one forward pass
+    against a live torch.nn.Module (named explicitly, or the first one
+    found in scope) using a synthetic input built from a live tensor
+    already in scope, and dump every submodule's input/output shape via
+    forward hooks. Best-effort/PyTorch-only; eliminates shape-mismatch
+    guessing for the common case of a single top-level model."""
+    try:
+        import torch
+        import torch.nn as nn
+    except ImportError:
+        return "SHAPETRACE: requires PyTorch to be importable in the training process; none found."
+
+    ns = _exec_namespace(frame)
+    model = None
+    arg = (arg or "").strip()
+    if arg and arg in ns and isinstance(ns[arg], nn.Module):
+        model = ns[arg]
+    if model is None:
+        for v in ns.values():
+            if isinstance(v, nn.Module):
+                model = v
+                break
+    if model is None:
+        return "SHAPETRACE: no torch.nn.Module found in scope to trace."
+
+    sample = None
+    for name in ("x", "inputs", "input", "batch", "images", "data"):
+        if name in ns and torch.is_tensor(ns[name]):
+            sample = ns[name]
+            break
+    if sample is None:
+        for v in ns.values():
+            if torch.is_tensor(v):
+                sample = v
+                break
+    if sample is None:
+        return "SHAPETRACE: no tensor found in scope to use as a synthetic input."
+
+    records = []
+    hooks = []
+
+    def _make_hook(name):
+        def _fn(module, inp, out):
+            in_shapes = [tuple(t.shape) for t in inp if torch.is_tensor(t)]
+            out_list = out if isinstance(out, (tuple, list)) else [out]
+            out_shapes = [tuple(o.shape) for o in out_list if torch.is_tensor(o)]
+            records.append(f"  {name} ({type(module).__name__}): in={in_shapes} out={out_shapes}")
+        return _fn
+
+    for name, module in model.named_modules():
+        if name == "":
+            continue
+        hooks.append(module.register_forward_hook(_make_hook(name)))
+
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            model(sample.clone())
+        model.train(was_training)
+    except Exception:
+        return f"SHAPETRACE: forward pass raised\n{_format_exc_short(traceback.format_exc())}"
+    finally:
+        for h in hooks:
+            h.remove()
+
+    if not records:
+        return "SHAPETRACE: forward pass ran but no submodule shapes were captured."
+    header = f"SHAPETRACE (forward pass, synthetic input shape {tuple(sample.shape)}):\n"
+    return header + "\n".join(records)
+
+
+def _exec_gradcheck(frame, param_name):
+    """GRADCHECK: <param> -- numerical finite-difference gradient check on
+    a specific parameter. Deterministic pass/fail against the parameter's
+    already-computed .grad, catching wrong backward-pass implementations
+    without anyone reasoning through calculus. Requires a zero-argument
+    callable named `loss_fn` in scope that recomputes and returns the
+    current scalar loss purely from live model state -- there's no
+    general way to know how to recompute a loss otherwise."""
+    try:
+        import torch
+    except ImportError:
+        return "GRADCHECK: requires PyTorch to be importable in the training process; none found."
+
+    ns = _exec_namespace(frame)
+    param_name = param_name.strip()
+    param = ns.get(param_name)
+    if param is None or not torch.is_tensor(param):
+        param = None
+        for v in ns.values():
+            named_parameters = getattr(v, "named_parameters", None)
+            if not callable(named_parameters):
+                continue
+            try:
+                for pname, p in v.named_parameters():
+                    if pname == param_name or pname.endswith("." + param_name):
+                        param = p
+                        break
+            except Exception:
+                continue
+            if param is not None:
+                break
+    if param is None or not hasattr(param, "grad"):
+        return (
+            f"GRADCHECK '{param_name}': couldn't find a tensor parameter with a .grad by that name in "
+            "scope (checked locals/globals directly and any model's named_parameters())."
+        )
+    if param.grad is None:
+        return f"GRADCHECK '{param_name}': has no .grad yet -- call backward() at least once first."
+
+    loss_fn = ns.get("loss_fn")
+    if not callable(loss_fn):
+        return (
+            f"GRADCHECK '{param_name}': needs a zero-argument callable named `loss_fn` in scope that "
+            "recomputes and returns the current scalar loss from live model state (e.g. "
+            "`loss_fn = lambda: criterion(model(x), y)`) -- define one and resend GRADCHECK."
+        )
+
+    eps = 1e-3
+    flat = param.data.view(-1)
+    grad_flat = param.grad.view(-1)
+    n_check = min(5, flat.numel())
+    if n_check == 0:
+        return f"GRADCHECK '{param_name}': parameter is empty."
+    idxs = sorted({int(i) for i in torch.linspace(0, flat.numel() - 1, n_check).tolist()})
+    lines = []
+    max_rel_err = 0.0
+    try:
+        with torch.no_grad():
+            for idx in idxs:
+                orig = flat[idx].item()
+                flat[idx] = orig + eps
+                loss_plus = float(loss_fn())
+                flat[idx] = orig - eps
+                loss_minus = float(loss_fn())
+                flat[idx] = orig
+                numeric = (loss_plus - loss_minus) / (2 * eps)
+                analytic = grad_flat[idx].item()
+                denom = max(abs(numeric), abs(analytic), 1e-8)
+                rel_err = abs(numeric - analytic) / denom
+                max_rel_err = max(max_rel_err, rel_err)
+                lines.append(f"  idx {idx}: analytic={analytic:.6g} numeric={numeric:.6g} rel_err={rel_err:.2e}")
+    except Exception:
+        flat[idxs[0]] = flat[idxs[0]]  # best-effort restore already happened per-iteration above
+        return f"GRADCHECK '{param_name}': loss_fn() raised while probing\n{_format_exc_short(traceback.format_exc())}"
+
+    verdict = "PASS" if max_rel_err < 1e-2 else "FAIL"
+    header = f"GRADCHECK '{param_name}': {verdict} (max rel_err={max_rel_err:.2e} over {n_check} sampled entries)\n"
+    return header + "\n".join(lines)
+
+
+# Rolling ring buffer of (step, {name: serialized state_dict bytes})
+# snapshots for REPLAY -- module-level and process-local, since the
+# training process that owns the live model/optimizer is the only place
+# this is ever populated or consumed (see _replay_maybe_checkpoint, called
+# periodically from persistent_tracer's ticker, and _exec_replay below).
+_REPLAY_CHECKPOINTS = []
+_REPLAY_MAX_CHECKPOINTS = 20
+
+
+def _replay_maybe_checkpoint(frame, step):
+    """Snapshot every in-scope object exposing state_dict() (model,
+    optimizer, ...) so REPLAY has something to roll back to. Cheap
+    best-effort: skipped entirely if torch isn't importable, and any
+    individual object that fails to serialize is just left out rather
+    than aborting the whole snapshot."""
+    try:
+        import torch
+    except ImportError:
+        return
+    ns = _exec_namespace(frame)
+    snap = {}
+    for name, v in ns.items():
+        state_dict_fn = getattr(v, "state_dict", None)
+        if not callable(state_dict_fn):
+            continue
+        try:
+            buf = io.BytesIO()
+            torch.save(v.state_dict(), buf)
+            snap[name] = buf.getvalue()
+        except Exception:
+            continue
+    if snap:
+        _REPLAY_CHECKPOINTS.append((step, snap))
+        del _REPLAY_CHECKPOINTS[:-_REPLAY_MAX_CHECKPOINTS]
+
+
+def _exec_replay(frame, arg):
+    """REPLAY: <n_steps> -- from the last checkpoint at least n_steps
+    back, restore a copy of tracked state and replay n_steps via a
+    zero-argument `train_step` callable the user defines in scope,
+    reporting the resulting loss curve, then restore live state back to
+    where it actually was. A much more conclusive check than restarting
+    the whole process and seeing if it crashes -- correctness becomes an
+    empirical fact instead of another LLM call asserting it."""
+    try:
+        n_steps = int(str(arg).strip())
+    except ValueError:
+        return f"REPLAY '{arg}': expected an integer number of steps, e.g. 'REPLAY: 5'."
+
+    if not _REPLAY_CHECKPOINTS:
+        return (
+            "REPLAY: no checkpoints captured yet -- Pulse periodically snapshots any in-scope object "
+            "with a state_dict() (model/optimizer); wait for at least one snapshot after training starts."
+        )
+
+    if n_steps >= len(_REPLAY_CHECKPOINTS):
+        step, snap = _REPLAY_CHECKPOINTS[0]
+    else:
+        step, snap = _REPLAY_CHECKPOINTS[-1 - n_steps]
+
+    try:
+        import torch
+    except ImportError:
+        return "REPLAY: requires PyTorch to be importable in the training process; none found."
+
+    ns = _exec_namespace(frame)
+    train_step = ns.get("train_step")
+    if not callable(train_step):
+        return (
+            "REPLAY: needs a zero-argument callable named `train_step` in scope that performs one "
+            "optimizer step on the live model and returns the step's loss -- define one and resend REPLAY."
+        )
+
+    restored, originals = [], {}
+    for name, blob in snap.items():
+        obj = ns.get(name)
+        if obj is None or not hasattr(obj, "load_state_dict"):
+            continue
+        try:
+            originals[name] = copy.deepcopy(obj.state_dict())
+            obj.load_state_dict(torch.load(io.BytesIO(blob)))
+            restored.append(name)
+        except Exception:
+            continue
+    if not restored:
+        return "REPLAY: had a checkpoint but couldn't restore it into any live object (state_dict shape mismatch?)."
+
+    def _restore_live():
+        for name in restored:
+            try:
+                ns[name].load_state_dict(originals[name])
+            except Exception:
+                pass
+
+    losses = []
+    try:
+        for _ in range(max(1, n_steps)):
+            losses.append(float(train_step()))
+    except Exception:
+        _restore_live()
+        return f"REPLAY: patched replay raised\n{_format_exc_short(traceback.format_exc())}"
+    _restore_live()
+
+    curve = ", ".join(f"{l:.6g}" for l in losses)
+    return (
+        f"REPLAY: replayed {len(losses)} step(s) from a checkpoint at step {step}, on an isolated copy of "
+        f"tracked state, then restored the live process back to its actual current values. Resulting loss "
+        f"curve: [{curve}]"
+    )
+
+
+def _handle_exec_request(frame, kind, arg):
+    """Dispatch a single EXEC-style directive (REPL/DRYRUN/SHAPETRACE/
+    GRADCHECK/REPLAY/LAYERSTATS/HARDEXAMPLES) against the live training
+    process's frame. Runs IN the training process (see persistent_tracer's
+    control_queue drain loop) -- never let an unexpected exception here
+    propagate and take training down with it."""
+    try:
+        if kind == "REPL":
+            return _exec_repl(frame, arg)
+        if kind == "DRYRUN":
+            return _exec_dryrun(frame, arg)
+        if kind == "SHAPETRACE":
+            return _exec_shapetrace(frame, arg)
+        if kind == "GRADCHECK":
+            return _exec_gradcheck(frame, arg)
+        if kind == "REPLAY":
+            return _exec_replay(frame, arg)
+        if kind == "LAYERSTATS":
+            return _exec_layerstats(frame, arg)
+        if kind == "HARDEXAMPLES":
+            return _exec_hardexamples(frame, arg)
+        if kind == "AMPSTATUS":
+            return _exec_ampstatus(frame, arg)
+        if kind == "SEEDCHECK":
+            return _exec_seedcheck(frame, arg)
+        return f"{kind}: unknown execution directive."
+    except Exception:
+        return f"{kind} '{arg}': Pulse's own handler raised while trying to run this:\n{_format_exc_short(traceback.format_exc())}"
+
+
+def _exec_find_model(ns, arg=""):
+    """Shared model-finding heuristic used by SHAPETRACE/LAYERSTATS: an
+    explicitly-named variable if given and it checks out, else the first
+    torch.nn.Module found in the namespace."""
+    import torch.nn as nn
+    arg = (arg or "").strip()
+    if arg and arg in ns and isinstance(ns[arg], nn.Module):
+        return ns[arg]
+    for v in ns.values():
+        if isinstance(v, nn.Module):
+            return v
+    return None
+
+
+def _exec_layerstats(frame, arg):
+    """LAYERSTATS: [optional model variable name] -- per-layer gradient
+    norm, weight norm, and their ratio for every parameter of a live
+    torch.nn.Module, right after backward() has populated .grad. The
+    ratio is Karpathy's classic training-health sanity check (a healthy
+    ratio is usually roughly 1e-4 to 1e-2 per step for SGD-like updates);
+    a layer near 0 signals a vanishing-gradient dead layer, a layer near
+    or above 1 signals a likely-exploding one. This is a raw grad/weight
+    norm ratio, not literally "how much the optimizer will move the
+    weight" -- for adaptive optimizers (Adam etc.) the real per-step
+    update also depends on that optimizer's own internal moment
+    estimates, which this can't see, so treat the numbers as a relative
+    signal across layers, not an exact update size. PyTorch only."""
+    try:
+        import torch
+        import torch.nn as nn
+    except ImportError:
+        return "LAYERSTATS: requires PyTorch to be importable in the training process; none found."
+
+    ns = _exec_namespace(frame)
+    model = _exec_find_model(ns, arg)
+    if model is None:
+        return "LAYERSTATS: no torch.nn.Module found in scope."
+
+    rows = []
+    any_grad = False
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            rows.append((name, tuple(param.shape), None, None, None))
+            continue
+        any_grad = True
+        with torch.no_grad():
+            w_norm = float(param.data.norm().item())
+            g_norm = float(param.grad.norm().item())
+        ratio = g_norm / (w_norm + 1e-12)
+        rows.append((name, tuple(param.shape), w_norm, g_norm, ratio))
+
+    if not any_grad:
+        return "LAYERSTATS: found the model but no parameter has a .grad yet -- call backward() at least once first."
+
+    scored = [r for r in rows if r[4] is not None]
+    scored.sort(key=lambda r: r[4])
+    lines = []
+    for name, shape, w_norm, g_norm, ratio in scored:
+        flag = ""
+        if ratio < 1e-6:
+            flag = "  <- near-zero, possible dead/vanishing layer"
+        elif ratio > 1.0:
+            flag = "  <- large, possible exploding layer"
+        lines.append(f"  {name} {shape}: weight_norm={w_norm:.4g} grad_norm={g_norm:.4g} ratio={ratio:.2e}{flag}")
+    no_grad_names = [name for name, _s, w, g, r in rows if r is None]
+    footer = f"\n  ({len(no_grad_names)} parameter(s) with no .grad, not shown: {', '.join(no_grad_names[:5])}{'...' if len(no_grad_names) > 5 else ''})" if no_grad_names else ""
+    return f"LAYERSTATS ({len(scored)} parameter(s) with gradients, sorted low->high ratio):\n" + "\n".join(lines) + footer
+
+
+def _exec_hardexamples(frame, arg):
+    """HARDEXAMPLES: [optional N, default 10] -- per-example loss for the
+    current batch, surfacing the N highest-loss samples. Often the
+    fastest way to spot label noise or a preprocessing bug: a handful of
+    examples with wildly higher loss than everything else is a strong
+    signal, much stronger than an aggregate loss number. Needs a
+    zero-argument callable named `per_example_losses_fn` in scope that
+    recomputes and returns a per-sample loss array/tensor (e.g. a
+    criterion called with reduction='none') for the current batch -- no
+    general way to know how to get per-sample losses otherwise. If a
+    tracked `sample_ids` (or `indices`) array of the same length is also
+    in scope, its values are used to label examples instead of raw
+    positions."""
+    ns = _exec_namespace(frame)
+    fn = ns.get("per_example_losses_fn")
+    if not callable(fn):
+        return (
+            "HARDEXAMPLES: needs a zero-argument callable named `per_example_losses_fn` in scope that "
+            "returns a per-sample loss array for the current batch (e.g. "
+            "`per_example_losses_fn = lambda: F.cross_entropy(model(x), y, reduction='none')`) -- "
+            "define one and resend HARDEXAMPLES."
+        )
+    try:
+        losses = fn()
+    except Exception:
+        return f"HARDEXAMPLES: per_example_losses_fn() raised\n{_format_exc_short(traceback.format_exc())}"
+
+    try:
+        import torch
+        if torch.is_tensor(losses):
+            losses = losses.detach().cpu().numpy()
+    except ImportError:
+        pass
+    try:
+        losses = np.asarray(losses, dtype=float).reshape(-1)
+    except Exception:
+        return f"HARDEXAMPLES: per_example_losses_fn() returned something that isn't a flat numeric array ({type(losses)})."
+
+    n = 10
+    arg = (arg or "").strip()
+    if arg:
+        try:
+            n = max(1, int(arg))
+        except ValueError:
+            return f"HARDEXAMPLES '{arg}': expected an integer N, e.g. 'HARDEXAMPLES: 20'."
+
+    ids = ns.get("sample_ids", ns.get("indices"))
+    id_arr = None
+    if ids is not None:
+        try:
+            import torch
+            if torch.is_tensor(ids):
+                ids = ids.detach().cpu().numpy()
+        except ImportError:
+            pass
+        try:
+            id_arr = np.asarray(ids).reshape(-1)
+            if len(id_arr) != len(losses):
+                id_arr = None
+        except Exception:
+            id_arr = None
+
+    order = np.argsort(-losses)[:n]
+    lines = []
+    for rank, idx in enumerate(order, 1):
+        label = f"id={id_arr[idx]}" if id_arr is not None else f"batch-position {idx}"
+        lines.append(f"  #{rank}: {label}, loss={losses[idx]:.6g}")
+    mean, std = float(losses.mean()), float(losses.std())
+    return (
+        f"HARDEXAMPLES: top {len(order)} of {len(losses)} example(s) by loss "
+        f"(batch mean={mean:.4g}, std={std:.4g}):\n" + "\n".join(lines)
+    )
+
+
+def _exec_ampstatus(frame, arg):
+    """AMPSTATUS: [optional GradScaler variable name] -- current mixed-
+    precision (torch.cuda.amp.GradScaler) state: scale factor and, where
+    obtainable, the running count of skipped steps due to inf/NaN
+    gradients. A scale that's collapsed toward 1.0 (from a much larger
+    starting value like 65536) or a high skip count both point at fp16
+    numerical instability -- exactly the kind of thing that's otherwise
+    invisible unless you go looking for it."""
+    ns = _exec_namespace(frame)
+    arg = (arg or "").strip()
+    scaler = ns.get(arg) if arg else None
+    if scaler is None:
+        for v in ns.values():
+            if type(v).__name__ == "GradScaler":
+                scaler = v
+                break
+    if scaler is None:
+        return "AMPSTATUS: no GradScaler found in scope (this training run may not be using AMP)."
+    try:
+        scale = float(scaler.get_scale())
+    except Exception:
+        scale = None
+    growth_tracker = getattr(scaler, "_get_growth_tracker", None)
+    skips = None
+    try:
+        state = scaler.state_dict()
+        skips = state.get("_growth_tracker")
+    except Exception:
+        pass
+    parts = []
+    if scale is not None:
+        parts.append(f"current scale factor: {scale:.6g}")
+    if skips is not None:
+        parts.append(f"growth tracker (consecutive non-skipped steps at current scale): {skips}")
+    if not parts:
+        return "AMPSTATUS: found a GradScaler but couldn't read its internal state (API may have changed)."
+    return "AMPSTATUS:\n  " + "\n  ".join(parts)
+
+
+def _run_history_path(script_path):
+    base = os.path.dirname(script_path) if script_path else "."
+    return os.path.join(base, ".pulse_run_history.json")
+
+
+def _load_run_history(script_path):
+    try:
+        with open(_run_history_path(script_path), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _seed_fingerprint():
+    """Best-effort, deterministic fingerprint of every RNG this process
+    can introspect. NumPy/stdlib `random` don't expose the ORIGINAL seed
+    once reseeded, only their large internal generator state -- still
+    useful as a "did anything about RNG state change" fingerprint even
+    though it's not a human-readable seed number. PyTorch's
+    initial_seed() IS the real recoverable seed value, when available."""
+    info = {}
+    try:
+        import random as _random
+        info["python_random_state_hash"] = hashlib.sha256(repr(_random.getstate()).encode()).hexdigest()[:16]
+    except Exception:
+        pass
+    try:
+        state = np.random.get_state()
+        info["numpy_state_hash"] = hashlib.sha256(repr(state).encode()).hexdigest()[:16]
+    except Exception:
+        pass
+    try:
+        import torch
+        info["torch_initial_seed"] = torch.initial_seed()
+        if torch.cuda.is_available():
+            info["torch_cuda_initial_seed"] = torch.cuda.initial_seed()
+    except Exception:
+        pass
+    info["PYTHONHASHSEED"] = os.environ.get("PYTHONHASHSEED")
+    return info
+
+
+def _seed_history_path(script_path):
+    base = os.path.dirname(script_path) if script_path else "."
+    return os.path.join(base, ".pulse_seed_history.json")
+
+
+def _exec_seedcheck(frame, arg):
+    """SEEDCHECK: -- a reproducibility fingerprint of every RNG this
+    process can see, compared against the fingerprint from the last time
+    SEEDCHECK ran on this project. A mismatch isn't necessarily wrong --
+    intentional reseeding, a new data shuffle order, or simply more steps
+    having run before checking will all show up as a difference too --
+    but an UNEXPECTED difference (e.g. between two runs meant to be
+    identical for a REPLAY/A-B comparison) is worth flagging instead of
+    silently assuming determinism held.
+    """
+    current = _seed_fingerprint()
+    path = _seed_history_path(frame.f_code.co_filename)
+    previous = None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            previous = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        pass
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(current, f)
+    except OSError:
+        pass
+
+    lines = [f"  {k}: {v}" for k, v in current.items() if v is not None]
+    header = "SEEDCHECK: current RNG fingerprint\n" + "\n".join(lines)
+    if previous is None:
+        return header + "\n\n(no prior fingerprint recorded for this project -- this is now the baseline for future SEEDCHECK calls.)"
+    diffs = [k for k in current if current.get(k) != previous.get(k)]
+    if not diffs:
+        return header + "\n\nMatches the last recorded fingerprint for this project exactly."
+    diff_lines = [f"  {k}: was {previous.get(k)!r}, now {current.get(k)!r}" for k in diffs]
+    return (
+        header + "\n\nDIFFERS from the last recorded fingerprint in:\n" + "\n".join(diff_lines) +
+        "\n(this alone doesn't mean anything is wrong -- more steps run, an intentional reseed, or a "
+        "different data shuffle order would all cause this too -- but worth confirming it's expected.)"
+    )
+
+
+# ============================================================================
+# ML anti-pattern static checks (MLLINT). Deliberately kept to a small,
+# high-confidence set of AST-detectable patterns worded as things "worth
+# double-checking," not certainties -- unlike the syntax/undefined-name
+# LINT gate, these are heuristics about ML *semantics*, not "will crash"
+# facts, so they're surfaced as an on-demand directive rather than an
+# automatic gate that blocks a fix.
+# ============================================================================
+_MLLINT_REGRESSION_LOSSES = {
+    "mse", "mae", "mean_squared_error", "mean_absolute_error", "msle",
+    "mean_squared_logarithmic_error", "huber", "huber_loss", "logcosh",
+}
+_MLLINT_ACCURACY_METRICS = {
+    "accuracy", "acc", "categorical_accuracy", "binary_accuracy",
+    "sparse_categorical_accuracy", "top_k_categorical_accuracy",
+}
+_MLLINT_OPTIMIZER_NAMES = {"Adam", "SGD", "RMSprop", "Adagrad", "AdamW", "Adadelta", "NAdam", "RAdam"}
+_MLLINT_CLASSIFICATION_LOSSES = {
+    "categorical_crossentropy", "sparse_categorical_crossentropy",
+    "binary_crossentropy", "crossentropy", "hinge", "categorical_hinge",
+    "kld", "kullback_leibler_divergence",
+}
+_MLLINT_REGRESSION_METRICS = {
+    "mae", "mse", "mean_absolute_error", "mean_squared_error", "rmse",
+    "r2", "r2_score", "msle", "mean_squared_logarithmic_error",
+}
+
+
+def _mllint_const_str(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _mllint_list_of_str(node):
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [s for s in (_mllint_const_str(e) for e in node.elts) if s is not None]
+    return []
+
+
+def _mllint_scan(trees):
+    """trees: iterable of (label, path, text, tree). Returns a list of
+    (label, lineno, message) findings."""
+    findings = []
+
+    # Cross-file signals for the double-softmax/double-sigmoid checks,
+    # since a model class and its loss function are very often in
+    # different files.
+    softmax_loc = None
+    crossentropy_loc = None
+    sigmoid_loc = None
+    bce_logits_loc = None
+    softmax_module_loc = None
+    nllloss_loc = None
+
+    trees = list(trees)
+
+    for label, _path, _text, tree in trees:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            fname = func.attr if isinstance(func, ast.Attribute) else (func.id if isinstance(func, ast.Name) else None)
+            if fname is None:
+                continue
+
+            # 1. Keras: model.compile(loss=<regression>, metrics=[<accuracy-ish>])
+            if fname == "compile":
+                loss_val, metrics_val = None, None
+                for kw in node.keywords:
+                    if kw.arg == "loss":
+                        loss_val = _mllint_const_str(kw.value)
+                    elif kw.arg == "metrics":
+                        metrics_val = _mllint_list_of_str(kw.value)
+                if loss_val and metrics_val and loss_val.lower() in _MLLINT_REGRESSION_LOSSES:
+                    if any(m.lower() in _MLLINT_ACCURACY_METRICS for m in metrics_val):
+                        findings.append((label, node.lineno,
+                            f"model.compile(loss='{loss_val}', metrics={metrics_val}): '{loss_val}' is a "
+                            "regression loss, but an accuracy-style metric was also requested. Accuracy is "
+                            "an exact-match classification metric and is typically meaningless (often "
+                            "silently stuck at 0.0 for the whole run) against a continuous target -- worth "
+                            "double-checking mae/rmse/r2 or similar is what's actually meant to be watched."))
+
+                # 1b. Inverse of the above: a classification loss paired
+                # with a regression-only metric (mae/mse/r2/...). Same
+                # confidence tier, opposite direction -- both are "the
+                # metric can't have moved the whole run" bugs.
+                if loss_val and metrics_val and loss_val.lower() in _MLLINT_CLASSIFICATION_LOSSES:
+                    bad_metrics = [m for m in metrics_val if m.lower() in _MLLINT_REGRESSION_METRICS]
+                    if bad_metrics:
+                        findings.append((label, node.lineno,
+                            f"model.compile(loss='{loss_val}', metrics={metrics_val}): '{loss_val}' is a "
+                            f"classification loss, but {bad_metrics} is a regression-only metric. mae/mse/r2 "
+                            "compare continuous values and are typically meaningless against class labels -- "
+                            "worth double-checking accuracy or similar is what's actually meant to be watched."))
+
+            if fname in ("Softmax", "LogSoftmax", "softmax", "log_softmax") and softmax_loc is None:
+                softmax_loc = (label, node.lineno)
+            if fname in ("CrossEntropyLoss", "cross_entropy") and crossentropy_loc is None:
+                crossentropy_loc = (label, node.lineno)
+            if fname in ("Sigmoid", "sigmoid") and sigmoid_loc is None:
+                sigmoid_loc = (label, node.lineno)
+            if fname == "BCEWithLogitsLoss" and bce_logits_loc is None:
+                bce_logits_loc = (label, node.lineno)
+            # Only a plain Softmax (not LogSoftmax) paired with NLLLoss is
+            # the bug -- NLLLoss expects log-probabilities, and a plain
+            # Softmax hands it raw probabilities instead, silently
+            # producing the wrong gradient scale without erroring.
+            if fname == "Softmax" and softmax_module_loc is None:
+                softmax_module_loc = (label, node.lineno)
+            if fname == "NLLLoss" and nllloss_loc is None:
+                nllloss_loc = (label, node.lineno)
+
+            # 5. Suspiciously high literal learning rate on an optimizer constructor.
+            if fname in _MLLINT_OPTIMIZER_NAMES:
+                lr_node = None
+                for kw in node.keywords:
+                    if kw.arg == "lr":
+                        lr_node = kw.value
+                if lr_node is None and node.args:
+                    lr_node = node.args[-1] if len(node.args) >= 2 else None
+                if isinstance(lr_node, ast.Constant) and isinstance(lr_node.value, (int, float)):
+                    if lr_node.value > 1.0:
+                        findings.append((label, node.lineno,
+                            f"{fname}(..., lr={lr_node.value}): a learning rate above 1.0 is unusually high "
+                            "for almost any optimizer/architecture combination and often causes immediate "
+                            "divergence -- worth double-checking this wasn't meant to be a smaller value "
+                            "(e.g. missing an extra leading zero or an accidental e2/e-2 typo)."))
+
+        # 4. backward() without any zero_grad() in the same function.
+        # 4b. backward()+zero_grad() present but no optimizer.step() --
+        # gradients are computed and cleared but the weights never
+        # actually move, so training runs to completion with a "normal
+        # looking" loss curve that just never improves.
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            has_backward, has_zero_grad, has_step, backward_line = False, False, False, None
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
+                    if inner.func.attr == "backward":
+                        has_backward = True
+                        backward_line = backward_line or inner.lineno
+                    if inner.func.attr == "zero_grad":
+                        has_zero_grad = True
+                    if inner.func.attr == "step":
+                        has_step = True
+            if has_backward and not has_zero_grad:
+                findings.append((label, backward_line,
+                    f"function '{node.name}' calls .backward() but no .zero_grad() appears anywhere in "
+                    "it -- worth double-checking gradients are being cleared each step somewhere else in "
+                    "the call chain, since silently accumulating them across steps is a common, subtle bug."))
+            if has_backward and has_zero_grad and not has_step:
+                findings.append((label, backward_line,
+                    f"function '{node.name}' calls .backward() and .zero_grad() but no .step() appears "
+                    "anywhere in it -- worth double-checking an optimizer step is actually being taken "
+                    "somewhere else in the call chain, since without it gradients are computed and "
+                    "cleared but the weights never update (loss can look like it's training while the "
+                    "model silently never learns anything)."))
+
+        # 6. eval/valid/test-named function that calls something without
+        # torch.no_grad() or a nearby .eval() call anywhere in the file.
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            lname = node.name.lower()
+            if not any(k in lname for k in ("eval", "valid", "test")):
+                continue
+            has_no_grad = any(
+                isinstance(inner, ast.withitem) and isinstance(inner.context_expr, ast.Call)
+                and isinstance(inner.context_expr.func, ast.Attribute) and inner.context_expr.func.attr == "no_grad"
+                for inner in ast.walk(node)
+            )
+            has_eval_call = any(
+                isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute) and inner.func.attr == "eval"
+                for inner in ast.walk(node)
+            )
+            calls_something = any(isinstance(inner, ast.Call) for inner in ast.walk(node))
+            if calls_something and not has_no_grad and not has_eval_call:
+                findings.append((label, node.lineno,
+                    f"function '{node.name}' looks like an evaluation/validation function by name but has "
+                    "no `with torch.no_grad():` block and no `.eval()` call anywhere in it -- worth "
+                    "double-checking dropout/batchnorm are in eval mode and gradients aren't being tracked "
+                    "unnecessarily during evaluation (this is a naming heuristic, so it may be a false "
+                    "positive for a function that isn't actually doing torch evaluation)."))
+
+    if softmax_loc and crossentropy_loc:
+        findings.append((softmax_loc[0], softmax_loc[1],
+            f"a Softmax/LogSoftmax call here, combined with CrossEntropyLoss/cross_entropy at "
+            f"{crossentropy_loc[0]}:{crossentropy_loc[1]} -- CrossEntropyLoss already applies "
+            "log_softmax internally, so feeding it already-softmaxed logits (a 'double softmax') "
+            "typically flattens gradients and hurts convergence. Worth double-checking the softmax "
+            "layer is only used for inference-time probabilities, not fed into this loss."))
+    if sigmoid_loc and bce_logits_loc:
+        findings.append((sigmoid_loc[0], sigmoid_loc[1],
+            f"a Sigmoid call here, combined with BCEWithLogitsLoss at "
+            f"{bce_logits_loc[0]}:{bce_logits_loc[1]} -- BCEWithLogitsLoss already applies sigmoid "
+            "internally for numerical stability, so a 'double sigmoid' here is the likely equivalent "
+            "of the CrossEntropyLoss case above."))
+    if softmax_module_loc and nllloss_loc:
+        findings.append((softmax_module_loc[0], softmax_module_loc[1],
+            f"a plain Softmax call here, combined with NLLLoss at "
+            f"{nllloss_loc[0]}:{nllloss_loc[1]} -- NLLLoss expects log-probabilities as input, but a "
+            "plain Softmax produces raw probabilities (not log-probabilities), so this silently trains "
+            "with the wrong gradient scale instead of erroring. Worth double-checking this should be "
+            "LogSoftmax instead, or the loss should be CrossEntropyLoss on raw logits."))
+
+    return findings
+
+
+_COMMENT_EXT_MAP = {
+    ".js": "//", ".ts": "//", ".jsx": "//", ".tsx": "//", ".java": "//",
+    ".c": "//", ".cpp": "//", ".h": "//", ".hpp": "//", ".cs": "//",
+    ".go": "//", ".rs": "//", ".swift": "//", ".kt": "//",
+}
+
+
+def _comment_char_for(path):
+    return _COMMENT_EXT_MAP.get(os.path.splitext(path)[1].lower(), "#")
+
+
+def _normalize_ws_for_match(s):
+    """Collapse each line's leading/trailing whitespace and drop blank
+    lines, for a lenient equality check used only to LOCATE a snippet
+    that doesn't match verbatim -- never used to decide what to write.
+    A weaker model is far more likely to reproduce a snippet with a
+    slightly different indent depth or an extra/missing blank line than
+    to get the actual tokens wrong, so this recovers those cases instead
+    of silently skipping a fix that's semantically exact."""
+    lines = [ln.strip() for ln in s.splitlines()]
+    return "\n".join(ln for ln in lines if ln)
+
+
+def _find_fuzzy_snippet_span(content, old):
+    """If `old` doesn't appear verbatim in `content` but a whitespace-
+    normalized version of it appears exactly once as a contiguous run of
+    lines, return (start, end) character offsets of that exact run in
+    `content` (so the ORIGINAL text spanning those offsets -- not `old`
+    itself -- can be replaced, preserving whatever indentation/blank
+    lines the file actually has). Returns None if there's no unambiguous
+    match. This is a fallback path only; an exact match is always tried
+    first and preferred."""
+    target = _normalize_ws_for_match(old)
+    if not target:
+        return None
+
+    content_lines = content.splitlines(keepends=True)
+    # Precompute normalized, non-blank (line_index, stripped_text) pairs
+    # so we can slide a window over just the "meaningful" lines while
+    # still tracking real offsets for the eventual span.
+    meaningful = [(i, ln.strip()) for i, ln in enumerate(content_lines) if ln.strip()]
+    target_lines = target.split("\n")
+    n = len(target_lines)
+    if n == 0 or len(meaningful) < n:
+        return None
+
+    matches = []
+    for start in range(len(meaningful) - n + 1):
+        window = [meaningful[start + k][1] for k in range(n)]
+        if window == target_lines:
+            first_line_idx = meaningful[start][0]
+            last_line_idx = meaningful[start + n - 1][0]
+            matches.append((first_line_idx, last_line_idx))
+
+    if len(matches) != 1:
+        return None
+
+    first_line_idx, last_line_idx = matches[0]
+    start_offset = sum(len(l) for l in content_lines[:first_line_idx])
+    end_offset = sum(len(l) for l in content_lines[:last_line_idx + 1])
+    return start_offset, end_offset
+
+
+def _banner_wrap_fix(old, new, path):
+    """Wrap a code-fix replacement so the OLD code stays visible, commented
+    out, directly above the NEW (live) code -- instead of silently
+    swapping one for the other with no trace in the file itself. Written
+    directly into the file content that gets saved to disk, so it shows
+    up the next time the file is opened, not just in Pulse's own chat
+    transcript.
+    """
+    c = _comment_char_for(path)
+    old_commented = "\n".join(f"{c} {line}" if line.strip() else c for line in old.splitlines())
+    return f"{c} =====Pulse Change====\n{c} Old\n{old_commented}\n{c} New\n{new}"
+
+
+# ============================================================================
+# Persistent, cross-process fix history + revert -- module-level (not a
+# ChatPanel method) because the automatic-rollback-on-repeated-restart-
+# failure case (see persistent_tracer's RESTART handler) needs to call
+# this from the TRAINING process, not the Dashboard process that owns
+# ChatPanel; they only share a filesystem, so this is plain file I/O
+# using the same on-disk format pulse_cli.py's .pulse_history uses, kept
+# independent (no cross-import) since either tool may run standalone.
+# ============================================================================
+def _fix_history_dir(script_path):
+    base = os.path.dirname(script_path) if script_path else "."
+    d = os.path.join(base, ".pulse_history")
+    os.makedirs(os.path.join(d, "diffs"), exist_ok=True)
+    return d
+
+
+def _fix_history_path(script_path):
+    return os.path.join(_fix_history_dir(script_path), "changelog.jsonl")
+
+
+def _load_fix_history(script_path):
+    path = _fix_history_path(script_path)
+    entries = []
+    if not os.path.exists(path):
+        return entries
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
+    return entries
+
+
+def _record_fix_history_commit(script_path, files, explanation, kind="fix"):
+    """files: {path: (before, after)}. Returns the new commit's short id,
+    or None if there was nothing to record."""
+    if not files:
+        return None
+    commit_id = hashlib_sha1_short(f"{time.time()}|{explanation}|{sorted(files)}")
+    file_entries = []
+    diff_parts = []
+    for fpath, (before, after) in files.items():
+        label = os.path.basename(fpath)
+        diff = "".join(difflib.unified_diff(
+            before.splitlines(keepends=True), after.splitlines(keepends=True),
+            fromfile=f"a/{label}", tofile=f"b/{label}",
+        ))
+        diff_parts.append(diff or f"(no textual change to {label})\n")
+        file_entries.append({"path": fpath, "before": before, "after": after, "diff": diff})
+    entry = {"id": commit_id, "kind": kind, "t": time.time(), "explanation": explanation, "files": file_entries}
+    try:
+        with open(_fix_history_path(script_path), "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        return None
+    try:
+        with open(os.path.join(_fix_history_dir(script_path), "diffs", f"{commit_id}.diff"), "w", encoding="utf-8") as f:
+            f.write("\n".join(diff_parts))
+    except OSError:
+        pass
+    return commit_id
+
+
+def hashlib_sha1_short(s):
+    import hashlib
+    return hashlib.sha1(s.encode("utf-8", "replace")).hexdigest()[:8]
+
+
+def _fix_history_state_asof(entries, target_idx):
+    state = {}
+    for i, e in enumerate(entries):
+        if i > target_idx:
+            break
+        for fc in e.get("files", []):
+            state[fc["path"]] = fc["after"]
+    return state
+
+
+def _fix_history_original(entries, path):
+    for e in entries:
+        for fc in e.get("files", []):
+            if fc["path"] == path:
+                return fc["before"]
+    return None
+
+
+def _perform_fix_history_revert(script_path, entries, target_idx, target_label, on_code_change=None, extra_files=None):
+    """Restore every file the changelog has ever touched to its state as
+    of `target_idx` (-1 == "before the very first commit"). Pure file
+    I/O -- safe to call from either the Dashboard process (ChatPanel's
+    ROLLBACK: directive) or the training process (automatic rollback
+    after repeated restart failures). `on_code_change`/`extra_files` are
+    optional in-memory updates for a caller that has a live copy of the
+    script/extra-file text to keep in sync (ChatPanel does; the training
+    process's persistent_tracer doesn't need to, since it's about to
+    restart anyway). Returns (restored_paths, failed_paths, new_commit_id).
+    """
+    all_paths = sorted({fc["path"] for e in entries for fc in e.get("files", [])})
+    asof = _fix_history_state_asof(entries, target_idx)
+    restored, failed = [], []
+    revert_files = {}
+    for fpath in all_paths:
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                current = f.read()
+        except OSError:
+            current = None
+        content = asof.get(fpath)
+        if content is None:
+            content = _fix_history_original(entries, fpath)
+        if content is None or content == current:
+            continue
+        try:
+            with open(fpath, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError as exc:
+            failed.append((fpath, str(exc)))
+            continue
+        if current is not None:
+            revert_files[fpath] = (current, content)
+        restored.append(fpath)
+        if fpath == script_path and on_code_change:
+            on_code_change(content)
+        elif extra_files is not None and fpath in extra_files:
+            extra_files[fpath] = content
+    new_commit = None
+    if restored:
+        new_commit = _record_fix_history_commit(script_path, revert_files, f"Reverted to state {target_label}", kind="revert")
+    return restored, failed, new_commit
+
+
+def _auto_rollback_after_failed_restarts_gui(script_path, chain_start_commit_id):
+    """GUI-side counterpart of pulse_cli.py's
+    PulseCLI._auto_rollback_after_failed_restarts -- called from
+    persistent_tracer's RESTART handler once MAX_RESTART_ATTEMPTS is
+    exhausted, in the training process itself. Prints its own status
+    (there's no ChatPanel to hand a return string to here -- this
+    process's stdout is the only channel), and the training process is
+    continuing afterward either way, so a rolled-back script only takes
+    effect the NEXT time it's actually restarted (manually, or by a
+    future successful auto-fix).
+    """
+    if not chain_start_commit_id:
+        print("[PULSE] ⚠ Could not automatically roll back (no recorded pre-fix commit for this chain) -- inspect .pulse_history/changelog.jsonl manually.")
+        return False
+    entries = _load_fix_history(script_path)
+    chain_start_idx = next((i for i, e in enumerate(entries) if e.get("id") == chain_start_commit_id), None)
+    if chain_start_idx is None:
+        print(f"[PULSE] ⚠ Could not find commit {chain_start_commit_id} in .pulse_history to roll back from.")
+        return False
+    target_idx = chain_start_idx - 1
+    target_label = f"before commit {chain_start_commit_id} (auto-rollback after repeated restart failures)"
+    restored, failed, new_commit = _perform_fix_history_revert(script_path, entries, target_idx, target_label)
+    if restored:
+        print(
+            f"[PULSE] 🛟 Automatic rollback: the fix chain starting at commit {chain_start_commit_id} kept "
+            f"crashing after every retry, so Pulse restored {len(restored)} file(s) to their state right "
+            "before that fix, instead of leaving known-broken code on disk for an unattended run."
+        )
+        for p in restored:
+            print(f"    - {os.path.basename(p)}")
+        if new_commit:
+            print(f"[PULSE] 📝 Logged as commit {new_commit} in .pulse_history/ -- inspect/undo it there if this wasn't wanted.")
+    if failed:
+        print(f"[PULSE] ⚠ Automatic rollback failed to restore {len(failed)} file(s):")
+        for p, err in failed:
+            print(f"    - {os.path.basename(p)}: {err}")
+    return bool(restored)
 
 
 class ChatPanel(tk.Frame):
-    def __init__(self, parent, get_manifest_fn, get_code_fn=None, script_path=None, on_code_change=None, promote_fn=None, get_extra_files_fn=None, initial_provider=None, restart_fn=None):
+    def __init__(self, parent, get_manifest_fn, get_code_fn=None, script_path=None, on_code_change=None, promote_fn=None, get_extra_files_fn=None, initial_provider=None, restart_fn=None, exec_fn=None):
         super().__init__(parent, bg=PANEL)
         self.get_manifest_fn = get_manifest_fn
         self.get_code_fn = get_code_fn
@@ -1450,6 +3033,34 @@ class ChatPanel(tk.Frame):
         self.promote_fn = promote_fn  # (var_name) -> None, switches a lotrack var to full tracking
         self.get_extra_files_fn = get_extra_files_fn  # () -> {path: text} for other local project files
         self.restart_fn = restart_fn  # (provider_name) -> None, restarts the whole training process
+        self.exec_fn = exec_fn  # (kind, arg) -> result str; runs an EXEC-style directive in the live training process
+        # Lazily-initialized {path: text} snapshot of "the last checkpoint
+        # that didn't crash" for CHANGELOG -- see _run_changelog.
+        self._changelog_baseline = None
+        # (rank, local_rank, world_size, session_key) -- set by Dashboard
+        # right after construction when running under a multi-GPU/
+        # multi-process launch; defaults to "not distributed".
+        self.dist_info = (0, 0, 1, None)
+        # Per-session id (fresh every time this ChatPanel is constructed,
+        # i.e. every process start) used to identify "this run" in the
+        # local run-history file -- see _run_runcompare.
+        self._run_id = str(uuid.uuid4())[:8]
+        # Running token/cost accounting across every agent call this
+        # session -- see _record_usage / _run_cost.
+        self._token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0, "cost_usd": 0.0}
+        # Background retry queue for agent calls that fail only due to a
+        # transient error (rate limit, timeout, provider blip) after
+        # exhausting _call_model's own in-call retries -- see
+        # _queue_agent_retry / _ensure_retry_ticker. Training itself is
+        # never blocked on any of this.
+        self._last_call_failed_transiently = False
+        self._pending_agent_retry = None
+        self._retry_ticker_started = False
+        # id of the most recently recorded .pulse_history commit -- lets
+        # Dashboard._restart_training know exactly what to roll back to
+        # if the fix that triggered a restart keeps crashing (see
+        # _auto_rollback_after_failed_restarts_gui).
+        self._last_commit_id = None
         self._label_for_path = {}
         self._path_for_label = {}
         self.history = []
@@ -1602,7 +3213,26 @@ class ChatPanel(tk.Frame):
         has_key = self._has_active_key(self.provider_var.get())
         self.dot.itemconfig(self.dot_id, fill=TEAL if has_key else AMBER)
 
-    def _on_provider_change(self, _selection):
+    def _on_provider_change(self, selection):
+        if PROVIDERS.get(selection, {}).get("custom"):
+            model_string = simpledialog.askstring(
+                "Custom Model", "Model string (e.g. openai/gpt-6-astra):", parent=self
+            )
+            if not model_string or "/" not in model_string:
+                # Cancelled or invalid -- fall back to whatever provider was
+                # active before this selection instead of leaving the
+                # sentinel entry selected with nothing behind it.
+                self.provider_var.set(list(PROVIDERS.keys())[0])
+                self._update_status_indicator()
+                return
+            env_var = simpledialog.askstring(
+                "Env Var", "Env var name for the API key (blank = none needed):", parent=self
+            ) or None
+            label = f"Custom: {model_string}"
+            PROVIDERS[label] = {"model": model_string, "env_key": env_var}
+            menu = self.provider_dropdown["menu"]
+            menu.add_command(label=label, command=tk._setit(self.provider_var, label, self._on_provider_change))
+            self.provider_var.set(label)
         self._update_status_indicator()
 
     def _set_stage(self, label):
@@ -1668,11 +3298,13 @@ class ChatPanel(tk.Frame):
 
         current_provider = self.provider_var.get()
         prov_info = PROVIDERS[current_provider]
-        env_var = prov_info["env_key"]
+        env_var = prov_info.get("env_key")
 
         if not self._has_active_key(current_provider):
             api_key = simpledialog.askstring(
-                prov_info["prompt_title"], prov_info["prompt_msg"], parent=self, show='*'
+                prov_info.get("prompt_title", "API Key Required"),
+                prov_info.get("prompt_msg", f"Enter the API key for {env_var}:"),
+                parent=self, show='*'
             )
             if not api_key or not api_key.strip():
                 return
@@ -1687,7 +3319,7 @@ class ChatPanel(tk.Frame):
         self.entry.delete(0, tk.END)
         self._append("You  (+ code)" if include_code else "You", question)
 
-        threading.Thread(target=self._ask, args=(question, include_code, current_provider), daemon=True).start()
+        threading.Thread(target=self._ask_and_maybe_retry, args=(question, include_code, current_provider), daemon=True).start()
 
     def _build_file_labels(self, extra_files):
         """Give every file a short, unique display label (usually just its
@@ -1782,12 +3414,54 @@ class ChatPanel(tk.Frame):
                 pass
         return payloads
 
+    _RETRYABLE_ERROR_ATTRS = (
+        "RateLimitError", "Timeout", "APIConnectionError",
+        "ServiceUnavailableError", "InternalServerError",
+    )
+
+    def _is_retryable_model_error(self, exc):
+        for attr in self._RETRYABLE_ERROR_ATTRS:
+            cls = getattr(litellm, attr, None)
+            if cls is not None and isinstance(exc, cls):
+                return True
+        return False
+
+    def _classify_model_error(self, exc):
+        """Turn whatever litellm/the provider's SDK raised into one short,
+        stable, user-facing reason instead of a raw exception repr."""
+        for attr, reason in (
+            ("AuthenticationError", "authentication failed -- check the API key for this provider"),
+            ("PermissionDeniedError", "the API key doesn't have permission for this model"),
+            ("RateLimitError", "rate limited by the provider -- try again shortly"),
+            ("ContextWindowExceededError", "the conversation/code context is too large for this model's context window"),
+            ("BadRequestError", "the provider rejected the request (often an invalid/unavailable model name)"),
+            ("NotFoundError", "model not found -- check the model name is correct and available on this provider/account"),
+            ("Timeout", "the request timed out"),
+            ("APIConnectionError", "couldn't connect to the provider (network issue, or a local server that isn't running)"),
+            ("ServiceUnavailableError", "the provider's service is temporarily unavailable"),
+            ("InternalServerError", "the provider's own service hit an internal error"),
+        ):
+            cls = getattr(litellm, attr, None)
+            if cls is not None and isinstance(exc, cls):
+                return reason
+        msg = str(exc)
+        return msg[:200] + ("…" if len(msg) > 200 else "")
+
     def _call_model(self, model_name, instruction, image_payloads=None, max_tokens=2000):
         """One lightweight completion call: system prompt + recent history +
         a one-off stage instruction (+ images on the first call only, so
         they aren't re-uploaded on every stage). Does not touch
         self.history -- the caller decides what gets persisted once the
         whole pipeline finishes.
+
+        Transient failures (rate limits, timeouts, connection blips, a
+        provider's own 500) are retried up to 3 times with a short
+        backoff before giving up; anything else (bad API key, invalid
+        model name, context too long) fails immediately since retrying
+        won't change the outcome. On exhaustion, raises AgentRequestFailed
+        rather than returning an error string dressed up as a real answer
+        -- see _ask's try/except, the one chokepoint for the whole
+        multi-pass pipeline.
         """
         content = [{"type": "text", "text": instruction}]
         if image_payloads:
@@ -1797,23 +3471,751 @@ class ChatPanel(tk.Frame):
             + self.history[-10:]
             + [{"role": "user", "content": content}]
         )
-        try:
-            response = litellm.completion(
-                model=model_name,
-                messages=messages,
-                max_tokens=max_tokens,
-                timeout=120.0,
-            )
-            return (response.choices[0].message.content or "").strip()
-        except Exception as e:
-            return f"(request failed: {e})"
+        max_attempts = 3
+        last_exc = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = litellm.completion(
+                    model=model_name,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    timeout=120.0,
+                )
+                text = (response.choices[0].message.content or "").strip()
+                if not text:
+                    raise AgentRequestFailed("the provider returned an empty response")
+                self._record_usage(response)
+                return text
+            except AgentRequestFailed:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                if attempt < max_attempts and self._is_retryable_model_error(exc):
+                    backoff = 2 ** (attempt - 1)  # 1s, 2s, 4s
+                    reason = self._classify_model_error(exc)
+                    self.after(0, lambda a=attempt, m=max_attempts, b=backoff, r=reason: self._append(
+                        "Pulse", f"⚠ Agent request hit a transient error (attempt {a}/{m}), retrying in {b}s: {r}"))
+                    time.sleep(backoff)
+                    continue
+                raise AgentRequestFailed(self._classify_model_error(exc)) from exc
+        raise AgentRequestFailed(self._classify_model_error(last_exc) if last_exc else "unknown error")
 
-    def _apply_directives(self, calc_exprs, promote_names):
-        """Deterministically compute any CALC: expressions and figure out
-        which PROMOTE: names match a currently-known variable. Pure
-        computation only -- no Tk calls -- so this is safe to run on the
-        background request thread. Returns (note_text, calc_lines,
-        promoted_names) for the caller to display/apply on the main thread.
+    def _record_usage(self, response):
+        """Best-effort token/cost accounting for the COST directive --
+        never let a usage-accounting hiccup affect the actual chat
+        response. Cost is litellm's own estimate where it has pricing
+        data for the model; otherwise only token counts are available."""
+        try:
+            usage = getattr(response, "usage", None)
+            if usage:
+                self._token_usage["prompt_tokens"] += getattr(usage, "prompt_tokens", 0) or 0
+                self._token_usage["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
+                self._token_usage["total_tokens"] += getattr(usage, "total_tokens", 0) or 0
+            self._token_usage["calls"] += 1
+            try:
+                self._token_usage["cost_usd"] += float(litellm.completion_cost(completion_response=response) or 0.0)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    _GREP_MAX_MATCHES = 40
+    _GREP_CONTEXT_LINES = 1
+    _VIEW_MAX_LINES = 400
+    _VIEW_ARG_RE = re.compile(r"^(?:([^:]+):)?\s*(\d+)\s*-\s*(\d+)\s*$")
+
+    def _iter_searchable_files(self):
+        """(label, path, text) for the entry script plus every other local
+        project file Pulse knows about, regardless of whether 'Send Code'
+        is currently checked -- GREP/VIEW let the agent pull in only the
+        slice it actually needs instead of requiring the whole file(s) to
+        already be in context.
+        """
+        extra_files = (self.get_extra_files_fn() or {}) if self.get_extra_files_fn else {}
+        self._build_file_labels(extra_files)
+        code = self.get_code_fn() if self.get_code_fn else None
+        if self.script_path and code is not None:
+            label = self._label_for_path.get(self.script_path, os.path.basename(self.script_path))
+            yield label, self.script_path, code
+        for path, text in extra_files.items():
+            label = self._label_for_path.get(path, os.path.basename(path))
+            yield label, path, text
+
+    def _run_grep(self, pattern):
+        """Case-insensitive regex (or literal, if not valid regex) search
+        across every known project file, returning matches as
+        'label, line N' with a line of context on each side, capped at
+        _GREP_MAX_MATCHES total."""
+        try:
+            rx = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            rx = re.compile(re.escape(pattern), re.IGNORECASE)
+
+        blocks = []
+        total = 0
+        for label, _path, text in self._iter_searchable_files():
+            if total >= self._GREP_MAX_MATCHES:
+                break
+            lines = text.splitlines()
+            for i, line in enumerate(lines):
+                if total >= self._GREP_MAX_MATCHES:
+                    break
+                if not rx.search(line):
+                    continue
+                lo = max(0, i - self._GREP_CONTEXT_LINES)
+                hi = min(len(lines), i + self._GREP_CONTEXT_LINES + 1)
+                snippet = "\n".join(f"    {n + 1:>4} | {lines[n]}" for n in range(lo, hi))
+                blocks.append(f"  {label}, line {i + 1}:\n{snippet}")
+                total += 1
+
+        if not blocks:
+            return f"GREP '{pattern}': no matches in any tracked file."
+        truncated = " (truncated -- narrow the pattern for more)" if total >= self._GREP_MAX_MATCHES else ""
+        return f"GREP '{pattern}': {total} match(es){truncated}\n" + "\n".join(blocks)
+
+    def _run_view(self, arg):
+        """Exact line range from a known project file -- '<file>:<start>-
+        <end>' (file label optional, defaults to the main script), e.g.
+        'model.py:40-75' or '120-160'. Capped at _VIEW_MAX_LINES."""
+        m = self._VIEW_ARG_RE.match(arg.strip())
+        if not m:
+            return f"VIEW '{arg}': could not parse -- expected '<file>:<start>-<end>' or '<start>-<end>'."
+        file_label, start_str, end_str = m.groups()
+        start, end = int(start_str), int(end_str)
+        if end < start:
+            start, end = end, start
+
+        extra_files = (self.get_extra_files_fn() or {}) if self.get_extra_files_fn else {}
+        # Build/refresh the label<->path map before resolving -- VIEW can
+        # be sent on its own, without a preceding GREP or 'Send Code' this
+        # turn, so _path_for_label may otherwise still be empty or stale.
+        self._build_file_labels(extra_files)
+        path = self._resolve_fix_path(file_label) if file_label else self.script_path
+        if not path:
+            return f"VIEW '{arg}': could not resolve file '{file_label}'."
+
+        code = self.get_code_fn() if self.get_code_fn else None
+        text = code if path == self.script_path else extra_files.get(path)
+        if text is None:
+            return f"VIEW '{arg}': no source text available for '{file_label or os.path.basename(path)}'."
+
+        lines = text.splitlines()
+        end = min(end, len(lines))
+        start = max(1, start)
+        if end - start + 1 > self._VIEW_MAX_LINES:
+            end = start + self._VIEW_MAX_LINES - 1
+        if start > len(lines):
+            return f"VIEW '{arg}': file only has {len(lines)} lines."
+
+        label = self._label_for_path.get(path, os.path.basename(path))
+        numbered = "\n".join(f"    {n:>4} | {lines[n - 1]}" for n in range(start, end + 1))
+        return f"VIEW {label}:{start}-{end}\n{numbered}"
+
+    # ------------------------------------------------------------------
+    # Code intelligence (AST-based, pure/local -- no live-process access
+    # needed): DEFOF/CALLERS/DEPGRAPH.
+    # ------------------------------------------------------------------
+    def _iter_ast_trees(self):
+        """(label, path, text, tree) for every known project file that
+        parses as valid Python -- a file that doesn't parse (mid-edit
+        syntax error, or a non-Python file that slipped into extra_files)
+        is skipped rather than raising."""
+        for label, path, text in self._iter_searchable_files():
+            try:
+                tree = ast.parse(text, filename=path)
+            except (SyntaxError, ValueError):
+                continue
+            yield label, path, text, tree
+
+    def _run_defof(self, symbol):
+        """DEFOF: <symbol> -- AST-based jump-to-definition across every
+        tracked file, not text search."""
+        symbol = symbol.strip()
+        hits = []
+        for label, _path, text, tree in self._iter_ast_trees():
+            lines = text.splitlines()
+            for node in ast.walk(tree):
+                kind, name = None, None
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == symbol:
+                    name = node.name
+                    kind = "class" if isinstance(node, ast.ClassDef) else "function"
+                elif isinstance(node, ast.Assign):
+                    for t in node.targets:
+                        if isinstance(t, ast.Name) and t.id == symbol:
+                            name, kind = symbol, "assignment"
+                            break
+                if name is None:
+                    continue
+                start = node.lineno
+                end = min(start + 4, len(lines))
+                snippet = "\n".join(f"    {n:>4} | {lines[n - 1]}" for n in range(start, end + 1) if n <= len(lines))
+                hits.append(f"  {label}:{start} ({kind} {symbol})\n{snippet}")
+        if not hits:
+            return f"DEFOF '{symbol}': no definition found in any tracked file."
+        return f"DEFOF '{symbol}': {len(hits)} definition(s)\n" + "\n\n".join(hits)
+
+    def _run_callers(self, symbol):
+        """CALLERS: <symbol> -- every call site of a function/class, so a
+        model doesn't have to guess whether a signature change breaks
+        something elsewhere."""
+        symbol = symbol.strip()
+        hits = []
+        for label, _path, text, tree in self._iter_ast_trees():
+            lines = text.splitlines()
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                called_name = func.id if isinstance(func, ast.Name) else (func.attr if isinstance(func, ast.Attribute) else None)
+                if called_name != symbol:
+                    continue
+                lineno = node.lineno
+                line = lines[lineno - 1].strip() if lineno <= len(lines) else ""
+                hits.append(f"  {label}, line {lineno}: {line}")
+        if not hits:
+            return f"CALLERS '{symbol}': no call sites found in any tracked file."
+        capped = hits[:60]
+        suffix = f" (truncated, showing first {len(capped)})" if len(hits) > len(capped) else ""
+        return f"CALLERS '{symbol}': {len(hits)} call site(s){suffix}\n" + "\n".join(capped)
+
+    def _run_depgraph(self):
+        """DEPGRAPH: -- the actual import graph between tracked project
+        files, so the model knows which file owns a piece of logic
+        instead of guessing from filenames."""
+        trees = list(self._iter_ast_trees())
+        label_by_modname = {os.path.splitext(os.path.basename(path))[0]: label for label, path, _t, _tr in trees}
+        edges = []
+        for label, _path, _text, tree in trees:
+            deps = set()
+            for node in ast.walk(tree):
+                mods = []
+                if isinstance(node, ast.Import):
+                    mods = [alias.name.split(".")[0] for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    mods = [node.module.split(".")[0]]
+                for m in mods:
+                    other = label_by_modname.get(m)
+                    if other and other != label:
+                        deps.add(other)
+            if deps:
+                edges.append(f"  {label} -> {', '.join(sorted(deps))}")
+        if not edges:
+            return "DEPGRAPH: no import relationships found between tracked local files."
+        return "DEPGRAPH (import graph between tracked local files):\n" + "\n".join(edges)
+
+    # ------------------------------------------------------------------
+    # Statistical tooling beyond CALC: pattern-detection across a
+    # variable's full recorded history, exactly the kind of thing code is
+    # better at than eyeballing a chart. Scalars (loss/accuracy/lr/custom
+    # logged values) get a persisted (step, value) history in the
+    # manifest -- see the "history" field written in _worker_main.
+    # ------------------------------------------------------------------
+    def _scalar_history(self, name):
+        """Resolve `name` against the manifest (exact match, else a
+        unique case-insensitive substring match, same convention as
+        PROMOTE) and return (resolved_name, [(step, value), ...] or None).
+        """
+        manifest = self.get_manifest_fn() or {}
+        stats = manifest.get(name)
+        if stats is None:
+            matches = [k for k in manifest if name.lower() in k.lower()]
+            if len(matches) == 1:
+                name, stats = matches[0], manifest[matches[0]]
+        if stats is None:
+            return name, None
+        hist = stats.get("history")
+        if hist is None:
+            recent = stats.get("recent")
+            hist = list(enumerate(recent)) if recent else None
+        return name, hist
+
+    def _run_corr(self, arg):
+        """CORR: <var1> <var2> -- real correlation coefficient between two
+        tracked scalar histories, instead of eyeballing whether two charts
+        move together."""
+        parts = arg.split()
+        if len(parts) != 2:
+            return f"CORR '{arg}': expected two variable names, e.g. 'CORR: loss grad_norm'."
+        name1, hist1 = self._scalar_history(parts[0])
+        name2, hist2 = self._scalar_history(parts[1])
+        if not hist1 or not hist2:
+            missing = parts[0] if not hist1 else parts[1]
+            return f"CORR '{arg}': no numeric history for '{missing}' -- only scalar-tracked variables (loss, accuracy, lr, ...) have one."
+        v1 = [v for _, v in hist1 if v is not None]
+        v2 = [v for _, v in hist2 if v is not None]
+        n = min(len(v1), len(v2))
+        if n < 3:
+            return f"CORR '{name1}' vs '{name2}': not enough overlapping data points yet ({n})."
+        v1, v2 = v1[-n:], v2[-n:]
+        mean1, mean2 = sum(v1) / n, sum(v2) / n
+        cov = sum((a - mean1) * (b - mean2) for a, b in zip(v1, v2))
+        var1 = sum((a - mean1) ** 2 for a in v1)
+        var2 = sum((b - mean2) ** 2 for b in v2)
+        if var1 == 0 or var2 == 0:
+            return f"CORR '{name1}' vs '{name2}': one series is constant over these {n} points -- correlation undefined."
+        r = cov / math.sqrt(var1 * var2)
+        return f"CORR '{name1}' vs '{name2}' (last {n} points): r = {r:.4f}"
+
+    def _run_outlier(self, var):
+        """OUTLIER: <var> -- deterministic z-score anomaly detection over a
+        variable's history, flags exact points instead of 'eyeball the
+        chart.'"""
+        name, hist = self._scalar_history(var)
+        if not hist:
+            return f"OUTLIER '{var}': no numeric history available -- only scalar-tracked variables have one."
+        pts = [(i, v) for i, v in hist if v is not None]
+        if len(pts) < 4:
+            return f"OUTLIER '{name}': not enough data points yet ({len(pts)})."
+        values = [v for _, v in pts]
+        mean = sum(values) / len(values)
+        variance = sum((v - mean) ** 2 for v in values) / len(values)
+        std = math.sqrt(variance)
+        if std == 0:
+            return f"OUTLIER '{name}': series is constant -- no outliers."
+        flagged = [(i, v, (v - mean) / std) for i, v in pts if abs((v - mean) / std) > 3]
+        if not flagged:
+            return f"OUTLIER '{name}': no points with |z| > 3 over {len(pts)} points (mean={mean:.4g}, std={std:.4g})."
+        lines = "\n".join(f"  history idx {i}: {v:.6g} (z={z:.2f})" for i, v, z in flagged[-20:])
+        return f"OUTLIER '{name}': {len(flagged)} outlier point(s) (mean={mean:.4g}, std={std:.4g})\n{lines}"
+
+    _DIFFSTATS_ARG_RE = re.compile(r"^\s*(\S+)\s+(-?\d+)\s+(-?\d+)\s*$")
+
+    def _run_diffstats(self, arg):
+        """DIFFSTATS: <var> <index_a> <index_b> -- exact delta in a
+        variable's recorded history between two points (indices count
+        into that variable's own deduplicated history, negative counts
+        from the end -- like a Python list index), instead of mentally
+        subtracting two numbers off two different messages."""
+        m = self._DIFFSTATS_ARG_RE.match(arg.strip())
+        if not m:
+            return f"DIFFSTATS '{arg}': expected '<var> <index_a> <index_b>', e.g. 'DIFFSTATS: loss 10 40'."
+        var, a_str, b_str = m.groups()
+        name, hist = self._scalar_history(var)
+        if not hist:
+            return f"DIFFSTATS '{var}': no numeric history available."
+        values = [v for _, v in hist]
+        try:
+            va, vb = values[int(a_str)], values[int(b_str)]
+        except IndexError:
+            return f"DIFFSTATS '{name}': index out of range (history has {len(values)} point(s))."
+        if va is None or vb is None:
+            return f"DIFFSTATS '{name}': one of those points is None/unreadable."
+        delta = vb - va
+        pct = f" ({delta / va * 100:+.2f}%)" if va else ""
+        return f"DIFFSTATS '{name}' [{a_str}] -> [{b_str}]: {va:.6g} -> {vb:.6g}, delta = {delta:+.6g}{pct}"
+
+    def _run_histogram(self, var, buckets=10):
+        """HISTOGRAM: <var> -- actual bucketed distribution counts over a
+        variable's history, not a description of what a heatmap image
+        'looks like it shows.'"""
+        name, hist = self._scalar_history(var)
+        if not hist:
+            return f"HISTOGRAM '{var}': no numeric history available."
+        values = [v for _, v in hist if v is not None]
+        if len(values) < 2:
+            return f"HISTOGRAM '{name}': not enough data points yet ({len(values)})."
+        lo, hi = min(values), max(values)
+        if lo == hi:
+            return f"HISTOGRAM '{name}': all {len(values)} point(s) equal {lo:.6g}."
+        width = (hi - lo) / buckets
+        counts = [0] * buckets
+        for v in values:
+            counts[min(buckets - 1, int((v - lo) / width))] += 1
+        peak = max(counts) or 1
+        lines = []
+        for i, c in enumerate(counts):
+            b_lo, b_hi = lo + i * width, lo + (i + 1) * width
+            bar = "#" * max(1, int(40 * c / peak)) if c else ""
+            lines.append(f"  [{b_lo:>10.4g}, {b_hi:>10.4g}): {c:>5}  {bar}")
+        return f"HISTOGRAM '{name}' ({len(values)} points, range [{lo:.4g}, {hi:.4g}]):\n" + "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Grounding tooling: replacing recall with lookup.
+    # ------------------------------------------------------------------
+    def _run_doclookup(self, arg):
+        """DOCLOOKUP: <library>.<symbol> -- fetch the actual current
+        signature/docstring for an already-installed library function,
+        instead of trusting memorized API shape that may be stale for the
+        installed version."""
+        arg = arg.strip()
+        parts = arg.split(".")
+        if len(parts) < 2:
+            return f"DOCLOOKUP '{arg}': expected '<library>.<symbol>', e.g. 'DOCLOOKUP: torch.nn.functional.cross_entropy'."
+        root = parts[0]
+        try:
+            obj = importlib.import_module(root)
+        except Exception as exc:
+            return f"DOCLOOKUP '{arg}': could not import '{root}' ({type(exc).__name__}: {exc}) -- it may not be installed in this environment."
+        resolved = [root]
+        for attr in parts[1:]:
+            try:
+                obj = getattr(obj, attr)
+            except AttributeError:
+                try:
+                    obj = importlib.import_module(".".join(resolved + [attr]))
+                except Exception:
+                    return f"DOCLOOKUP '{arg}': '{'.'.join(resolved)}' has no attribute '{attr}'."
+            resolved.append(attr)
+        try:
+            sig = str(inspect.signature(obj))
+        except (TypeError, ValueError):
+            sig = ""
+        doc = inspect.getdoc(obj) or "(no docstring)"
+        if len(doc) > 1200:
+            doc = doc[:1200] + "\n... (truncated)"
+        return f"DOCLOOKUP '{arg}': {'.'.join(resolved)}{sig}\n{doc}"
+
+    def _run_changelog(self):
+        """CHANGELOG: -- diff of exactly what's changed in tracked files
+        since the last checkpoint, so attention narrows to what's actually
+        different rather than re-reading a whole file. The baseline is
+        the code as of this chat session's start (i.e. the last state
+        training was actually running under) and is advanced to "now"
+        every time CHANGELOG runs, so a second call only shows what's
+        changed since the first."""
+        extra_files = (self.get_extra_files_fn() or {}) if self.get_extra_files_fn else {}
+        self._build_file_labels(extra_files)
+        code = self.get_code_fn() if self.get_code_fn else None
+        current = dict(extra_files)
+        if self.script_path and code is not None:
+            current[self.script_path] = code
+
+        if self._changelog_baseline is None:
+            self._changelog_baseline = current
+            return "CHANGELOG: no prior checkpoint yet -- this turn's code is now the baseline for future CHANGELOG calls."
+
+        diffs = []
+        for path, new_text in current.items():
+            old_text = self._changelog_baseline.get(path, "")
+            if old_text == new_text:
+                continue
+            label = self._label_for_path.get(path, os.path.basename(path))
+            diff = "\n".join(difflib.unified_diff(
+                old_text.splitlines(), new_text.splitlines(),
+                fromfile=f"{label} (last checkpoint)", tofile=f"{label} (now)", lineterm="", n=2,
+            ))
+            if diff:
+                diffs.append(diff)
+
+        self._changelog_baseline = current
+        if not diffs:
+            return "CHANGELOG: no changes since the last checkpoint."
+        body = "\n\n".join(diffs)
+        if len(body) > 4000:
+            body = body[:4000] + "\n... (truncated)"
+        return f"CHANGELOG (since last checkpoint):\n{body}"
+
+    def _fixlog_path(self):
+        base = os.path.dirname(self.script_path) if self.script_path else "."
+        return os.path.join(base, ".pulse_fixlog.json")
+
+    def _load_fixlog(self):
+        try:
+            with open(self._fixlog_path(), "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return []
+
+    def _append_fixlog(self, path, old, new, explanation):
+        """Persist every applied code fix (old/new/explanation) to a
+        project-level fix-log so PASTFIX can search it later -- this
+        project's own history of prior fixes, so established local
+        patterns get reused instead of rediscovered from scratch."""
+        log = self._load_fixlog()
+        log.append({"time": time.time(), "path": path, "old": old, "new": new, "explanation": explanation})
+        log = log[-200:]
+        try:
+            with open(self._fixlog_path(), "w", encoding="utf-8") as f:
+                json.dump(log, f)
+        except OSError:
+            pass
+
+    def _run_pastfix(self, query):
+        """PASTFIX: <symbol_or_region> -- search this project's own
+        persistent fix-log for prior fixes touching the same
+        function/region."""
+        query_l = query.strip().lower()
+        hits = []
+        for entry in reversed(self._load_fixlog()):
+            haystack = " ".join([
+                str(entry.get("explanation", "")), str(entry.get("old", "")),
+                str(entry.get("new", "")), str(entry.get("path", "")),
+            ]).lower()
+            if query_l in haystack:
+                hits.append(entry)
+            if len(hits) >= 5:
+                break
+        if not hits:
+            return f"PASTFIX '{query}': no prior fix in this project's fix-log mentions that."
+        lines = []
+        for e in hits:
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(e.get("time", 0)))
+            lines.append(f"  [{ts}] {os.path.basename(str(e.get('path', '?')))}: {e.get('explanation', '(no explanation)')}")
+        return f"PASTFIX '{query}': {len(hits)} prior fix(es)\n" + "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Automatic safety/verification gate -- NOT model-invoked, runs on
+    # every proposed fix regardless of what directives the model used.
+    # ------------------------------------------------------------------
+    def _lint_check(self, content, path):
+        """Syntax/AST validation, then a real static-analysis pass
+        (pyflakes) if it's importable, on the FULL proposed file content
+        before it's ever written to disk -- catches undefined names, bad
+        syntax, and unused imports deterministically instead of trusting
+        the agent's own read of its diff. Returns (ok, messages)."""
+        if os.path.splitext(path)[1] != ".py":
+            return True, []
+        try:
+            compile(content, path, "exec")
+        except SyntaxError as exc:
+            return False, [f"SyntaxError: {exc.msg} (line {exc.lineno})"]
+
+        try:
+            import pyflakes.api as _pyflakes_api
+            import pyflakes.reporter as _pyflakes_reporter
+        except ImportError:
+            return True, []
+
+        out, err = io.StringIO(), io.StringIO()
+        _pyflakes_api.check(content, path, _pyflakes_reporter.Reporter(out, err))
+        messages = [l for l in (out.getvalue() + err.getvalue()).splitlines() if l.strip()]
+        # Only undefined-name-class errors block the write -- style-only
+        # warnings (unused imports/locals) are reported but don't block,
+        # since those are common in intentionally-scaffolded fixes.
+        blocking = [m for m in messages if "undefined name" in m.lower() or "syntaxerror" in m.lower()]
+        return (len(blocking) == 0), messages
+
+    def _run_gpustatus(self):
+        """GPUSTATUS: -- real per-device GPU memory/utilization instead of
+        the model guessing about 'the GPU'. Under a multi-GPU/multi-rank
+        launch (see _distributed_info), aggregates every rank's status
+        (published periodically to a shared status directory) into one
+        report instead of just this process's own device(s)."""
+        rank, _local_rank, world_size, session_key = self.dist_info
+        if world_size > 1 and session_key:
+            return _format_multi_rank_gpu_status(session_key, rank)
+        return _format_gpu_status(_gpu_status_snapshot())
+
+    def _run_rollback(self, arg):
+        """ROLLBACK: <commit_id, or 'last'> -- deterministically revert
+        via the same .pulse_history mechanism the automatic
+        restart-failure rollback uses, instead of the agent trying to
+        manually reconstruct old code from memory of the conversation."""
+        entries = _load_fix_history(self.script_path)
+        if not entries:
+            return "ROLLBACK: no recorded Pulse code changes to revert."
+        arg = arg.strip()
+        if not arg or arg.lower() == "last":
+            target_idx = len(entries) - 2
+            target_label = f"before commit {entries[-1].get('id', '?')} (most recent)"
+        else:
+            target_idx = None
+            target_label = ""
+            for i, e in enumerate(entries):
+                eid = e.get("id", "")
+                if eid == arg or eid.startswith(arg):
+                    target_idx = i
+                    target_label = f"commit {eid}"
+                    break
+            if target_idx is None:
+                return f"ROLLBACK '{arg}': no commit matches that id -- send CHANGELOG or check .pulse_history/changelog.jsonl."
+        extra_files = (self.get_extra_files_fn() or {}) if self.get_extra_files_fn else {}
+        restored, failed, new_commit = _perform_fix_history_revert(
+            self.script_path, entries, target_idx, target_label,
+            on_code_change=self.on_code_change, extra_files=extra_files,
+        )
+        if new_commit:
+            self._last_commit_id = new_commit
+        if not restored and not failed:
+            return f"ROLLBACK '{arg}': workspace already matches that state -- nothing to revert."
+        parts = []
+        if restored:
+            parts.append(
+                f"ROLLBACK: reverted to state {target_label} -- {len(restored)} file(s) restored: "
+                + ", ".join(os.path.basename(p) for p in restored)
+                + (f" (logged as commit {new_commit})" if new_commit else "")
+                + " -- restart training to pick it up."
+            )
+        if failed:
+            parts.append("ROLLBACK: failed to restore " + ", ".join(f"{os.path.basename(p)} ({err})" for p, err in failed))
+        return "\n".join(parts)
+
+    def _run_mllint(self):
+        """MLLINT: -- a small set of high-confidence, AST-detectable ML
+        anti-patterns (metric/loss mismatches, double-softmax/sigmoid,
+        missing zero_grad, suspiciously high LR, eval functions missing
+        no_grad/.eval()) across every tracked file. These are heuristics
+        about ML *semantics*, worded as things worth double-checking, not
+        certainties the way the syntax LINT gate's findings are."""
+        findings = _mllint_scan(self._iter_ast_trees())
+        if not findings:
+            return "MLLINT: no anti-patterns found in this heuristic check across the tracked files (this doesn't guarantee correctness, just that none of Pulse's known patterns matched)."
+        lines = [f"  {label}:{lineno}: {msg}" for label, lineno, msg in findings]
+        return f"MLLINT: {len(findings)} finding(s) worth double-checking\n" + "\n\n".join(lines)
+
+    def _run_rankdiverge(self, var):
+        """RANKDIVERGE: <var> -- compares this rank's latest value of a
+        tracked scalar against every other rank's latest value (published
+        via the same rank-status files GPUSTATUS reads). In correctly
+        synced distributed training, per-rank loss/metric values should
+        track closely after gradient sync; a rank whose value has drifted
+        noticeably from the rest is a strong signal of something rank-
+        specific gone wrong (unsynced BatchNorm stats, a corrupted data
+        shard, a rank stuck on stale weights, ...). Only meaningful under
+        a multi-rank launch."""
+        rank, _local_rank, world_size, session_key = self.dist_info
+        if world_size <= 1 or not session_key:
+            return "RANKDIVERGE: this process isn't part of a multi-rank launch (world_size == 1)."
+        statuses = _read_all_rank_status(session_key)
+        if not statuses:
+            return "RANKDIVERGE: no rank status files found yet."
+        values = {}
+        for s in statuses:
+            scalars = s.get("scalars") or {}
+            if var in scalars and scalars[var] is not None:
+                values[s.get("rank")] = scalars[var]
+        if len(values) < 2:
+            return f"RANKDIVERGE '{var}': fewer than 2 ranks currently report this variable ({len(values)} found) -- nothing to compare yet."
+        mean = sum(values.values()) / len(values)
+        lines = [f"  rank {r}{' (this process)' if r == rank else ''}: {v:.6g}  (delta from mean: {v - mean:+.4g})" for r, v in sorted(values.items())]
+        spread = max(values.values()) - min(values.values())
+        verdict = "large spread across ranks -- worth investigating" if spread > abs(mean) * 0.1 + 1e-9 else "spread looks tight"
+        return f"RANKDIVERGE '{var}' across {len(values)}/{world_size} rank(s), mean={mean:.6g}, spread={spread:.4g} ({verdict}):\n" + "\n".join(lines)
+
+    def _run_runcompare(self):
+        """RUNCOMPARE: -- compares this run's current scalar values
+        against the most recent PREVIOUS run recorded for this project (a
+        "run" is one process lifetime), so a regression against last
+        time's numbers is visible without anyone having to remember them.
+        Local, per-project file -- see PulseCLI's version for the
+        additional workspace/team-shared comparison when logged in."""
+        manifest = self.get_manifest_fn() or {}
+        current_scalars = {
+            name: stats.get("latest_value") for name, stats in manifest.items()
+            if isinstance(stats, dict) and stats.get("latest_value") is not None
+        }
+        if not current_scalars:
+            return "RUNCOMPARE: no scalar values recorded yet this run."
+
+        history = _load_run_history(self.script_path)
+        previous = next((r for r in reversed(history) if r.get("run_id") != self._run_id), None)
+
+        this_entry = next((r for r in history if r.get("run_id") == self._run_id), None)
+        if this_entry is None:
+            this_entry = {"run_id": self._run_id, "started": time.time()}
+            history.append(this_entry)
+        this_entry["updated"] = time.time()
+        this_entry["scalars"] = current_scalars
+        history = history[-10:]
+        try:
+            with open(_run_history_path(self.script_path), "w", encoding="utf-8") as f:
+                json.dump(history, f)
+        except OSError:
+            pass
+
+        if previous is None:
+            return "RUNCOMPARE: no prior run recorded for this project yet -- this run is now the baseline for future RUNCOMPARE calls."
+
+        prev_scalars = previous.get("scalars", {})
+        lines = []
+        for name, cur_val in current_scalars.items():
+            prev_val = prev_scalars.get(name)
+            if prev_val is None or cur_val is None:
+                continue
+            delta = cur_val - prev_val
+            pct = f" ({delta / prev_val * 100:+.2f}%)" if prev_val else ""
+            lname = name.lower()
+            got_worse = (("loss" in lname or "err" in lname) and delta > 0) or ("acc" in lname and delta < 0)
+            flag = "  <- worse than last run" if got_worse else ""
+            lines.append(f"  {name}: {prev_val:.6g} -> {cur_val:.6g}  (delta {delta:+.6g}{pct}){flag}")
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(previous.get("updated", previous.get("started", 0))))
+        if not lines:
+            return f"RUNCOMPARE: found a previous run (last updated {when}) but no overlapping scalar names to compare."
+        return f"RUNCOMPARE vs previous run (last updated {when}):\n" + "\n".join(lines)
+
+    def _run_cost(self):
+        """COST: -- running token/cost usage for this chat session's
+        agent calls, accumulated across every pipeline pass (LOCATE/
+        ANALYZE/DEVELOP/VERIFY/SWEEP), not just the current question."""
+        u = self._token_usage
+        if u["calls"] == 0:
+            return "COST: no agent calls recorded yet this session."
+        lines = [
+            f"  agent calls: {u['calls']}",
+            f"  prompt tokens: {u['prompt_tokens']:,}",
+            f"  completion tokens: {u['completion_tokens']:,}",
+            f"  total tokens: {u['total_tokens']:,}",
+        ]
+        if u["cost_usd"] > 0:
+            lines.append(f"  estimated cost: ${u['cost_usd']:.4f}")
+        else:
+            lines.append("  estimated cost: unavailable (no pricing data for this model/provider)")
+        return "COST (this session so far):\n" + "\n".join(lines)
+
+    def _apply_new_directives(self, requests):
+        """Deterministically service the extended toolset (see
+        _extract_new_directives) the same way _apply_directives handles
+        CALC/PROMOTE/GREP/VIEW -- pure computation/file-reading/subprocess
+        round-trip only, safe to run on the background request thread."""
+        notes = []
+        for symbol in requests.get("defof", []):
+            notes.append(self._run_defof(symbol))
+        for symbol in requests.get("callers", []):
+            notes.append(self._run_callers(symbol))
+        if "depgraph" in requests:
+            notes.append(self._run_depgraph())
+        for arg in requests.get("corr", []):
+            notes.append(self._run_corr(arg))
+        for var in requests.get("outlier", []):
+            notes.append(self._run_outlier(var))
+        for arg in requests.get("diffstats", []):
+            notes.append(self._run_diffstats(arg))
+        for var in requests.get("histogram", []):
+            notes.append(self._run_histogram(var))
+        for arg in requests.get("doclookup", []):
+            notes.append(self._run_doclookup(arg))
+        if "changelog" in requests:
+            notes.append(self._run_changelog())
+        if "gpustatus" in requests:
+            notes.append(self._run_gpustatus())
+        if "mllint" in requests:
+            notes.append(self._run_mllint())
+        for var in requests.get("rankdiverge", []):
+            notes.append(self._run_rankdiverge(var))
+        if "runcompare" in requests:
+            notes.append(self._run_runcompare())
+        if "cost" in requests:
+            notes.append(self._run_cost())
+        for arg in requests.get("rollback", []):
+            notes.append(self._run_rollback(arg))
+        for query in requests.get("pastfix", []):
+            notes.append(self._run_pastfix(query))
+
+        exec_kinds = (("dryrun", "DRYRUN"), ("repl", "REPL"), ("replay", "REPLAY"),
+                      ("gradcheck", "GRADCHECK"), ("shapetrace", "SHAPETRACE"),
+                      ("layerstats", "LAYERSTATS"), ("hardexamples", "HARDEXAMPLES"),
+                      ("ampstatus", "AMPSTATUS"), ("seedcheck", "SEEDCHECK"))
+        for req_key, kind in exec_kinds:
+            if req_key not in requests:
+                continue
+            if not self.exec_fn:
+                notes.append(f"{kind}: execution tooling isn't available in this session (no live training process bridge).")
+                continue
+            for arg in requests[req_key]:
+                notes.append(self.exec_fn(kind, arg))
+
+        return "\n\n".join(n for n in notes if n)
+
+    def _apply_directives(self, calc_exprs, promote_names, grep_patterns=None, view_requests=None):
+        """Deterministically compute any CALC: expressions, figure out
+        which PROMOTE: names match a currently-known variable, and run any
+        GREP:/VIEW: requests. Pure computation/file-reading only -- no Tk
+        calls -- so this is safe to run on the background request thread.
+        Returns (note_text, calc_lines, promoted_names) for the caller to
+        display/apply on the main thread; GREP/VIEW results are folded
+        into note_text (and so into the agent's own history) rather than
+        surfaced as separate return values, since nothing on the main
+        thread needs to act on them the way it does for promotions.
         """
         calc_lines = ""
         if calc_exprs:
@@ -1841,6 +4243,12 @@ class ChatPanel(tk.Frame):
             notes.append(f"Pulse computed these deterministically -- use these exact values:\n{calc_lines}")
         if promoted:
             notes.append(f"Promoted to full tracking: {', '.join(promoted)}.")
+        if grep_patterns:
+            for pattern in grep_patterns:
+                notes.append(self._run_grep(pattern))
+        if view_requests:
+            for arg in view_requests:
+                notes.append(self._run_view(arg))
 
         return "\n\n".join(notes), calc_lines, promoted
 
@@ -2000,87 +4408,184 @@ class ChatPanel(tk.Frame):
         call (_depth == 0) restarts the training process afterward, once,
         if any fix landed anywhere in the (possibly recursive) chain.
         """
+        try:
+            if _depth == 0:
+                self._fix_applied_this_turn = False
+                self._last_call_failed_transiently = False
+            model_name = PROVIDERS[provider_name]["model"]
+            context = self._build_context(include_code=include_code)
+            base_text = f"{context}\nQuestion: {question}"
+            images = self._image_payloads()
+
+            self.history.append({"role": "user", "content": [{"type": "text", "text": base_text}] + images})
+
+            wants_implementation = include_code and any(
+                kw in question.lower() for kw in _IMPLEMENT_KEYWORDS
+            )
+
+            # Pass 1: locate the region(s) of the error.
+            self.after(0, lambda: self._set_stage("Reading for region of error"))
+            regions = self._call_model(model_name, f"{base_text}\n\n{_PASS1_LOCATE}", images, max_tokens=200)
+            self.after(0, lambda: self._append("Pulse (1 · Region of error)", regions))
+
+            # Pass 2: focused second read + diagnosis/reasoning.
+            self.after(0, lambda: self._set_stage("Analyzing"))
+            raw_analysis = self._call_model(model_name, _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=700)
+            analysis, calc_exprs, promote_names, grep_patterns, view_requests = _extract_directives(raw_analysis)
+            analysis, new_requests = _extract_new_directives(analysis)
+            self.after(0, lambda: self._append("Pulse (2 · Diagnosis & reasoning)", analysis))
+
+            directive_note = ""
+            if calc_exprs or promote_names or grep_patterns or view_requests:
+                directive_note, calc_lines, promoted = self._apply_directives(
+                    calc_exprs, promote_names, grep_patterns, view_requests
+                )
+                if calc_lines:
+                    self.after(0, lambda: self._append("Pulse (verified calculations)", calc_lines))
+                for target in promoted:
+                    self.after(0, lambda t=target: self.promote_fn(t))
+                if promoted:
+                    promoted_str = ", ".join(promoted)
+                    self.after(0, lambda s=promoted_str: self._append("Pulse", f"⚙ Promoted to full tracking (agent request): {s}"))
+                if directive_note:
+                    self.history.append({"role": "user", "content": [{"type": "text", "text": directive_note}]})
+
+            if new_requests:
+                new_note = self._apply_new_directives(new_requests)
+                if new_note:
+                    self.after(0, lambda n=new_note: self._append("Pulse (tool results)", n))
+                    self.history.append({"role": "user", "content": [{"type": "text", "text": new_note}]})
+
+            full_answer = f"{regions}\n\n{analysis}"
+
+            if not wants_implementation:
+                self.after(0, lambda: self._set_stage("Developing fix"))
+                fix_text = self._call_model(model_name, _PASS3_FIX_TEXT, max_tokens=300)
+                self.after(0, lambda: self._set_stage(None))
+                full_answer += f"\n\n{fix_text}"
+                self.after(0, lambda: self._append("Pulse (3 · Fix)", fix_text))
+                self.history.append({"role": "assistant", "content": full_answer})
+                return
+
+            # Pass 3: develop and implement the fix.
+            self.after(0, lambda: self._set_stage("Developing & implementing fix"))
+            fix_answer = self._call_model(model_name, _PASS3_IMPLEMENT, max_tokens=4000)
+            fix = self._parse_code_fix(fix_answer)
+            if fix is None:
+                self.after(0, lambda: self._set_stage(None))
+                full_answer += f"\n\n{fix_answer}"
+                self.after(0, lambda: self._append("Pulse (3 · Fix)", fix_answer))
+                self.history.append({"role": "assistant", "content": full_answer})
+                return
+
+            # Pass 4: verify the fix's math/logic before handing it to the
+            # user; revise and re-check on failure (bounded retries).
+            fix, verify_ok, verify_reason = self._verify_fix_with_retries(model_name, fix)
+            status = "passed" if verify_ok else "did not clearly pass -- applying best effort"
+            self.after(0, lambda: self._append("Pulse (4 · Verification)", f"{status}: {verify_reason}"))
+
+            self.after(0, lambda: self._set_stage(None))
+            self.history.append({"role": "assistant", "content": full_answer})
+
+            write_lines, applied_by_path, _originals, skipped = self._write_code_fix(fix)
+
+            # If any snippet failed to match (verbatim or fuzzy), give the
+            # model ONE chance to re-quote the exact text before reporting
+            # a miss -- a weaker model is much more likely to slightly
+            # misquote a snippet than to have picked the wrong fix
+            # entirely, and this is the cheapest place to recover that
+            # without re-running the whole diagnosis.
+            if skipped and self._path_for_label:
+                retry_fix = self._request_corrected_snippets(model_name, fix, skipped)
+                if retry_fix is not None:
+                    retry_write_lines, retry_applied, _retry_orig, retry_skipped = self._write_code_fix(retry_fix)
+                    if retry_applied:
+                        # Merge: keep whatever landed on the first pass,
+                        # add whatever landed on the retry (concatenating
+                        # per-file change lists rather than overwriting,
+                        # in case both passes touched the same file).
+                        write_lines = write_lines + "\n\n(retry after correcting a snippet mismatch)\n" + retry_write_lines
+                        for p, changes in retry_applied.items():
+                            applied_by_path[p] = applied_by_path.get(p, []) + changes
+                        skipped = retry_skipped
+
+            self.after(0, lambda: self._append("Pulse", write_lines))
+            if applied_by_path:
+                self._fix_applied_this_turn = True
+
+            # Pass 5 (+ 6): only worth a full re-read if a fix actually landed.
+            if applied_by_path and _depth < 3:
+                self._run_sweep_and_maybe_recurse(model_name, include_code, provider_name, _depth)
+
+            if _depth == 0 and self._fix_applied_this_turn and self.restart_fn:
+                self.after(0, lambda: self._append("Pulse", "⚙ Restarting the training loop to pick up the fix..."))
+                self.restart_fn(provider_name)
+        except AgentRequestFailed as exc:
+            # Whichever pass hit this, stop the pipeline right here rather
+            # than let a raw failure get treated as a real diagnosis/fix
+            # downstream. Queuing for a background retry (rather than just
+            # printing and dropping it) happens in the thin wrapper that
+            # spawns _ask -- see _ask_and_maybe_retry.
+            msg = f"⚠ AI agent request failed: {exc}"
+            self.after(0, lambda m=msg: self._append("Pulse", m))
+            self.history.append({"role": "assistant", "content": msg})
+            if _depth == 0:
+                self._last_call_failed_transiently = True
+
+    def _ask_and_maybe_retry(self, question, include_code, provider_name, _depth=0):
+        """Thin wrapper around _ask -- every _ask spawn site calls this
+        instead, so a transient failure gets queued for a background
+        retry (see _queue_agent_retry) rather than just printed and
+        dropped. Recursive sweep-pass calls (_depth > 0) are invoked
+        directly by _ask itself via _run_sweep_and_maybe_recurse, not
+        through here, so only top-level asks are ever queued."""
+        self._ask(question, include_code, provider_name, _depth)
         if _depth == 0:
-            self._fix_applied_this_turn = False
+            if self._last_call_failed_transiently:
+                self._queue_agent_retry(question, include_code, provider_name)
+            elif self._pending_agent_retry and self._pending_agent_retry.get("question") == question:
+                self._pending_agent_retry = None
 
-        model_name = PROVIDERS[provider_name]["model"]
-        context = self._build_context(include_code=include_code)
-        base_text = f"{context}\nQuestion: {question}"
-        images = self._image_payloads()
+    def _queue_agent_retry(self, question, include_code, provider_name):
+        """Called when a top-level ask failed only because of a transient
+        agent-side error after exhausting _call_model's own in-call
+        retries. Kept and retried again later on a backoff instead of
+        lost for good, while training keeps going untouched in the
+        meantime."""
+        existing = self._pending_agent_retry
+        backoff = 60.0
+        if existing and existing.get("question") == question:
+            backoff = min(existing.get("backoff", 60.0) * 2, 600.0)
+        self._pending_agent_retry = {
+            "question": question, "include_code": include_code, "provider_name": provider_name,
+            "next_attempt": time.time() + backoff, "backoff": backoff,
+        }
+        msg = (f"⚠ Will retry this request again in ~{backoff:.0f}s (agent request hit a rate limit/"
+               "transient error) -- training continues unaffected in the meantime.")
+        self.after(0, lambda m=msg: self._append("Pulse", m))
+        self._ensure_retry_ticker()
 
-        self.history.append({"role": "user", "content": [{"type": "text", "text": base_text}] + images})
-
-        wants_implementation = include_code and any(
-            kw in question.lower() for kw in _IMPLEMENT_KEYWORDS
-        )
-
-        # Pass 1: locate the region(s) of the error.
-        self.after(0, lambda: self._set_stage("Reading for region of error"))
-        regions = self._call_model(model_name, f"{base_text}\n\n{_PASS1_LOCATE}", images, max_tokens=200)
-        self.after(0, lambda: self._append("Pulse (1 · Region of error)", regions))
-
-        # Pass 2: focused second read + diagnosis/reasoning.
-        self.after(0, lambda: self._set_stage("Analyzing"))
-        raw_analysis = self._call_model(model_name, _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=700)
-        analysis, calc_exprs, promote_names = _extract_directives(raw_analysis)
-        self.after(0, lambda: self._append("Pulse (2 · Diagnosis & reasoning)", analysis))
-
-        directive_note = ""
-        if calc_exprs or promote_names:
-            directive_note, calc_lines, promoted = self._apply_directives(calc_exprs, promote_names)
-            if calc_lines:
-                self.after(0, lambda: self._append("Pulse (verified calculations)", calc_lines))
-            for target in promoted:
-                self.after(0, lambda t=target: self.promote_fn(t))
-            if promoted:
-                promoted_str = ", ".join(promoted)
-                self.after(0, lambda s=promoted_str: self._append("Pulse", f"⚙ Promoted to full tracking (agent request): {s}"))
-            if directive_note:
-                self.history.append({"role": "user", "content": [{"type": "text", "text": directive_note}]})
-
-        full_answer = f"{regions}\n\n{analysis}"
-
-        if not wants_implementation:
-            self.after(0, lambda: self._set_stage("Developing fix"))
-            fix_text = self._call_model(model_name, _PASS3_FIX_TEXT, max_tokens=300)
-            self.after(0, lambda: self._set_stage(None))
-            full_answer += f"\n\n{fix_text}"
-            self.after(0, lambda: self._append("Pulse (3 · Fix)", fix_text))
-            self.history.append({"role": "assistant", "content": full_answer})
+    def _ensure_retry_ticker(self):
+        """Starts the one background thread that periodically retries
+        whatever's in self._pending_agent_retry, if anything. Lazily
+        started on first need, idempotent."""
+        if self._retry_ticker_started:
             return
+        self._retry_ticker_started = True
 
-        # Pass 3: develop and implement the fix.
-        self.after(0, lambda: self._set_stage("Developing & implementing fix"))
-        fix_answer = self._call_model(model_name, _PASS3_IMPLEMENT, max_tokens=4000)
-        fix = self._parse_code_fix(fix_answer)
-        if fix is None:
-            self.after(0, lambda: self._set_stage(None))
-            full_answer += f"\n\n{fix_answer}"
-            self.after(0, lambda: self._append("Pulse (3 · Fix)", fix_answer))
-            self.history.append({"role": "assistant", "content": full_answer})
-            return
+        def _loop():
+            while True:
+                time.sleep(15.0)
+                pending = self._pending_agent_retry
+                if pending and time.time() >= pending["next_attempt"]:
+                    msg = "⚙ Retrying an earlier request that hit a rate limit/transient error..."
+                    self.after(0, lambda m=msg: self._append("Pulse", m))
+                    try:
+                        self._ask_and_maybe_retry(pending["question"], pending["include_code"], pending["provider_name"])
+                    except Exception:
+                        pass
 
-        # Pass 4: verify the fix's math/logic before handing it to the
-        # user; revise and re-check on failure (bounded retries).
-        fix, verify_ok, verify_reason = self._verify_fix_with_retries(model_name, fix)
-        status = "passed" if verify_ok else "did not clearly pass -- applying best effort"
-        self.after(0, lambda: self._append("Pulse (4 · Verification)", f"{status}: {verify_reason}"))
-
-        self.after(0, lambda: self._set_stage(None))
-        self.history.append({"role": "assistant", "content": full_answer})
-
-        write_lines, applied_by_path, _originals = self._write_code_fix(fix)
-        self.after(0, lambda: self._append("Pulse", write_lines))
-        if applied_by_path:
-            self._fix_applied_this_turn = True
-
-        # Pass 5 (+ 6): only worth a full re-read if a fix actually landed.
-        if applied_by_path and _depth < 3:
-            self._run_sweep_and_maybe_recurse(model_name, include_code, provider_name, _depth)
-
-        if _depth == 0 and self._fix_applied_this_turn and self.restart_fn:
-            self.after(0, lambda: self._append("Pulse", "⚙ Restarting the training loop to pick up the fix..."))
-            self.restart_fn(provider_name)
+        threading.Thread(target=_loop, daemon=True).start()
 
     @staticmethod
     def _parse_code_fix(answer):
@@ -2190,10 +4695,13 @@ class ChatPanel(tk.Frame):
         contents; snippets that don't match cleanly, or whose file can't be
         resolved, are skipped and reported rather than guessed at.
 
-        Returns (display_text, applied_by_path, originals): applied_by_path
-        maps touched file path -> [(old, new), ...] (empty if nothing
-        landed); originals maps path -> its content before this edit, kept
-        around in case a manual revert is ever needed.
+        Returns (display_text, applied_by_path, originals, skipped):
+        applied_by_path maps touched file path -> [(old, new), ...] (empty
+        if nothing landed); originals maps path -> its content before this
+        edit, kept around in case a manual revert is ever needed; skipped
+        is a list of (old, file_label_or_path, reason) for snippets that
+        couldn't be matched/applied, so the caller can decide whether to
+        ask the agent for a corrected snippet and retry.
         """
         by_path = {}
         unresolved = []
@@ -2205,13 +4713,14 @@ class ChatPanel(tk.Frame):
             by_path.setdefault(path, []).append((old, new))
 
         if not by_path and not unresolved:
-            return "(Proposed a code fix with nothing to apply.)", {}, {}
+            return "(Proposed a code fix with nothing to apply.)", {}, {}, []
 
         lines = []
         if fix["explanation"]:
             lines.append(f"**Explanation:** {fix['explanation']}")
 
         originals = {}
+        after_by_path = {}
         applied_by_path = {}
         skipped = []
 
@@ -2229,14 +4738,42 @@ class ChatPanel(tk.Frame):
             for old, new in pairs:
                 count = content.count(old)
                 if count == 1:
-                    content = content.replace(old, new, 1)
+                    content = content.replace(old, _banner_wrap_fix(old, new, path), 1)
                     applied.append((old, new))
-                elif count == 0:
-                    skipped.append((old, path, "no exact match found in the file"))
+                    continue
+                if count == 0:
+                    # Fallback: the agent may have reproduced the right
+                    # lines with slightly different indentation or an
+                    # extra/missing blank line -- a weaker model does this
+                    # far more often than it gets the actual tokens wrong.
+                    # Only take this path when a whitespace-normalized
+                    # match is unambiguous (exactly one span in the file);
+                    # otherwise fall through to reporting it as unmatched
+                    # rather than guessing.
+                    span = _find_fuzzy_snippet_span(content, old)
+                    if span is not None:
+                        start, end = span
+                        actual_old = content[start:end]
+                        content = content[:start] + _banner_wrap_fix(actual_old, new, path) + content[end:]
+                        applied.append((actual_old, new))
+                    else:
+                        skipped.append((old, path, "no exact match found in the file"))
                 else:
                     skipped.append((old, path, f"matched {count} times (ambiguous), skipped for safety"))
 
             if not applied:
+                continue
+
+            # Automatic gate -- NOT model-invoked, runs regardless of what
+            # directives the model used. Syntax/AST validation (always)
+            # plus a real lint pass (pyflakes, if importable) on the FULL
+            # proposed file content, before anything touches disk.
+            lint_ok, lint_messages = self._lint_check(content, path)
+            if not lint_ok:
+                lines.append(
+                    f"⚠ Fix for '{path}' failed the automatic syntax/lint gate and was NOT written:\n"
+                    + "\n".join(lint_messages)
+                )
                 continue
 
             try:
@@ -2248,6 +4785,9 @@ class ChatPanel(tk.Frame):
 
             originals[path] = original_content
             applied_by_path[path] = applied
+            after_by_path[path] = content
+            for old, new in applied:
+                self._append_fixlog(path, old, new, fix.get("explanation", ""))
             if path == self.script_path and self.on_code_change:
                 self.on_code_change(content)
 
@@ -2258,7 +4798,7 @@ class ChatPanel(tk.Frame):
             lines.append("\n⚠ No changes were applied -- none of the proposed snippets matched cleanly:")
             for old, where, reason in skipped:
                 lines.append(f"  - [{os.path.basename(str(where))}] {reason}: `{old.splitlines()[0][:80]}...`")
-            return "\n".join(lines), {}, {}
+            return "\n".join(lines), {}, {}, skipped
 
         for path, applied in applied_by_path.items():
             lines.append(f"\n✓ Applied {len(applied)} change(s) to `{os.path.basename(path)}`:")
@@ -2271,7 +4811,68 @@ class ChatPanel(tk.Frame):
             for old, where, reason in skipped:
                 lines.append(f"  - [{os.path.basename(str(where))}] {reason}: `{old.splitlines()[0][:80]}...`")
 
-        return "\n".join(lines), applied_by_path, originals
+        commit_files = {p: (originals[p], after_by_path[p]) for p in applied_by_path}
+        commit_id = _record_fix_history_commit(self.script_path, commit_files, fix.get("explanation") or "(no explanation given)")
+        if commit_id:
+            self._last_commit_id = commit_id
+            lines.append(f"\n📝 Logged as commit {commit_id} in .pulse_history/ -- send `ROLLBACK: {commit_id}` (or ROLLBACK: last) to undo.")
+
+        return "\n".join(lines), applied_by_path, originals, skipped
+
+    def _request_corrected_snippets(self, model_name, fix, skipped):
+        """One bounded retry for snippets that failed to match (verbatim
+        or fuzzy) in _write_code_fix. Shows the model the actual current
+        content of each affected file plus exactly which of its own "old"
+        snippets didn't match and why, and asks ONLY for corrected old/new
+        pairs for those -- not a full re-diagnosis. Returns a fix dict
+        covering just the corrected entries, or None if nothing could be
+        recovered (unparsable response, or no snippets left worth
+        retrying)."""
+        if not skipped:
+            return None
+
+        # Ambiguous-match skips ("matched N times") aren't a quoting
+        # mistake -- retrying with the same or a re-guessed snippet is
+        # just as likely to be ambiguous again, so only retry the
+        # genuinely-not-found cases.
+        retryable = [(old, label) for old, label, reason in skipped if "no exact match" in reason]
+        if not retryable:
+            return None
+
+        file_blocks = []
+        seen_paths = set()
+        for old, label in retryable:
+            path = self._resolve_fix_path(label)
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    file_blocks.append(f"--- current content of {os.path.basename(path)} ---\n{f.read()}")
+            except OSError:
+                continue
+
+        if not file_blocks:
+            return None
+
+        mismatch_lines = "\n".join(
+            f"- targeting '{label or self.script_path}': your snippet did not match anywhere in that "
+            f"file's current content:\n{old}"
+            for old, label in retryable
+        )
+        prompt = (
+            "CORRECTION: some of the exact snippets you proposed did not match the file's actual "
+            "current content (below), so nothing was changed for them. This is almost always a "
+            "quoting mistake (wrong indentation, a missing/extra blank line, or slightly different "
+            "text) rather than a wrong diagnosis -- do NOT change what the fix does, just re-quote "
+            "the 'old' text EXACTLY as it appears in the file content shown below.\n\n"
+            + "\n\n".join(file_blocks)
+            + f"\n\nSnippets that didn't match:\n{mismatch_lines}\n\n"
+            "Respond with ONLY a corrected code-fix JSON object (old/new/files/explanation) covering "
+            "just these snippets -- no prose, no markdown fences."
+        )
+        answer = self._call_model(model_name, prompt, max_tokens=4000)
+        return self._parse_code_fix(answer)
 
     def report_training_trouble(self, problem):
         """Called by the Dashboard when auto-intervention detects training
@@ -2302,7 +4903,23 @@ class ChatPanel(tk.Frame):
             "Please diagnose the root cause and, if you can, fix it."
         )
         self._append("You (training auto-paused)", "(auto-reported by Pulse)")
-        threading.Thread(target=self._ask, args=(question, True, current_provider), daemon=True).start()
+        threading.Thread(target=self._ask_and_maybe_retry, args=(question, True, current_provider), daemon=True).start()
+
+    _TB_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+)')
+
+    def _last_user_frame(self, tb_text):
+        """Return (file, line) of the deepest traceback frame that belongs
+        to the tracked script, so a crash report can lead with 'line N'
+        instead of making the user hunt through the whole traceback for
+        it. Falls back to the deepest frame overall if none match."""
+        matches = self._TB_FRAME_RE.findall(tb_text)
+        if not matches:
+            return None
+        if self.script_path:
+            own = [m for m in matches if os.path.abspath(m[0]) == os.path.abspath(self.script_path)]
+            if own:
+                return own[-1]
+        return matches[-1]
 
     def report_script_error(self, tb_text):
         """Called by the Dashboard when it finds a crash file: the user's
@@ -2314,9 +4931,11 @@ class ChatPanel(tk.Frame):
         question would. The fix still can't un-crash the process that
         already exited, but it means the *next* run has a shot at working.
         """
+        frame_info = self._last_user_frame(tb_text)
+        header = f"⚠ Error at {os.path.basename(frame_info[0])}, line {frame_info[1]}\n\n" if frame_info else ""
         self._append(
             "Pulse",
-            "⚠ Your script crashed with an uncaught exception (the process has already exited). "
+            f"{header}⚠ Your script crashed with an uncaught exception (the process has already exited). "
             f"Here's the traceback:\n\n```\n{tb_text}\n```",
         )
 
@@ -2334,7 +4953,48 @@ class ChatPanel(tk.Frame):
             "Please diagnose the root cause and, if you can, fix it."
         )
         self._append("You (script crashed)", "(auto-reported by Pulse)")
-        threading.Thread(target=self._ask, args=(question, True, current_provider), daemon=True).start()
+        threading.Thread(target=self._ask_and_maybe_retry, args=(question, True, current_provider), daemon=True).start()
+
+    def report_restart_failure(self, failure):
+        """Called by the Dashboard when a fix-triggered restart's
+        replacement process crashed immediately (nonzero exit) instead of
+        picking up training. Unlike the old behavior of blindly retrying
+        the exact same broken code (or giving up and leaving the run on
+        stale in-memory code), this hands the failure's stdout/stderr
+        straight back to the agent so it can fix the CURRENT code rather
+        than starting the diagnosis over from scratch. If a new fix lands,
+        `_ask` will trigger another restart via `restart_fn` the same way
+        as any other fix -- persistent_tracer's RESTART handler (which is
+        still alive, since a failed attempt no longer tears the process
+        down) picks that up and tries again.
+        """
+        returncode = failure.get("returncode")
+        stdout = failure.get("stdout", "")
+        stderr = failure.get("stderr", "")
+        self._append(
+            "Pulse",
+            f"⚠ The restarted training process crashed immediately (exit code {returncode}) instead of "
+            f"picking up the fix. Feeding this back to the agent to fix the current code:\n\n"
+            f"```\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}\n```",
+        )
+
+        current_provider = self.provider_var.get()
+        if not self._has_active_key(current_provider):
+            self._append(
+                "Pulse",
+                "Pick a provider and enter an API key above, then ask me to fix this and I'll take a look.",
+            )
+            return
+
+        question = (
+            f"The fix you just applied caused the restarted training process to crash immediately with "
+            f"exit code {returncode}. Its output:\n\nSTDOUT:\n{stdout or '(empty)'}\n\n"
+            f"STDERR:\n{stderr or '(empty)'}\n\n"
+            "This is the same bug context as before -- fix the CURRENT code (shown below) directly. Do "
+            "not restart the diagnosis from scratch, and do not reintroduce whatever change just failed."
+        )
+        self._append("You (restart failed)", "(auto-reported by Pulse)")
+        threading.Thread(target=self._ask_and_maybe_retry, args=(question, True, current_provider), daemon=True).start()
 
 
 # ============================================================================
@@ -2350,15 +5010,22 @@ class Dashboard:
     THUMB_SIZE = (170, 170)
     COLS = 3
 
-    def __init__(self, session_id, display_configs, code_text=None, config_queue=None, control_queue=None, known_names=None, script_path=None, var_states=None, extra_files=None, initial_provider=None):
+    def __init__(self, session_id, display_configs, code_text=None, config_queue=None, control_queue=None, known_names=None, script_path=None, var_states=None, extra_files=None, initial_provider=None, response_queue=None, dist_info=None):
         self.session_id = session_id
         self.cache = session_dir(session_id)
         self.manifest_path = os.path.join(self.cache, "manifest.json")
         self.crash_path = os.path.join(self.cache, "crash.json")
         self._crash_reported = False
+        self.restart_failure_path = os.path.join(self.cache, "restart_failure.json")
         self.display_configs = display_configs
         self.config_queue = config_queue
         self.control_queue = control_queue
+        self.response_queue = response_queue
+        self._exec_req_counter = itertools.count()
+        # (rank, local_rank, world_size, session_key) -- see
+        # _distributed_info in auto_track(). world_size == 1 (the default)
+        # means an ordinary single-process/single-GPU run.
+        self.dist_info = dist_info or (0, 0, 1, None)
         self.code_text = code_text
         self.script_path = script_path
         self.extra_files = dict(extra_files or {})
@@ -2437,7 +5104,9 @@ class Dashboard:
             get_extra_files_fn=lambda: self.extra_files,
             initial_provider=self.initial_provider,
             restart_fn=self._restart_training,
+            exec_fn=self._exec_request,
         )
+        self.chat_panel.dist_info = self.dist_info
         self.chat_panel.pack(fill=tk.BOTH, expand=True)
 
         self.hidden_tiles = set()
@@ -2480,11 +5149,30 @@ class Dashboard:
             except Exception:
                 pass
 
+        if os.path.exists(self.restart_failure_path):
+            # Consumed (removed) immediately after reading rather than a
+            # boolean "already reported" flag like crash.json -- a restart
+            # can legitimately fail more than once per run (agent's second
+            # fix attempt also crashes), and each occurrence should still
+            # reach the agent.
+            try:
+                with open(self.restart_failure_path, "r", encoding="utf-8") as f:
+                    failure = json.load(f)
+                os.remove(self.restart_failure_path)
+                self.chat_panel.report_restart_failure(failure)
+            except Exception:
+                pass
+
         manifest = self._load_manifest()
         self._manifest = manifest
 
         if self.auto_intervene.get() and not self.is_paused:
             problem = self._check_for_trouble(manifest)
+            _pulse_log(
+                f"GUI AUTO_GATE enabled={self.auto_intervene.get()} paused={self.is_paused} "
+                f"manifest_count={len(manifest)} problem={problem!r}",
+                console=True,
+            )
             if problem and problem != self._last_intervention_signature:
                 self._last_intervention_signature = problem
                 self._trigger_auto_intervention(problem)
@@ -2631,12 +5319,31 @@ class Dashboard:
         return "; ".join(reasons) if reasons else None
 
     def _trigger_auto_intervention(self, problem):
-        """Pause the user's training loop (via control_queue -- see
-        persistent_tracer's PAUSE/RESUME handling in pulse.py) and
-        automatically hand the problem to the agent to diagnose and, if it
-        can, fix -- without waiting for the user to notice and ask.
+        """Pause the user's training loop and hand the problem to the agent.
+
+        The Dashboard owns the Tk UI, while the training loop lives in this
+        process. Therefore the pause has to be explicitly sent through
+        control_queue. Previously this method only called
+        report_training_trouble(), even though its docstring claimed the loop
+        had already been paused. That made GUI auto-intervention advisory
+        rather than an actual intervention.
         """
-        # Auto-diagnostics must never block the training process.
+        self.is_paused = True
+
+        # Tell the training process to stop at its next trace boundary BEFORE
+        # starting the agent thread. That way the agent sees a genuinely
+        # paused run, even if the model request takes a while.
+        if self.control_queue is not None:
+            try:
+                self.control_queue.put(("PAUSE", None))
+            except Exception:
+                pass
+
+        if not self.pause_banner.winfo_ismapped():
+            self.pause_label.configure(text=f"Auto-paused: {problem}")
+            self.pause_banner.pack(fill=tk.X, side=tk.TOP, before=self.canvas)
+
+        # Auto-diagnostics must never block the Tk main thread.
         self.chat_panel.report_training_trouble(problem)
 
     def _resume_training(self):
@@ -2649,6 +5356,48 @@ class Dashboard:
                 pass
         if self.pause_banner.winfo_ismapped():
             self.pause_banner.pack_forget()
+
+    def _exec_request(self, kind, arg):
+        """Bridge for the chat panel's execution directives (REPL/DRYRUN/
+        SHAPETRACE/GRADCHECK/REPLAY) -- called from ChatPanel's background
+        request thread (see _apply_new_directives), never from the Tk main
+        thread, so blocking here is safe. Sends an EXEC message to the
+        training process via control_queue (drained in persistent_tracer,
+        which actually runs it against the live frame -- see
+        _handle_exec_request) and blocks on response_queue for the
+        matching request id, with a bounded timeout so a stuck training
+        process can't hang the chat panel forever.
+        """
+        if self.control_queue is None or self.response_queue is None:
+            return f"{kind}: execution tooling isn't available (no live training process bridge in this run)."
+        req_id = next(self._exec_req_counter)
+        try:
+            self.control_queue.put(("EXEC", req_id, kind, arg))
+        except Exception as exc:
+            return f"{kind} '{arg}': couldn't reach the training process ({exc})."
+
+        deadline = time.time() + 20.0
+        pending = []
+        while time.time() < deadline:
+            remaining = max(0.05, deadline - time.time())
+            try:
+                resp_id, result = self.response_queue.get(timeout=remaining)
+            except Exception:
+                break
+            if resp_id == req_id:
+                for leftover in pending:
+                    try:
+                        self.response_queue.put(leftover)
+                    except Exception:
+                        pass
+                return result
+            pending.append((resp_id, result))
+        for leftover in pending:
+            try:
+                self.response_queue.put(leftover)
+            except Exception:
+                pass
+        return f"{kind} '{arg}': timed out waiting for the training process to respond."
 
     def _restart_training(self, provider_name):
         """Called by the chat panel right after a code fix has been
@@ -3019,8 +5768,8 @@ class Dashboard:
         self.root.mainloop()
 
 
-def _run_dashboard(session_id, display_configs, code_text=None, config_queue=None, control_queue=None, known_names=None, script_path=None, var_states=None, extra_files=None, initial_provider=None):
-    Dashboard(session_id, display_configs, code_text=code_text, config_queue=config_queue, control_queue=control_queue, known_names=known_names, script_path=script_path, var_states=var_states, extra_files=extra_files, initial_provider=initial_provider).run()
+def _run_dashboard(session_id, display_configs, code_text=None, config_queue=None, control_queue=None, known_names=None, script_path=None, var_states=None, extra_files=None, initial_provider=None, response_queue=None, dist_info=None):
+    Dashboard(session_id, display_configs, code_text=code_text, config_queue=config_queue, control_queue=control_queue, known_names=known_names, script_path=script_path, var_states=var_states, extra_files=extra_files, initial_provider=initial_provider, response_queue=response_queue, dist_info=dist_info).run()
 
 
 # ============================================================================
@@ -3137,8 +5886,70 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
     global _debugger_bg, _session_id
     mp.freeze_support()
 
+    # Multi-GPU / multi-process launch detection (torchrun,
+    # torch.distributed.launch, OpenMPI, Slurm) -- world_size > 1 means
+    # this is one of several ranks, typically one per GPU. Only rank 0
+    # gets the interactive dashboard/chat; every rank (including rank 0)
+    # periodically publishes its own GPU status so rank 0's GPUSTATUS
+    # directive can show the whole job, not just its own device(s).
+    rank, local_rank, world_size, session_key = _distributed_info()
+    is_distributed = world_size > 1
+    is_primary_rank = rank == 0
+    if is_distributed:
+        _previously_stale_ranks = set()
+
+        def _rank_status_ticker():
+            while True:
+                scalars = {}
+                # Best-effort scalar enrichment: only available once
+                # _session_id (GUI mode) is assigned and manifest.json
+                # exists -- CLI mode enriches its own rank status
+                # separately (see PulseCLI's periodic checkpoint), since
+                # it has no manifest.json/worker process to read from here.
+                if _session_id:
+                    try:
+                        with open(os.path.join(session_dir(_session_id), "manifest.json"), "r", encoding="utf-8") as f:
+                            manifest_now = json.load(f)
+                        scalars = {
+                            name: stats.get("latest_value") for name, stats in manifest_now.items()
+                            if isinstance(stats, dict) and "latest_value" in stats
+                        }
+                    except (OSError, json.JSONDecodeError):
+                        pass
+                _write_rank_status(session_key, rank, local_rank, world_size, extra={"scalars": scalars} if scalars else None)
+
+                # Proactive hang/deadlock detection (rank 0 only, to avoid
+                # every rank printing the same alert): a rank going stale
+                # while others keep advancing is the signature of the most
+                # common real-world DDP failure mode, a collective-op
+                # deadlock -- surfaced here instead of waiting for the
+                # person to notice a frozen terminal on their own.
+                if is_primary_rank:
+                    try:
+                        statuses = _read_all_rank_status(session_key)
+                        now = time.time()
+                        stale_now = {s.get("rank") for s in statuses if now - s.get("updated", 0) > 15}
+                        newly_stale = stale_now - _previously_stale_ranks
+                        if newly_stale:
+                            print(f"[PULSE] ⚠ rank(s) {sorted(newly_stale)} of {world_size} have stopped "
+                                  f"reporting (no update in >15s) while other ranks are still active -- this "
+                                  f"is the usual signature of a collective-op deadlock/hang in distributed "
+                                  f"training. Send GPUSTATUS in chat for full per-rank detail.")
+                        _previously_stale_ranks.clear()
+                        _previously_stale_ranks.update(stale_now)
+                    except Exception:
+                        pass
+                time.sleep(5.0)
+        threading.Thread(target=_rank_status_ticker, daemon=True).start()
+
     active_mode = _determine_mode(mode)
     caller_frame = sys._getframe(1)
+    _pulse_log(
+        f"AUTO_TRACK start requested_mode={mode!r} active_mode={active_mode!r} "
+        f"caller={caller_frame.f_code.co_filename}:{caller_frame.f_lineno} "
+        f"caller_func={caller_frame.f_code.co_name!r} throttle={throttle_interval}",
+        console=True,
+    )
     root = os.path.normcase(os.path.abspath(project_root)) if project_root else None
 
     # The caller's own source file -- this is what the CLI agent's code-fix
@@ -3175,6 +5986,10 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
             total_chars += len(text)
 
     discovered = _discover_candidates(caller_frame, root)
+    _pulse_log(
+        f"DISCOVERY static/runtime candidates count={len(discovered)} "
+        f"names={sorted(discovered)!r} shapes={dict((k, v) for k, v in discovered.items() if v is not None)!r}",        console=True,
+    )
 
     runtime_shapes = {k: v for k, v in discovered.items() if v is not None}
 
@@ -3212,10 +6027,34 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
         print("[PULSE] No trackable variables found (nothing in scope, and nothing parseable in the source).")
         return
 
+    if is_distributed and not is_primary_rank:
+        # Multiple ranks racing for the same GUI window or the same
+        # terminal's stdin (CLI mode) would be actively harmful, not just
+        # redundant -- so only rank 0 gets the interactive experience.
+        # This rank still: (a) keeps publishing its GPU status via the
+        # ticker started above, so rank 0's GPUSTATUS shows it, and (b)
+        # installs an excepthook so a crash here is recorded into its
+        # status file instead of silently vanishing into a terminal no
+        # one is watching.
+        print(f"[PULSE] rank {rank}/{world_size} (local_rank {local_rank}): running headless -- "
+              f"only rank 0 opens the Pulse dashboard/chat. This rank's GPU status is still "
+              f"visible to rank 0 via the GPUSTATUS chat directive.")
+        if startup_error:
+            _write_rank_status(session_key, rank, local_rank, world_size, extra={"error": startup_error})
+
+        def _rank_excepthook(exc_type, exc_value, exc_tb):
+            formatted = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+            _write_rank_status(session_key, rank, local_rank, world_size, extra={"error": formatted})
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+        sys.excepthook = _rank_excepthook
+        return
+
     if active_mode == "cli":
         _start_cli_tracker(
             caller_frame, root, throttle_interval, discovered, runtime_shapes,
             code_text, entry_path, extra_files=extra_files, startup_error=startup_error,
+            dist_info=(rank, local_rank, world_size, session_key),
         )
         return
 
@@ -3227,9 +6066,19 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
     # happened), so both get auto-filled here instead of popping the setup
     # dialog and asking the user all over again.
     auto_provider = os.environ.pop("PULSE_AUTO_PROVIDER", None)
+    auto_custom_model = os.environ.pop("PULSE_AUTO_CUSTOM_MODEL", None)
+    auto_custom_env_key = os.environ.pop("PULSE_AUTO_CUSTOM_ENV_KEY", None)
+    # A dynamically-registered "Custom: ..." provider only ever lived in
+    # the PROVIDERS dict of the process that created it -- a fresh process
+    # starts with just the static entries, so re-register it here from
+    # what the pre-restart process carried over (see persistent_tracer's
+    # RESTART handler).
+    if auto_provider and auto_provider not in PROVIDERS and auto_custom_model:
+        PROVIDERS[auto_provider] = {"model": auto_custom_model, "env_key": auto_custom_env_key or None}
     result = None
     if auto_provider and auto_provider in PROVIDERS:
-        auto_key = os.environ.get(PROVIDERS[auto_provider]["env_key"], "").strip()
+        env_key = PROVIDERS[auto_provider].get("env_key")
+        auto_key = os.environ.get(env_key, "").strip() if env_key else "local"
         if auto_key:
             result = (auto_provider, auto_key)
             print(f"[PULSE] Resumed with agent {auto_provider} (auto-filled after restart).")
@@ -3240,7 +6089,9 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
         print("[PULSE] Setup cancelled.")
         return
     initial_provider, api_key = result
-    os.environ[PROVIDERS[initial_provider]["env_key"]] = api_key
+    env_key = PROVIDERS[initial_provider].get("env_key")
+    if env_key:
+        os.environ[env_key] = api_key
 
     # Zero-config, same as the CLI: track everything by default.
     tracked_vars = set(discovered.keys())
@@ -3257,10 +6108,15 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
     _debugger_bg = HeatmapCreatorBG(display_configs, _session_id, var_states)
     shared_config_queue = _debugger_bg.queue
     control_queue = mp.Queue()
+    # Response side of the EXEC bridge (REPL/DRYRUN/SHAPETRACE/GRADCHECK/
+    # REPLAY) -- the training process (this one) puts results here after
+    # draining an ("EXEC", req_id, kind, arg) message off control_queue;
+    # see persistent_tracer below and Dashboard._exec_request.
+    response_queue = mp.Queue()
 
     dash_process = mp.Process(
         target=_run_dashboard,
-        args=(_session_id, display_configs, code_text, shared_config_queue, control_queue, sorted(discovered), entry_path, var_states, extra_files, initial_provider),
+        args=(_session_id, display_configs, code_text, shared_config_queue, control_queue, sorted(discovered), entry_path, var_states, extra_files, initial_provider, response_queue, (rank, local_rank, world_size, session_key)),
         daemon=True,
     )
     dash_process.start()
@@ -3309,15 +6165,32 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
     # including caller_frame's own.
     _CAPTURE_SPAN = min(0.05, throttle_interval / 4 if throttle_interval > 0 else 0.05)
     window = {"open": True}  # start open so initial discovery isn't starved
+    _replay_checkpoint_counter = itertools.count()
 
     def _ticker():
         while True:
             time.sleep(throttle_interval)
             window["open"] = True
+            # REPLAY: <n_steps> needs something to roll back to -- piggyback
+            # the (already-throttled) snapshot cadence to also stash a
+            # state_dict checkpoint of anything in scope that has one.
+            try:
+                _replay_maybe_checkpoint(caller_frame, next(_replay_checkpoint_counter))
+            except Exception:
+                pass
             time.sleep(_CAPTURE_SPAN)
             window["open"] = False
 
     threading.Thread(target=_ticker, daemon=True).start()
+
+    # Total restart-launch attempts across the whole "restart storm" for
+    # this process, shared across every RESTART message persistent_tracer
+    # handles (a fresh agent re-fix can trigger another RESTART message
+    # without this process ever having exited) -- caps the total work at
+    # MAX_RESTART_ATTEMPTS regardless of how many separate RESTART
+    # messages that takes, instead of resetting the counter (and so the
+    # cap) on every individual message.
+    restart_state = {"attempts": 0}
 
     def persistent_tracer(frame, event, arg):
         while True:
@@ -3329,6 +6202,21 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
                 if msg[0] == "ADD_VAR":
                     tracked_vars.add(msg[1])
                     last_logged.pop(msg[1], None)
+                elif msg[0] == "EXEC":
+                    # ("EXEC", req_id, kind, arg) from ChatPanel's execution
+                    # directives (REPL/DRYRUN/SHAPETRACE/GRADCHECK/REPLAY)
+                    # -- run it right here against the real live frame, and
+                    # hand the result back over response_queue.
+                    _req_id, _kind, _arg = msg[1], msg[2], msg[3]
+                    try:
+                        _result = _handle_exec_request(caller_frame, _kind, _arg)
+                    except Exception:
+                        _result = f"{_kind} '{_arg}': Pulse's own dispatcher raised\n{_format_exc_short(traceback.format_exc())}"
+                    if response_queue is not None:
+                        try:
+                            response_queue.put((_req_id, _result))
+                        except Exception:
+                            pass
                 elif msg[0] == "PAUSE":
                     paused["value"] = True
                 elif msg[0] == "RESUME":
@@ -3341,56 +6229,54 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
                     # active provider is threaded through PULSE_AUTO_PROVIDER
                     # so the next run's setup auto-fills the agent and API
                     # key (already set in os.environ) instead of asking
-                    # again -- see the UI-mode setup above.
+                    # again -- see the UI-mode setup above. A dynamically
+                    # registered "Custom: ..." provider doesn't exist in a
+                    # fresh process's (static) PROVIDERS dict, so its model
+                    # string/env var are carried over too via
+                    # PULSE_AUTO_CUSTOM_MODEL/PULSE_AUTO_CUSTOM_ENV_KEY --
+                    # see auto_track()'s resume path.
                     provider_name = msg[1] if len(msg) > 1 else None
                     if provider_name:
                         os.environ["PULSE_AUTO_PROVIDER"] = provider_name
-                    try:
-                        _debugger_bg.shutdown()
-                    except Exception:
-                        pass
-                    try:
-                        dash_process.terminate()
-                    except Exception:
-                        pass
-                    sys.settrace(None)
+                        info = PROVIDERS.get(provider_name)
+                        if info and "model" in info:
+                            os.environ["PULSE_AUTO_CUSTOM_MODEL"] = info["model"]
+                            if info.get("env_key"):
+                                os.environ["PULSE_AUTO_CUSTOM_ENV_KEY"] = info["env_key"]
+
                     print("\n[PULSE] Fix applied -- restarting the training loop to pick it up...\n")
                     sys.stdout.flush()
-# Replace the final os.execv line with this:
                     script_path = getattr(sys.modules.get('__main__'), '__file__', None)
-                    
                     script_path = os.path.abspath(script_path)
-                    
 
-                    # Spawn the new process safely using subprocess (which handles spaces on Windows)
-                            # Just before os.execv or subprocess call:
-                    sys.stdout.write("\033c\033[0m") # Reset ANSI and clear screen
+                    sys.stdout.write("\033c\033[0m")  # Reset ANSI and clear screen
                     sys.stdout.flush()
                     if os.name == 'nt':
                         subprocess.run('cls', shell=True)
                     else:
-                        # Windows: Clears the screen and resets the basic console buffer
-                        # macOS/Linux: Resets raw terminal modes and clears the screen
                         subprocess.run('stty sane', shell=True)
                         subprocess.run('clear', shell=True)
+
                     # Retry the restart itself instead of falling back to
                     # "keep running the old, already-in-memory process" on
-                    # a bad exit code. A nonzero exit almost always means
-                    # the replacement process crashed immediately (the
-                    # agent's fix didn't fully take, or introduced a new
-                    # bug) -- silently resuming the OLD code just means
-                    # the same already-broken run limps along unsupervised
-                    # with nobody watching. Retrying gives a transient
-                    # cause (a file/port briefly held by the exiting old
-                    # process, a flaky import) a real chance to clear.
-                    # Capped, not infinite, so a deterministically-broken
-                    # script can't spin forever burning compute unattended.
+                    # a bad exit code. IMPORTANT: unlike the old version of
+                    # this handler, the dashboard/tracer are NOT torn down
+                    # here up front -- they're only torn down right before
+                    # a SUCCESSFUL relaunch's sys.exit(0), below. This is
+                    # what lets a failed restart hand the failure back to
+                    # the still-alive agent (via restart_failure.json,
+                    # picked up by Dashboard._poll -> report_restart_failure)
+                    # to fix the CURRENT code, instead of the old behavior
+                    # of blindly retrying the exact same broken code, or
+                    # giving up with the dashboard already killed.
                     MAX_RESTART_ATTEMPTS = 5
                     RETRY_BACKOFF_SECONDS = 3
 
                     restart_argv = [sys.executable, script_path] + sys.argv[1:]
-                    attempt = 0
+                    attempt = restart_state.get("attempts", 0)
                     restarted_ok = False
+                    restart_result = None
+
                     while attempt < MAX_RESTART_ATTEMPTS:
                         attempt += 1
                         try:
@@ -3409,6 +6295,11 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
                             restarted_ok = True
                             break
 
+                        # A nonzero exit almost always means the agent's fix
+                        # didn't fully take, or introduced a new bug -- hand
+                        # the failure straight back to the (still-running)
+                        # agent instead of blindly relaunching the same
+                        # broken code or giving up and reverting to scratch.
                         print(
                             f"\n[PULSE] Replacement training process exited with code "
                             f"{restart_result.returncode} (attempt {attempt}/{MAX_RESTART_ATTEMPTS})."
@@ -3417,14 +6308,41 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
                             print("[PULSE] STDERR from failed run:\n", restart_result.stderr)
                         if restart_result.stdout:
                             print("[PULSE] STDOUT from failed run:\n", restart_result.stdout)
-                        if attempt < MAX_RESTART_ATTEMPTS:
-                            print("[PULSE] Retrying restart...")
-                            time.sleep(min(RETRY_BACKOFF_SECONDS * attempt, 30))
+                        break  # hand off to the agent below rather than looping blindly
+
+                    restart_state["attempts"] = attempt
 
                     if restarted_ok:
+                        # Only now -- once a replacement process has actually
+                        # taken over successfully -- tear this one down.
+                        try:
+                            _debugger_bg.shutdown()
+                        except Exception:
+                            pass
+                        try:
+                            dash_process.terminate()
+                        except Exception:
+                            pass
+                        sys.settrace(None)
                         sys.exit(0)
 
-                    print(f"[PULSE] ⚠ Giving up after {MAX_RESTART_ATTEMPTS} restart attempts -- continuing the current process.")
+                    if attempt >= MAX_RESTART_ATTEMPTS:
+                        print(f"[PULSE] ⚠ Giving up after {MAX_RESTART_ATTEMPTS} restart attempts -- continuing the current process (dashboard stays up).")
+                    elif restart_result is not None:
+                        try:
+                            _atomic_write_json(
+                                os.path.join(session_dir(_session_id), "restart_failure.json"),
+                                {
+                                    "returncode": restart_result.returncode,
+                                    "stdout": restart_result.stdout or "",
+                                    "stderr": restart_result.stderr or "",
+                                    "attempt": attempt,
+                                    "time": time.time(),
+                                },
+                            )
+                            print("[PULSE] Handed the failure to the AI agent to fix the current code -- see the dashboard chat.")
+                        except Exception as exc:
+                            print(f"[PULSE] ⚠ Could not write restart_failure.json ({exc}) -- continuing the current process.")
         # bad (NaN/inf, a loss spike) and asked training to hold here until
         # the user hits "Resume Training" -- or a fix gets applied and they
         # resume manually. Blocks this exact line from executing further,
@@ -3441,6 +6359,17 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
                 elif msg[0] == "ADD_VAR":
                     tracked_vars.add(msg[1])
                     last_logged.pop(msg[1], None)
+                elif msg[0] == "EXEC":
+                    _req_id, _kind, _arg = msg[1], msg[2], msg[3]
+                    try:
+                        _result = _handle_exec_request(caller_frame, _kind, _arg)
+                    except Exception:
+                        _result = f"{_kind} '{_arg}': Pulse's own dispatcher raised\n{_format_exc_short(traceback.format_exc())}"
+                    if response_queue is not None:
+                        try:
+                            response_queue.put((_req_id, _result))
+                        except Exception:
+                            pass
 
         filename = frame.f_code.co_filename
         if _is_library_frame(filename):
@@ -3541,6 +6470,24 @@ def _install_cli_excepthook(cli):
     previous_hook = sys.excepthook
 
     def _hook(exc_type, exc_value, exc_tb):
+        # Disarm the global line/call tracer immediately. Once the script
+        # has crashed, nothing below should still be traced -- and if we
+        # leave `sys.settrace` pointed at `cli_tracer`, it stays the
+        # process-wide trace function into interpreter shutdown, where it
+        # gets invoked on unrelated __del__ calls (e.g. litellm's
+        # AsyncHTTPHandler) after module globals have already been cleared
+        # to None. That produces a second, uncatchable "Exception ignored
+        # in ..." failure from *inside* the tracer, separate from (and
+        # after) whatever we report here.
+        sys.settrace(None)
+        try:
+            frame = exc_tb.tb_frame if exc_tb else None
+            while frame is not None:
+                frame.f_trace = None
+                frame = frame.f_back
+        except Exception:
+            pass
+
         previous_hook(exc_type, exc_value, exc_tb)
         if issubclass(exc_type, KeyboardInterrupt):
             return
@@ -3600,6 +6547,7 @@ def _install_cli_excepthook(cli):
 def _start_cli_tracker(
     caller_frame, root, throttle_interval, discovered, runtime_shapes,
     code_text=None, script_path=None, extra_files=None, startup_error=None,
+    dist_info=None,
 ):
     """CLI mode: synchronous, in-process -- no subprocess, no multiprocessing
     Queue, no pickling tensors across a process boundary (which can be
@@ -3633,15 +6581,35 @@ def _start_cli_tracker(
     cli.set_code_text(code_text, script_path=script_path)
     cli.extra_files = dict(extra_files or {})
     cli.pending_startup_error = startup_error
+    cli.dist_info = dist_info or (0, 0, 1, None)
     cli.print_banner()
-    _install_cli_excepthook(cli)
+    # Agent/provider setup used to be deferred until cli_tracer saw its
+    # first 'line' event with a trackable/resolved local in scope -- fine
+    # for a training loop, but it meant any crash before that point (e.g.
+    # failing during data loading, before the loop even starts) left
+    # cli.agent_provider unset, so the crash hook below had no agent to
+    # hand the traceback to and could only print "no AI agent is
+    # configured". discover_variables() already falls back to the
+    # statically-discovered `cli.discovered` names (populated from AST
+    # parsing at auto_track()-call time, before any user code runs) when
+    # there are no live locals yet, so setup doesn't actually need to wait
+    # for a live frame -- run it eagerly, before the excepthook can matter.
+    cli.interactive_setup()
+
+    # Internally attach Pulse to Keras Model.fit().
+    # Users only need auto_track().
+    _install_keras_pulse_hook(cli)
 
     if startup_error:
         print("[Pulse] The function passed to auto_track() raised an exception during its dry run:")
         print(startup_error)
-        print("[Pulse] Set up an AI agent below and Pulse will offer to diagnose/fix it before continuing.\n")
+        if cli.agent_provider:
+            print("[Pulse] Pulse will offer to diagnose/fix it (via the agent set up above) before continuing.\n")
+        else:
+            print("[Pulse] No agent configured (see summary above) -- run /agent to set one up before continuing.\n")
 
-    setup_done = {"value": False}
+    _install_cli_excepthook(cli)
+
     last_logged = {"t": 0.0}
 
     # ------------------------------------------------------------------
@@ -3672,7 +6640,7 @@ def _start_cli_tracker(
     # next window. Between windows, the training loop runs at native,
     # untraced speed.
     _CAPTURE_SPAN = min(0.05, throttle_interval / 4 if throttle_interval > 0 else 0.05)
-    window = {"open": True, "closes_at": 0.0}  # start open so setup can run immediately
+    window = {"open": True, "closes_at": 0.0}  # start open so the first snapshot can run immediately
 
     def _close_window():
         window["open"] = False
@@ -3693,6 +6661,11 @@ def _start_cli_tracker(
             time.sleep(_CAPTURE_SPAN)
             if window["open"]:
                 _close_window()
+
+    # Setup now runs eagerly, before tracing even starts (see above), so
+    # the ticker can start right away too -- no need to wait for the
+    # tracer to see a live frame first.
+    threading.Thread(target=_ticker, daemon=True).start()
 
     def cli_tracer(frame, event, arg):
         filename = frame.f_code.co_filename
@@ -3723,6 +6696,19 @@ def _start_cli_tracker(
 
         local_vars = frame.f_locals
 
+        # DEBUG: prove whether execution enters the user's model.fit() call
+        # and whether tracing resumes only after the whole Keras fit returns.
+        try:
+            _src_line = linecache.getline(filename, frame.f_lineno).strip()
+            if _src_line and ("model.fit" in _src_line or "auto_track" in _src_line):
+                _pulse_log(
+                    f"TRACE user-code {frame.f_code.co_name} {os.path.basename(filename)}:"
+                    f"{frame.f_lineno}: {_src_line!r} | locals={sorted(k for k in local_vars if not k.startswith('__'))}",
+                    console=True,
+                )
+        except Exception:
+            pass
+
         # Fill in shapes for statically-discovered names as soon as they
         # actually resolve to a value -- same as the GUI's shape_tracer
         # dry-run, just kept live instead of front-loaded into a single
@@ -3740,22 +6726,19 @@ def _start_cli_tracker(
                 ):
                     cli.var_states[name] = "track"
 
-        if not setup_done["value"]:
-            has_resolved_shape = any(shape is not None for shape in cli.discovered.values())
-            has_trackable_local = any(
-                not n.startswith("__") and is_trackable(v) for n, v in local_vars.items()
-            )
-            if has_resolved_shape or has_trackable_local:
-                cli.watch_locals = local_vars
-                cli.interactive_setup()
-                setup_done["value"] = True
-                # Setup is interactive/blocking; once it's done, start the
-                # background ticker that opens/closes future windows. (Kept
-                # off until now so setup itself isn't racing a window close.)
-                threading.Thread(target=_ticker, daemon=True).start()
-            return cli_tracer
-
-        cli.watch_locals = local_vars
+        # MERGE, don't replace: a snapshot window can land on any traced
+        # frame -- the outer train.py loop, or a nested call like a Keras
+        # callback's on_epoch_end() in a different file -- and different
+        # frames define different names. Wholesale-replacing watch_locals
+        # with whichever frame happened to fire the most recent 'line'
+        # event meant a variable that's only ever assigned inside, say,
+        # on_train_batch_end() would read back as missing (-> reported to
+        # the agent as "NoneType, not run yet") the instant some other
+        # frame's line event was the one caught next, even though its real
+        # value hadn't changed at all -- it just wasn't a local of *that*
+        # particular frame. Once a name has been observed anywhere, its
+        # last known value should stick until it's actually reassigned.
+        cli.watch_locals.update(local_vars)
 
         now = time.time()
         if now - last_logged["t"] > throttle_interval * 0.5:

@@ -1010,14 +1010,37 @@ def git_remote_url(cwd: Optional[str] = None) -> Optional[str]:
         return None
 
 
-_TEAM_SELECT = "team_id,members,admin_ids,join_code,plan,owner_id,repo"
+_TEAM_SELECT = "team_id,members,admin_ids,join_code,plan,owner_id,repo,name"
+_TEAM_SELECT_NO_NAME = "team_id,members,admin_ids,join_code,plan,owner_id,repo"
+
+
+def _teams_request(method: str, params: Optional[Dict[str, str]] = None, body: Optional[Any] = None,
+                    prefer: Optional[str] = None) -> Any:
+    """Wraps _request for the Teams table so every read/write degrades
+    gracefully if this deployment hasn't run the migration below yet:
+        ALTER TABLE "Teams" ADD COLUMN name text;
+    On an "unknown column" error for a `select` containing 'name', retries
+    once with `name` dropped from the select list; rows will simply lack
+    a 'name' key (every caller treats an absent/empty name as 'use the
+    fallback label' already, so this is safe). Body writes that reference
+    `name` are NOT retried here -- see update_team_name, which handles
+    that failure explicitly since it needs to tell the caller the name
+    wasn't actually saved."""
+    try:
+        return _request(method, "Teams", params=params, body=body, prefer=prefer)
+    except SupabaseError as exc:
+        if params and params.get("select") == _TEAM_SELECT and _is_unknown_column_error(exc):
+            retried_params = dict(params)
+            retried_params["select"] = _TEAM_SELECT_NO_NAME
+            return _request(method, "Teams", params=retried_params, body=body, prefer=prefer)
+        raise
 
 
 def find_team_by_join_code(code: str) -> Optional[Dict[str, Any]]:
     if not is_valid_join_code(code):
         return None
-    rows = _request(
-        "GET", "Teams",
+    rows = _teams_request(
+        "GET",
         params={"join_code": f"eq.{code}", "select": _TEAM_SELECT},
     )
     return rows[0] if rows else None
@@ -1034,8 +1057,8 @@ def find_teams_for_user(user_id: str) -> List[Dict[str, Any]]:
     """Teams whose members array contains this user_id."""
     if not is_valid_uuid(user_id):
         return []
-    rows = _request(
-        "GET", "Teams",
+    rows = _teams_request(
+        "GET",
         params={
             "members": f"cs.{{{user_id}}}",  # Postgres array "contains" filter
             "select": _TEAM_SELECT,
@@ -1049,6 +1072,7 @@ def create_team(
     plan: Optional[str] = None,
     repo: Optional[str] = None,
     cwd: Optional[str] = None,
+    name: Optional[str] = None,
 ) -> Dict[str, Any]:
     body = {
         "members": [owner_id],
@@ -1058,10 +1082,44 @@ def create_team(
         "owner_id": owner_id,
         "repo": repo or git_remote_url(cwd) or "unknown",
     }
-    rows = _request("POST", "Teams", body=body, prefer="return=representation")
+    clean_name = (name or "").strip()
+    if clean_name:
+        body["name"] = clean_name[:80]
+    try:
+        rows = _request("POST", "Teams", body=body, prefer="return=representation")
+    except SupabaseError as exc:
+        if clean_name and _is_unknown_column_error(exc):
+            # Deployment hasn't run the `name` migration -- create the
+            # team without it rather than failing the whole signup/setup
+            # flow over a cosmetic field.
+            body.pop("name", None)
+            rows = _request("POST", "Teams", body=body, prefer="return=representation")
+        else:
+            raise
     if not rows:
         raise SupabaseError("Team creation succeeded but no row was returned.")
     return rows[0]
+
+
+def update_team_name(team_id: str, name: str) -> bool:
+    """Set/rename a workspace's display name. Returns True if it was
+    saved, False if this deployment doesn't have the `name` column yet
+    (caller should tell the user the name couldn't be saved rather than
+    silently pretending it worked) -- see the migration note on
+    _teams_request. Raises SupabaseError for any other failure."""
+    clean_name = (name or "").strip()[:80]
+    try:
+        _request(
+            "PATCH", "Teams",
+            params={"team_id": f"eq.{team_id}"},
+            body={"name": clean_name, "updated_at": datetime.now(timezone.utc).isoformat()},
+            prefer="return=minimal",
+        )
+        return True
+    except SupabaseError as exc:
+        if _is_unknown_column_error(exc):
+            return False
+        raise
 
 
 def update_team_repo(team_id: str, repo: str) -> None:
@@ -1113,8 +1171,8 @@ def add_team_admin(team_id: str, user_id: str, members: Optional[List[str]] = No
     already be team members -- add them as a member first (join_team)
     before promoting them.
     """
-    team = _request(
-        "GET", "Teams", params={"team_id": f"eq.{team_id}", "select": _TEAM_SELECT}
+    team = _teams_request(
+        "GET", params={"team_id": f"eq.{team_id}", "select": _TEAM_SELECT}
     )
     team = team[0] if team else None
     if not team:
@@ -1140,8 +1198,8 @@ def add_team_admin(team_id: str, user_id: str, members: Optional[List[str]] = No
 def remove_team_admin(team_id: str, user_id: str) -> Dict[str, Any]:
     """Revoke `user_id`'s admin rights on the team. Leaves their regular
     membership untouched -- this only removes them from admin_ids."""
-    team = _request(
-        "GET", "Teams", params={"team_id": f"eq.{team_id}", "select": _TEAM_SELECT}
+    team = _teams_request(
+        "GET", params={"team_id": f"eq.{team_id}", "select": _TEAM_SELECT}
     )
     team = team[0] if team else None
     if not team:
@@ -1156,6 +1214,55 @@ def remove_team_admin(team_id: str, user_id: str) -> Dict[str, Any]:
     )
     team["admin_ids"] = admin_ids
     return team
+
+
+def leave_team(team_id: str, user_id: str) -> None:
+    """Remove `user_id` from a workspace's membership (and admin list, if
+    they were an admin) without deleting the workspace itself -- for a
+    member who just wants out, as opposed to an admin deleting the whole
+    thing for everyone (see delete_team). Owner leaving does NOT
+    transfer ownership or delete the team; if the owner wants the team
+    gone, use delete_team instead. If this was the last member, the
+    now-empty team is left in place rather than auto-deleted, since an
+    admin may still want to invite someone back into it."""
+    team = _teams_request(
+        "GET", params={"team_id": f"eq.{team_id}", "select": _TEAM_SELECT}
+    )
+    team = team[0] if team else None
+    if not team:
+        raise SupabaseError(f"No team found with id '{team_id}'.")
+
+    members = [uid for uid in (team.get("members") or []) if uid != user_id]
+    admin_ids = [uid for uid in (team.get("admin_ids") or []) if uid != user_id]
+    _request(
+        "PATCH", "Teams",
+        params={"team_id": f"eq.{team_id}"},
+        body={"members": members, "admin_ids": admin_ids, "updated_at": datetime.now(timezone.utc).isoformat()},
+        prefer="return=minimal",
+    )
+
+
+def delete_team(team_id: str, requesting_user_id: str) -> None:
+    """Permanently delete a workspace -- any current admin may do this,
+    regardless of how many members it has (removing everyone from it,
+    not just themselves; members who want out without destroying the
+    workspace for others should use leave_team instead). Raises
+    SupabaseError if the requesting user isn't an admin, or if the team
+    doesn't exist."""
+    team = _teams_request(
+        "GET", params={"team_id": f"eq.{team_id}", "select": _TEAM_SELECT}
+    )
+    team = team[0] if team else None
+    if not team:
+        raise SupabaseError(f"No team found with id '{team_id}'.")
+    if not is_team_admin(team, requesting_user_id):
+        raise SupabaseError("Only a workspace admin can delete it.")
+
+    _request(
+        "DELETE", "Teams",
+        params={"team_id": f"eq.{team_id}"},
+        prefer="return=minimal",
+    )
 
 
 # ----------------------------------------------------------------------------
