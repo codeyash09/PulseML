@@ -70,7 +70,10 @@ import inspect
 import importlib
 import __main__
 import subprocess
-from  pulse.pulse_cli import _install_keras_pulse_hook
+from  pulse.pulse_cli import (
+    _install_keras_pulse_hook, _RESTART_CHILD_ENV,
+    _AGENT_MAX_TOKENS, _AGENT_TIMEOUT_SECONDS, _clamp_output_tokens,
+)
 
 import numpy as np
 import matplotlib
@@ -1271,14 +1274,14 @@ class AgentSetupDialog:
         self.existing_note = ttk.Label(body, text="", style="Dim.TLabel", wraplength=370)
         self.existing_note.pack(anchor="w", pady=(0, 10))
 
-        # Only relevant when PROVIDER is set to the "Custom" sentinel --
-        # left empty/disabled otherwise, and ignored by submit() for every
-        # other provider.
-        ttk.Label(body, text="MODEL STRING (Custom only)", style="Faint.TLabel").pack(anchor="w")
+        # Only relevant when PROVIDER is set to the "Custom" or "OpenRouter
+        # (any model)" sentinel -- left empty/disabled otherwise, and ignored
+        # by submit() for every other provider.
+        ttk.Label(body, text="MODEL STRING (Custom / OpenRouter any model)", style="Faint.TLabel").pack(anchor="w")
         self.custom_model_var = tk.StringVar()
         custom_model_entry = ttk.Entry(body, textvariable=self.custom_model_var)
         custom_model_entry.pack(fill=tk.X, pady=(4, 2))
-        ttk.Label(body, text="e.g. openai/gpt-6-astra, ollama_chat/llama3.1", style="Faint.TLabel").pack(anchor="w", pady=(0, 10))
+        ttk.Label(body, text="e.g. openai/gpt-6-astra, ollama_chat/llama3.1 (OpenRouter: deepseek/deepseek-v4-flash)", style="Faint.TLabel").pack(anchor="w", pady=(0, 10))
 
         ttk.Label(body, text="ENV VAR FOR KEY (Custom only, optional)", style="Faint.TLabel").pack(anchor="w")
         self.custom_env_var = tk.StringVar()
@@ -1320,6 +1323,13 @@ class AgentSetupDialog:
                 self.result = (label, key or "local")
                 self.root.destroy()
                 return
+
+            if PROVIDERS[provider].get("openrouter"):
+                model_string = self.custom_model_var.get().strip()
+                if not model_string or "/" not in model_string:
+                    messagebox.showerror("Model required", "Enter an OpenRouter model, e.g. deepseek/deepseek-v4-flash")
+                    return
+                provider = register_openrouter_model(model_string)
 
             key = self.key_var.get().strip()
             env_var = PROVIDERS[provider]["env_key"]
@@ -1702,6 +1712,22 @@ PROVIDERS = {
         "prompt_title": "OpenRouter API Key Required",
         "prompt_msg": "Please enter your OpenRouter API Key (sk-or-...):"
     },
+    "OpenRouter (DeepSeek V4 Flash)": {
+        "model": "openrouter/deepseek/deepseek-v4-flash",
+        "env_key": "OPENROUTER_API_KEY",
+        "prompt_title": "OpenRouter API Key Required",
+        "prompt_msg": "Please enter your OpenRouter API Key (sk-or-...):"
+    },
+    # Sentinel entry: picking this prompts for any OpenRouter model slug,
+    # then registers a real PROVIDERS entry for it via
+    # register_openrouter_model -- see AgentSetupDialog.submit() and
+    # ChatPanel._on_provider_change().
+    "OpenRouter (any model)": {
+        "openrouter": True,
+        "env_key": "OPENROUTER_API_KEY",
+        "prompt_title": "OpenRouter API Key Required",
+        "prompt_msg": "Please enter your OpenRouter API Key (sk-or-...):"
+    },
     # Sentinel entry: picking this prompts for a raw litellm model string
     # (e.g. "openai/gpt-6-astra", "ollama_chat/llama3.1") plus an optional
     # env var for its key, then dynamically registers a real PROVIDERS
@@ -1709,6 +1735,24 @@ PROVIDERS = {
     # ChatPanel._on_provider_change(), the two places this is handled.
     "Custom (enter provider/model manually)": {"custom": True},
 }
+
+
+def register_openrouter_model(slug):
+    """Register an OpenRouter model slug (e.g. "deepseek/deepseek-v4-flash",
+    with or without a leading "openrouter/") as a PROVIDERS entry and return
+    its label. Stored like a "Custom: ..." entry, so the restart hand-off
+    (PULSE_AUTO_CUSTOM_MODEL) re-registers it with no extra handling."""
+    slug = slug.strip()
+    if slug.lower().startswith("openrouter/"):
+        slug = slug.split("/", 1)[1]
+    label = f"OpenRouter: {slug}"
+    PROVIDERS[label] = {
+        "model": f"openrouter/{slug}",
+        "env_key": "OPENROUTER_API_KEY",
+        "prompt_title": "OpenRouter API Key Required",
+        "prompt_msg": "Please enter your OpenRouter API Key (sk-or-...):"
+    }
+    return label
 
 class _SpinnerLabel:
     """Tiny /-\\| spinner driven by Tk's `after()` loop, used in the chat
@@ -1787,19 +1831,22 @@ _PASS2_ANALYZE_TMPL = (
     "numbers/image/code you were given, with real math, referencing line numbers). Do not "
     "implement the fix yet."
 )
-_PASS3_FIX_TEXT = (
+_PASS3_FIX_TEXT_TMPL = (
+    "Your analysis so far:\n{diagnosis}\n\n"
     "PASS 3 -- DEVELOP: Give the Fix: a concrete, concise change (not generic advice), in 1-3 "
     "sentences. Describe the smallest change that fixes the root cause -- a changed value, argument, "
     "or line -- not a broader rewrite."
 )
-_PASS3_IMPLEMENT = (
-    "PASS 3 -- DEVELOP & IMPLEMENT: The user wants this fix applied to their code. Default to the "
+_PASS3_IMPLEMENT_TMPL = (
+    "Your analysis so far:\n{diagnosis}\n\n"
+    "PASS 3 -- DEVELOP & IMPLEMENT: Implement the fix for the root cause diagnosed above. The user wants this fix applied to their code. Default to the "
     "smallest possible change -- a single line or a few adjacent lines -- and only widen the edit if "
     "the root cause genuinely can't be fixed that narrowly. Do not refactor, restructure, or rewrite "
     "code beyond what's needed to fix the diagnosed root cause. Respond with ONLY the code-fix JSON "
     "object described in your instructions (old/new/explanation) -- no prose, no markdown fences."
 )
 _PASS4_VERIFY_TMPL = (
+    "Your analysis:\n{diagnosis}\n\n"
     "The fix you are about to apply:\n{fix_desc}\n\n"
     "PASS 4 -- VERIFY: Carefully check the math/logic of this fix against the numbers and code you "
     'were given. Also check its SCOPE: does it change only what\'s needed to fix the diagnosed root '
@@ -1809,6 +1856,8 @@ _PASS4_VERIFY_TMPL = (
     "root cause, AND is no larger than necessary to do so."
 )
 _PASS4_REVISE_TMPL = (
+    "Your analysis:\n{diagnosis}\n\n"
+    "The fix you proposed:\n{fix_desc}\n\n"
     "Your proposed fix did not pass verification: {reason}\n\n"
     "Revise it -- if the issue was scope (too large a change), narrow it down to the smallest edit "
     "that still fixes the root cause. Respond with ONLY the corrected code-fix JSON object (old/new/"
@@ -3233,6 +3282,18 @@ class ChatPanel(tk.Frame):
             menu = self.provider_dropdown["menu"]
             menu.add_command(label=label, command=tk._setit(self.provider_var, label, self._on_provider_change))
             self.provider_var.set(label)
+        elif PROVIDERS.get(selection, {}).get("openrouter"):
+            model_string = simpledialog.askstring(
+                "OpenRouter Model", "OpenRouter model (e.g. deepseek/deepseek-v4-flash):", parent=self
+            )
+            if not model_string or "/" not in model_string:
+                self.provider_var.set(list(PROVIDERS.keys())[0])
+                self._update_status_indicator()
+                return
+            label = register_openrouter_model(model_string)
+            menu = self.provider_dropdown["menu"]
+            menu.add_command(label=label, command=tk._setit(self.provider_var, label, self._on_provider_change))
+            self.provider_var.set(label)
         self._update_status_indicator()
 
     def _set_stage(self, label):
@@ -3447,7 +3508,7 @@ class ChatPanel(tk.Frame):
         msg = str(exc)
         return msg[:200] + ("…" if len(msg) > 200 else "")
 
-    def _call_model(self, model_name, instruction, image_payloads=None, max_tokens=2000):
+    def _call_model(self, model_name, instruction, image_payloads=None, max_tokens=_AGENT_MAX_TOKENS):
         """One lightweight completion call: system prompt + recent history +
         a one-off stage instruction (+ images on the first call only, so
         they aren't re-uploaded on every stage). Does not touch
@@ -3471,6 +3532,7 @@ class ChatPanel(tk.Frame):
             + self.history[-10:]
             + [{"role": "user", "content": content}]
         )
+        max_tokens = _clamp_output_tokens(model_name, max_tokens)
         max_attempts = 3
         last_exc = None
         for attempt in range(1, max_attempts + 1):
@@ -3479,7 +3541,7 @@ class ChatPanel(tk.Frame):
                     model=model_name,
                     messages=messages,
                     max_tokens=max_tokens,
-                    timeout=120.0,
+                    timeout=_AGENT_TIMEOUT_SECONDS,
                 )
                 text = (response.choices[0].message.content or "").strip()
                 if not text:
@@ -4338,17 +4400,23 @@ class ChatPanel(tk.Frame):
             parts.append(f"Explanation: {fix['explanation']}")
         return "\n\n".join(parts)
 
-    def _verify_fix_with_retries(self, model_name, fix):
+    def _verify_fix_with_retries(self, model_name, fix, diagnosis):
         """PASS 4: check the fix's math/logic before it's handed to the
         user. If it fails, ask the agent to revise and re-check, up to
-        _MAX_VERIFY_ATTEMPTS times. Returns (fix, passed, reason)."""
+        _MAX_VERIFY_ATTEMPTS times. Returns (fix, passed, reason). A failed
+        verify/revise request applies the fix as unverified best effort
+        instead of discarding it (see pulse_cli's copy)."""
         reason = ""
         for attempt in range(_MAX_VERIFY_ATTEMPTS):
             fix_desc = self._describe_fix(fix)
             self.after(0, lambda: self._set_stage("Checking the fix"))
-            verify_answer = self._call_model(
-                model_name, _PASS4_VERIFY_TMPL.format(fix_desc=fix_desc), max_tokens=350
-            )
+            try:
+                verify_answer = self._call_model(
+                    model_name, _PASS4_VERIFY_TMPL.format(diagnosis=diagnosis, fix_desc=fix_desc),
+                    max_tokens=_AGENT_MAX_TOKENS,
+                )
+            except AgentRequestFailed as exc:
+                return fix, False, f"(verification request failed: {exc})"
             verdict = self._parse_json_obj(verify_answer)
             if verdict is None:
                 return fix, True, "(verification response was unparsable; proceeding anyway)"
@@ -4359,9 +4427,13 @@ class ChatPanel(tk.Frame):
             if attempt == _MAX_VERIFY_ATTEMPTS - 1:
                 break
             self.after(0, lambda: self._set_stage("Revising fix"))
-            revised_answer = self._call_model(
-                model_name, _PASS4_REVISE_TMPL.format(reason=reason), max_tokens=4000
-            )
+            try:
+                revised_answer = self._call_model(
+                    model_name, _PASS4_REVISE_TMPL.format(diagnosis=diagnosis, fix_desc=fix_desc, reason=reason),
+                    max_tokens=_AGENT_MAX_TOKENS,
+                )
+            except AgentRequestFailed:
+                break
             revised = self._parse_code_fix(revised_answer)
             if revised is None:
                 break
@@ -4373,7 +4445,7 @@ class ChatPanel(tk.Frame):
         turn up, ask the user whether to fix those too (PASS 6 recurses
         through the same 1-5 format for the new issue)."""
         self.after(0, lambda: self._set_stage("Reading for other errors"))
-        sweep_answer = self._call_model(model_name, _PASS5_SWEEP, max_tokens=300)
+        sweep_answer = self._call_model(model_name, _PASS5_SWEEP, max_tokens=_AGENT_MAX_TOKENS)
         self.after(0, lambda: self._set_stage(None))
         sweep = self._parse_json_obj(sweep_answer)
         found = bool(sweep.get("other_errors_found")) if sweep else False
@@ -4425,12 +4497,12 @@ class ChatPanel(tk.Frame):
 
             # Pass 1: locate the region(s) of the error.
             self.after(0, lambda: self._set_stage("Reading for region of error"))
-            regions = self._call_model(model_name, f"{base_text}\n\n{_PASS1_LOCATE}", images, max_tokens=200)
+            regions = self._call_model(model_name, f"{base_text}\n\n{_PASS1_LOCATE}", images, max_tokens=_AGENT_MAX_TOKENS)
             self.after(0, lambda: self._append("Pulse (1 · Region of error)", regions))
 
             # Pass 2: focused second read + diagnosis/reasoning.
             self.after(0, lambda: self._set_stage("Analyzing"))
-            raw_analysis = self._call_model(model_name, _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=700)
+            raw_analysis = self._call_model(model_name, _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=_AGENT_MAX_TOKENS)
             analysis, calc_exprs, promote_names, grep_patterns, view_requests = _extract_directives(raw_analysis)
             analysis, new_requests = _extract_new_directives(analysis)
             self.after(0, lambda: self._append("Pulse (2 · Diagnosis & reasoning)", analysis))
@@ -4460,16 +4532,21 @@ class ChatPanel(tk.Frame):
 
             if not wants_implementation:
                 self.after(0, lambda: self._set_stage("Developing fix"))
-                fix_text = self._call_model(model_name, _PASS3_FIX_TEXT, max_tokens=300)
+                fix_text = self._call_model(
+                    model_name, _PASS3_FIX_TEXT_TMPL.format(diagnosis=full_answer), max_tokens=_AGENT_MAX_TOKENS
+                )
                 self.after(0, lambda: self._set_stage(None))
                 full_answer += f"\n\n{fix_text}"
                 self.after(0, lambda: self._append("Pulse (3 · Fix)", fix_text))
                 self.history.append({"role": "assistant", "content": full_answer})
                 return
 
-            # Pass 3: develop and implement the fix.
+            # Pass 3: develop and implement the fix, with passes 1-2's
+            # findings handed over (otherwise it re-derives them from scratch).
             self.after(0, lambda: self._set_stage("Developing & implementing fix"))
-            fix_answer = self._call_model(model_name, _PASS3_IMPLEMENT, max_tokens=4000)
+            fix_answer = self._call_model(
+                model_name, _PASS3_IMPLEMENT_TMPL.format(diagnosis=full_answer), max_tokens=_AGENT_MAX_TOKENS
+            )
             fix = self._parse_code_fix(fix_answer)
             if fix is None:
                 self.after(0, lambda: self._set_stage(None))
@@ -4480,7 +4557,7 @@ class ChatPanel(tk.Frame):
 
             # Pass 4: verify the fix's math/logic before handing it to the
             # user; revise and re-check on failure (bounded retries).
-            fix, verify_ok, verify_reason = self._verify_fix_with_retries(model_name, fix)
+            fix, verify_ok, verify_reason = self._verify_fix_with_retries(model_name, fix, full_answer)
             status = "passed" if verify_ok else "did not clearly pass -- applying best effort"
             self.after(0, lambda: self._append("Pulse (4 · Verification)", f"{status}: {verify_reason}"))
 
@@ -4514,8 +4591,14 @@ class ChatPanel(tk.Frame):
                 self._fix_applied_this_turn = True
 
             # Pass 5 (+ 6): only worth a full re-read if a fix actually landed.
+            # The fix is already on disk, so a failed sweep request must not
+            # stop the restart that tests it.
             if applied_by_path and _depth < 3:
-                self._run_sweep_and_maybe_recurse(model_name, include_code, provider_name, _depth)
+                try:
+                    self._run_sweep_and_maybe_recurse(model_name, include_code, provider_name, _depth)
+                except AgentRequestFailed as exc:
+                    msg = f"⚠ Full re-read skipped (agent request failed: {exc}) -- continuing with the applied fix."
+                    self.after(0, lambda m=msg: self._append("Pulse", m))
 
             if _depth == 0 and self._fix_applied_this_turn and self.restart_fn:
                 self.after(0, lambda: self._append("Pulse", "⚙ Restarting the training loop to pick up the fix..."))
@@ -4529,7 +4612,12 @@ class ChatPanel(tk.Frame):
             msg = f"⚠ AI agent request failed: {exc}"
             self.after(0, lambda m=msg: self._append("Pulse", m))
             self.history.append({"role": "assistant", "content": msg})
-            if _depth == 0:
+            if _depth == 0 and self._fix_applied_this_turn and self.restart_fn:
+                # A fix already landed before this later request failed --
+                # still restart so it actually gets run and tested.
+                self.after(0, lambda: self._append("Pulse", "⚙ Restarting the training loop to pick up the fix..."))
+                self.restart_fn(provider_name)
+            elif _depth == 0:
                 self._last_call_failed_transiently = True
 
     def _ask_and_maybe_retry(self, question, include_code, provider_name, _depth=0):
@@ -4677,6 +4765,11 @@ class ChatPanel(tk.Frame):
         label = file_label.strip()
         if label in self._path_for_label:
             return self._path_for_label[label]
+        # Already a real path: _write_code_fix records resolved paths (not
+        # labels) in `skipped`, which _request_corrected_snippets resolves
+        # again -- without this the re-quote retry finds no file to show.
+        if os.path.isfile(label):
+            return os.path.abspath(label)
         matches = [p for lbl, p in self._path_for_label.items() if label.lower() in lbl.lower()]
         if len(matches) == 1:
             return matches[0]
@@ -4871,7 +4964,7 @@ class ChatPanel(tk.Frame):
             "Respond with ONLY a corrected code-fix JSON object (old/new/files/explanation) covering "
             "just these snippets -- no prose, no markdown fences."
         )
-        answer = self._call_model(model_name, prompt, max_tokens=4000)
+        answer = self._call_model(model_name, prompt, max_tokens=_AGENT_MAX_TOKENS)
         return self._parse_code_fix(answer)
 
     def report_training_trouble(self, problem):
@@ -6025,7 +6118,12 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
 
     if not discovered:
         print("[PULSE] No trackable variables found (nothing in scope, and nothing parseable in the source).")
-        return
+        # CLI mode still starts: its crash hook and agent don't need any
+        # tracked variables, and a script whose first lines already fail
+        # (e.g. using a name that was never defined) is exactly the case
+        # that needs them. The UI dashboard has nothing to show, so it stops.
+        if active_mode != "cli":
+            return
 
     if is_distributed and not is_primary_rank:
         # Multiple ranks racing for the same GUI window or the same
@@ -6459,6 +6557,9 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
     caller_frame.f_trace_lines = True
 
 
+_CRASH_RETRY_DELAYS = (5, 20, 60)
+
+
 def _install_cli_excepthook(cli):
     """Catch any uncaught exception that crashes the rest of the user's
     script (anywhere after CLI tracing starts -- an init error, or a bug
@@ -6491,8 +6592,24 @@ def _install_cli_excepthook(cli):
         previous_hook(exc_type, exc_value, exc_tb)
         if issubclass(exc_type, KeyboardInterrupt):
             return
+        if os.environ.get(_RESTART_CHILD_ENV) == "1":
+            # This run was launched by a fix-triggered restart: the parent
+            # Pulse process is waiting on it, captures this output, and
+            # feeds it back to the agent within its own bounded retry loop.
+            # Starting a second fix/restart chain here is what nested into
+            # hundreds of agent calls.
+            print("\n[Pulse] Restarted run crashed -- handing the traceback back to the Pulse process that restarted it.")
+            return
         tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
         print("\n[Pulse] Your script just crashed with the exception above.")
+        user_frames = []
+        tb = exc_tb
+        while tb is not None:
+            filename = tb.tb_frame.f_code.co_filename
+            if not filename.startswith("<") and not _is_library_frame(filename):
+                user_frames.append(tb.tb_frame)
+            tb = tb.tb_next
+        cli.capture_crash_state(user_frames)
         # handle_crash logs the traceback (same as the old direct
         # log_traceback call did) AND does the signature/dedup bookkeeping
         # that offer_known_fix below depends on -- without it, a bug
@@ -6540,6 +6657,19 @@ def _install_cli_excepthook(cli):
             "Please diagnose the root cause and, if you can, fix it."
         )
         cli.ask_agent(question, include_code=True)
+
+        # A transient agent failure normally queues a retry on a background
+        # ticker while training carries on -- but the script has crashed and
+        # the process exits as soon as this hook returns, taking that daemon
+        # thread with it. Retry here, in the foreground, instead.
+        for delay in _CRASH_RETRY_DELAYS:
+            if not cli._last_call_failed_transiently:
+                break
+            print(f"[Pulse] Agent request failed while handling the crash -- retrying in {delay}s before exiting...")
+            time.sleep(delay)
+            cli.ask_agent(question, include_code=True)
+        if cli._last_call_failed_transiently:
+            print("[Pulse] ⚠ Agent still unavailable after retries -- exiting without a fix.")
 
     sys.excepthook = _hook
 

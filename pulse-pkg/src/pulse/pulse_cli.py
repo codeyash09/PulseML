@@ -760,6 +760,20 @@ PROVIDERS = {
         "model": "openrouter/openai/gpt-oss-120b:free",
         "env_key": "OPENROUTER_API_KEY",
     },
+    "OpenRouter (DeepSeek V4 Flash)": {
+        "model": "openrouter/deepseek/deepseek-v4-flash",
+        "env_key": "OPENROUTER_API_KEY",
+    },
+    # Sentinel entry: picking this prompts for any OpenRouter model slug
+    # (one OPENROUTER_API_KEY reaches every model OpenRouter serves), then
+    # registers a real PROVIDERS entry for it -- see
+    # register_openrouter_model and _select_agent_provider_and_key's
+    # "openrouter" branch.
+    "OpenRouter (any model)": {
+        "openrouter": True,
+        "env_key": "OPENROUTER_API_KEY",
+        "model_hint": "an OpenRouter model slug, e.g. deepseek/deepseek-v4-flash, anthropic/claude-sonnet-5",
+    },
     # --- Local / self-hosted -- no API key, nothing leaves the machine.
     # For teams whose training code/data/logs can't go to a third-party
     # LLM API at all. See _select_agent_provider_and_key's "local" branch
@@ -783,6 +797,20 @@ PROVIDERS = {
     # _select_agent_provider_and_key's "custom" branch.
     "Custom (enter provider/model manually)": {"custom": True},
 }
+
+
+def register_openrouter_model(slug: str) -> str:
+    """Register an OpenRouter model slug (e.g. "deepseek/deepseek-v4-flash",
+    with or without a leading "openrouter/") as a PROVIDERS entry and return
+    its label. Registered like a "Custom: ..." entry -- a plain model string
+    plus env var -- so _call_model and the restart hand-off
+    (PULSE_AUTO_CUSTOM_MODEL) need no OpenRouter-specific handling."""
+    slug = slug.strip()
+    if slug.lower().startswith("openrouter/"):
+        slug = slug.split("/", 1)[1]
+    label = f"OpenRouter: {slug}"
+    PROVIDERS[label] = {"model": f"openrouter/{slug}", "env_key": "OPENROUTER_API_KEY"}
+    return label
 
 
 import math as _math_module
@@ -855,8 +883,9 @@ class _Spinner:
 #                        those too.
 #   Pass 6:             if the user says yes, recurse through the same
 #                        format (passes 1-5) for the newly-found issue(s).
-# Each call is kept small/cheap (small max_tokens) and streams to the
-# terminal as soon as it's ready, same spirit as the old fixed pipeline.
+# Each call prints to the terminal as soon as it's ready, same spirit as the
+# old fixed pipeline. Every pass gets the same generous _AGENT_MAX_TOKENS
+# budget (see its comment) -- the prompts, not the cap, keep answers short.
 _PASS1_LOCATE = (
     "PASS 1 -- LOCATE: Read through everything you were given (stats, code, history) and identify "
     "the specific region(s) where the problem likely originates -- file/line numbers, variable "
@@ -872,19 +901,22 @@ _PASS2_ANALYZE_TMPL = (
     "numbers/code you were given, with real math, referencing line numbers). Do not implement the "
     "fix yet."
 )
-_PASS3_FIX_TEXT = (
+_PASS3_FIX_TEXT_TMPL = (
+    "Your analysis so far:\n{diagnosis}\n\n"
     "PASS 3 -- DEVELOP: Give the Fix: a concrete, concise change (not generic advice), in 1-3 "
     "sentences. Describe the smallest change that fixes the root cause -- a changed value, argument, "
     "or line -- not a broader rewrite."
 )
-_PASS3_IMPLEMENT = (
-    "PASS 3 -- DEVELOP & IMPLEMENT: The user wants this fix applied to their code. Default to the "
+_PASS3_IMPLEMENT_TMPL = (
+    "Your analysis so far:\n{diagnosis}\n\n"
+    "PASS 3 -- DEVELOP & IMPLEMENT: Implement the fix for the root cause diagnosed above. The user wants this fix applied to their code. Default to the "
     "smallest possible change -- a single line or a few adjacent lines -- and only widen the edit if "
     "the root cause genuinely can't be fixed that narrowly. Do not refactor, restructure, or rewrite "
     "code beyond what's needed to fix the diagnosed root cause. Respond with ONLY the code-fix JSON "
     "object described in your instructions (old/new/explanation) -- no prose, no markdown fences."
 )
 _PASS4_VERIFY_TMPL = (
+    "Your analysis:\n{diagnosis}\n\n"
     "The fix you are about to apply:\n{fix_desc}\n\n"
     "PASS 4 -- VERIFY: Carefully check the math/logic of this fix against the numbers and code you "
     'were given. Also check its SCOPE: does it change only what\'s needed to fix the diagnosed root '
@@ -894,6 +926,8 @@ _PASS4_VERIFY_TMPL = (
     "root cause, AND is no larger than necessary to do so."
 )
 _PASS4_REVISE_TMPL = (
+    "Your analysis:\n{diagnosis}\n\n"
+    "The fix you proposed:\n{fix_desc}\n\n"
     "Your proposed fix did not pass verification: {reason}\n\n"
     "Revise it -- if the issue was scope (too large a change), narrow it down to the smallest edit "
     "that still fixes the root cause. Respond with ONLY the corrected code-fix JSON object (old/new/"
@@ -907,6 +941,36 @@ _PASS5_SWEEP = (
 )
 _IMPLEMENT_KEYWORDS = ("fix", "edit", "patch", "change the code", "apply", "implement")
 _MAX_VERIFY_ATTEMPTS = 3
+
+# Output-token budget for every agent call. Deliberately generous: reasoning
+# models spend part of it on hidden reasoning before any visible text, and a
+# tight per-pass cap (the old 200/300/700) left them returning an empty reply
+# with finish_reason="length". The prompts themselves ask for short answers,
+# so non-reasoning models don't get longer. Clamped per model in _call_model.
+_AGENT_MAX_TOKENS = 32000
+_AGENT_TIMEOUT_SECONDS = 600.0
+
+# Restarted runs launched by _restart_process get this set: their crashes are
+# reported back to the parent process (which feeds the output to the agent
+# and owns the bounded retry loop) instead of starting a nested fix/restart
+# chain of their own.
+_RESTART_CHILD_ENV = "PULSE_RESTART_CHILD"
+# How deep fix -> restart -> fix chains may nest. A restarted run that is not
+# crashing (a training-quality fault, say) can still auto-intervene and
+# restart again on its own, so without a cap the chain nests indefinitely.
+_RESTART_DEPTH_ENV = "PULSE_RESTART_DEPTH"
+_MAX_RESTART_DEPTH = 3
+_RESTART_FEEDBACK_MAX_CHARS = 20000
+
+
+def _clamp_output_tokens(model: str, requested: int) -> int:
+    """Cap `requested` at the model's known max output (e.g. deepseek-chat
+    allows 8192); unknown models get the request unchanged."""
+    try:
+        limit = litellm.get_model_info(model).get("max_output_tokens")
+    except Exception:
+        return requested
+    return min(requested, int(limit)) if limit else requested
 
 _COMMENT_EXT_MAP = {
     ".js": "//", ".ts": "//", ".jsx": "//", ".tsx": "//", ".java": "//",
@@ -1812,6 +1876,8 @@ class PulseCLI:
         self._known_fixes: Dict[str, Dict[str, Any]] = {}  # signature -> fix dict
         self._last_applied_fix: Optional[Dict[str, Any]] = None
         self._last_apply_skipped: List[tuple] = []
+        # (path, line) of the most recent crash -- see _occurrence_at_crash.
+        self._last_crash_location: Optional[tuple] = None
         # Dedup bookkeeping so one recurring bug doesn't get treated as N
         # separate incidents within a single run.
         self._traceback_signatures_seen: Dict[str, int] = {}
@@ -1920,10 +1986,25 @@ class PulseCLI:
                 trackable[name] = val
 
         for name in self.discovered:
-            if name not in trackable:
+            # A name Pulse has seen holding a non-trackable value (a list,
+            # a model object, ...) did run -- don't report it as unassigned.
+            if name not in trackable and name not in self.watch_locals:
                 trackable[name] = None
 
         return trackable
+
+    def capture_crash_state(self, user_frames) -> None:
+        """Refresh watch_locals from the user-code frames of an uncaught
+        exception (outermost first -- see pulse.py's crash hook). The
+        periodic sampler only snapshots every throttle_interval, so a
+        script that crashes quickly (or between windows) would otherwise
+        show the agent stale or empty state -- e.g. every variable as "not
+        run yet" when it was in fact assigned. Inner frames' names win.
+        Also makes REPL/DRYRUN evaluate against the real crash-time objects."""
+        for frame in user_frames:
+            self.watch_locals.update(
+                {k: v for k, v in frame.f_locals.items() if not k.startswith("__")}
+            )
     def _cmd_gputrack(self, var_name: str, quiet: bool = False) -> Optional[str]:
         """Flag a variable as GPU-resident and worth a closer look -- via
         the manual /gputrack command, or via the agent's GPUTRACK:
@@ -2297,8 +2378,9 @@ class PulseCLI:
         """
         variables = self.discover_variables()
         if not variables:
-            cprint("[Pulse CLI] No trackable variables found in scope.")
-            return
+            # Still set up the agent: crash diagnosis/fixing doesn't need
+            # any tracked variables (see auto_track's no-variables branch).
+            cprint("[Pulse CLI] No trackable variables found in scope -- crash diagnosis stays on.")
 
         var_list = sorted(variables.keys(), key=lambda n: (not _looks_like_loss(n), n))
 
@@ -3932,6 +4014,13 @@ class PulseCLI:
         frame_info = self._last_user_frame(tb_text)
         if frame_info:
             cprint(f"[Pulse] ⚠ Error at {os.path.basename(frame_info[0])}, line {frame_info[1]}", color=_RED)
+            # Remembered so _apply_code_fix can disambiguate a snippet that
+            # occurs more than once (duplicated cell/block) by preferring the
+            # occurrence at the crash.
+            try:
+                self._last_crash_location = (os.path.abspath(frame_info[0]), int(frame_info[1]))
+            except (TypeError, ValueError):
+                self._last_crash_location = None
         self._log_incident(
             "crash", tb_text.strip().splitlines()[-1] if tb_text.strip() else "(empty traceback)",
             signature=sig, occurrence=self._traceback_signatures_seen[sig],
@@ -4001,7 +4090,10 @@ class PulseCLI:
         "Claude") plus that provider's own API key env var (e.g.
         ANTHROPIC_API_KEY -- see PROVIDERS[...]["env_key"]); for a local
         provider, set PULSE_PROVIDER to it and PULSE_LOCAL_MODEL (+
-        optionally PULSE_LOCAL_API_BASE). If what's needed is missing,
+        optionally PULSE_LOCAL_API_BASE); for any OpenRouter model, set
+        PULSE_PROVIDER to "openrouter/<model slug>" (e.g.
+        "openrouter/deepseek/deepseek-v4-flash") plus OPENROUTER_API_KEY.
+        If what's needed is missing,
         the agent is simply left disabled for the run rather than
         blocking on a prompt that will never be answered.
         """
@@ -4016,7 +4108,13 @@ class PulseCLI:
             # A raw "provider/model" string that doesn't match any named
             # entry is treated as a custom model directly -- mirrors the
             # interactive "Custom" branch below, just without the prompts.
-            if want and "/" in want and not any(n.lower() == want.lower() for n in names):
+            if want.lower().startswith("openrouter/") and not any(n.lower() == want.lower() for n in names):
+                # OpenRouter always reads OPENROUTER_API_KEY, so there's no
+                # env var to ask for -- and keeping the key in os.environ
+                # under that name is what carries it across a fix restart.
+                candidates = [register_openrouter_model(want)]
+                names.append(candidates[0])
+            elif want and "/" in want and not any(n.lower() == want.lower() for n in names):
                 env_var = self._config_text("api_key_env", "env_key") or os.environ.get("PULSE_API_KEY_ENV", "").strip() or None
                 key = self._config_text("api_key", "key") or (os.environ.get(env_var, "").strip() if env_var else "")
                 label = f"Custom: {want}"
@@ -4031,7 +4129,7 @@ class PulseCLI:
                 cloud.save_cached_profile(agent_provider=label, agent_env_key=env_var)
                 cprint(f"[Pulse] Non-interactive mode -- custom agent set to {want}.")
                 return True
-            if want.isdigit() and 1 <= int(want) <= len(names):
+            elif want.isdigit() and 1 <= int(want) <= len(names):
                 candidates = [names[int(want) - 1]]
             elif want:
                 candidates = [want]
@@ -4053,6 +4151,14 @@ class PulseCLI:
                     self._set_local_agent(match, api_base, model_name)
                     cprint(f"[Pulse] Non-interactive mode -- agent set to {match} ({model_name} @ {api_base}).")
                     return True
+                if info.get("custom"):
+                    continue  # needs a model string -- see the raw "provider/model" branch above
+                if info.get("openrouter"):
+                    slug = self._config_text("model") or os.environ.get("PULSE_OPENROUTER_MODEL", "").strip()
+                    if not slug:
+                        continue  # can't use "any model" without knowing which one
+                    match = register_openrouter_model(slug)
+                    info = PROVIDERS[match]
                 env_var = info["env_key"]
                 key = self._config_text("api_key", "key") or os.environ.get(env_var, "").strip()
                 if key:
@@ -4079,6 +4185,8 @@ class PulseCLI:
             local_tag = "  [local -- no data leaves this machine]" if PROVIDERS[name].get("local") else ""
             if PROVIDERS[name].get("custom"):
                 local_tag = "  [type any provider/model string]"
+            if PROVIDERS[name].get("openrouter"):
+                local_tag = "  [type any OpenRouter model]"
             marker = "  (current)" if name == self.agent_provider else ("  (last used)" if name == cached_provider else "")
             print(f"  {i}) {name}{local_tag}{marker}")
 
@@ -4163,6 +4271,19 @@ class PulseCLI:
                 print(f"✓ Switched to {chosen}. Conversation history reset for the new agent.")
             self._warn_if_cloud_sync_defeats_local_privacy()
             return True
+
+        if info.get("openrouter"):
+            _flush_stdin()
+            slug = input(f"Model ({info['model_hint']}) > ").strip()
+            if not slug:
+                cprint("[Pulse CLI] No model entered. Agent unchanged.")
+                if initial:
+                    self.agent_provider = None
+                return False
+            # From here on it's an ordinary cloud provider: same key prompt,
+            # same OPENROUTER_API_KEY, just under its registered label.
+            chosen = register_openrouter_model(slug)
+            info = PROVIDERS[chosen]
 
         env_var = info["env_key"]
         existing = os.environ.get(env_var, "").strip()
@@ -4389,6 +4510,20 @@ class PulseCLI:
                 color=_YELLOW,
             )
 
+        depth = 0
+        try:
+            depth = int(os.environ.get(_RESTART_DEPTH_ENV, "0"))
+        except ValueError:
+            depth = 0
+        if depth >= _MAX_RESTART_DEPTH:
+            cprint(
+                f"[Pulse] ⚠ Already {depth} restarts deep -- not restarting again. The fix is saved "
+                "to disk; run the script yourself to pick it up.",
+                color=_YELLOW,
+            )
+            self._log_incident("restart_skipped", f"restart depth cap ({_MAX_RESTART_DEPTH}) reached")
+            return
+
         # Mark the replacement process as an unattended auto-fix resume.
         # __init__ consumes this flag before workspace/provider setup so the
         # restarted run never stops for interactive input.
@@ -4473,6 +4608,10 @@ class PulseCLI:
         # which may be the stale path this whole resolution step exists
         # to route around.
         argv = [python_exe, script_path] + sys.argv[1:]
+        # Only the child gets the marker (not this process's os.environ):
+        # if every retry fails and this process keeps running the old code,
+        # its own later crashes must still go through the agent as normal.
+        child_env = dict(os.environ, **{_RESTART_CHILD_ENV: "1", _RESTART_DEPTH_ENV: str(depth + 1)})
 
         # Retry the restart itself instead of ever falling back to "keep
         # running the old, already-in-memory process" on a bad exit code.
@@ -4500,7 +4639,7 @@ class PulseCLI:
                 # capture_output=True so a failure's stdout/stderr can be
                 # fed back to the agent below -- printed after the fact
                 # either way, so nothing is hidden, just no longer live.
-                result = subprocess.run(argv, capture_output=True, text=True)
+                result = subprocess.run(argv, capture_output=True, text=True, env=child_env)
             except Exception as exc:
                 cprint(f"[Pulse] ⚠ Restart attempt {attempt}/{MAX_RESTART_ATTEMPTS} failed to launch ({exc}).", color=_RED)
                 if attempt >= MAX_RESTART_ATTEMPTS:
@@ -4555,10 +4694,18 @@ class PulseCLI:
                         self.code_text = f.read()
                 except OSError:
                     pass
+                def _tail(text: str) -> str:
+                    # Progress bars and training logs can run to megabytes;
+                    # the traceback that matters is at the end.
+                    text = text or "(empty)"
+                    if len(text) <= _RESTART_FEEDBACK_MAX_CHARS:
+                        return text
+                    return "[... earlier output truncated ...]\n" + text[-_RESTART_FEEDBACK_MAX_CHARS:]
+
                 failure_question = (
-                    f"The fix you just applied caused the restarted training process to crash "
-                    f"immediately with exit code {result.returncode}. Its output:\n\n"
-                    f"STDOUT:\n{result.stdout or '(empty)'}\n\nSTDERR:\n{result.stderr or '(empty)'}\n\n"
+                    f"After the fix you just applied, the restarted training process crashed "
+                    f"with exit code {result.returncode}. Its output:\n\n"
+                    f"STDOUT:\n{_tail(result.stdout)}\n\nSTDERR:\n{_tail(result.stderr)}\n\n"
                     "This is the same bug context as before -- fix the CURRENT code shown below "
                     "directly. Do not start the diagnosis over from scratch, and do not reintroduce "
                     "whatever change just failed."
@@ -4720,6 +4867,23 @@ class PulseCLI:
         self._label_for_path = label_for_path
         self._path_for_label = path_for_label
 
+    def _occurrence_at_crash(self, content: str, snippet: str, path: str) -> Optional[int]:
+        """Offset of the occurrence of `snippet` containing the crash line in
+        `path`, when exactly one occurrence does. Else None (stay safe)."""
+        location = getattr(self, "_last_crash_location", None)
+        if not location or os.path.abspath(path) != location[0]:
+            return None
+        crash_line = location[1]
+        hits = []
+        start = content.find(snippet)
+        while start != -1:
+            first_line = content.count("\n", 0, start) + 1
+            last_line = first_line + snippet.count("\n")
+            if first_line <= crash_line <= last_line:
+                hits.append(start)
+            start = content.find(snippet, start + 1)
+        return hits[0] if len(hits) == 1 else None
+
     def _resolve_fix_path(self, file_label: Optional[str]) -> Optional[str]:
         """Map a fix entry's optional "file" label back to a real path on
         disk, defaulting to the entry script when unset. Falls back to
@@ -4730,7 +4894,15 @@ class PulseCLI:
         label = file_label.strip()
         if label in self._path_for_label:
             return self._path_for_label[label]
-        matches = [p for lbl, p in self._path_for_label.items() if label.lower() in lbl.lower()]
+        # Already a real path: _apply_code_fix records resolved paths (not
+        # labels) in `skipped`, and _request_corrected_snippets resolves
+        # those again -- without this, every re-quote retry silently found
+        # no file to show the model and gave up.
+        if os.path.isfile(label):
+            return os.path.abspath(label)
+        basename = os.path.basename(label).lower()
+        matches = [p for lbl, p in self._path_for_label.items()
+                   if label.lower() in lbl.lower() or basename == lbl.lower()]
         if len(matches) == 1:
             return matches[0]
         return None
@@ -4743,7 +4915,7 @@ class PulseCLI:
             if val is None and variables[name] is not None:
                 continue
             if val is None:
-                lines.append(f"- {name}: NoneType (not run yet, or currently None)")
+                lines.append(f"- {name}: no value observed (not assigned yet, currently None, or not sampled yet)")
                 continue
             try:
                 for sub_name, s_val in self._yield_slices(name, val):
@@ -4874,7 +5046,7 @@ class PulseCLI:
         # very long body (full request/response dump).
         return msg[:200] + ("…" if len(msg) > 200 else "")
 
-    def _call_model(self, instruction: str, max_tokens: int = 2000) -> str:
+    def _call_model(self, instruction: str, max_tokens: int = _AGENT_MAX_TOKENS) -> str:
         """One lightweight completion call: system prompt + recent history +
         a one-off stage instruction. Does not touch self.agent_history --
         callers decide what (if anything) gets persisted once the whole
@@ -4898,15 +5070,17 @@ class PulseCLI:
             + self.agent_history[-10:]
             + [{"role": "user", "content": instruction}]
         )
+        model = self.agent_model_string or PROVIDERS[self.agent_provider]["model"]
+        max_tokens = _clamp_output_tokens(model, max_tokens)
         max_attempts = 3
         last_exc: Optional[Exception] = None
         for attempt in range(1, max_attempts + 1):
             try:
                 response = litellm.completion(
-                    model=self.agent_model_string or PROVIDERS[self.agent_provider]["model"],
+                    model=model,
                     messages=messages,
                     max_tokens=max_tokens,
-                    timeout=120.0,
+                    timeout=_AGENT_TIMEOUT_SECONDS,
                     api_base=self.agent_api_base,  # only set for local/self-hosted providers
                     api_key=(self.agent_key if self.agent_key and self.agent_key != "local" else None),
                 )
@@ -6409,7 +6583,7 @@ class PulseCLI:
             color=_YELLOW,
         )
         try:
-            answer = self._call_model(prompt, max_tokens=150)
+            answer = self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS)
         except AgentRequestFailed as exc:
             # This is a periodic, low-stakes background check -- never
             # worth interrupting training over. Quietly skip this round
@@ -6495,18 +6669,27 @@ class PulseCLI:
             parts.append(f"Explanation: {fix['explanation']}")
         return "\n\n".join(parts)
 
-    def _verify_fix_with_retries(self, fix: Dict[str, Any]):
+    def _verify_fix_with_retries(self, fix: Dict[str, Any], diagnosis: str):
         """PASS 4: check the fix's math/logic before it's handed to the
         user. If it fails, ask the agent to revise and re-check, up to
         _MAX_VERIFY_ATTEMPTS times. Returns (fix, passed, reason).
+
+        A failed verify/revise *request* never discards the fix: the fix
+        was already developed, so it goes ahead as unverified best effort
+        (same as a verdict that doesn't clearly pass) rather than being
+        dropped along with the diagnosis behind it.
         """
         reason = ""
         for attempt in range(_MAX_VERIFY_ATTEMPTS):
             fix_desc = self._describe_fix(fix)
-            with _Spinner("Checking the fix"):
-                verify_answer = self._call_model(
-                    _PASS4_VERIFY_TMPL.format(fix_desc=fix_desc), max_tokens=350
-                )
+            try:
+                with _Spinner("Checking the fix"):
+                    verify_answer = self._call_model(
+                        _PASS4_VERIFY_TMPL.format(diagnosis=diagnosis, fix_desc=fix_desc),
+                        max_tokens=_AGENT_MAX_TOKENS,
+                    )
+            except AgentRequestFailed as exc:
+                return fix, False, f"(verification request failed: {exc})"
             verdict = self._parse_json_obj(verify_answer)
             if verdict is None:
                 # Unparsable verdict -- don't block the user on a formatting
@@ -6518,10 +6701,14 @@ class PulseCLI:
                 return fix, True, reason
             if attempt == _MAX_VERIFY_ATTEMPTS - 1:
                 break
-            with _Spinner("Revising fix"):
-                revised_answer = self._call_model(
-                    _PASS4_REVISE_TMPL.format(reason=reason), max_tokens=4000
-                )
+            try:
+                with _Spinner("Revising fix"):
+                    revised_answer = self._call_model(
+                        _PASS4_REVISE_TMPL.format(diagnosis=diagnosis, fix_desc=fix_desc, reason=reason),
+                        max_tokens=_AGENT_MAX_TOKENS,
+                    )
+            except AgentRequestFailed:
+                break
             revised = self._parse_code_fix(revised_answer)
             if revised is None:
                 break
@@ -6533,7 +6720,7 @@ class PulseCLI:
         turn up, ask the user whether to fix those too (PASS 6 recurses
         through the same 1-5 format for the new issue)."""
         with _Spinner("Reading for other errors"):
-            sweep_answer = self._call_model(_PASS5_SWEEP, max_tokens=300)
+            sweep_answer = self._call_model(_PASS5_SWEEP, max_tokens=_AGENT_MAX_TOKENS)
         sweep = self._parse_json_obj(sweep_answer)
         found = bool(sweep.get("other_errors_found")) if sweep else False
         summary = str(sweep.get("summary", "")).strip() if sweep else ""
@@ -6653,7 +6840,7 @@ class PulseCLI:
         try:
             # Pass 1: locate the region(s) of the error.
             with _Spinner("Reading for region of error"):
-                regions = self._call_model(_PASS1_LOCATE, max_tokens=200)
+                regions = self._call_model(_PASS1_LOCATE, max_tokens=_AGENT_MAX_TOKENS)
             print(f"\n[1] Region of error\n{regions}\n")
 
             # Pass 2: focused second read + diagnosis/reasoning. May include
@@ -6661,7 +6848,7 @@ class PulseCLI:
             # executed deterministically rather than trusted from the model.
             with _Spinner("Analyzing"):
                 raw_analysis = self._call_model(
-                    _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=700
+                    _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=_AGENT_MAX_TOKENS
                 )
             (
                 analysis, calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
@@ -6687,15 +6874,22 @@ class PulseCLI:
                 # No code change requested -- pass 3 is just the concrete fix
                 # in text; nothing to verify or sweep.
                 with _Spinner("Developing fix"):
-                    fix_text = self._call_model(_PASS3_FIX_TEXT, max_tokens=300)
+                    fix_text = self._call_model(
+                        _PASS3_FIX_TEXT_TMPL.format(diagnosis=full_answer), max_tokens=_AGENT_MAX_TOKENS
+                    )
                 print(f"[3] Fix\n{fix_text}\n")
                 full_answer += f"\n\n{fix_text}"
                 self.agent_history.append({"role": "assistant", "content": full_answer})
                 return full_answer
 
-            # Pass 3: develop and implement the fix.
+            # Pass 3: develop and implement the fix. Passes 1-2's findings
+            # are handed over explicitly -- otherwise this call sees only the
+            # original code + traceback and has to re-derive the diagnosis
+            # from scratch (tool results from pass 2 are already in history).
             with _Spinner("Developing & implementing fix"):
-                fix_answer = self._call_model(_PASS3_IMPLEMENT, max_tokens=4000)
+                fix_answer = self._call_model(
+                    _PASS3_IMPLEMENT_TMPL.format(diagnosis=full_answer), max_tokens=_AGENT_MAX_TOKENS
+                )
             fix = self._parse_code_fix(fix_answer)
             if fix is None:
                 print(f"[3] Fix\n{fix_answer}\n")
@@ -6705,7 +6899,7 @@ class PulseCLI:
 
             # Pass 4: verify the fix's math/logic before handing it to the
             # user; revise and re-check on failure (bounded retries).
-            fix, verify_ok, verify_reason = self._verify_fix_with_retries(fix)
+            fix, verify_ok, verify_reason = self._verify_fix_with_retries(fix, full_answer)
             status = "passed" if verify_ok else "did not clearly pass -- applying best effort"
             print(f"[4] Verification {status}: {verify_reason}\n")
 
@@ -6730,8 +6924,13 @@ class PulseCLI:
             result = f"{full_answer}\n\n{apply_result}"
 
             # Pass 5 (+ 6): only worth a full re-read if a fix actually landed.
+            # The fix is already on disk at this point, so a failed sweep
+            # request must not stop the restart that tests it.
             if self._fix_applied_this_turn and _depth < 3:
-                self._run_sweep_and_maybe_recurse(include_code, _depth)
+                try:
+                    self._run_sweep_and_maybe_recurse(include_code, _depth)
+                except AgentRequestFailed as exc:
+                    cprint(f"[Pulse] ⚠ Full re-read skipped (agent request failed: {exc}) -- continuing with the applied fix.", color=_YELLOW)
         except AgentRequestFailed as exc:
             # Whichever pass hit this, stop the pipeline right here rather
             # than let the raw failure get treated as a real diagnosis/fix
@@ -6742,9 +6941,13 @@ class PulseCLI:
             msg = f"⚠ AI agent request failed: {exc}"
             print(f"\n{msg}\n")
             self.agent_history.append({"role": "assistant", "content": msg})
-            if _depth == 0:
-                self._last_call_failed_transiently = True
-            return msg
+            if not (_depth == 0 and self._fix_applied_this_turn):
+                if _depth == 0:
+                    self._last_call_failed_transiently = True
+                return msg
+            # A fix already landed on disk before this later request failed
+            # -- still restart so it actually gets run and tested.
+            result = msg
 
         if _depth == 0 and self._fix_applied_this_turn and not self._suppress_auto_restart:
             self._restart_process()  # does not return
@@ -7260,7 +7463,19 @@ class PulseCLI:
                     else:
                         skipped.append((old, path, "no exact match found in the file"))
                 else:
-                    skipped.append((old, path, f"matched {count} times (ambiguous), skipped for safety"))
+                    # Ambiguous -- but if the crash happened inside one of the
+                    # occurrences (a duplicated cell/block is exactly how that
+                    # happens), that one is the one the fix is about.
+                    start = self._occurrence_at_crash(content, old, path)
+                    if start is not None:
+                        content = content[:start] + _banner_wrap_fix(old, new, path) + content[start + len(old):]
+                        applied.append((old, new))
+                        cprint(
+                            f"     snippet occurs {count}x -- applied the one at the crash "
+                            f"(line {self._last_crash_location[1]})", color=_YELLOW,
+                        )
+                    else:
+                        skipped.append((old, path, f"matched {count} times (ambiguous), skipped for safety"))
 
             if not applied:
                 continue
@@ -7316,6 +7531,9 @@ class PulseCLI:
             for old, where, reason in skipped:
                 lines.append(f"  - [{os.path.basename(str(where))}] {reason}: {old.splitlines()[0][:80]}...")
             self._last_apply_skipped = skipped
+            # Printed like the success path below -- no caller prints the
+            # returned text, so otherwise a rejected fix fails silently.
+            cprint("\n".join(lines), color=_RED)
             return "\n".join(lines)
 
         for path, applied in applied_by_path.items():
@@ -7400,7 +7618,7 @@ class PulseCLI:
             "Respond with ONLY a corrected code-fix JSON object (old/new/files/explanation) covering "
             "just these snippets -- no prose, no markdown fences."
         )
-        answer = self._call_model(prompt, max_tokens=4000)
+        answer = self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS)
         return self._parse_code_fix(answer)
 
     def _cmd_code(self, arg: str) -> None:
@@ -8361,7 +8579,7 @@ class PulseCLI:
             return
         try:
             context = self._build_agent_context(include_code=True)
-            answer = self._call_model(f"{context}\n\n{self._START_PRIME_PROMPT}", max_tokens=300)
+            answer = self._call_model(f"{context}\n\n{self._START_PRIME_PROMPT}", max_tokens=_AGENT_MAX_TOKENS)
         except AgentRequestFailed as exc:
             cprint(f"[Pulse] ⚠ Start-of-run sensitivity check skipped (agent request failed: {exc})", color=_YELLOW)
             answer = None
@@ -8423,7 +8641,7 @@ class PulseCLI:
         if not mllint_findings and self.code_text:
             try:
                 context = self._build_agent_context(include_code=True)
-                answer = self._call_model(f"{context}\n\n{self._START_PRIME_PROMPT}", max_tokens=300)
+                answer = self._call_model(f"{context}\n\n{self._START_PRIME_PROMPT}", max_tokens=_AGENT_MAX_TOKENS)
                 _, _calc, _promote, gputrack_names, _gpuu, sensitivity_args, normal_start_args, _grep, _view = self._extract_directives(answer)
                 summary = self._apply_directives([], [], gputrack_names, None, sensitivity_args, normal_start_args)
                 if summary:
