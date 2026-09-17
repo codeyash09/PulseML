@@ -909,30 +909,11 @@ _PASS3_FIX_TEXT_TMPL = (
 )
 _PASS3_IMPLEMENT_TMPL = (
     "Your analysis so far:\n{diagnosis}\n\n"
-    "PASS 3 -- DEVELOP & IMPLEMENT: You are fixing a bug in someone's training run, nothing else. "
-    "Fix the bug and only the bug: no optimisation, no refactoring, no renaming, no added "
-    "callbacks or seeds, no style or formatting changes, no 'while I am here' improvements -- "
-    "even where you can see something you would write differently. Every line you touch beyond "
-    "the bug is a line that can break a run that is otherwise working. "
-    "Implement the fix for the root cause diagnosed above. The user wants this fix applied to their code. Default to the "
+    "PASS 3 -- DEVELOP & IMPLEMENT: Implement the fix for the root cause diagnosed above. The user wants this fix applied to their code. Default to the "
     "smallest possible change -- a single line or a few adjacent lines -- and only widen the edit if "
     "the root cause genuinely can't be fixed that narrowly. Do not refactor, restructure, or rewrite "
     "code beyond what's needed to fix the diagnosed root cause. Respond with ONLY the code-fix JSON "
     "object described in your instructions (old/new/explanation) -- no prose, no markdown fences."
-)
-_PASS4_RECHECK_TMPL = (
-    "Your analysis:\n{diagnosis}\n\n"
-    "The fix you proposed:\n{fix_desc}\n\n"
-    "An automated check on this fix reported:\n{reason}\n\n"
-    "PASS 4b -- RE-EXAMINE: That check is itself automated and can be wrong; it is one more "
-    "piece of evidence, not a verdict, and it is not evidence that your fix is right either. "
-    "Look again at the code and the evidence you were given and decide for yourself.\n"
-    "Respond with ONLY one of:\n"
-    '- {{"decision": "keep", "reason": "one sentence"}} if the fix should be applied as it is\n'
-    '- {{"decision": "revise", "old": [...], "new": [...], "files": [...], "explanation": "..."}} '
-    "with a corrected fix\n"
-    '- {{"decision": "drop", "reason": "one sentence"}} if it should not be applied at all\n'
-    "Fix only the bug; a revision must stay as small as the bug requires."
 )
 _PASS4_VERIFY_TMPL = (
     "Your analysis:\n{diagnosis}\n\n"
@@ -959,16 +940,182 @@ _PASS5_SWEEP = (
     'if none"}.'
 )
 _IMPLEMENT_KEYWORDS = ("fix", "edit", "patch", "change the code", "apply", "implement")
-
-# How many times the fix pass may ask to see more code before giving up.
-_MAX_FIX_TOOL_ROUNDS = 3
-_PASS3_NO_TOOLS_NOTE = (
-    "You did not return the code-fix JSON. Everything you were given is above. If you need to "
-    "see more code, ask for it with a directive line -- e.g. 'VIEW: <file>:<start>-<end>' or "
-    "'GREP: <pattern>' -- and it will be answered. Otherwise respond with ONLY the code-fix "
-    "JSON object (old/new/files/explanation), fixing the bug and nothing else."
-)
 _MAX_VERIFY_ATTEMPTS = 3
+
+# ---------------------------------------------------------------------------
+# PASS 4.5 -- MEASURE: Pass 4 only asks the model whether its own fix *looks*
+# right. That misses anything that only shows up once the code actually
+# runs -- e.g. a loss/label-encoding mismatch that doesn't crash but also
+# doesn't train. This pass builds a fast, time-boxed copy of the REAL
+# training script (same model, same data, same loss -- just fewer
+# epochs/steps so it finishes quickly) and empirically checks whether the
+# loss actually moves the right way, instead of trusting a self-report.
+_PASS4B_PROBE_TMPL = (
+    "The fix has already been applied to the file below.\n\n"
+    "PASS 4.5 -- BUILD A FAST PROBE: Produce a modified copy of this file that runs a QUICK but "
+    "REPRESENTATIVE slice of its own training loop, so the actual loss trend can be checked "
+    "empirically. Use the REAL model architecture, REAL loss function/optimizer, and REAL data "
+    "pipeline exactly as they are -- do NOT swap in dummy data, do NOT shrink the network, do NOT "
+    "change the fix that was just applied. The ONLY thing you should change is how much of the loop "
+    "actually runs: cut epochs/steps down to the smallest number that still shows a real trend "
+    "(as few as 2-4 data points is fine), and/or subsample the dataset if loading or preprocessing "
+    "it is what dominates the runtime. If training is a manual loop rather than a framework .fit() "
+    "call, cap its iteration count the same way and make sure it still prints or otherwise surfaces "
+    "the loss each iteration. Keep everything else byte-for-byte identical.\n\n"
+    "Respond with ONLY the full modified file contents in a single ```python fenced code block -- "
+    "no prose, no explanation, no markdown outside that one block.\n\n"
+    "--- {filename} ---\n{content}"
+)
+_PASS4B_REVISE_WITH_EVIDENCE_TMPL = (
+    "Your analysis:\n{diagnosis}\n\n"
+    "The fix you applied:\n{fix_desc}\n\n"
+    "This was actually run (briefly, on the real model/data) to check the loss empirically, and it "
+    "did not pass: {evidence}\n\n"
+    "Revise the fix so the loss actually decreases -- this is real measured behavior, not a guess, "
+    "so make sure the revision addresses what the numbers show rather than re-applying the same "
+    "change. Respond with ONLY the corrected code-fix JSON object (old/new/explanation) -- no prose, "
+    "no markdown fences."
+)
+_MAX_EMPIRICAL_ATTEMPTS = 2
+# Soft, in-process budget handed to the probe harness itself: once this much
+# wall-clock time has elapsed, it sets model.stop_training so a currently
+# in-flight run ends gracefully (and gets to flush whatever loss values it
+# already has) rather than being killed mid-write.
+_PROBE_SOFT_TIME_BUDGET_SECONDS = 45.0
+# Hard backstop at the subprocess level, independent of anything the probe
+# script or harness does -- covers a hang before .fit() is ever reached
+# (e.g. stuck data loading) that the in-process budget can't see.
+_PROBE_HARD_TIMEOUT_SECONDS = 75.0
+_PROBE_MIN_POINTS = 2
+
+_STDOUT_LOSS_RE = re.compile(r"(?<![a-zA-Z_])loss:\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)")
+
+
+def _scrape_stdout_losses(text: str) -> List[float]:
+    """Fallback loss source when the probe harness's own callback hook
+    didn't catch anything (e.g. a training setup it doesn't recognize):
+    Keras' default verbose=1 progress bar prints 'loss: <num>' per
+    batch/epoch on its own, with no instrumentation needed."""
+    out: List[float] = []
+    for m in _STDOUT_LOSS_RE.finditer(text or ""):
+        try:
+            out.append(float(m.group(1)))
+        except ValueError:
+            pass
+    return out
+
+
+def _loss_probe_verdict(losses: List[float]):
+    """Returns ("pass"|"fail"|"inconclusive", detail_str)."""
+    n = len(losses)
+    if n < _PROBE_MIN_POINTS:
+        return "inconclusive", f"only {n} loss reading(s) captured during the probe -- not enough to judge a trend"
+    if any((v != v) or (abs(v) == float("inf")) for v in losses):  # NaN/Inf
+        return "fail", f"loss went NaN/Inf during the probe run: {losses[:10]}"
+    k = max(1, n // 3)
+    first = sum(losses[:k]) / k
+    last = sum(losses[-k:]) / k
+    detail = f"loss {first:.4g} -> {last:.4g} over {n} reading(s)"
+    if last < first - 1e-9:
+        return "pass", f"loss trended down over the probe run ({detail})"
+    return "fail", f"loss did NOT trend down over the probe run ({detail})"
+
+
+# Standalone module written next to the probe copy and imported as its very
+# first line. Two jobs: (1) silence Pulse's own tracking/agent/cloud-sync
+# machinery inside this throwaway run (auto_track() is a real call baked
+# into the tracked script itself -- see pulse.py's auto_track -- so it would
+# otherwise fire here too), and (2) hook whatever training API is in use so
+# real per-epoch loss values get written to PULSE_PROBE_METRICS_PATH as they
+# happen, surviving even a hard kill once at least one epoch has landed.
+_PROBE_HARNESS_SRC = '''
+import os as _os, sys as _sys, json as _json, time as _time, atexit as _atexit
+
+for _modname in ("pulse", "pulse_cli", "pulse.pulse_cli"):
+    try:
+        __import__(_modname)
+    except Exception:
+        pass
+for _modname in ("pulse", "pulse_cli", "pulse.pulse_cli"):
+    _m = _sys.modules.get(_modname)
+    if _m is not None:
+        try:
+            _m.auto_track = lambda *a, **k: None
+        except Exception:
+            pass
+
+_METRICS_PATH = _os.environ.get("PULSE_PROBE_METRICS_PATH")
+_TIME_BUDGET = float(_os.environ.get("PULSE_PROBE_TIME_BUDGET", "45"))
+_START = _time.time()
+_LOSSES = []
+
+def _pulse_probe_flush():
+    if not _METRICS_PATH:
+        return
+    try:
+        with open(_METRICS_PATH, "w", encoding="utf-8") as _f:
+            _json.dump({"loss": _LOSSES}, _f)
+    except Exception:
+        pass
+
+_atexit.register(_pulse_probe_flush)
+
+def _pulse_probe_record(logs):
+    try:
+        val = None
+        if isinstance(logs, dict):
+            for _k in ("loss", "val_loss", "training_loss"):
+                if logs.get(_k) is not None:
+                    val = float(logs[_k])
+                    break
+        elif logs is not None:
+            val = float(logs)
+        if val is not None and val == val and abs(val) != float("inf"):
+            _LOSSES.append(val)
+            _pulse_probe_flush()
+    except Exception:
+        pass
+
+def _pulse_probe_time_up():
+    return (_time.time() - _START) >= _TIME_BUDGET
+
+def _pulse_probe_hook_keras(_keras_mod):
+    try:
+        _Base = _keras_mod.callbacks.Callback
+
+        class _PulseProbeCB(_Base):
+            def on_epoch_end(self, epoch, logs=None):
+                _pulse_probe_record(logs)
+                if _pulse_probe_time_up():
+                    self.model.stop_training = True
+
+            def on_batch_end(self, batch, logs=None):
+                if _pulse_probe_time_up():
+                    self.model.stop_training = True
+
+        _orig_fit = _keras_mod.Model.fit
+
+        def _pulse_probe_patched_fit(self, *args, **kwargs):
+            cbs = list(kwargs.get("callbacks") or [])
+            cbs.append(_PulseProbeCB())
+            kwargs["callbacks"] = cbs
+            return _orig_fit(self, *args, **kwargs)
+
+        _keras_mod.Model.fit = _pulse_probe_patched_fit
+    except Exception:
+        pass
+
+try:
+    import tensorflow as _tf
+    _pulse_probe_hook_keras(_tf.keras)
+except Exception:
+    pass
+try:
+    import keras as _keras_standalone
+    _pulse_probe_hook_keras(_keras_standalone)
+except Exception:
+    pass
+'''
 
 # Output-token budget for every agent call. Deliberately generous: reasoning
 # models spend part of it on hidden reasoning before any visible text, and a
@@ -1012,13 +1159,11 @@ def _comment_char_for(path: str) -> str:
 
 
 def _normalize_ws_for_match(s: str) -> str:
-    """Collapse whitespace and drop blank lines -- see the matching, more
-    heavily-commented copy in pulse.py. A lenient equality check used only
-    to LOCATE a snippet that doesn't match verbatim, never to decide what
-    gets written. Runs of whitespace *within* a line are collapsed too, so
-    a model that re-types `fit(x, y)` as `fit(x,  y)` still locates the
-    line it meant; the file keeps its own formatting either way."""
-    lines = [re.sub(r"\s+", " ", ln.strip()) for ln in s.splitlines()]
+    """Collapse each line's leading/trailing whitespace and drop blank
+    lines -- see the matching, more heavily-commented copy in pulse.py.
+    A lenient equality check used only to LOCATE a snippet that doesn't
+    match verbatim, never to decide what gets written."""
+    lines = [ln.strip() for ln in s.splitlines()]
     return "\n".join(ln for ln in lines if ln)
 
 
@@ -1031,8 +1176,7 @@ def _find_fuzzy_snippet_span(content: str, old: str):
         return None
 
     content_lines = content.splitlines(keepends=True)
-    meaningful = [(i, re.sub(r"\s+", " ", ln.strip()))
-                  for i, ln in enumerate(content_lines) if ln.strip()]
+    meaningful = [(i, ln.strip()) for i, ln in enumerate(content_lines) if ln.strip()]
     target_lines = target.split("\n")
     n = len(target_lines)
     if n == 0 or len(meaningful) < n:
@@ -1056,17 +1200,15 @@ def _find_fuzzy_snippet_span(content: str, old: str):
 
 
 def _banner_wrap_fix(old: str, new: str, path: str) -> str:
-    """The replacement text written to disk: just the new code.
-
-    This used to leave the old code behind, commented out under a
-    "=====Pulse Change====" banner. Every later fix then had to read
-    around that dead code -- and with more than one fix in a run the
-    banners nested, so patches started trying to clean up Pulse's own
-    leftovers instead of the bug. The pre-fix content of every file is
-    already stored in .pulse_history (that is what /revert and /log read),
-    so nothing is lost by keeping the file itself minimal.
+    """Wrap a code-fix replacement so the OLD code stays visible, commented
+    out, directly above the NEW (live) code -- instead of silently
+    swapping one for the other with no trace in the file itself. Written
+    directly into the file content saved to disk, so it shows up the next
+    time the file is opened, not just in Pulse's own console output.
     """
-    return new
+    c = _comment_char_for(path)
+    old_commented = "\n".join(f"{c} {line}" if line.strip() else c for line in old.splitlines())
+    return f"{c} =====Pulse Change====\n{c} Old\n{old_commented}\n{c} New\n{new}"
 
 
 def _format_exc_short(exc_text: str, max_lines: int = 25) -> str:
@@ -6707,26 +6849,14 @@ class PulseCLI:
         user. If it fails, ask the agent to revise and re-check, up to
         _MAX_VERIFY_ATTEMPTS times. Returns (fix, passed, reason).
 
-        A check that doesn't pass is reported back to the model as
-        evidence, not enforced as a verdict: the model re-examines and
-        decides to keep, revise or drop the fix. Pulse used to apply a
-        fix the check had rejected as "best effort", which is how a
-        correct fix that had already landed was followed by an edit that
-        deleted the training call.
-
-        The same fix is never re-checked twice: if the model comes back
-        with the fix it already had, that answer stands and the loop ends
-        rather than asking again with the same evidence.
+        A failed verify/revise *request* never discards the fix: the fix
+        was already developed, so it goes ahead as unverified best effort
+        (same as a verdict that doesn't clearly pass) rather than being
+        dropped along with the diagnosis behind it.
         """
         reason = ""
-        seen = set()
         for attempt in range(_MAX_VERIFY_ATTEMPTS):
             fix_desc = self._describe_fix(fix)
-            signature = json.dumps([fix["old"], fix["new"]], sort_keys=True)
-            if signature in seen:
-                # Same fix, same evidence -- asking again just burns calls.
-                return fix, True, (reason or "(re-examined and unchanged)")
-            seen.add(signature)
             try:
                 with _Spinner("Checking the fix"):
                     verify_answer = self._call_model(
@@ -6744,58 +6874,222 @@ class PulseCLI:
             reason = str(verdict.get("reason", "")).strip()
             if passes:
                 return fix, True, reason
-
-            # Hand the check's finding back and let the model decide.
+            if attempt == _MAX_VERIFY_ATTEMPTS - 1:
+                break
             try:
-                with _Spinner("Re-examining the fix"):
-                    recheck_answer = self._call_model(
-                        _PASS4_RECHECK_TMPL.format(
-                            diagnosis=diagnosis, fix_desc=fix_desc,
-                            reason=reason or "(no reason given)"),
+                with _Spinner("Revising fix"):
+                    revised_answer = self._call_model(
+                        _PASS4_REVISE_TMPL.format(diagnosis=diagnosis, fix_desc=fix_desc, reason=reason),
                         max_tokens=_AGENT_MAX_TOKENS,
                     )
-            except AgentRequestFailed as exc:
-                return fix, False, f"(re-examination request failed: {exc})"
-
-            decision_obj = self._parse_json_obj(recheck_answer) or {}
-            decision = str(decision_obj.get("decision", "")).strip().lower()
-            note = str(decision_obj.get("reason", "") or decision_obj.get("explanation", "")).strip()
-            if decision == "keep":
-                return fix, True, f"kept by the agent after re-examination: {note or '(no reason given)'}"
-            if decision == "drop":
-                return fix, False, f"dropped by the agent after re-examination: {note or '(no reason given)'}"
-            revised = self._parse_code_fix(recheck_answer)
+            except AgentRequestFailed:
+                break
+            revised = self._parse_code_fix(revised_answer)
             if revised is None:
-                # No usable decision: treat the check as unconfirmed rather
-                # than applying a fix nobody stood behind.
-                return fix, False, (reason or "(the check did not pass and the agent did not respond usably)")
+                break
             fix = revised
-        return fix, False, (reason or "(the check did not pass after re-examination)")
+        return fix, False, (reason or "(verification did not clearly pass after retries)")
 
-    def _service_tool_requests(self, answer: str) -> str:
-        """Run any directives the model put in `answer` (GREP:/VIEW:/CALC:
-        and the extended toolset) and return their combined output, or ""
-        if it asked for nothing. Same servicing pass 2 gets -- shared so
-        that asking for context works wherever the model does it."""
-        notes = []
+    _PROBE_CODEBLOCK_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
+
+    def _build_fast_probe_source(self, path: str, content: str) -> Optional[str]:
+        """Ask the agent for a fast-but-faithful copy of `content`: same
+        model/data/loss, just iteration-capped. Returns the probe source,
+        or None if the agent didn't return something that at least parses
+        as Python (in which case the empirical check is skipped rather
+        than run against garbage)."""
         try:
-            (_clean, calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
-             sensitivity_args, normal_start_args, grep_patterns, view_requests) = self._extract_directives(answer)
-            if calc_exprs or promote_names or grep_patterns or view_requests:
-                note = self._apply_directives(
-                    calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
-                    sensitivity_args, normal_start_args, grep_patterns, view_requests,
+            with _Spinner("Building fast probe of the fix"):
+                answer = self._call_model(
+                    _PASS4B_PROBE_TMPL.format(filename=os.path.basename(path), content=content),
+                    max_tokens=_AGENT_MAX_TOKENS,
                 )
-                if note:
-                    notes.append(note)
-            _clean2, new_requests = self._extract_new_directives(answer)
-            if new_requests:
-                note = self._apply_new_directives(new_requests)
-                if note:
-                    notes.append(note)
-        except Exception as exc:  # a malformed directive must not end the fix
-            _pulse_log(f"TOOL REQUEST servicing failed: {exc!r}")
-        return "\n\n".join(n for n in notes if n)
+        except AgentRequestFailed:
+            return None
+        m = self._PROBE_CODEBLOCK_RE.search(answer or "")
+        probe_src = (m.group(1) if m else (answer or "")).strip()
+        if not probe_src:
+            return None
+        try:
+            ast.parse(probe_src)
+        except SyntaxError:
+            return None
+        return probe_src
+
+    def _run_loss_probe(self, target_path: str, probe_src: str) -> Dict[str, Any]:
+        """Write `probe_src` next to the real script, run it as a short,
+        hard-capped subprocess, and return whatever loss readings it
+        reported before finishing or being cut off. Always cleans up
+        every file it created -- the probe copy, the harness, the metrics
+        sidecar, and anything the run itself wrote to disk (checkpoints,
+        saved models, csv logs, __pycache__ entries) -- so a throwaway
+        smoke test never leaves artifacts in the user's project.
+        """
+        directory = os.path.dirname(os.path.abspath(target_path)) or "."
+        token = uuid.uuid4().hex[:10]
+        probe_path = os.path.join(directory, f".__pulse_probe_{token}.py")
+        harness_name = f"_pulse_probe_harness_{token}"
+        harness_path = os.path.join(directory, f"{harness_name}.py")
+        metrics_path = os.path.join(directory, f".__pulse_probe_{token}.json")
+
+        try:
+            before_entries = set(os.listdir(directory))
+        except OSError:
+            before_entries = set()
+
+        result: Dict[str, Any] = {"loss": [], "note": "", "stdout_tail": "", "stderr_tail": ""}
+        try:
+            with open(harness_path, "w", encoding="utf-8") as f:
+                f.write(_PROBE_HARNESS_SRC)
+            with open(probe_path, "w", encoding="utf-8") as f:
+                f.write(f"import {harness_name}  # noqa -- Pulse empirical-verify harness, deleted after this probe\n")
+                f.write(probe_src)
+
+            depth = 0
+            try:
+                depth = int(os.environ.get(_RESTART_DEPTH_ENV, "0"))
+            except ValueError:
+                depth = 0
+            env = dict(
+                os.environ,
+                **{
+                    # Same markers _restart_process uses -- keeps auto_track()
+                    # in this child quiet/non-interactive and stops it from
+                    # starting its own nested fix/restart chain if the probe
+                    # script hits an unrelated crash.
+                    _RESTART_CHILD_ENV: "1",
+                    _RESTART_DEPTH_ENV: str(depth + 1),
+                    "PULSE_AUTO_RESTART": "1",
+                    "PULSE_PROBE_METRICS_PATH": metrics_path,
+                    "PULSE_PROBE_TIME_BUDGET": str(_PROBE_SOFT_TIME_BUDGET_SECONDS),
+                },
+            )
+            python_exe = self._resolve_restart_interpreter() or sys.executable
+
+            try:
+                proc = subprocess.run(
+                    [python_exe, probe_path], cwd=directory, env=env,
+                    capture_output=True, text=True, timeout=_PROBE_HARD_TIMEOUT_SECONDS,
+                )
+                result["stdout_tail"] = (proc.stdout or "")[-4000:]
+                result["stderr_tail"] = (proc.stderr or "")[-4000:]
+                if proc.returncode != 0:
+                    result["note"] = f"probe process exited with code {proc.returncode}"
+            except subprocess.TimeoutExpired as exc:
+                result["note"] = f"probe run hit the hard {_PROBE_HARD_TIMEOUT_SECONDS:.0f}s cap and was stopped"
+                result["stdout_tail"] = (exc.stdout or "")[-4000:]
+                result["stderr_tail"] = (exc.stderr or "")[-4000:]
+            except Exception as exc:
+                result["note"] = f"probe run failed to launch: {exc}"
+
+            if os.path.exists(metrics_path):
+                try:
+                    with open(metrics_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict) and isinstance(data.get("loss"), list):
+                        result["loss"] = [v for v in data["loss"] if isinstance(v, (int, float))]
+                except Exception:
+                    pass
+
+            if not result["loss"]:
+                result["loss"] = _scrape_stdout_losses(result["stdout_tail"])
+        finally:
+            for p in (probe_path, harness_path, metrics_path):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except OSError:
+                    pass
+            try:
+                after_entries = set(os.listdir(directory))
+            except OSError:
+                after_entries = set()
+            for name in after_entries - before_entries:
+                full = os.path.join(directory, name)
+                try:
+                    if os.path.isdir(full):
+                        shutil.rmtree(full, ignore_errors=True)
+                    else:
+                        os.remove(full)
+                except OSError:
+                    pass
+        return result
+
+    def _verify_fix_empirically(self, fix: Dict[str, Any], diagnosis: str):
+        """PASS 4.5 -- MEASURE: Pass 4 is the model grading its own
+        homework; this actually runs a fast, time-boxed slice of the real
+        training loop and checks whether the loss really moves the right
+        way. On a bad or NaN'ing verdict, reverts this attempt, asks the
+        agent to revise using the measured curve as evidence, and tries
+        again (bounded by _MAX_EMPIRICAL_ATTEMPTS). Never silently claims
+        a pass it didn't earn: if every attempt fails or is inconclusive,
+        the LAST attempted fix is left applied (same philosophy as Pass 4
+        -- a fix already developed goes ahead as best effort rather than
+        being discarded) but the return value says so clearly.
+
+        Returns (fix, ok, detail) where ok is True (measured improvement),
+        False (measured, but didn't improve / NaN'd / still applied best
+        effort after retries), or None (skipped -- nothing to measure,
+        e.g. the fix didn't touch the main tracked script, or a probe
+        couldn't be built/run at all).
+        """
+        target_path = self.script_path
+        if not target_path or target_path not in self._pending_revert_backups:
+            return fix, None, "fix didn't touch the main tracked script -- nothing to run standalone"
+
+        original_content = self._pending_revert_backups[target_path]
+        evidence = ""
+        for attempt in range(_MAX_EMPIRICAL_ATTEMPTS):
+            try:
+                with open(target_path, "r", encoding="utf-8") as f:
+                    current_content = f.read()
+            except OSError as exc:
+                return fix, None, f"couldn't re-read {os.path.basename(target_path)}: {exc}"
+
+            probe_src = self._build_fast_probe_source(target_path, current_content)
+            if probe_src is None:
+                return fix, None, "couldn't build a runnable fast probe of the fix"
+
+            with _Spinner(f"Running fast probe (hard cap {_PROBE_HARD_TIMEOUT_SECONDS:.0f}s)"):
+                probe_result = self._run_loss_probe(target_path, probe_src)
+
+            verdict, detail = _loss_probe_verdict(probe_result["loss"])
+            note = probe_result.get("note") or ""
+            evidence = detail + (f" [{note}]" if note else "")
+
+            if verdict == "pass":
+                return fix, True, evidence
+            if verdict == "inconclusive":
+                return fix, None, evidence
+
+            # verdict == "fail" -- revert this attempt and try a revision,
+            # if there's a retry left.
+            if attempt == _MAX_EMPIRICAL_ATTEMPTS - 1:
+                break
+            try:
+                with open(target_path, "w", encoding="utf-8") as f:
+                    f.write(original_content)
+            except OSError:
+                break
+            fix_desc = self._describe_fix(fix)
+            try:
+                with _Spinner("Revising fix using probe results"):
+                    revised_answer = self._call_model(
+                        _PASS4B_REVISE_WITH_EVIDENCE_TMPL.format(
+                            diagnosis=diagnosis, fix_desc=fix_desc, evidence=evidence,
+                        ),
+                        max_tokens=_AGENT_MAX_TOKENS,
+                    )
+            except AgentRequestFailed:
+                break
+            revised = self._parse_code_fix(revised_answer)
+            if revised is None:
+                break
+            self._apply_code_fix(revised)
+            if not self._fix_applied_this_turn:
+                break
+            fix = revised
+        return fix, False, evidence or "loss did not improve after retries"
 
     def _run_sweep_and_maybe_recurse(self, include_code: bool, _depth: int) -> None:
         """PASS 5: re-read everything for OTHER, unrelated errors. If any
@@ -6973,34 +7267,6 @@ class PulseCLI:
                     _PASS3_IMPLEMENT_TMPL.format(diagnosis=full_answer), max_tokens=_AGENT_MAX_TOKENS
                 )
             fix = self._parse_code_fix(fix_answer)
-
-            # Wanting to see more code is not a failed fix. Pass 2 already
-            # services GREP:/VIEW:/REPL: and friends; this pass used to
-            # accept nothing but the finished JSON, so a model that asked
-            # for context ("let me look at lines 295-305") ended the whole
-            # pipeline with the bug undiagnosed. Answer what it asked for
-            # and let it try again, a bounded number of times.
-            for _round in range(_MAX_FIX_TOOL_ROUNDS):
-                if fix is not None:
-                    break
-                print(f"[3] Fix (not final)\n{fix_answer}\n")
-                self.agent_history.append({"role": "assistant", "content": fix_answer})
-                note = self._service_tool_requests(fix_answer)
-                if note:
-                    print(f"[tool results]\n{note}\n")
-                    self.agent_history.append({"role": "user", "content": note})
-                else:
-                    self.agent_history.append({"role": "user", "content": _PASS3_NO_TOOLS_NOTE})
-                try:
-                    with _Spinner("Developing & implementing fix"):
-                        fix_answer = self._call_model(
-                            _PASS3_IMPLEMENT_TMPL.format(diagnosis=full_answer),
-                            max_tokens=_AGENT_MAX_TOKENS,
-                        )
-                except AgentRequestFailed:
-                    break
-                fix = self._parse_code_fix(fix_answer)
-
             if fix is None:
                 print(f"[3] Fix\n{fix_answer}\n")
                 full_answer += f"\n\n{fix_answer}"
@@ -7010,16 +7276,8 @@ class PulseCLI:
             # Pass 4: verify the fix's math/logic before handing it to the
             # user; revise and re-check on failure (bounded retries).
             fix, verify_ok, verify_reason = self._verify_fix_with_retries(fix, full_answer)
-            status = "passed" if verify_ok else "not confirmed -- fix NOT applied"
+            status = "passed" if verify_ok else "did not clearly pass -- applying best effort"
             print(f"[4] Verification {status}: {verify_reason}\n")
-            if not verify_ok:
-                # Nobody stood behind this edit: the check flagged it and the
-                # agent, shown that finding, did not confirm it. Writing it
-                # anyway is how a working program gets broken after the real
-                # fix has already landed.
-                result = f"{full_answer}\n\n(Fix not applied: {verify_reason})"
-                self.agent_history.append({"role": "assistant", "content": full_answer})
-                return result
 
             self.agent_history.append({"role": "assistant", "content": full_answer})
             apply_result = self._apply_code_fix(fix)
@@ -7040,6 +7298,27 @@ class PulseCLI:
                         apply_result = apply_result + f"\n\n({note} change applied)\n" + retry_result
 
             result = f"{full_answer}\n\n{apply_result}"
+
+            # Pass 4.5: don't just trust Pass 4's self-report -- actually run
+            # a fast, hard-capped slice of the real training loop and check
+            # the loss for real. Only meaningful once a fix has actually
+            # landed on disk (there's nothing to run otherwise).
+            if self._fix_applied_this_turn:
+                try:
+                    fix, empirical_ok, empirical_detail = self._verify_fix_empirically(fix, full_answer)
+                except Exception as exc:
+                    empirical_ok, empirical_detail = None, f"probe step raised an unexpected error: {exc}"
+                if empirical_ok is True:
+                    empirical_note = f"[4.5] Empirical check PASSED -- {empirical_detail}"
+                elif empirical_ok is False:
+                    empirical_note = (
+                        f"[4.5] Empirical check DID NOT PASS -- {empirical_detail} "
+                        "-- fix left applied as best effort."
+                    )
+                else:
+                    empirical_note = f"[4.5] Empirical check skipped -- {empirical_detail}"
+                print(f"\n{empirical_note}\n")
+                result = f"{result}\n\n{empirical_note}"
 
             # Pass 5 (+ 6): only worth a full re-read if a fix actually landed.
             # The fix is already on disk at this point, so a failed sweep
@@ -7111,16 +7390,6 @@ class PulseCLI:
 
         if not isinstance(payload, dict):
             return None
-
-        if not ("old" in payload and "new" in payload):
-            # Some models wrap the object they were asked for in an envelope
-            # ({"pulse_analysis": {...}, "json": {"old": [...], ...}}). The
-            # schema is right, it is just one level down -- take it rather
-            # than throwing a usable fix away over packaging.
-            for value in payload.values():
-                if isinstance(value, dict) and "old" in value and "new" in value:
-                    payload = value
-                    break
 
         old, new, explanation = payload.get("old"), payload.get("new"), payload.get("explanation")
         files = payload.get("files")
@@ -8003,12 +8272,7 @@ class PulseCLI:
             ]
 
         def _history(name):
-            # Epoch-level metrics first: under Keras, loss/accuracy arrive
-            # once per epoch through the fit hook and land in
-            # epoch_scalar_histories, while scalar_histories (step-level
-            # sampling) can stay empty for the whole run. Reading only the
-            # latter meant a Keras run had nothing to detect on at all.
-            return _finite(self._history_for_detector(name))
+            return _finite(self.scalar_histories.get(name, []))
 
         def _find_history(*names):
             """
@@ -8429,44 +8693,6 @@ class PulseCLI:
                     f"{val_first:.4g} → {val_last:.4g}. "
                     "Training loss is not translating into improving "
                     "validation performance."
-                )
-
-        # ------------------------------------------------------------
-        # 2b. The run never learned anything
-        #
-        # Every check above looks for training going *wrong* -- a spike, a
-        # regression, a plateau after progress. A run that is simply not
-        # learning (loss flat from the first epoch to the last) trips none
-        # of them, which is how a zeroed initializer, dropout(1.0) or a
-        # far-too-large learning rate can train to the end unremarked.
-        #
-        # Only the whole-run shape is used: the loss at the end vs at the
-        # start. Improvement of any size keeps this quiet, so a run that
-        # simply converges to a poor result is NOT flagged (Pulse has no
-        # way to know what result was achievable).
-        # ------------------------------------------------------------
-
-        loss_name, loss_hist = _find_history("loss", "train_loss")
-
-        if loss_hist and len(loss_hist) >= 10:
-            span = max(2, len(loss_hist) // 5)
-            start_mean = sum(loss_hist[:span]) / span
-            end_mean = sum(loss_hist[-span:]) / span
-
-            if start_mean > 0 and end_mean >= start_mean * 0.98:
-                accuracy_note = ""
-                for acc_name in ("accuracy", "val_accuracy", "acc", "categorical_accuracy"):
-                    acc_hist = _history(acc_name)
-                    if len(acc_hist) >= 10 and max(acc_hist) - min(acc_hist) < 0.01:
-                        accuracy_note = (
-                            f", and '{acc_name}' never moved from {acc_hist[-1]:.4g}"
-                        )
-                        break
-
-                reasons.append(
-                    f"'{loss_name}' is no better at the end of the run than at the start "
-                    f"({start_mean:.4g} → {end_mean:.4g} over {len(loss_hist)} epochs)"
-                    f"{accuracy_note} -- the model does not appear to be learning"
                 )
 
         # ------------------------------------------------------------
