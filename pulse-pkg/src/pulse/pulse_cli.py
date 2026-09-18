@@ -44,6 +44,7 @@ from pulse.pulse_backend import (
     to_numpy,
 )
 from pulse.pulse_pdf import generate_heatmap_pdf
+from pulse import pulse_detect as _pulse_detect
 from pulse import pulse_supabase as cloud
 try:
     import litellm
@@ -9371,7 +9372,103 @@ class PulseCLI:
         print(msg)
         return None
     
+    # Checks the engine runs that the legacy detector did not have a counterpart for,
+    # and vice versa, are listed in the benchmark README; the switch below is what
+    # decides which of the two a normal `pulse run` actually uses.
+    _LEGACY_DETECTOR_ENV = "PULSE_LEGACY_DETECTOR"
+
+    def _detector_histories(self) -> Dict[str, List[Any]]:
+        """Every scalar history worth checking, whatever route it arrived by.
+
+        Names come from three places and the union matters: a Keras metric exists only
+        in epoch_scalar_histories, a sampled local only in scalar_histories, and the
+        per-variable checks used to iterate tracked_vars alone -- so a metric that
+        static discovery had not found was never checked at all, which is why sixteen
+        Deep4ge runs detected nothing.
+        """
+        names = set(getattr(self, "epoch_scalar_histories", {}) or {})
+        names.update(getattr(self, "scalar_histories", {}) or {})
+        names.update(getattr(self, "tracked_vars", []) or [])
+        histories: Dict[str, List[Any]] = {}
+        for name in names:
+            try:
+                values = self._history_for_detector(name)
+            except Exception:
+                continue
+            if values:
+                histories[name] = list(values)
+        return histories
+
+    def _detection_engine(self):
+        """The engine, kept across calls: confirmations and clearing are stateful."""
+        engine = getattr(self, "_detector", None)
+        overrides = {
+            "explosion_multiplier": self.explosion_multiplier,
+            "plateau_range_frac": self.plateau_range_frac,
+            "oscillation_flip_threshold": self.oscillation_flip_threshold,
+            "oscillation_delta_frac": self.oscillation_delta_frac,
+            "stagnation_frac": self.stagnation_frac,
+        }
+        if engine is None:
+            engine = _pulse_detect.DetectionEngine(sensitivity=self.sensitivity)
+            self._detector = engine
+        # /sensitivity takes effect on the next check, with no restart, as before.
+        engine.sensitivity = self.sensitivity
+        engine.overrides = {k: v for k, v in overrides.items() if v is not None}
+        return engine
+
     def _check_for_trouble(self) -> Optional[str]:
+        """Is this training run going wrong? Returns why, or None.
+
+        The judgment itself lives in pulse_detect.DetectionEngine, which is the version
+        that is tested and benchmarked. On the 37-run detection benchmark the two agree
+        on every broken run and disagree sharply on healthy ones: the implementation
+        below this one raised a false alarm on 7 of 15 healthy runs -- a deliberate
+        learning-rate drop, a converged run sitting at its floor, a fine-tune improving
+        slowly, a GAN, a noisy small validation split -- against 0 for the engine.
+
+        Set PULSE_LEGACY_DETECTOR=1 to get the old one back.
+        """
+        if os.environ.get(self._LEGACY_DETECTOR_ENV, "").strip().lower() in ("1", "true", "yes", "on"):
+            return self._check_for_trouble_legacy()
+
+        histories = self._detector_histories()
+        if not histories:
+            return None
+        tensor_stats = {}
+        for name, entry in (getattr(self, "_matrix_cache", {}) or {}).items():
+            if isinstance(entry, dict) and isinstance(entry.get("stats"), dict):
+                tensor_stats[name] = entry["stats"]
+        step = max((len(values) for values in histories.values()), default=0)
+        try:
+            raised = self._detection_engine().update(
+                histories, step=step, tensor_stats=tensor_stats or None)["raised"]
+        except Exception as exc:
+            # A detector that raises takes the training run with it. Say nothing.
+            if _PULSE_LOGGING:
+                try:
+                    _pulse_log(f"DETECTOR ERROR {type(exc).__name__}: {exc}")
+                except Exception:
+                    pass
+            return None
+        # Info-level findings are observations, not problems: "accuracy has not moved"
+        # on a fine-tune sitting at 97% is true and worth showing, and pausing the run
+        # to ask an agent about it is not. Only actionable severities escalate.
+        raised = [f for f in raised if f.severity in (_pulse_detect.CRITICAL, _pulse_detect.WARNING)]
+        if not raised:
+            return None
+        order = {_pulse_detect.CRITICAL: 0, _pulse_detect.WARNING: 1}
+        raised.sort(key=lambda f: (order.get(f.severity, 9), -f.confidence))
+        result = "; ".join(f.message for f in raised)
+        if _PULSE_LOGGING:
+            try:
+                _pulse_log(f"DETECTOR result={result!r} "
+                           f"histories={ {k: len(v) for k, v in histories.items()} !r}")
+            except Exception:
+                pass
+        return result
+
+    def _check_for_trouble_legacy(self) -> Optional[str]:
         """
         Deterministic runtime training-health detector.
 
