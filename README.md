@@ -170,6 +170,98 @@ The benchmark is not presented as proof that Pulse is already better than genera
 
 ---
 
+## Two processes: the monitor and the brain
+
+Pulse used to be one process. The tracker, the detectors and the AI agent all ran on the
+training thread, so a run stopped dead while the model thought. Measured on a 20k-step
+loop, `PulseCLI.update()` held the training thread for 84% of the wall clock, and almost
+all of that was two blocking model calls.
+
+```text
+training process                          brain process
+----------------                          -------------
+pulse_monitor.Monitor      ---stream--->  pulse_brain.Brain
+  reads values                              history, detection
+  writes frames                             the audit, the agent
+  never blocks, never thinks                thinks as long as it likes
+```
+
+Start it from the training side:
+
+```python
+from pulse import auto_track
+auto_track(mode="stream")
+```
+
+and watch it from anywhere else:
+
+```bash
+python -m pulse.brain                      # newest session
+python -m pulse.brain <session-dir> --model openrouter/deepseek/deepseek-v4.1-flash
+python -m pulse.brain <session-dir> --once # one pass over a finished run
+```
+
+### What the training process pays
+
+Nothing is installed into the training loop. There is no `sys.settrace`, no frame-local
+trace function, no callback into user code: a background thread reads the training
+thread's variables a few times a second.
+
+| Work on the training thread, 20k steps | single process | stream mode |
+|---|---:|---:|
+| `is_trackable` calls | 67,112 | 0 |
+| `to_numpy` (a device sync and copy on a GPU tensor) | 264 | 0 |
+| full-array `statistics` passes | 60 | 0 |
+| blocking model calls | yes, 13.3 s of a 15.9 s run | never |
+
+Three rules keep the monitor that cheap. It never converts data to answer a question
+about its shape; only 0-d and few-element values cross the device boundary, and only on
+a schedule; and it holds no references, so tracking a tensor no longer keeps it, and its
+GPU memory, alive for the rest of the run.
+
+The stream is lossy on purpose. Under backpressure the oldest frame is dropped and the
+loss is recorded, so the brain knows its view has a hole rather than the training loop
+being slowed down. It is written to an append-only file rather than a socket, so the
+brain can attach late, crash, or be restarted without the run ever waiting for it.
+
+### The agent decides when it is next needed
+
+Every time the brain finishes talking to the model, the last thing it asks for is when to
+come back, and why. A fix that just landed, a metric heading the wrong way, or anything
+the model is unsure about pulls the next look in to minutes. A run that has been
+descending smoothly for an hour gets left alone for an hour.
+
+This used to apply only to the periodic check-in. Applying a fix never touched the
+interval, so the riskiest minutes in a run -- the ones just after the code changed
+underneath it -- were watched no more closely than any other. A NaN, a critical finding
+or a fix now brings the next look forward immediately, and the schedule is persisted, so
+a brain restarted after a fix resumes the cadence that was asked for rather than
+resetting to the default.
+
+### Waking up means re-reading the run
+
+The audit pass is handed the whole run: every curve downsampled into buckets of
+min/mean/max, so a two-step spike survives the compression instead of being averaged
+away; every current finding; the tensors; what has already been fixed; what previous
+audits concluded; and how many samples the monitor had to drop. It is asked specifically
+for what the deterministic checks cannot see -- a loss that is still technically
+decreasing but far slower than it should, two metrics that disagree, a value that is
+plausible but wrong.
+
+### Detection
+
+The detectors moved out of the training process and became structured. A finding now
+carries a check id, a variable, a severity, its numbers and a confidence, and it is
+deduplicated on (check, variable) rather than on its own formatted message -- which is
+why "spiked to 4.12" and "spiked to 4.13" used to escalate as two separate problems. A
+check has to hold for two consecutive evaluations before it is raised, except NaN and
+Inf, where waiting is itself the damage. Findings clear when the condition goes away and
+can fire again afterwards.
+
+Detection also no longer depends on the fixer: it runs whether or not auto-fix is on.
+
+---
+
 ## Key Features
 
 ### Live ML Training Monitoring
@@ -460,6 +552,20 @@ LESS OVERHEAD
 ```
 
 Rather than collecting everything continuously, Pulse lets you decide what information is worth monitoring.
+
+Measured, on a 20k-step loop with the loop in the same frame as `auto_track()`:
+
+| Work on the training thread | single process | `mode="stream"` |
+|---|---:|---:|
+| `is_trackable` calls | 67,112 | 0 |
+| `to_numpy` (device sync + copy on GPU) | 264 | 0 |
+| full-array `statistics` passes | 60 | 0 |
+| seconds of Pulse on the training thread | 0.059 | 0 |
+| with an agent configured, `update()` on the training thread | 13.39 s of a 15.9 s run | never runs there |
+
+`docs/overhead.md` has the method and the caveats. The short version: in stream mode the
+training process runs no Pulse code at all beyond a background thread reading its
+variables, and it never waits for a model.
 
 ---
 
