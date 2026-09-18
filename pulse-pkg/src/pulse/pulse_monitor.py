@@ -28,8 +28,11 @@ Three rules keep it that way:
 """
 from __future__ import annotations
 
+import atexit
 import math
 import os
+import sys
+import threading
 import time
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -82,6 +85,20 @@ def _scalar_of(value: Any) -> Optional[float]:
         return float(item())
     except (TypeError, ValueError, RuntimeError):
         return None
+
+
+# Loop counters, in the order they are trusted. Using the training loop's own counter
+# rather than "how many times the sampler has run" is what lets the brain line a finding
+# up with a step number the user recognises.
+_STEP_NAMES = ("global_step", "step", "iteration", "iter", "batch_idx", "epoch", "i")
+
+
+def _infer_step(local_vars: Dict[str, Any], fallback: int) -> int:
+    for name in _STEP_NAMES:
+        value = local_vars.get(name)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return fallback
 
 
 def _describe(value: Any) -> Optional[Dict[str, Any]]:
@@ -175,7 +192,7 @@ class Monitor:
         if step is not None:
             self.step = int(step)
         else:
-            self.step += 1
+            self.step = _infer_step(local_vars, self.step + 1)
 
         scalars: Dict[str, Any] = {}
         tripwires: List[Tuple[str, float]] = []
@@ -186,10 +203,13 @@ class Monitor:
                 continue
             number = _scalar_of(value)
             if number is not None:
-                previous = self._last_values.get(name)
-                if previous is None or previous != number:
-                    scalars[name] = number
-                    self._last_values[name] = number
+                # Every sample is sent, including one identical to the last. Suppressing
+                # repeats looks like free bandwidth and is actually how a frozen run
+                # becomes invisible: "this value has not moved in six readings" is the
+                # signal, and it cannot be reconstructed from a stream that only carries
+                # changes. A float a few times a second is not worth the blind spot.
+                scalars[name] = number
+                self._last_values[name] = number
                 if not math.isfinite(number):
                     tripwires.append((name, number))
                 continue
@@ -346,3 +366,112 @@ class Monitor:
         self.snapshot_state({"finished": True})
         self.event("finished", cost=self.cost())
         self.writer.close()
+
+
+# ---------------------------------------------------------------------------------------
+# Attaching to a running script
+# ---------------------------------------------------------------------------------------
+
+_ACTIVE: Optional["Monitor"] = None
+_SAMPLER: Optional[threading.Thread] = None
+_STOP = threading.Event()
+
+_SKIP_PATH_MARKERS = (os.sep + "pulse" + os.sep, os.sep + "site-packages" + os.sep,
+                      os.sep + "lib" + os.sep + "python", "<frozen", "<string>")
+
+
+def _is_user_frame(frame: Any) -> bool:
+    """True for a frame in the user's own code, rather than in Pulse, a library or the stdlib."""
+    filename = getattr(getattr(frame, "f_code", None), "co_filename", "") or ""
+    return not any(marker in filename for marker in _SKIP_PATH_MARKERS)
+
+
+def _collect_locals(frame: Any, depth: int) -> Dict[str, Any]:
+    """Locals of the innermost `depth` user frames, innermost winning on a name clash."""
+    chain = []
+    while frame is not None and len(chain) < depth:
+        if _is_user_frame(frame):
+            chain.append(frame)
+        frame = frame.f_back
+    merged: Dict[str, Any] = {}
+    for candidate in reversed(chain):          # outermost first, so the innermost wins
+        try:
+            merged.update(candidate.f_locals)
+        except Exception:
+            continue
+    return merged
+
+
+def _sample_loop(monitor: "Monitor", thread_id: int, depth: int, interval: float) -> None:
+    """Read the training thread's variables from outside it.
+
+    Pulse used to install sys.settrace and a frame-local trace function, which runs
+    Python on every line of the training loop for the life of the run. Sampling from
+    another thread costs the training loop nothing at all: it never runs Pulse's code,
+    it is never called back into, and the only interaction is this thread briefly
+    holding the GIL a few times a second.
+    """
+    while not _STOP.wait(interval):
+        frames = sys._current_frames()
+        frame = frames.get(thread_id)
+        if frame is None:
+            continue
+        try:
+            monitor.observe_locals(_collect_locals(frame, depth))
+        except Exception as exc:                 # sampling must never kill a run
+            try:
+                monitor.event("sampler_error", error=f"{type(exc).__name__}: {exc}")
+            except Exception:
+                pass
+        if monitor.stop_requested:
+            return
+
+
+def attach(
+    *,
+    script_path: Optional[str] = None,
+    interval: float = 0.25,
+    depth: int = 3,
+    tensor_interval: float = 5.0,
+    session_id: Optional[str] = None,
+    directory: Optional[str] = None,
+    thread_id: Optional[int] = None,
+) -> "Monitor":
+    """Start streaming this thread's training variables to a brain process.
+
+    Returns the Monitor. Sampling happens on a background thread, so the training loop
+    is not instrumented at all -- nothing is installed into it and nothing calls into it.
+    """
+    global _ACTIVE, _SAMPLER
+    if _ACTIVE is not None:
+        return _ACTIVE
+    monitor = Monitor(script_path=script_path, session_id=session_id, directory=directory,
+                      interval=0.0,            # the sampler thread sets the pace
+                      tensor_interval=tensor_interval)
+    _STOP.clear()
+    _ACTIVE = monitor
+    _SAMPLER = threading.Thread(
+        target=_sample_loop,
+        args=(monitor, thread_id or threading.get_ident(), depth, max(0.01, interval)),
+        name="pulse-monitor-sampler", daemon=True)
+    _SAMPLER.start()
+    atexit.register(detach)
+    return monitor
+
+
+def detach() -> None:
+    global _ACTIVE, _SAMPLER
+    monitor, _ACTIVE = _ACTIVE, None
+    _STOP.set()
+    if _SAMPLER is not None:
+        _SAMPLER.join(timeout=1.0)
+    _SAMPLER = None
+    if monitor is not None:
+        try:
+            monitor.close()
+        except Exception:
+            pass
+
+
+def active() -> Optional["Monitor"]:
+    return _ACTIVE

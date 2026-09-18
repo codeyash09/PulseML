@@ -6813,6 +6813,58 @@ def _install_pulse_excepthook(session_id):
     sys.excepthook = _hook
 
 
+def _stream_mode_requested(mode):
+    return str(mode or "").strip().lower() == "stream" or \
+        os.environ.get("PULSE_MODE", "").strip().lower() == "stream"
+
+
+def _start_stream_monitor(caller_frame, throttle_interval):
+    """Attach the light monitor and leave the thinking to a separate brain process.
+
+    Nothing is installed into the training loop: no sys.settrace, no frame-local trace
+    function, no callback on the user's code at all. A background thread reads the
+    training thread's variables a few times a second and streams them out, and a brain
+    process picks them up from there. Detection, the agent and any fix happen over
+    there, where taking a minute to think costs the run nothing.
+    """
+    from . import pulse_monitor
+
+    script_path = None
+    try:
+        script_path = os.path.abspath(caller_frame.f_code.co_filename)
+    except (AttributeError, OSError):
+        pass
+    try:
+        interval = float(throttle_interval)
+    except (TypeError, ValueError):
+        interval = 1.0
+    interval = min(2.0, max(0.05, interval / 4.0))
+
+    monitor = pulse_monitor.attach(script_path=script_path, interval=interval,
+                                   thread_id=threading.get_ident())
+
+    previous_excepthook = sys.excepthook
+
+    def _stream_excepthook(exc_type, exc_value, exc_tb):
+        # The brain may be mid-sleep when the run dies. Put the traceback in the stream
+        # first, so the evidence is there whenever it next looks.
+        try:
+            monitor.event("crash", urgent=True,
+                          exception=f"{getattr(exc_type, '__name__', exc_type)}: {exc_value}",
+                          traceback="".join(traceback.format_exception(exc_type, exc_value, exc_tb))[-8000:])
+            monitor.snapshot_state({"crashed": True})
+            pulse_monitor.detach()
+        except Exception:
+            pass
+        return previous_excepthook(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _stream_excepthook
+
+    print(f"[Pulse] Monitoring this run into {monitor.directory}")
+    print(f"[Pulse] Watch it with:  python -m pulse.brain {monitor.directory} --model <model>")
+    return monitor
+
+
 def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_root=None, mode="cli"):
     """
     Call this once before your training loop, optionally passing your
@@ -6820,10 +6872,15 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
         auto_track(train_step)
 
     mode: "ui" (dashboard + chat), "cli" (headless, Colab/SSH-friendly),
-    or "auto" (default -- detects a real display and falls back to cli).
+    "stream" (monitor only: stream to a separate brain process, the lightest
+    option and the one that never blocks training), or "auto" (default --
+    detects a real display and falls back to cli).
     """
     global _debugger_bg, _session_id
     mp.freeze_support()
+
+    if _stream_mode_requested(mode):
+        return _start_stream_monitor(sys._getframe(1), throttle_interval)
 
     # Multi-GPU / multi-process launch detection (torchrun,
     # torch.distributed.launch, OpenMPI, Slurm) -- world_size > 1 means

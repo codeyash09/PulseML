@@ -100,6 +100,7 @@ def thresholds(sensitivity: float) -> Dict[str, float]:
         "divergence_val_frac": max(0.05, 0.003 + 0.077 * s),
         "divergence_train_frac": 0.02,
         "perfect_metric": 0.999,
+        "vanishing_norm": 1e-8,
     }
 
 
@@ -279,10 +280,22 @@ class DetectionEngine:
                                        f"{name} jumped to {latest:g}, {latest / baseline:.1f}x its recent average",
                                        step, {"latest": latest, "baseline": baseline},
                                        _confidence(latest / baseline, t["explosion_multiplier"], len(values))))
-                elif latest * t["explosion_multiplier"] < baseline:
-                    out.append(Finding("norm_collapse", name, WARNING,
-                                       f"{name} collapsed to {latest:g} from a recent average of {baseline:g}",
-                                       step, {"latest": latest, "baseline": baseline}, 0.7))
+                else:
+                    # A gradient norm that shrinks as a model converges is what success
+                    # looks like, so "smaller than it was" is not a finding: comparing
+                    # against a 50-reading average flagged every healthy run. What is
+                    # pathological is a norm that has effectively reached zero, or one
+                    # that falls off a cliff between two consecutive readings.
+                    previous = values[-2]
+                    vanished = latest < t["vanishing_norm"]
+                    fell_off = previous > 0 and latest * t["explosion_multiplier"] < previous
+                    if vanished or fell_off:
+                        detail = (f"{name} has effectively reached zero ({latest:g})" if vanished
+                                  else f"{name} fell from {previous:g} to {latest:g} in one reading")
+                        out.append(Finding("norm_collapse", name, WARNING,
+                                           f"{detail}: gradients this small stop the model learning",
+                                           step, {"latest": latest, "previous": previous,
+                                                  "baseline": baseline, "vanished": vanished}, 0.7))
 
         if looks_like_lr(name) and len(values) >= 2:
             previous = values[-2]

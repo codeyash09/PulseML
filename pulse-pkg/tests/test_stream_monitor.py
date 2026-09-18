@@ -192,14 +192,24 @@ class MonitorTest(unittest.TestCase):
         scalars = self._frames(stream.KIND_SCALARS)
         self.assertEqual(len(scalars), 1, "sampling interval ignored: %d frames" % len(scalars))
 
-    def test_unchanged_scalars_are_not_resent(self):
+    def test_repeated_values_are_sent_not_deduplicated(self):
+        # A value that has stopped moving is the signal, not noise: "unchanged for six
+        # readings" is how a frozen loss is detected, and a stream that only carries
+        # changes cannot express it.
         monitor = self._monitor()
         for step in range(5):
             monitor.observe_locals({"loss": 1.0, "lr": 0.01}, step=step)
-        monitor.observe_locals({"loss": 2.0, "lr": 0.01}, step=5)
         monitor.close()
         sent = [f["values"] for f in self._frames(stream.KIND_SCALARS)]
-        self.assertEqual(sent, [{"loss": 1.0, "lr": 0.01}, {"loss": 2.0}])
+        self.assertEqual(len(sent), 5)
+        self.assertTrue(all(v == {"loss": 1.0, "lr": 0.01} for v in sent))
+
+    def test_step_is_taken_from_the_training_loop_counter(self):
+        monitor = self._monitor()
+        monitor.observe_locals({"step": 4096, "loss": 0.5})
+        monitor.close()
+        frames = self._frames(stream.KIND_SCALARS)
+        self.assertEqual(frames[0]["step"], 4096)
 
     def test_nonfinite_raises_an_urgent_event(self):
         monitor = self._monitor()
