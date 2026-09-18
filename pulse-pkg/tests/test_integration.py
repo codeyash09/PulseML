@@ -6,6 +6,7 @@ have caught auto_track() crashing on a machine without TensorFlow.
 import glob
 import json
 import os
+import site
 import subprocess
 import sys
 import tempfile
@@ -50,8 +51,13 @@ def run_training(workdir, lr, steps=600, timeout=180):
     script = os.path.join(workdir, "train.py")
     with open(script, "w", encoding="utf-8") as handle:
         handle.write(SCRIPT)
+    # HOME is redirected so the run cannot touch the real ~/.pulse state --
+    # but on a machine where dependencies live in the user's site-packages
+    # (pip install --user) that also hides them from the subprocess, so the
+    # parent's user site directory is put back on PYTHONPATH explicitly.
     env = dict(os.environ,
-               PYTHONPATH=SRC + os.pathsep + os.environ.get("PYTHONPATH", ""),
+               PYTHONPATH=os.pathsep.join(
+                   p for p in (SRC, site.getusersitepackages(), os.environ.get("PYTHONPATH", "")) if p),
                PULSE_LOGGING="0", LR=str(lr), STEPS=str(steps),
                HOME=os.path.join(workdir, "home"))
     os.makedirs(env["HOME"], exist_ok=True)
@@ -123,7 +129,9 @@ class StreamModeTest(unittest.TestCase):
                 loss = 1.0
                 raise ValueError("training exploded")
             """))
-        env = dict(os.environ, PYTHONPATH=SRC + os.pathsep + os.environ.get("PYTHONPATH", ""),
+        env = dict(os.environ,
+                   PYTHONPATH=os.pathsep.join(
+                       p for p in (SRC, site.getusersitepackages(), os.environ.get("PYTHONPATH", "")) if p),
                    PULSE_LOGGING="0", HOME=os.path.join(self.tmp, "home2"))
         os.makedirs(env["HOME"], exist_ok=True)
         subprocess.run([sys.executable, script], cwd=self.tmp, env=env,
