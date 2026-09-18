@@ -933,6 +933,19 @@ _PASS4_REVISE_TMPL = (
     "that still fixes the root cause. Respond with ONLY the corrected code-fix JSON object (old/new/"
     "explanation) -- no prose, no markdown fences."
 )
+_PASS6_CONFIRM_TMPL = (
+    "The fix below was applied and the program was then re-run from the start.\n\n"
+    "The fix:\n{fix_desc}\n\n"
+    "What the problem was:\n{problem}\n\n"
+    "What the re-run printed (its last {limit} characters):\n{output}\n\n"
+    "PASS 6 -- CONFIRM: answer one question and nothing else: did that fix do its job? "
+    "Judge it from the output above. Do not look for other problems, do not propose "
+    "changes, do not re-diagnose -- if something is still wrong, saying so here is enough "
+    "and the full pipeline will run next.\n"
+    'Respond with ONLY {{"resolved": true or false, "reason": "one sentence"}}.'
+)
+_CONFIRM_OUTPUT_CHARS = 4000
+
 _PASS5_SWEEP = (
     "PASS 5 -- FULL RE-READ: Re-read the ENTIRE code/context again -- not just the region you just "
     "fixed -- and check for any OTHER, unrelated bugs or issues. Respond with ONLY a JSON object of "
@@ -2053,6 +2066,11 @@ class PulseCLI:
         self._last_apply_skipped: List[tuple] = []
         # (path, line) of the most recent crash -- see _occurrence_at_crash.
         self._last_crash_location: Optional[tuple] = None
+        # What the agent was last asked about, quoted back by the post-fix check.
+        self._last_problem_description: Optional[str] = None
+        # Look for unrelated bugs after fixing the reported one? Off by
+        # default -- see the pass 5 call site.
+        self.sweep_enabled: bool = os.environ.get("PULSE_SWEEP", "").strip().lower() in ("1", "true", "yes", "on")
         # Dedup bookkeeping so one recurring bug doesn't get treated as N
         # separate incidents within a single run.
         self._traceback_signatures_seen: Dict[str, int] = {}
@@ -2122,6 +2140,7 @@ class PulseCLI:
             return
 
         self.auto_intervene = self._config_bool("autofix", "auto_fix", default=True)
+        self.sweep_enabled = self._config_bool("sweep", "sweep_for_other_bugs", default=self.sweep_enabled)
         self.telemetry_enabled = self._config_bool("telemetry", default=cloud.telemetry_enabled())
         if self._config_has("sensitivity"):
             self._cmd_sensitivity(str(self._config_value("sensitivity")), quiet=True)
@@ -4830,11 +4849,17 @@ class PulseCLI:
                 continue
 
             if result.returncode == 0:
-                sys.exit(0)
-
-            sys.stdout.write(result.stdout or "")
-            sys.stderr.write(result.stderr or "")
-            message = f"Replacement training process exited with code {result.returncode} (attempt {attempt}/{MAX_RESTART_ATTEMPTS})"
+                resolved, reason = self._confirm_fix_did_its_job(result)
+                if resolved:
+                    sys.exit(0)
+                sys.stdout.write(result.stdout or "")
+                sys.stderr.write(result.stderr or "")
+                message = (f"The re-run finished, but the fix does not appear to have done its job "
+                           f"(attempt {attempt}/{MAX_RESTART_ATTEMPTS}): {reason}")
+            else:
+                sys.stdout.write(result.stdout or "")
+                sys.stderr.write(result.stderr or "")
+                message = f"Replacement training process exited with code {result.returncode} (attempt {attempt}/{MAX_RESTART_ATTEMPTS})"
 
             if attempt >= MAX_RESTART_ATTEMPTS:
                 cprint(
@@ -4893,6 +4918,47 @@ class PulseCLI:
             else:
                 cprint(f"[Pulse] ⚠ {message}. Retrying restart...", color=_YELLOW)
                 time.sleep(min(RETRY_BACKOFF_SECONDS * attempt, 30))
+
+    def _confirm_fix_did_its_job(self, result) -> tuple:
+        """One small question after a re-run that finished cleanly: did the fix
+        work? Returns (resolved, reason).
+
+        A re-run used to be taken as success on its exit code alone, while
+        anything further was a fresh full investigation of an
+        already-fixed program -- locate, diagnose, write, verify, all over
+        again. This is the cheap middle step: one call that only judges the
+        outcome. If it says no, the caller escalates to the full pipeline
+        with the re-run's own output as evidence.
+
+        Anything that goes wrong here (no agent, a failed request, an
+        unparsable answer) counts as resolved: a check that cannot answer
+        must not hold up a run that finished cleanly.
+        """
+        if not self.agent_provider or not self.agent_key:
+            return True, ""
+        fix = self._last_applied_fix
+        fix_desc = self._describe_fix(fix) if fix else "(no fix recorded)"
+        problem = (self._last_problem_description or "(not recorded)")[:1500]
+        output = ((result.stdout or "") + "\n" + (result.stderr or ""))[-_CONFIRM_OUTPUT_CHARS:]
+        try:
+            with _Spinner("Checking the fix did its job"):
+                answer = self._call_model(
+                    _PASS6_CONFIRM_TMPL.format(fix_desc=fix_desc, problem=problem,
+                                               limit=_CONFIRM_OUTPUT_CHARS, output=output),
+                    max_tokens=_AGENT_MAX_TOKENS,
+                )
+        except AgentRequestFailed as exc:
+            cprint(f"[Pulse] ⚠ Post-fix check skipped (agent request failed: {exc})", color=_YELLOW)
+            return True, ""
+        verdict = self._parse_json_obj(answer)
+        if not verdict or "resolved" not in verdict:
+            return True, ""
+        reason = str(verdict.get("reason", "")).strip() or "(no reason given)"
+        if bool(verdict["resolved"]):
+            cprint(f"[Pulse] ✓ Re-run checked: the fix did its job -- {reason}", color=_YELLOW)
+            return True, reason
+        cprint(f"[Pulse] ⚠ Re-run checked: the fix did NOT do its job -- {reason}", color=_RED)
+        return False, reason
 
     def _print_variable_summary(self) -> None:
         variables = self.discover_variables()
@@ -7141,6 +7207,7 @@ class PulseCLI:
         with self._retry_ticker_lock:
             if _depth == 0:
                 self._last_applied_fix = None
+                self._last_problem_description = question
             answer = self._ask_agent_impl(question, include_code=include_code, _depth=_depth)
             if _depth == 0:
                 if self._last_call_failed_transiently:
@@ -7320,10 +7387,13 @@ class PulseCLI:
                 print(f"\n{empirical_note}\n")
                 result = f"{result}\n\n{empirical_note}"
 
-            # Pass 5 (+ 6): only worth a full re-read if a fix actually landed.
-            # The fix is already on disk at this point, so a failed sweep
-            # request must not stop the restart that tests it.
-            if self._fix_applied_this_turn and _depth < 3:
+            # Pass 5 (+ 6): a re-read of the whole file looking for OTHER,
+            # unrelated bugs, which then recurses into a fresh diagnose/fix
+            # round of its own. Off unless asked for ("sweep": true in
+            # pulse_config.json, or PULSE_SWEEP=1): on a benchmark of 36
+            # fixed bugs it turned 36 pipelines into 83, and most of the
+            # work happened after the reported bug was already fixed.
+            if self.sweep_enabled and self._fix_applied_this_turn and _depth < 3:
                 try:
                     self._run_sweep_and_maybe_recurse(include_code, _depth)
                 except AgentRequestFailed as exc:
@@ -8899,6 +8969,11 @@ class PulseCLI:
 
         return patched_any
 
+    def _resumed_from_restart(self) -> bool:
+        """This process was launched by a fix-triggered restart."""
+        return bool(getattr(self, "_resumed_after_restart", False)
+                    or os.environ.get(_RESTART_CHILD_ENV) == "1")
+
     def _prime_at_start(self) -> None:
         """Runs once, automatically, before the very first training step.
 
@@ -8973,6 +9048,12 @@ class PulseCLI:
 
         # Sensitivity / baseline / GPU-track priming (independent of MLLINT).
         if not self.agent_provider or not self.agent_key or not self.code_text:
+            return
+        if self._resumed_from_restart():
+            # A restart re-runs the same script with the same settings; the
+            # first run already answered this. Paying for it again on every
+            # restart was 154 calls across a 36-run benchmark and changed
+            # nothing.
             return
         try:
             context = self._build_agent_context(include_code=True)
