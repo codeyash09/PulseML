@@ -348,6 +348,33 @@ def _looks_like_metric(name: str) -> bool:
     return any(hint in n for hint in METRIC_NAME_HINTS)
 
 
+def _looks_like_grad_or_weight_norm(name: str) -> bool:
+    """A tracked scalar that's some kind of gradient/parameter norm
+    (grad_norm, gradient_norm, weight_norm, param_norm, ...) rather than
+    a loss or a metric -- these should be roughly stable, so a sudden
+    multiplicative jump (exploding gradients) or collapse toward zero
+    (vanishing gradients) is itself the anomaly, independent of what the
+    loss curve happens to be doing at the same time."""
+    n = (name or "").lower()
+    return any(
+        hint in n for hint in (
+            "grad_norm", "gradient_norm", "grad norm", "gradnorm",
+            "weight_norm", "param_norm", "parameter_norm", "weightnorm",
+        )
+    )
+
+
+def _looks_like_learning_rate(name: str) -> bool:
+    """A tracked scalar that's the current learning rate -- expected to
+    change only smoothly/deliberately (a scheduler step, a warmup ramp),
+    so a sudden large multiplicative jump between consecutive
+    observations usually means the scheduler itself is misconfigured
+    (wrong milestone/step count, wrong decay factor, stepped more than
+    once per actual optimizer step) rather than intended behavior."""
+    n = (name or "").lower()
+    return n in ("lr", "learning_rate", "learningrate") or n.endswith(("_lr", "_learning_rate"))
+
+
 def _enable_windows_ansi() -> None:
     """Turn on ANSI escape processing in classic Windows consoles (Win10+
     supports it, but it has to be switched on explicitly). No-op, and safe
@@ -1300,9 +1327,11 @@ def _seed_history_path(script_path: Optional[str]) -> str:
 
 # ----------------------------------------------------------------------
 # ML anti-pattern static checks (MLLINT) -- see the matching, more
-# heavily-commented copy in pulse.py. Deliberately a small, high-
-# confidence set of AST-detectable patterns worded as things "worth
-# double-checking," not certainties.
+# heavily-commented copy in pulse.py. A small, high-confidence set of
+# AST-detectable patterns worded as things "worth double-checking," not
+# certainties. Organized by scope: general/cross-backend patterns that
+# apply regardless of which of numpy/torch/tf-keras/jax/cupy a script
+# uses, then patterns specific to one backend's idioms.
 # ----------------------------------------------------------------------
 _MLLINT_REGRESSION_LOSSES = {
     "mse", "mae", "mean_squared_error", "mean_absolute_error", "msle",
@@ -1312,7 +1341,6 @@ _MLLINT_ACCURACY_METRICS = {
     "accuracy", "acc", "categorical_accuracy", "binary_accuracy",
     "sparse_categorical_accuracy", "top_k_categorical_accuracy",
 }
-_MLLINT_OPTIMIZER_NAMES = {"Adam", "SGD", "RMSprop", "Adagrad", "AdamW", "Adadelta", "NAdam", "RAdam"}
 _MLLINT_CLASSIFICATION_LOSSES = {
     "categorical_crossentropy", "sparse_categorical_crossentropy",
     "binary_crossentropy", "crossentropy", "hinge", "categorical_hinge",
@@ -1322,18 +1350,257 @@ _MLLINT_REGRESSION_METRICS = {
     "mae", "mse", "mean_absolute_error", "mean_squared_error", "rmse",
     "r2", "r2_score", "msle", "mean_squared_logarithmic_error",
 }
+# Optimizer constructors across torch, keras/tf, and optax (jax) -- kept
+# as one set since the "suspicious lr" check is otherwise identical for
+# all three. optax's own constructors are plain lowercase functions
+# (optax.adam(...)), unlike torch/keras classes, hence the mixed case.
+_MLLINT_OPTIMIZER_NAMES = {
+    "Adam", "SGD", "RMSprop", "Adagrad", "AdamW", "Adadelta", "NAdam",
+    "Nadam", "RAdam", "Adamax", "ASGD", "Rprop", "LBFGS", "SparseAdam",
+    "Ftrl",
+    # optax (jax)
+    "adam", "sgd", "adamw", "rmsprop", "adagrad", "adabelief", "lamb",
+    "novograd", "yogi", "radam", "lars", "fromage", "adamax", "noisy_sgd",
+    "sm3",
+}
+# Initializer kwargs that set a layer's *weight* matrix (as opposed to its
+# bias, where zeros is the normal/harmless default). Zero-initializing any
+# of these breaks symmetry: every unit in the layer starts identical, sees
+# an identical gradient, and (for a layer fed by a single upstream tensor)
+# can stay identical for a very long time. This is a genuinely silent bug:
+# a network with a zeroed weight matrix deeper than the input layer can
+# still limp forward via asymmetry introduced elsewhere (a nonzero bias,
+# an adjacent randomly-initialized layer feeding it a nonzero backprop
+# signal), so the loss curve often still trends down -- just far slower
+# and far worse than intended -- which is exactly the shape that the
+# runtime "loss never improved at all" detector cannot see.
+_MLLINT_WEIGHT_INITIALIZER_PARAMS = {
+    "kernel_initializer", "depthwise_initializer", "pointwise_initializer",
+    "recurrent_kernel_initializer", "embeddings_initializer",
+}
+_MLLINT_ZERO_INITIALIZER_NAMES = {"zeros", "zero", "Zeros", "zeros_initializer"}
+# Layer types whose entire purpose is to randomly zero out units -- a rate
+# of 1.0 (or a torch `p=1.0`) zeroes *every* unit on *every* forward pass
+# during training, so no signal at all passes through the layer. Loss can
+# still visibly decrease (whatever the layers before/after are able to do
+# on their own), so this is another "trains to completion looking mostly
+# normal" bug rather than a crash or an obviously flat loss curve.
+_MLLINT_DROPOUT_LAYER_NAMES = {
+    "Dropout", "Dropout1d", "Dropout2d", "Dropout3d",
+    "SpatialDropout1D", "SpatialDropout2D", "SpatialDropout3D",
+    "AlphaDropout", "GaussianDropout",
+}
+# A PRNG reseed call across every backend Pulse supports: np.random.seed,
+# random.seed, torch.manual_seed, tf.random.set_seed, cp.random.seed all
+# end in one of these names (JAX has no global seed to reseed -- keys are
+# explicit values, which is exactly why it gets its own key-reuse check
+# instead, below).
+_MLLINT_SEED_FUNC_NAMES = {"seed", "manual_seed", "set_seed", "set_random_seed"}
+# sklearn-style fit calls -- used for the "fit on test data" leak check.
+_MLLINT_FIT_CALL_NAMES = {"fit", "fit_transform"}
+# Keras/TF loss classes that take a `from_logits=` kwarg. Paired with an
+# already-activated final layer, this is the Keras equivalent of the
+# torch double-softmax/double-sigmoid checks below.
+_MLLINT_LOGITS_LOSS_CLASSES = {
+    "CategoricalCrossentropy", "SparseCategoricalCrossentropy", "BinaryCrossentropy",
+}
+_MLLINT_TEST_NAME_RE = re.compile(r"(?:^|_)test(?:$|_)", re.IGNORECASE)
+_MLLINT_TRAIN_NAME_RE = re.compile(r"(?:^|_)train(?:$|_)", re.IGNORECASE)
+_MLLINT_LOSSY_ACCUM_TARGET_RE = re.compile(r"(?:^|_)(loss|total|running|epoch)(?:$|_)", re.IGNORECASE)
+_MLLINT_LOSS_NAME_RE = re.compile(r"(?:^|_)loss(?:$|_)", re.IGNORECASE)
+_MLLINT_JAX_KEY_NAME_RE = re.compile(r"(?:^|_)(key|rng)(?:$|_)", re.IGNORECASE)
 
 
-def _mllint_const_str(node):
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+def _mllint_resolve(node, env):
+    """Resolve `node` to a literal Python value if possible: a direct
+    literal, a negative literal (`-0.01` parses as UnaryOp(USub,
+    Constant(0.01))), or -- the whole point of `env` -- a plain variable
+    reference to a name that a lightweight, conservative constant-
+    propagation pass (see `_mllint_literal_env`) could pin down to a
+    single literal value elsewhere in the file. Without this, something
+    as ordinary as
+
+        DROPOUT_RATE = 1.0
+        ...
+        model.add(Dropout(DROPOUT_RATE))
+
+    passes every check silently, because the Dropout(...) call site holds
+    a bare Name, not the literal -- the bug is real but AST-invisible
+    unless the Name is traced back to its assignment."""
+    if isinstance(node, ast.Constant):
         return node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        inner = _mllint_resolve(node.operand, env)
+        if isinstance(inner, (int, float)) and not isinstance(inner, bool):
+            return -inner
+        return None
+    if isinstance(node, ast.Name):
+        return env.get(node.id)
     return None
 
 
-def _mllint_list_of_str(node):
+def _mllint_const_str(node, env=None):
+    val = _mllint_resolve(node, env or {})
+    return val if isinstance(val, str) else None
+
+
+def _mllint_list_of_str(node, env=None):
     if isinstance(node, (ast.List, ast.Tuple)):
-        return [s for s in (_mllint_const_str(e) for e in node.elts) if s is not None]
+        return [s for s in (_mllint_const_str(e, env) for e in node.elts) if s is not None]
     return []
+
+
+def _mllint_bool_const(node, env=None):
+    val = _mllint_resolve(node, env or {})
+    return val if isinstance(val, bool) else None
+
+
+def _mllint_fname(node):
+    """The bare (unqualified) function name of a Call node, e.g. 'Zeros'
+    for both `Zeros()` and `initializers.Zeros()`."""
+    if not isinstance(node, ast.Call):
+        return None
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return None
+
+
+def _mllint_literal_env(tree):
+    """Tiny, deliberately conservative constant-propagation table: name ->
+    literal value, but ONLY for a name assigned to a literal exactly once
+    (to the same literal) anywhere in the file. This is not real dataflow
+    analysis -- it doesn't know about scope or assignment order -- so any
+    name that's reassigned, reassigned to a *different* literal, or ever
+    assigned something non-literal, is dropped entirely rather than risk
+    resolving a use to a stale or wrong value. That's enough to catch the
+    extremely common pattern of hyperparameters pulled out to a named
+    constant once near the top of a script."""
+    MULTI = object()
+    seen = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name = node.targets[0].id
+            lit = _mllint_resolve(node.value, {})
+            candidate = lit if lit is not None else MULTI
+            if name not in seen:
+                seen[name] = candidate
+            elif seen[name] != candidate:
+                seen[name] = MULTI
+    return {k: v for k, v in seen.items() if v is not MULTI and v is not None}
+
+
+def _mllint_call_env(tree):
+    """Companion to `_mllint_literal_env` for the non-literal case that
+    matters most here: an object built once and reused, e.g.
+
+        loss_fn = tf.keras.losses.CategoricalCrossentropy(from_logits=True)
+        ...
+        model.compile(loss=loss_fn, ...)
+
+    Maps name -> the Call node that built it, but only when that name is
+    assigned to a Call exactly once anywhere in the file (same
+    conservative reasoning as `_mllint_literal_env`: any reassignment,
+    even to another Call, drops the name rather than guessing)."""
+    MULTI = object()
+    seen = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name = node.targets[0].id
+            candidate = node.value if isinstance(node.value, ast.Call) else MULTI
+            if name not in seen:
+                seen[name] = candidate
+            elif seen[name] is not candidate:
+                seen[name] = MULTI
+    return {k: v for k, v in seen.items() if v is not MULTI}
+
+
+def _mllint_is_zero_initializer(node, env=None):
+    """True if `node` (an AST expression, resolved through `env` if it's
+    just a variable reference) is recognizably a zero initializer: the
+    string 'zeros'/'zero', a bare Zeros()/zeros_initializer() call (e.g.
+    `initializers.Zeros()`, `tf.zeros_initializer()`), or a Constant-style
+    initializer whose value is literally 0."""
+    s = _mllint_const_str(node, env)
+    if s is not None:
+        return s.lower() in {"zeros", "zero"}
+    if isinstance(node, ast.Call):
+        fname = _mllint_fname(node)
+        if fname in _MLLINT_ZERO_INITIALIZER_NAMES:
+            return True
+        if fname == "Constant":
+            val_node = node.keywords[0].value if node.keywords and node.keywords[0].arg in (None, "value") else (
+                node.args[0] if node.args else None)
+            if isinstance(val_node, ast.Constant) and isinstance(val_node.value, (int, float)):
+                return val_node.value == 0
+    return False
+
+
+def _mllint_numeric_const(node, env=None):
+    """Return the numeric value of `node` if it's a numeric literal (or a
+    variable resolvable to one via `env`), handling unary minus too."""
+    val = _mllint_resolve(node, env or {})
+    return val if isinstance(val, (int, float)) and not isinstance(val, bool) else None
+
+
+def _mllint_numeric_kwarg_or_arg(node, kwarg_names, arg_index=0, env=None):
+    """Return the numeric value passed either as one of `kwarg_names` or
+    as the positional arg at `arg_index`, else None."""
+    for kw in node.keywords:
+        if kw.arg in kwarg_names:
+            val = _mllint_numeric_const(kw.value, env)
+            if val is not None:
+                return val
+    if len(node.args) > arg_index:
+        return _mllint_numeric_const(node.args[arg_index], env)
+    return None
+
+
+def _mllint_is_grad_result(call_node):
+    """True for a direct `grad(...)`/`value_and_grad(...)` call, or for
+    JAX's common curried form `jax.grad(f)(params, x, y)`, where the outer
+    call's own `.func` is itself a call to grad/value_and_grad."""
+    if _mllint_fname(call_node) in ("grad", "value_and_grad"):
+        return True
+    if isinstance(call_node.func, ast.Call) and _mllint_fname(call_node.func) in ("grad", "value_and_grad"):
+        return True
+    return False
+
+
+def _mllint_assign_target_names(assign_node):
+    """Flat list of plain Name targets of an Assign, unpacking simple
+    tuple/list targets (`a, b = ...`) one level deep."""
+    names = []
+    for tgt in assign_node.targets:
+        if isinstance(tgt, ast.Name):
+            names.append(tgt.id)
+        elif isinstance(tgt, (ast.Tuple, ast.List)):
+            for elt in tgt.elts:
+                if isinstance(elt, ast.Name):
+                    names.append(elt.id)
+    return names
+
+
+def _mllint_find_calls_in_loops(tree, names):
+    """Depth-first walk returning every Call node whose bare function name
+    is in `names` and that sits lexically inside the body of a For/While/
+    AsyncFor loop somewhere above it (a loop the call node itself might
+    introduce doesn't count)."""
+    found = []
+
+    def visit(node, in_loop):
+        child_in_loop = in_loop or isinstance(node, (ast.For, ast.While, ast.AsyncFor))
+        if isinstance(node, ast.Call) and in_loop:
+            fname = _mllint_fname(node)
+            if fname in names:
+                found.append(node)
+        for child in ast.iter_child_nodes(node):
+            visit(child, child_in_loop)
+
+    visit(tree, False)
+    return found
 
 
 def _mllint_scan(trees) -> List[tuple]:
@@ -1345,21 +1612,60 @@ def _mllint_scan(trees) -> List[tuple]:
     trees = list(trees)
 
     for label, _path, _text, tree in trees:
+        # Per-file accumulators used by the cross-check passes below.
+        activation_calls = []      # [(lineno, 'softmax'|'sigmoid'|...)]
+        compile_infos = []         # [{'lineno', 'loss_str', 'loss_call_fname', 'from_logits', 'metrics'}]
+        to_categorical_loc = None
+        one_hot_encoder_loc = None
+        label_encoder_loc = None
+        one_hot_torch_loc = None
+        ce_or_nll_loss_loc = None
+
+        # Conservative variable resolution -- see _mllint_literal_env's
+        # docstring. Threaded into every check below that previously only
+        # recognized a literal sitting directly at the call site, so e.g.
+        # `DROPOUT_RATE = 1.0` ... `Dropout(DROPOUT_RATE)` is caught the
+        # same as `Dropout(1.0)` would have been.
+        env = _mllint_literal_env(tree)
+        call_env = _mllint_call_env(tree)
+
+        # --------------------------------------------------------------
+        # Pass 1: every Call node, single walk.
+        # --------------------------------------------------------------
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            func = node.func
-            fname = func.attr if isinstance(func, ast.Attribute) else (func.id if isinstance(func, ast.Name) else None)
+            fname = _mllint_fname(node)
             if fname is None:
                 continue
 
+            # ---- Keras/TF: loss/metric mismatches at model.compile() ----
             if fname == "compile":
                 loss_val, metrics_val = None, None
+                loss_call_fname, from_logits = None, False
                 for kw in node.keywords:
                     if kw.arg == "loss":
-                        loss_val = _mllint_const_str(kw.value)
+                        loss_val = _mllint_const_str(kw.value, env)
+                        # `loss=` may be an already-built loss object,
+                        # either inline (`loss=CategoricalCrossentropy(...)`)
+                        # or via a variable assigned to one exactly once
+                        # earlier in the file (`loss_fn = ...; loss=loss_fn`).
+                        loss_call_node = kw.value if isinstance(kw.value, ast.Call) else (
+                            call_env.get(kw.value.id) if isinstance(kw.value, ast.Name) else None)
+                        if loss_val is None and loss_call_node is not None:
+                            loss_call_fname = _mllint_fname(loss_call_node)
+                            from_logits = any(
+                                k.arg == "from_logits" and _mllint_bool_const(k.value, env) is True
+                                for k in loss_call_node.keywords
+                            )
                     elif kw.arg == "metrics":
-                        metrics_val = _mllint_list_of_str(kw.value)
+                        metrics_val = _mllint_list_of_str(kw.value, env)
+                compile_infos.append({
+                    "lineno": node.lineno, "loss_str": loss_val,
+                    "loss_call_fname": loss_call_fname, "from_logits": from_logits,
+                    "metrics": metrics_val,
+                })
+
                 if loss_val and metrics_val and loss_val.lower() in _MLLINT_REGRESSION_LOSSES:
                     if any(m.lower() in _MLLINT_ACCURACY_METRICS for m in metrics_val):
                         findings.append((label, node.lineno,
@@ -1390,25 +1696,212 @@ def _mllint_scan(trees) -> List[tuple]:
                 softmax_module_loc = (label, node.lineno)
             if fname == "NLLLoss" and nllloss_loc is None:
                 nllloss_loc = (label, node.lineno)
+            if fname in ("CrossEntropyLoss", "NLLLoss") and ce_or_nll_loss_loc is None:
+                ce_or_nll_loss_loc = node.lineno
+            if fname == "to_categorical" and to_categorical_loc is None:
+                to_categorical_loc = node.lineno
+            if fname == "OneHotEncoder" and one_hot_encoder_loc is None:
+                one_hot_encoder_loc = node.lineno
+            if fname == "LabelEncoder" and label_encoder_loc is None:
+                label_encoder_loc = node.lineno
+            if fname == "one_hot" and one_hot_torch_loc is None:
+                one_hot_torch_loc = node.lineno
 
+            # Collect every string-literal (or single-assignment-variable)
+            # `activation=` kwarg anywhere in the file, plus a standalone
+            # `Activation('softmax')` layer -- a distinct, common Keras
+            # idiom (activation as its own layer rather than a kwarg) that
+            # the kwarg-only version of this collection used to miss
+            # entirely. The cross-check pass below treats the latest one
+            # (by line number) before compile() as "the final layer's
+            # activation" -- a coarse but effective proxy for these
+            # typically-linear Sequential-style scripts.
+            for kw in node.keywords:
+                if kw.arg == "activation":
+                    act_val = _mllint_const_str(kw.value, env)
+                    if act_val:
+                        activation_calls.append((node.lineno, act_val))
+            if fname == "Activation" and node.args:
+                act_val = _mllint_const_str(node.args[0], env)
+                if act_val:
+                    activation_calls.append((node.lineno, act_val))
+
+            # ---- GENERAL: zero-initialized weight matrix (any backend
+            # exposing a `*_initializer=` kwarg -- Keras/TF layers) ----
+            for kw in node.keywords:
+                if kw.arg in _MLLINT_WEIGHT_INITIALIZER_PARAMS and _mllint_is_zero_initializer(kw.value, env):
+                    findings.append((label, node.lineno,
+                        f"{fname}(..., {kw.arg}='zeros'): zero-initializing a layer's weights means every "
+                        "unit starts identical and (absent asymmetry introduced elsewhere) receives an "
+                        "identical gradient, so the layer can fail to break symmetry for a very long time. "
+                        "Unlike a totally dead network, a run like this can still show the loss slowly "
+                        "improving via other layers, so it won't necessarily look flat -- worth "
+                        "double-checking a non-zero default (e.g. 'glorot_uniform'/'he_normal') was meant "
+                        "here instead."))
+
+            # ---- PyTorch equivalent: nn.init.zeros_(module.weight) ----
+            if fname == "zeros_" and node.args:
+                arg_src = ast.dump(node.args[0]).lower()
+                if "bias" not in arg_src:
+                    findings.append((label, node.lineno,
+                        "nn.init.zeros_(...) called here on what looks like a weight tensor (not a bias) -- "
+                        "zero-initializing a layer's weight matrix breaks symmetry the same way a Keras "
+                        "kernel_initializer='zeros' does: every unit starts identical and can receive an "
+                        "identical gradient for a long time. Zero-initializing a *bias* is normal and "
+                        "harmless; zero-initializing a *weight* usually isn't -- worth double-checking this "
+                        "wasn't meant to target .bias instead of .weight, or use a proper weight init (e.g. "
+                        "nn.init.xavier_uniform_/kaiming_normal_) instead."))
+
+            # ---- GENERAL: dropout rate of 1.0 (Keras `rate=`/torch `p=`) ----
+            if fname in _MLLINT_DROPOUT_LAYER_NAMES:
+                rate = _mllint_numeric_kwarg_or_arg(node, {"rate", "p"}, env=env)
+                if rate is not None and rate >= 1.0:
+                    findings.append((label, node.lineno,
+                        f"{fname}(rate={rate}): a dropout rate of 1.0 zeroes out every unit on every "
+                        "forward pass during training, so no signal passes through this layer at all. "
+                        "The loss can still visibly decrease using whatever the surrounding layers can do "
+                        "on their own, so this won't necessarily look like a stalled run -- worth "
+                        "double-checking this wasn't meant to be a much smaller value (e.g. 0.1-0.5)."))
+
+            # ---- GENERAL: suspicious learning rate, any backend ----
+            # Checks both `lr=` (torch, older keras) and `learning_rate=`
+            # (current keras/tf, optax) -- the old version only checked
+            # `lr`, silently missing every keras/tf/optax script. Also now
+            # resolves through a named constant (`LR = 5.0; Adam(learning_rate=LR)`)
+            # via `env`, instead of only recognizing a literal at the call site.
             if fname in _MLLINT_OPTIMIZER_NAMES:
                 lr_node = None
                 for kw in node.keywords:
-                    if kw.arg == "lr":
+                    if kw.arg in ("lr", "learning_rate"):
                         lr_node = kw.value
                 if lr_node is None and node.args:
                     lr_node = node.args[-1] if len(node.args) >= 2 else None
-                if isinstance(lr_node, ast.Constant) and isinstance(lr_node.value, (int, float)):
-                    if lr_node.value > 1.0:
+                lr_val = _mllint_numeric_const(lr_node, env) if lr_node is not None else None
+                if lr_val is not None:
+                    if lr_val > 1.0:
                         findings.append((label, node.lineno,
-                            f"{fname}(..., lr={lr_node.value}): a learning rate above 1.0 is unusually high "
+                            f"{fname}(..., lr={lr_val}): a learning rate above 1.0 is unusually high "
                             "for almost any optimizer/architecture combination and often causes immediate "
                             "divergence -- worth double-checking this wasn't meant to be a smaller value "
                             "(e.g. missing an extra leading zero or an accidental e2/e-2 typo)."))
+                    elif lr_val <= 0:
+                        findings.append((label, node.lineno,
+                            f"{fname}(..., lr={lr_val}): a learning rate of {lr_val} means the "
+                            "optimizer will never move the weights at all (zero) or will move them in the "
+                            "wrong direction on every single step (negative). The run will train to "
+                            "completion looking superficially normal -- no crash, a loss value every epoch "
+                            "-- while either never learning anything or actively getting worse. Worth "
+                            "double-checking this wasn't meant to be a small positive value."))
 
+            # ---- GENERAL: data leakage -- fitting a transformer on
+            # something that looks like held-out data ----
+            if fname in _MLLINT_FIT_CALL_NAMES and node.args:
+                first_arg = node.args[0]
+                if isinstance(first_arg, ast.Name) and _MLLINT_TEST_NAME_RE.search(first_arg.id):
+                    findings.append((label, node.lineno,
+                        f".{fname}({first_arg.id}, ...): fitting on a variable named '{first_arg.id}' -- "
+                        "scalers/encoders/vectorizers (and models) should only ever be *fit* on training "
+                        "data and *applied* (.transform()/.predict()) to test data; fitting on test data "
+                        "leaks its statistics into preprocessing and inflates apparent performance without "
+                        "any error or crash. Worth double-checking this wasn't meant to be the training "
+                        "split, or a .transform() call instead of .fit()/.fit_transform()."))
+
+        # --------------------------------------------------------------
+        # Pass 2: cross-checks that need the whole-file collections above.
+        # --------------------------------------------------------------
+        final_activation = None
+        if activation_calls:
+            first_compile_line = min((c["lineno"] for c in compile_infos), default=None)
+            pool = (
+                [a for a in activation_calls if first_compile_line is None or a[0] < first_compile_line]
+                or activation_calls
+            )
+            final_activation = max(pool, key=lambda a: a[0])
+
+        for cinfo in compile_infos:
+            loss_str = (cinfo["loss_str"] or "").lower()
+
+            if final_activation:
+                _fa_line, fa_val = final_activation
+                fa_val_l = fa_val.lower()
+                if fa_val_l == "sigmoid" and loss_str in ("categorical_crossentropy", "sparse_categorical_crossentropy"):
+                    findings.append((label, cinfo["lineno"],
+                        f"model.compile(loss='{cinfo['loss_str']}', ...): the final layer's activation is "
+                        "'sigmoid' (a single-probability, binary output), but the loss is a multi-class "
+                        "crossentropy that expects a probability distribution over multiple classes -- worth "
+                        "double-checking the final layer should have `activation='softmax'` with enough "
+                        "units for the number of classes, or the loss should be 'binary_crossentropy'."))
+                if fa_val_l == "softmax" and loss_str == "binary_crossentropy":
+                    findings.append((label, cinfo["lineno"],
+                        f"model.compile(loss='{cinfo['loss_str']}', ...): the final layer's activation is "
+                        "'softmax' (a multi-class probability distribution), but 'binary_crossentropy' "
+                        "expects a single independent probability per output unit -- worth double-checking "
+                        "the final layer should have `activation='sigmoid'`, or the loss should be a "
+                        "categorical crossentropy variant."))
+
+            # Keras/TF "double softmax"/"double sigmoid" via an
+            # already-activated final layer feeding a from_logits=True loss.
+            if cinfo.get("loss_call_fname") in _MLLINT_LOGITS_LOSS_CLASSES and cinfo.get("from_logits") and final_activation:
+                _fa_line, fa_val = final_activation
+                fa_val_l = fa_val.lower()
+                mismatched = (
+                    (cinfo["loss_call_fname"] in ("CategoricalCrossentropy", "SparseCategoricalCrossentropy") and fa_val_l == "softmax")
+                    or (cinfo["loss_call_fname"] == "BinaryCrossentropy" and fa_val_l == "sigmoid")
+                )
+                if mismatched:
+                    findings.append((label, cinfo["lineno"],
+                        f"{cinfo['loss_call_fname']}(from_logits=True) is paired with a final layer whose "
+                        f"activation is already '{fa_val}' -- from_logits=True tells the loss to apply "
+                        f"{'softmax' if fa_val_l == 'softmax' else 'sigmoid'} internally, so an already-"
+                        f"activated output is a 'double {fa_val_l}': it typically flattens gradients and "
+                        "hurts convergence without ever erroring. Worth double-checking either the final "
+                        "layer's activation should be removed (feed raw logits), or from_logits should be "
+                        "False here."))
+
+            # to_categorical() (one-hot) + sparse_categorical_crossentropy
+            # (wants integer labels) -- a common, silent shape mismatch.
+            if to_categorical_loc is not None and loss_str == "sparse_categorical_crossentropy":
+                findings.append((label, cinfo["lineno"],
+                    "model.compile(loss='sparse_categorical_crossentropy', ...) here, combined with a "
+                    f"to_categorical(...) call at line {to_categorical_loc} -- sparse_categorical_crossentropy "
+                    "expects integer class labels, but to_categorical(...) produces one-hot vectors. Worth "
+                    "double-checking either the loss should be plain 'categorical_crossentropy', or the "
+                    "labels shouldn't be one-hot encoded."))
+
+            # LabelEncoder (integer labels) + a one-hot-expecting loss,
+            # with no to_categorical/OneHotEncoder anywhere to fix it up.
+            if (
+                label_encoder_loc is not None
+                and to_categorical_loc is None
+                and one_hot_encoder_loc is None
+                and loss_str in ("categorical_crossentropy", "hinge", "categorical_hinge", "kld", "kullback_leibler_divergence")
+            ):
+                findings.append((label, cinfo["lineno"],
+                    f"model.compile(loss='{cinfo['loss_str']}', ...) here expects one-hot encoded targets, "
+                    f"but the only label preparation found in this file is LabelEncoder (line {label_encoder_loc}), "
+                    "which produces integer labels, not one-hot vectors -- worth double-checking either the "
+                    "loss should be the 'sparse_' variant, or the labels should be one-hot encoded (e.g. via "
+                    "to_categorical()/OneHotEncoder)."))
+
+        # PyTorch: one_hot(...) feeding CrossEntropyLoss/NLLLoss, both of
+        # which want raw integer class indices, not a one-hot vector.
+        if one_hot_torch_loc is not None and ce_or_nll_loss_loc is not None:
+            findings.append((label, one_hot_torch_loc,
+                f"a one_hot(...) call here, combined with CrossEntropyLoss/NLLLoss at line "
+                f"{ce_or_nll_loss_loc} -- both of these losses expect raw integer class indices as the "
+                "target, not a one-hot vector, so feeding them one-hot-encoded labels is usually a shape "
+                "mismatch (or, when it doesn't error, computes the wrong loss). Worth double-checking the "
+                "raw class-index tensor is what's actually passed in, not its one_hot(...) encoding."))
+
+        # --------------------------------------------------------------
+        # Pass 3: per-function checks (torch training-loop hygiene, TF
+        # GradientTape hygiene, JAX grad/PRNG-key hygiene).
+        # --------------------------------------------------------------
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
+
+            # ---- PyTorch: backward()/zero_grad()/step() presence ----
             has_backward, has_zero_grad, has_step, backward_line = False, False, False, None
             for inner in ast.walk(node):
                 if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
@@ -1432,6 +1925,203 @@ def _mllint_scan(trees) -> List[tuple]:
                     "cleared but the weights never update (loss can look like it's training while the "
                     "model silently never learns anything)."))
 
+            # ---- TF: GradientTape().gradient(...) never applied ----
+            has_tape = any(
+                isinstance(inner, ast.withitem) and isinstance(inner.context_expr, ast.Call)
+                and _mllint_fname(inner.context_expr) == "GradientTape"
+                for inner in ast.walk(node)
+            )
+            tape_gradient_line = None
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute) and inner.func.attr == "gradient":
+                    tape_gradient_line = tape_gradient_line or inner.lineno
+            has_apply_gradients = any(
+                isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute) and inner.func.attr == "apply_gradients"
+                for inner in ast.walk(node)
+            )
+            if has_tape and tape_gradient_line and not has_apply_gradients:
+                findings.append((label, tape_gradient_line,
+                    f"function '{node.name}' opens a tf.GradientTape() and calls .gradient(...) on it, but "
+                    "no .apply_gradients(...) call appears anywhere in it -- worth double-checking the "
+                    "optimizer is actually applying these gradients somewhere else in the call chain, since "
+                    "without it the gradients are computed but the weights never update (loss can look like "
+                    "it's training while the model silently never learns anything)."))
+
+            # ---- JAX: jax.grad()/value_and_grad() result never used ----
+            grad_var_names = set()
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Assign) and isinstance(inner.value, ast.Call):
+                    if _mllint_is_grad_result(inner.value):
+                        grad_var_names.update(_mllint_assign_target_names(inner))
+            if grad_var_names:
+                used_names = {
+                    inner.id for inner in ast.walk(node)
+                    if isinstance(inner, ast.Name) and isinstance(inner.ctx, ast.Load)
+                }
+                unused = grad_var_names - used_names
+                if unused:
+                    findings.append((label, node.lineno,
+                        f"function '{node.name}' computes gradients via jax.grad/value_and_grad into "
+                        f"{sorted(unused)}, but that value is never used anywhere else in the function (e.g. "
+                        "passed to optax.apply_updates or a manual tree_map parameter update) and isn't "
+                        "returned either -- worth double-checking the gradients are actually applied to the "
+                        "parameters somewhere, since jax.grad alone computes a gradient but never updates "
+                        "anything."))
+
+            # ---- JAX: same PRNG key reused across multiple draws
+            # without an intervening jax.random.split() ----
+            key_uses = {}       # name -> [linenos]
+            key_reassigned = set()
+            for inner in ast.walk(node):
+                if (
+                    isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute)
+                    and inner.func.attr != "split" and inner.args
+                    and "random" in ast.dump(inner.func)
+                ):
+                    first_arg = inner.args[0]
+                    if isinstance(first_arg, ast.Name) and _MLLINT_JAX_KEY_NAME_RE.search(first_arg.id):
+                        key_uses.setdefault(first_arg.id, []).append(inner.lineno)
+                if isinstance(inner, ast.Assign) and isinstance(inner.value, ast.Call) and _mllint_fname(inner.value) == "split":
+                    key_reassigned.update(_mllint_assign_target_names(inner))
+            for key_name, linenos in key_uses.items():
+                if len(linenos) >= 2 and key_name not in key_reassigned:
+                    findings.append((label, linenos[0],
+                        f"function '{node.name}' passes the same PRNG key '{key_name}' to {len(linenos)} "
+                        f"separate jax.random.* calls without ever calling jax.random.split({key_name}) to "
+                        "derive a fresh subkey -- reusing one key for multiple draws produces correlated (in "
+                        "some cases identical) 'random' outputs, a common, silent JAX bug. Worth "
+                        "double-checking a fresh subkey is derived per use."))
+
+            # ---- JAX: @jit-decorated function calling print() ----
+            is_jitted = any(
+                _mllint_fname(dec) == "jit" if isinstance(dec, ast.Call) else (
+                    (isinstance(dec, ast.Name) and dec.id == "jit")
+                    or (isinstance(dec, ast.Attribute) and dec.attr == "jit")
+                )
+                for dec in node.decorator_list
+            )
+            if is_jitted:
+                for inner in ast.walk(node):
+                    if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name) and inner.func.id == "print":
+                        findings.append((label, inner.lineno,
+                            f"function '{node.name}' is decorated with @jit but calls print(...) inside it "
+                            "-- under jax.jit tracing, the function body runs (and prints) once to build the "
+                            "trace, not on every actual call, which is a common source of \"my print "
+                            "statement only fired once / isn't showing up\" confusion. Worth double-checking "
+                            "jax.debug.print(...) is used instead if per-call output is actually wanted."))
+                        break
+
+        # --------------------------------------------------------------
+        # Pass 4: per-file, non-function-scoped checks.
+        # --------------------------------------------------------------
+
+        # ---- GENERAL: PRNG reseeded on every iteration of a loop ----
+        for call_node in _mllint_find_calls_in_loops(tree, _MLLINT_SEED_FUNC_NAMES):
+            findings.append((label, call_node.lineno,
+                f"a {_mllint_fname(call_node)}(...) call sits inside a loop here -- reseeding a PRNG on "
+                "every iteration forces every epoch/step to draw the exact same sequence of 'random' "
+                "numbers (identical shuffles, identical dropout masks, identical augmentation/noise), "
+                "silently defeating randomness for the rest of the run. Worth double-checking the seed is "
+                "meant to be set once, before the loop, not inside it."))
+
+        # ---- GENERAL: shuffle=False on something that looks like the
+        # training set (DataLoader, tf.data.Dataset, etc.) ----
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)):
+                continue
+            shuffle_kw = next((kw for kw in node.value.keywords if kw.arg == "shuffle"), None)
+            if not (shuffle_kw and _mllint_bool_const(shuffle_kw.value, env) is False):
+                continue
+            for tgt_name in _mllint_assign_target_names(node):
+                if _MLLINT_TRAIN_NAME_RE.search(tgt_name):
+                    call_fname = _mllint_fname(node.value) or "call"
+                    findings.append((label, node.lineno,
+                        f"{tgt_name} = {call_fname}(..., shuffle=False): building a training data "
+                        f"loader/dataset named '{tgt_name}' with shuffling explicitly turned off -- "
+                        "training on data in a fixed order (especially if it's sorted or grouped by label) "
+                        "can bias gradient updates within each epoch and hurt convergence. Worth "
+                        "double-checking this wasn't meant to be shuffle=True."))
+
+        # ---- GENERAL: loss accumulated into a running total without
+        # detaching it from the autodiff graph first (torch/tf tensors) ----
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.AugAssign) and isinstance(node.op, ast.Add)):
+                continue
+            target = node.target
+            if not (isinstance(target, ast.Name) and _MLLINT_LOSSY_ACCUM_TARGET_RE.search(target.id)):
+                continue
+            calls_in_rhs = {
+                (inner.func.attr if isinstance(inner.func, ast.Attribute) else getattr(inner.func, "id", None))
+                for inner in ast.walk(node.value) if isinstance(inner, ast.Call)
+            }
+            if calls_in_rhs & {"item", "detach", "cpu", "numpy", "float", "block_until_ready"}:
+                continue
+            names_in_rhs = {inner.id for inner in ast.walk(node.value) if isinstance(inner, ast.Name)}
+            if any(_MLLINT_LOSS_NAME_RE.search(n) for n in names_in_rhs):
+                findings.append((label, node.lineno,
+                    f"{target.id} += ...: accumulating a loss-like value into '{target.id}' without calling "
+                    ".item()/.detach()/.cpu()/float() on it first -- if the right-hand side is still a "
+                    "tensor attached to the autodiff graph (common in torch/tf), this keeps every step's "
+                    "entire computation graph alive for the rest of the loop, which typically shows up as "
+                    "steadily growing memory use (and eventually an OOM) rather than a wrong result. Worth "
+                    "double-checking a plain Python number is what's actually being accumulated here."))
+
+        # ---- PyTorch: backward() called inside a `with ...no_grad():`
+        # block, where no gradients were tracked in the first place ----
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.With):
+                continue
+            is_no_grad = any(
+                isinstance(item.context_expr, ast.Call) and isinstance(item.context_expr.func, ast.Attribute)
+                and item.context_expr.func.attr == "no_grad"
+                for item in node.items
+            )
+            if not is_no_grad:
+                continue
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute) and inner.func.attr == "backward":
+                    findings.append((label, inner.lineno,
+                        "a .backward() call appears inside a `with torch.no_grad():` block -- tensors "
+                        "created (or operated on) inside no_grad() don't track gradients, so calling "
+                        ".backward() here either raises an error immediately or, if it doesn't, isn't "
+                        "backpropagating through anything meaningful. Worth double-checking this call isn't "
+                        "meant to sit outside the no_grad block."))
+
+        # ---- PyTorch: a model (an nn.Module subclass instance) that's
+        # never moved to a device, in a file that otherwise moves things
+        # to a device -- a common source of "works until it doesn't" ----
+        module_class_names = {
+            n.name for n in ast.walk(tree)
+            if isinstance(n, ast.ClassDef)
+            and any((b.attr if isinstance(b, ast.Attribute) else getattr(b, "id", None)) == "Module" for b in n.bases)
+        }
+        if module_class_names:
+            instance_vars = {}  # var name -> assign lineno
+            for n in ast.walk(tree):
+                if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call):
+                    ctor = n.value.func.id if isinstance(n.value.func, ast.Name) else None
+                    if ctor in module_class_names:
+                        for tgt_name in _mllint_assign_target_names(n):
+                            instance_vars.setdefault(tgt_name, n.lineno)
+            if instance_vars:
+                moved, any_device_call = set(), False
+                for n in ast.walk(tree):
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in ("to", "cuda"):
+                        any_device_call = True
+                        base = n.func.value
+                        if isinstance(base, ast.Name) and base.id in instance_vars:
+                            moved.add(base.id)
+                unmoved = set(instance_vars) - moved
+                if unmoved and any_device_call:
+                    for var_name in sorted(unmoved):
+                        findings.append((label, instance_vars[var_name],
+                            f"'{var_name}' (an instance of an nn.Module subclass) never has .to(...)/.cuda() "
+                            "called on it, but .to(...)/.cuda() is called elsewhere in this file on "
+                            "something else -- worth double-checking the model itself is being moved onto "
+                            "the same device as its data; a device mismatch usually raises immediately, but "
+                            "if the mismatched path only runs during eval/inference this can be silent."))
+
+        # ---- Evaluation-looking function without no_grad()/eval() ----
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -1456,6 +2146,10 @@ def _mllint_scan(trees) -> List[tuple]:
                     "unnecessarily during evaluation (this is a naming heuristic, so it may be a false "
                     "positive for a function that isn't actually doing torch evaluation)."))
 
+    # --------------------------------------------------------------
+    # Cross-file checks (a model class and its loss are often defined in
+    # different files).
+    # --------------------------------------------------------------
     if softmax_loc and crossentropy_loc:
         findings.append((softmax_loc[0], softmax_loc[1],
             f"a Softmax/LogSoftmax call here, combined with CrossEntropyLoss/cross_entropy at "
@@ -1692,15 +2386,26 @@ class PulseCLI:
         # device-to-host sync, which costs real training throughput, so
         # this is opt-in, always folded into the slow gpu_probe_interval
         # cadence (never the fast per-step one), and reviewed on a
-        # schedule: every gpu_checkin_interval seconds after start, Pulse
-        # proactively asks the agent whether it still wants each
-        # GPU-tracked variable (or wants to add one), in a specific,
-        # directive-only reply format -- see _maybe_gpu_checkin.
+        # schedule: every checkin_interval seconds after the last one,
+        # Pulse proactively asks the agent whether it still wants each
+        # GPU-tracked variable (or wants to add one) -- see
+        # _maybe_periodic_checkin. That same check-in also asks the
+        # agent to actually look at the current run and flag anything
+        # that looks off (a STATUS: line, escalated the same way as
+        # _check_for_trouble's own detections -- see
+        # _escalate_training_problem), and lets the agent set its own
+        # next interval via a NEXTCHECK: reply, so the cadence is
+        # dynamic rather than a fixed 15 minutes: a run that looks fine
+        # can go longer between check-ins, a borderline one can ask to
+        # be checked again sooner. The very first interval is itself
+        # negotiable the same way, via NEXTCHECK: in the one-time
+        # _START_PRIME_PROMPT reply (see _prime_at_start) -- 900s below
+        # is only the fallback if the agent doesn't set one.
         self.gpu_tracked_vars: set[str] = set()
         self._last_gpu_probe: float = 0.0
         self.gpu_probe_interval: float = 600.0  # 10 minutes
-        self._last_gpu_checkin: float = time.monotonic()
-        self.gpu_checkin_interval: float = 900.0  # 15 minutes, first one 15 min after start
+        self._last_checkin: float = time.monotonic()
+        self.checkin_interval: float = 900.0  # 15 minutes, first one 15 min after start unless negotiated sooner
 
         # Auto-intervention: watch tracked values for signs training is
         # going bad (a scalar going non-finite, or a loss-like scalar
@@ -2045,8 +2750,8 @@ class PulseCLI:
         sync, which is real overhead on a training loop, so this only
         ever folds the variable into the slow gpu_probe_interval cadence
         (never the fast per-step one) and the agent gets asked every
-        gpu_checkin_interval whether it's still needed -- see
-        _maybe_gpu_checkin. Returns the variable name on success, else
+        checkin_interval whether it's still needed -- see
+        _maybe_periodic_checkin. Returns the variable name on success, else
         None (mirrors _set_var_state's contract so it composes the same
         way in _apply_directives).
         """
@@ -6578,41 +7283,149 @@ class PulseCLI:
 
         return "\n\n".join(notes)
 
-    _GPU_CHECKIN_PROMPT = (
-        "[Automated GPU check-in -- sent automatically every {mins:g} minutes since Pulse started] "
+    _PERIODIC_CHECKIN_PROMPT = (
+        "[Automated Pulse check-in -- sent automatically since it's been {mins:g} minutes since "
+        "the last one] Here is the current state Pulse is tracking:\n\n{snapshot}\n\n"
         "Currently GPU-tracked variable(s): {tracked}. GPU stat probes force a device-to-host sync "
         "on every probe, which slows down training, so nothing should stay GPU-tracked longer than "
         "you actually need it -- and if training currently looks like it needs a closer look at a "
         "GPU-resident variable you're NOT already tracking, this is also your chance to start.\n\n"
-        "Reply with ONLY these two lines, in exactly this format, and nothing else -- no diagnosis, "
-        "no prose:\n"
+        "Take an actual look at the values/trends above rather than assuming Pulse's own detectors "
+        "would already have caught anything worth catching -- you may notice something they "
+        "wouldn't (a metric moving far slower than it should even though it's technically still "
+        "moving, a suspicious-looking value, anything about the run that just looks off).\n\n"
+        "Reply in exactly this format, and nothing else -- no other prose:\n"
+        "STATUS: <'ok' if training looks healthy, otherwise a short description of the problem>\n"
         "GPUTRACK: <comma-separated variable names to track, or 'none'>\n"
-        "GPUUNTRACK: <comma-separated variable names to stop tracking, or 'none'>"
+        "GPUUNTRACK: <comma-separated variable names to stop tracking, or 'none'>\n"
+        "NEXTCHECK: <minutes until your next check-in should happen -- as low as {min_mins:g} if "
+        "anything looks borderline and worth watching closely, as high as {max_mins:g} if training "
+        "looks stable and boring, or {mins:g} again if you have no particular reason to change it>"
     )
 
-    def _maybe_gpu_checkin(self) -> None:
-        """Every gpu_checkin_interval seconds (15 min by default) after
-        Pulse starts, proactively ask the agent whether it still wants to
-        GPU-track anything -- rather than only ever reacting to a
-        GPUTRACK:/GPUUNTRACK: line the agent happened to include while
-        diagnosing something else. Requires the reply to use the same
-        strict two-line format as the check-in prompt, so it's parsed the
-        same deterministic way as any other directive.
+    # Bounds on the agent-negotiated NEXTCHECK: interval -- keeps the
+    # cadence genuinely dynamic (see _maybe_periodic_checkin and the
+    # NEXTCHECK: line added to _START_PRIME_PROMPT) without letting a
+    # malformed or adversarial reply set it to something absurd (a
+    # near-0 value hammering the API in a loop, or a near-infinite value
+    # that never checks in again).
+    _CHECKIN_MIN_INTERVAL = 120.0    # 2 minutes
+    _CHECKIN_MAX_INTERVAL = 3600.0   # 60 minutes
+    _CHECKIN_OK_STATUSES = {
+        "ok", "ok.", "okay", "fine", "healthy", "looks good", "looks fine",
+        "looks healthy", "nominal", "good", "none", "no issues", "no problems",
+    }
+    _STATUS_RE = re.compile(r"^\s*STATUS:\s*(.+)$", re.MULTILINE)
+    _NEXTCHECK_RE = re.compile(r"^\s*NEXTCHECK:\s*([0-9]*\.?[0-9]+)", re.MULTILINE)
+
+    @classmethod
+    def _parse_nextcheck_minutes(cls, text: Optional[str]) -> Optional[float]:
+        """Pull a NEXTCHECK: <minutes> line out of an agent reply (the
+        periodic check-in prompt below, or the one-time
+        _START_PRIME_PROMPT), clamped to [_CHECKIN_MIN_INTERVAL,
+        _CHECKIN_MAX_INTERVAL] so a malformed or extreme reply can't set
+        an unreasonable cadence. Returns None if there's no parseable
+        NEXTCHECK: line at all, in which case the caller should leave
+        the existing interval alone rather than guess."""
+        m = cls._NEXTCHECK_RE.search(text or "")
+        if not m:
+            return None
+        try:
+            minutes = float(m.group(1))
+        except ValueError:
+            return None
+        if minutes <= 0 or not math.isfinite(minutes):
+            return None
+        lo, hi = cls._CHECKIN_MIN_INTERVAL / 60.0, cls._CHECKIN_MAX_INTERVAL / 60.0
+        return max(lo, min(hi, minutes))
+
+    def _escalate_training_problem(self, problem: Optional[str]) -> None:
+        """Shared escalation path for anything that decides training
+        looks like it's going wrong -- either _check_for_trouble's
+        deterministic, every-step signal-based detector, or the agent's
+        own free-text STATUS: read from a periodic check-in (see
+        _maybe_periodic_checkin). Either way: pause (even out of
+        continuous mode), hand the problem to the agent to diagnose and,
+        if possible, fix, then resume automatically. Deduplicated
+        against the last-escalated problem so a standing issue that's
+        already being worked doesn't re-trigger on every single
+        step/check-in it's still present for.
+        """
+        if not problem or problem == self._last_intervention_signature:
+            return
+        self._last_intervention_signature = problem
+        self.continuous = True
+
+        print("\n" + "=" * 60)
+        cprint(
+            "[Pulse] ⚠ Auto-intervention: training looks like it's going bad. "
+            "Diagnosing while preserving the loop.",
+            color=_RED,
+        )
+        cprint(f"[Pulse] Detected: {problem}", color=_RED)
+        print("=" * 60)
+
+        if self.agent_provider and self.agent_key:
+            question = (
+                "Pulse just auto-paused training because it detected a problem: "
+                f"{problem}\nPlease diagnose the root cause and, if you can, fix it."
+            )
+            cprint("Pulse:")
+            self._pending_agent_start_ts = time.monotonic()
+            self._pending_agent_problem = problem
+            self.ask_agent(question, include_code=bool(self.code_text))
+            self._finalize_agent_downtime()
+        else:
+            cprint(
+                "[Pulse] No AI agent is configured yet -- problem queued. Run /agent to set one "
+                "up and it will be diagnosed immediately.",
+                color=_YELLOW,
+            )
+            self._log_incident("auto_intervention", problem, downtime_seconds=0.0, fix_applied=False)
+            if not hasattr(self, "_queued_interventions"):
+                self._queued_interventions = []
+            if problem not in self._queued_interventions:
+                self._queued_interventions.append(problem)
+
+        cprint("[Pulse] Continuing training automatically.")
+
+    def _maybe_periodic_checkin(self) -> None:
+        """Every checkin_interval seconds (15 min by default, but
+        dynamic -- see the NEXTCHECK: line in _START_PRIME_PROMPT for
+        the first interval, and the one parsed out of this check-in's
+        own reply for every one after) since the last check-in,
+        proactively ask the agent two things it would otherwise only
+        ever get asked reactively:
+        1. Whether it still wants to GPU-track anything (as before).
+        2. To actually look at the current training snapshot and flag
+           anything that looks off via a STATUS: line, even if Pulse's
+           own step-by-step detectors haven't already caught it --
+           escalated through the same _escalate_training_problem path
+           as a deterministic detection, if it's not just 'ok'.
+        It also lets the agent set its own NEXTCHECK: interval, so a
+        run that looks fine can go longer between check-ins and a
+        borderline one can ask to be checked again sooner, instead of a
+        fixed cadence.
         """
         if not self.agent_provider or not self.agent_key:
             return
         now = time.monotonic()
-        if now - self._last_gpu_checkin < self.gpu_checkin_interval:
+        if now - self._last_checkin < self.checkin_interval:
             return
-        self._last_gpu_checkin = now
+        self._last_checkin = now
 
         tracked = ", ".join(sorted(self.gpu_tracked_vars)) if self.gpu_tracked_vars else "(none)"
-        prompt = self._GPU_CHECKIN_PROMPT.format(
-            mins=self.gpu_checkin_interval / 60.0, tracked=tracked
+        try:
+            snapshot = self._build_agent_context(include_code=False)
+        except Exception as exc:
+            snapshot = f"(unable to build a variable snapshot: {exc})"
+        prompt = self._PERIODIC_CHECKIN_PROMPT.format(
+            mins=self.checkin_interval / 60.0, tracked=tracked, snapshot=snapshot,
+            min_mins=self._CHECKIN_MIN_INTERVAL / 60.0, max_mins=self._CHECKIN_MAX_INTERVAL / 60.0,
         )
         cprint(
-            f"\n[Pulse] ⏱ {self.gpu_checkin_interval / 60:g}-min GPU check-in -- asking agent whether "
-            "it still needs GPU tracking...",
+            f"\n[Pulse] ⏱ {self.checkin_interval / 60:g}-min check-in -- asking agent to review "
+            "training health and GPU tracking...",
             color=_YELLOW,
         )
         try:
@@ -6621,7 +7434,7 @@ class PulseCLI:
             # This is a periodic, low-stakes background check -- never
             # worth interrupting training over. Quietly skip this round
             # and try again at the next interval.
-            cprint(f"[Pulse] ⚠ GPU check-in skipped (agent request failed: {exc})", color=_RED)
+            cprint(f"[Pulse] ⚠ Check-in skipped (agent request failed: {exc})", color=_RED)
             return
         _, _calc, _promote, gputrack_names, gpuuntrack_names, _sens, _norm, _grep, _view = self._extract_directives(answer)
         summary = self._apply_directives([], [], gputrack_names, gpuuntrack_names)
@@ -6631,6 +7444,31 @@ class PulseCLI:
             cprint(f"[Pulse] {summary}", color=_YELLOW)
         else:
             cprint("[Pulse] Agent made no GPU-tracking changes at this check-in.", color=_YELLOW)
+
+        status_match = self._STATUS_RE.search(answer)
+        status_text = status_match.group(1).strip() if status_match else ""
+        if status_text:
+            cprint(f"[Pulse] Agent's check-in analysis: {status_text}", color=_YELLOW)
+            if status_text.strip().lower().rstrip(".") not in self._CHECKIN_OK_STATUSES:
+                if self.auto_intervene:
+                    self._escalate_training_problem(f"[periodic check-in] {status_text}")
+                else:
+                    cprint(
+                        "[Pulse] Auto-intervene is off -- not auto-pausing for this, but flagging "
+                        "it for you to look at.",
+                        color=_YELLOW,
+                    )
+
+        next_minutes = self._parse_nextcheck_minutes(answer)
+        if next_minutes is not None:
+            next_seconds = next_minutes * 60.0
+            if abs(next_seconds - self.checkin_interval) > 1e-6:
+                cprint(
+                    f"[Pulse] Agent set its next check-in for {next_minutes:g} minutes from now "
+                    f"(was {self.checkin_interval / 60:g}).",
+                    color=_YELLOW,
+                )
+            self.checkin_interval = next_seconds
 
     @staticmethod
     def _parse_json_obj(answer: str) -> Optional[Dict[str, Any]]:
@@ -8094,6 +8932,84 @@ class PulseCLI:
             latest = hist_values[-1]
 
             # --------------------------------------------------------
+            # G. Exact repetition -- value frozen bit-for-bit
+            #
+            # Distinct from the plateau check below (which tolerates
+            # small movement): if a loss/metric hasn't changed AT ALL
+            # across several consecutive observations, that's a much
+            # stronger signal of an actual bug -- a forward/backward
+            # pass silently not running, an optimizer step not
+            # executing, a metric callback reading a stale/cached value
+            # -- rather than just slow learning. Scoped to loss/metric
+            # names specifically (not every tracked scalar) since a
+            # config value or a counter is *supposed* to sit still.
+            # --------------------------------------------------------
+            if (_is_loss_name(var_name) or _looks_like_metric(var_name)) and len(hist_values) >= 6:
+                frozen_window = hist_values[-6:]
+                if len(set(frozen_window)) == 1:
+                    reasons.append(
+                        f"'{var_name}' has been exactly frozen at {frozen_window[-1]:.6g} for the "
+                        f"last {len(frozen_window)} observations -- not just slow-moving, but "
+                        "bit-for-bit unchanged, which usually means something isn't actually "
+                        "running each step (a forward/backward pass being skipped, an optimizer "
+                        "step not executing, or a metric reading a stale/cached value) rather than "
+                        "the model just learning slowly."
+                    )
+
+            # --------------------------------------------------------
+            # H. Gradient/weight-norm explosion or collapse
+            #
+            # A grad/weight-norm scalar is expected to move smoothly; a
+            # sudden multiplicative jump is exploding gradients, and a
+            # sudden collapse toward zero is vanishing gradients -- the
+            # latter has NO equivalent among the loss-specific checks
+            # below, since a vanishing-gradient network can keep
+            # producing a loss curve that still looks like it's (very
+            # slowly) improving right up until it flatlines.
+            # --------------------------------------------------------
+            if _looks_like_grad_or_weight_norm(var_name) and len(hist_values) >= 5:
+                recent = hist_values[-50:]
+                previous = recent[:-1]
+                if previous:
+                    baseline = sum(previous) / len(previous)
+                    if baseline > 1e-12:
+                        if latest > baseline * th["explosion_multiplier"]:
+                            reasons.append(
+                                f"'{var_name}' spiked to {latest:.4g}, {latest / baseline:.1f}x its "
+                                f"recent average ({baseline:.4g}) -- looks like exploding "
+                                "gradients/weights."
+                            )
+                        elif latest < baseline / th["explosion_multiplier"]:
+                            reasons.append(
+                                f"'{var_name}' collapsed to {latest:.4g} from a recent average of "
+                                f"{baseline:.4g} -- looks like vanishing gradients (the network may "
+                                "have effectively stopped learning even if loss/metrics still look "
+                                "okay for now)."
+                            )
+
+            # --------------------------------------------------------
+            # I. Learning-rate discontinuity
+            #
+            # A tracked lr/learning_rate scalar is expected to change
+            # only smoothly/deliberately (a scheduler step, a warmup
+            # ramp) -- a sudden order-of-magnitude jump between two
+            # consecutive observations usually means the scheduler
+            # itself is misconfigured, not that a change was intended.
+            # --------------------------------------------------------
+            if _looks_like_learning_rate(var_name) and len(hist_values) >= 2:
+                prev_lr = hist_values[-2]
+                if prev_lr and prev_lr > 0 and latest > 0:
+                    ratio = latest / prev_lr
+                    if ratio >= 10.0 or ratio <= 0.1:
+                        reasons.append(
+                            f"'{var_name}' jumped from {prev_lr:.4g} to {latest:.4g} ({ratio:.3g}x) "
+                            "between consecutive observations -- worth double-checking a "
+                            "learning-rate scheduler isn't misconfigured (wrong step count/"
+                            "milestone, wrong decay factor, or being stepped more than once per "
+                            "actual optimizer step)."
+                        )
+
+            # --------------------------------------------------------
             # Loss-specific checks
             # --------------------------------------------------------
 
@@ -8470,6 +9386,33 @@ class PulseCLI:
                 )
 
         # ------------------------------------------------------------
+        # 2c. Suspiciously perfect performance, suspiciously early
+        #
+        # The mirror image of 2b above: that one flags too little
+        # progress; this one flags implausibly complete progress,
+        # implausibly fast. Hitting (near-)perfect accuracy within the
+        # first couple of observations is a classic symptom of data
+        # leakage -- the target leaking into the input features,
+        # evaluating on training data, or a train/test split bug -- far
+        # more often than it's genuinely instant learning.
+        # ------------------------------------------------------------
+        for acc_name in ("val_accuracy", "val_acc", "accuracy", "acc", "categorical_accuracy"):
+            acc_hist = _history(acc_name)
+            if len(acc_hist) >= 2 and len(acc_hist) <= 2 and max(acc_hist) >= 0.999:
+                loss_note = ""
+                if loss_hist and len(loss_hist) <= 2 and loss_hist[-1] < 0.01:
+                    loss_note = f" (loss is also already down to {loss_hist[-1]:.4g})"
+                reasons.append(
+                    f"'{acc_name}' already hit {max(acc_hist):.4g} within the first "
+                    f"{len(acc_hist)} observation(s){loss_note} -- (near-)perfect accuracy this "
+                    "early is a classic symptom of data leakage (the target leaking into the "
+                    "input features, evaluating on training data, or a train/test split bug) "
+                    "rather than of genuinely fast learning. Worth double-checking the data "
+                    "pipeline before trusting this result."
+                )
+                break
+
+        # ------------------------------------------------------------
         # 3. Matrix/tensor numerical failures
         # ------------------------------------------------------------
 
@@ -8531,7 +9474,7 @@ class PulseCLI:
     _START_PRIME_PROMPT = (
         "[Automatic start-of-run check -- sent once, automatically, before the first training step, "
         "so this is your only chance to set these from the code alone, before any real data exists] "
-        "Look at the training code and the tracked variables above. Three things:\n"
+        "Look at the training code and the tracked variables above. Four things:\n"
         "1. Judge how noisy this run's loss/metric curves are likely to be, given the model type, "
         "batch size, learning rate, and loss function, and set an appropriate sensitivity for "
         "spike/plateau/oscillation detection.\n"
@@ -8545,12 +9488,19 @@ class PulseCLI:
         "3. Identify any critical variables -- e.g. loss, or core tensors that live exclusively in "
         "GPU memory -- that are worth the closer, GPU-synced look from step one, to catch memory "
         "spikes or numerical instability early rather than after they've already caused visible "
-        "damage.\n\n"
-        "Reply with ONLY these three lines, in exactly this format, and nothing else -- no diagnosis, "
+        "damage.\n"
+        "4. Pulse will periodically check back in with you (to review training health and GPU-"
+        "tracking needs, and to let you re-set this same interval each time) -- decide how long "
+        "until your FIRST check-in should be, based on how quickly you'd expect problems to show "
+        "up in this specific run: a short, fast-iterating script might warrant just a couple of "
+        "minutes; a long, slow training run might warrant much longer. Anywhere from 2 to 60 "
+        "minutes.\n\n"
+        "Reply with ONLY these four lines, in exactly this format, and nothing else -- no diagnosis, "
         "no prose:\n"
         "SENSITIVITY: <0.0-1.0, a preset (loose/medium/tight), or 'spike|plateau|oscillation <value|auto>'>\n"
         "NORMAL_START: <comma-separated var=value pairs for loss-like tracked variables you can justify, or 'none'>\n"
-        "GPUTRACK: <comma-separated variable names to track closely from the start, or 'none'>"
+        "GPUTRACK: <comma-separated variable names to track closely from the start, or 'none'>\n"
+        "NEXTCHECK: <minutes (2-60) until your first periodic check-in>"
     )
 
     def _mllint_auto_fix(self, findings: List[tuple]) -> bool:
@@ -8759,6 +9709,15 @@ class PulseCLI:
             summary = self._apply_directives([], [], gputrack_names, None, sensitivity_args, normal_start_args)
             if summary:
                 cprint(f"[Pulse] Start-of-run check: {summary}", color=_YELLOW)
+            initial_minutes = self._parse_nextcheck_minutes(answer)
+            if initial_minutes is not None:
+                self.checkin_interval = initial_minutes * 60.0
+                self._last_checkin = time.monotonic()
+                cprint(
+                    f"[Pulse] Agent scheduled its first check-in for {initial_minutes:g} minutes "
+                    "from now.",
+                    color=_YELLOW,
+                )
 
     def _prime_with_agent_if_needed(self) -> None:
         """Called every update() once an agent is confirmed available.
@@ -8817,6 +9776,15 @@ class PulseCLI:
                 summary = self._apply_directives([], [], gputrack_names, None, sensitivity_args, normal_start_args)
                 if summary:
                     cprint(f"[Pulse] Start-of-run check (deferred, agent now available): {summary}", color=_YELLOW)
+                initial_minutes = self._parse_nextcheck_minutes(answer)
+                if initial_minutes is not None:
+                    self.checkin_interval = initial_minutes * 60.0
+                    self._last_checkin = time.monotonic()
+                    cprint(
+                        f"[Pulse] Agent scheduled its first check-in for {initial_minutes:g} "
+                        "minutes from now.",
+                        color=_YELLOW,
+                    )
             except AgentRequestFailed:
                 pass
 
@@ -9630,7 +10598,7 @@ class PulseCLI:
             matrix_lines,
         )
 
-        self._maybe_gpu_checkin()
+        self._maybe_periodic_checkin()
 
         # ------------------------------------------------------------
         # AUTO-INTERVENTION
@@ -9664,89 +10632,7 @@ class PulseCLI:
                 except Exception:
                     pass
 
-            if (
-                problem
-                and problem != self._last_intervention_signature
-            ):
-                self._last_intervention_signature = problem
-                self.continuous = True
-
-                print("\n" + "=" * 60)
-
-                cprint(
-                    "[Pulse] ⚠ Auto-intervention: "
-                    "training looks like it's going bad. "
-                    "Diagnosing while preserving the loop.",
-                    color=_RED,
-                )
-
-                cprint(
-                    f"[Pulse] Detected: {problem}",
-                    color=_RED,
-                )
-
-                print("=" * 60)
-
-                if (
-                    self.agent_provider
-                    and self.agent_key
-                ):
-                    question = (
-                        "Pulse just auto-paused training because "
-                        f"it detected a problem: {problem}\n"
-                        "Please diagnose the root cause and, "
-                        "if you can, fix it."
-                    )
-
-                    cprint("Pulse:")
-
-                    self._pending_agent_start_ts = (
-                        time.monotonic()
-                    )
-
-                    self._pending_agent_problem = problem
-
-                    self.ask_agent(
-                        question,
-                        include_code=bool(
-                            self.code_text
-                        ),
-                    )
-
-                    self._finalize_agent_downtime()
-
-                else:
-                    cprint(
-                        "[Pulse] No AI agent is configured yet "
-                        "-- problem queued. Run /agent to set one "
-                        "up and it will be diagnosed immediately.",
-                        color=_YELLOW,
-                    )
-
-                    self._log_incident(
-                        "auto_intervention",
-                        problem,
-                        downtime_seconds=0.0,
-                        fix_applied=False,
-                    )
-
-                    if not hasattr(
-                        self,
-                        "_queued_interventions",
-                    ):
-                        self._queued_interventions = []
-
-                    if (
-                        problem
-                        not in self._queued_interventions
-                    ):
-                        self._queued_interventions.append(
-                            problem
-                        )
-
-                cprint(
-                    "[Pulse] Continuing training automatically."
-                )
+            self._escalate_training_problem(problem)
 
         # ------------------------------------------------------------
         # UPDATE FINISHED
