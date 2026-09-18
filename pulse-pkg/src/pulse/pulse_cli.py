@@ -22,6 +22,7 @@ import hashlib
 import difflib
 import inspect
 import importlib
+import importlib.util
 import traceback
 import itertools
 import subprocess
@@ -67,13 +68,23 @@ except ImportError:
 # ---------------------------------------------------------------------------
 _PULSE_LOGGING = os.environ.get("PULSE_LOGGING", "1").strip().lower() not in ("0", "off", "false", "no")
 _PULSE_LOG_FILE = os.path.abspath(os.environ.get("PULSE_LOG_FILE", "pulse.log"))
-try:
-    import tensorflow as tf
-except Exception:
-    tf = None
+_PULSE_KERAS_TRACKER_CLS = None
 
-if tf is not None:
-    class PulseKerasTracker(tf.keras.callbacks.Callback):
+
+def _build_keras_tracker_class(callback_base):
+    """Define the Keras callback against whichever Callback base is actually loaded.
+
+    This used to be a module-level `import tensorflow` guarded by try/except, with the
+    class defined only when the import succeeded. That made merely importing Pulse pay
+    for a full TensorFlow import -- seconds, and GPU memory on some builds -- for
+    PyTorch, JAX and NumPy users who never touch Keras, while users without TensorFlow
+    got no class at all. Built on demand instead, from a module that is already loaded.
+    """
+    global _PULSE_KERAS_TRACKER_CLS
+    if _PULSE_KERAS_TRACKER_CLS is not None:
+        return _PULSE_KERAS_TRACKER_CLS
+
+    class PulseKerasTracker(callback_base):
         """
         Internal Pulse -> Keras bridge.
 
@@ -182,22 +193,98 @@ if tf is not None:
                     )
                 except Exception:
                     pass
+
+    _PULSE_KERAS_TRACKER_CLS = PulseKerasTracker
+    return PulseKerasTracker
+
+
 _PULSE_KERAS_HOOK_INSTALLED = False
 _PULSE_ACTIVE_INSTANCE = None
+_PULSE_KERAS_IMPORT_WATCHER = None
 
 
-def _install_keras_pulse_hook(pulse_instance):
+class _KerasImportWatcher:
+    """Patches Keras the moment it is imported, without importing it ourselves.
+
+    auto_track() used to `import tensorflow` outright. That raised ImportError on
+    every machine without TensorFlow -- a NumPy, PyTorch or JAX user could not call
+    auto_track() at all -- and on machines that do have it, it paid seconds of import
+    time and hundreds of MB for a framework the script may never touch.
+
+    Deferring is not enough on its own: the usual shape is `auto_track()` at the top
+    of the script and `import tensorflow` below it, so a one-shot check at auto_track
+    time would miss it. This sits in sys.meta_path, lets the normal machinery do the
+    import, and wraps the loader so the hook goes in as soon as the module finishes
+    executing.
+    """
+
+    _TARGETS = ("tensorflow", "keras")
+
+    def __init__(self):
+        self._resolving = False
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname not in self._TARGETS or self._resolving:
+            return None
+        self._resolving = True          # our own find_spec re-enters meta_path
+        try:
+            spec = importlib.util.find_spec(fullname)
+        except (ImportError, AttributeError, ValueError):
+            return None
+        finally:
+            self._resolving = False
+        loader = getattr(spec, "loader", None)
+        if spec is None or loader is None or not hasattr(loader, "exec_module"):
+            return None
+        original_exec_module = loader.exec_module
+
+        def exec_module(module, _original=original_exec_module):
+            _original(module)
+            _install_keras_fit_hook()   # the module is fully executed by now
+
+        try:
+            loader.exec_module = exec_module
+        except (AttributeError, TypeError):
+            return None                 # immutable loader: leave the import alone
+        return spec
+
+
+def _keras_callback_base():
+    """keras.callbacks.Callback if Keras is ALREADY imported, else None."""
+    tf_module = sys.modules.get("tensorflow")
+    keras_module = getattr(tf_module, "keras", None) if tf_module is not None else None
+    if keras_module is None:
+        keras_module = sys.modules.get("keras")
+    callbacks = getattr(keras_module, "callbacks", None)
+    return getattr(callbacks, "Callback", None)
+
+
+def _keras_model_class():
+    """tf.keras.Model / keras.Model if either is ALREADY imported, else None.
+
+    Only reads sys.modules: asking for a module we have not imported would trigger
+    the very import this whole dance exists to avoid.
+    """
+    tf_module = sys.modules.get("tensorflow")
+    keras_module = getattr(tf_module, "keras", None) if tf_module is not None else None
+    if keras_module is None:
+        keras_module = sys.modules.get("keras")
+    return getattr(keras_module, "Model", None)
+
+
+def _install_keras_fit_hook():
+    """Wrap Model.fit so Pulse's callback rides along. Safe to call repeatedly."""
     global _PULSE_KERAS_HOOK_INSTALLED
-    global _PULSE_ACTIVE_INSTANCE
 
-    _PULSE_ACTIVE_INSTANCE = pulse_instance
-
-    if _PULSE_KERAS_HOOK_INSTALLED:
+    if _PULSE_KERAS_HOOK_INSTALLED or _PULSE_ACTIVE_INSTANCE is None:
         return
+    model_cls = _keras_model_class()
+    callback_base = _keras_callback_base()
+    if model_cls is None or callback_base is None:
+        return
+    tracker_cls = _build_keras_tracker_class(callback_base)
 
-    import tensorflow as tf
-
-    original_fit = tf.keras.Model.fit
+    original_fit = model_cls.fit
 
     def pulse_fit(self, *args, **kwargs):
         callbacks = kwargs.get("callbacks")
@@ -208,17 +295,44 @@ def _install_keras_pulse_hook(pulse_instance):
             callbacks = list(callbacks)
 
         callbacks.append(
-            PulseKerasTracker(_PULSE_ACTIVE_INSTANCE)
+            tracker_cls(_PULSE_ACTIVE_INSTANCE)
         )
 
         kwargs["callbacks"] = callbacks
 
         return original_fit(self, *args, **kwargs)
 
-    tf.keras.Model.fit = pulse_fit
+    try:
+        model_cls.fit = pulse_fit
+    except (AttributeError, TypeError) as exc:      # exotic//frozen Keras build
+        _pulse_log(f"KERAS FIT HOOK could not be installed: {exc}")
+        return
     _PULSE_KERAS_HOOK_INSTALLED = True
 
     _pulse_log("KERAS FIT HOOK installed")
+
+
+def _install_keras_pulse_hook(pulse_instance):
+    """Arrange for Pulse to see Keras training, whenever Keras shows up.
+
+    Never imports TensorFlow or Keras. If one of them is already imported the hook
+    goes in now; otherwise a sys.meta_path watcher installs it if and when the
+    script imports one.
+    """
+    global _PULSE_ACTIVE_INSTANCE
+    global _PULSE_KERAS_IMPORT_WATCHER
+
+    _PULSE_ACTIVE_INSTANCE = pulse_instance
+
+    if _PULSE_KERAS_HOOK_INSTALLED:
+        return
+
+    _install_keras_fit_hook()
+    if _PULSE_KERAS_HOOK_INSTALLED or _PULSE_KERAS_IMPORT_WATCHER is not None:
+        return
+    watcher = _KerasImportWatcher()
+    sys.meta_path.insert(0, watcher)
+    _PULSE_KERAS_IMPORT_WATCHER = watcher
 def _pulse_log(message: str, *, console: bool = False) -> None:
     if not _PULSE_LOGGING:
         return
