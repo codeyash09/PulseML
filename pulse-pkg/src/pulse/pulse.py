@@ -2849,7 +2849,7 @@ def _mllint_find_calls_in_loops(tree, names):
     return found
 
 
-def _mllint_scan(trees) -> List[tuple]:
+def _mllint_scan(trees) -> list[tuple]:
     """trees: iterable of (label, path, text, tree). Returns a list of
     (label, lineno, message) findings."""
     findings = []
