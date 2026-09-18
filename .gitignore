@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.pulse_stream/
+.pulse_history/
+pulse.log
+*.egg-info/
+build/
+dist/
