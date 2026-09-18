@@ -10,6 +10,9 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Proprietary" }
 
+[project.scripts]
+pulse = "pulse.cli:main"
+
 authors = [
     { name = "Yash Patel", email = "codeyash09@gmail.com" }
 ]
