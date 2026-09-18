@@ -909,7 +909,12 @@ _PASS3_FIX_TEXT_TMPL = (
 )
 _PASS3_IMPLEMENT_TMPL = (
     "Your analysis so far:\n{diagnosis}\n\n"
-    "PASS 3 -- DEVELOP & IMPLEMENT: Implement the fix for the root cause diagnosed above. The user wants this fix applied to their code. Default to the "
+    "PASS 3 -- DEVELOP & IMPLEMENT: You are fixing a bug in someone's training run, nothing else. "
+    "Fix the bug and only the bug: no optimisation, no refactoring, no renaming, no added "
+    "callbacks or seeds, no style or formatting changes, no 'while I am here' improvements -- "
+    "even where you can see something you would write differently. Every line you touch beyond "
+    "the bug is a line that can break a run that is otherwise working. "
+    "Implement the fix for the root cause diagnosed above. The user wants this fix applied to their code. Default to the "
     "smallest possible change -- a single line or a few adjacent lines -- and only widen the edit if "
     "the root cause genuinely can't be fixed that narrowly. Do not refactor, restructure, or rewrite "
     "code beyond what's needed to fix the diagnosed root cause. Respond with ONLY the code-fix JSON "
@@ -954,6 +959,29 @@ _PASS5_SWEEP = (
 )
 _IMPLEMENT_KEYWORDS = ("fix", "edit", "patch", "change the code", "apply", "implement")
 _MAX_VERIFY_ATTEMPTS = 3
+
+# How many times the fix pass may ask to see more code before giving up.
+_MAX_FIX_TOOL_ROUNDS = 3
+_PASS3_NO_TOOLS_NOTE = (
+    "You did not return the code-fix JSON. Everything you were given is above. If you need to "
+    "see more code, ask for it with a directive line -- e.g. 'VIEW: <file>:<start>-<end>' or "
+    "'GREP: <pattern>' -- and it will be answered. Otherwise respond with ONLY the code-fix "
+    "JSON object (old/new/files/explanation), fixing the bug and nothing else."
+)
+_PASS4_RECHECK_TMPL = (
+    "Your analysis:\n{diagnosis}\n\n"
+    "The fix you proposed:\n{fix_desc}\n\n"
+    "An automated check on this fix reported:\n{reason}\n\n"
+    "PASS 4b -- RE-EXAMINE: That check is itself automated and can be wrong; it is one more "
+    "piece of evidence, not a verdict, and it is not evidence that your fix is right either. "
+    "Look again at the code and the evidence you were given and decide for yourself.\n"
+    "Respond with ONLY one of:\n"
+    '- {{"decision": "keep", "reason": "one sentence"}} if the fix should be applied as it is\n'
+    '- {{"decision": "revise", "old": [...], "new": [...], "files": [...], "explanation": "..."}} '
+    "with a corrected fix\n"
+    '- {{"decision": "drop", "reason": "one sentence"}} if it should not be applied at all\n'
+    "Fix only the bug; a revision must stay as small as the bug requires."
+)
 
 # ---------------------------------------------------------------------------
 # PASS 4.5 -- MEASURE: Pass 4 only asks the model whether its own fix *looks*
@@ -1176,7 +1204,7 @@ def _normalize_ws_for_match(s: str) -> str:
     lines -- see the matching, more heavily-commented copy in pulse.py.
     A lenient equality check used only to LOCATE a snippet that doesn't
     match verbatim, never to decide what gets written."""
-    lines = [ln.strip() for ln in s.splitlines()]
+    lines = [re.sub(r"\s+", " ", ln.strip()) for ln in s.splitlines()]
     return "\n".join(ln for ln in lines if ln)
 
 
@@ -1189,7 +1217,8 @@ def _find_fuzzy_snippet_span(content: str, old: str):
         return None
 
     content_lines = content.splitlines(keepends=True)
-    meaningful = [(i, ln.strip()) for i, ln in enumerate(content_lines) if ln.strip()]
+    meaningful = [(i, re.sub(r"\s+", " ", ln.strip()))
+                  for i, ln in enumerate(content_lines) if ln.strip()]
     target_lines = target.split("\n")
     n = len(target_lines)
     if n == 0 or len(meaningful) < n:
@@ -1219,9 +1248,7 @@ def _banner_wrap_fix(old: str, new: str, path: str) -> str:
     directly into the file content saved to disk, so it shows up the next
     time the file is opened, not just in Pulse's own console output.
     """
-    c = _comment_char_for(path)
-    old_commented = "\n".join(f"{c} {line}" if line.strip() else c for line in old.splitlines())
-    return f"{c} =====Pulse Change====\n{c} Old\n{old_commented}\n{c} New\n{new}"
+    return new
 
 
 def _format_exc_short(exc_text: str, max_lines: int = 25) -> str:
@@ -6921,8 +6948,14 @@ class PulseCLI:
         dropped along with the diagnosis behind it.
         """
         reason = ""
+        seen = set()
         for attempt in range(_MAX_VERIFY_ATTEMPTS):
             fix_desc = self._describe_fix(fix)
+            signature = json.dumps([fix["old"], fix["new"]], sort_keys=True)
+            if signature in seen:
+                # Same fix, same evidence -- asking again just burns calls.
+                return fix, True, (reason or "(re-examined and unchanged)")
+            seen.add(signature)
             try:
                 with _Spinner("Checking the fix"):
                     verify_answer = self._call_model(
@@ -6940,19 +6973,31 @@ class PulseCLI:
             reason = str(verdict.get("reason", "")).strip()
             if passes:
                 return fix, True, reason
-            if attempt == _MAX_VERIFY_ATTEMPTS - 1:
-                break
+
+            # Hand the check's finding back and let the model decide.
             try:
-                with _Spinner("Revising fix"):
-                    revised_answer = self._call_model(
-                        _PASS4_REVISE_TMPL.format(diagnosis=diagnosis, fix_desc=fix_desc, reason=reason),
+                with _Spinner("Re-examining the fix"):
+                    recheck_answer = self._call_model(
+                        _PASS4_RECHECK_TMPL.format(
+                            diagnosis=diagnosis, fix_desc=fix_desc,
+                            reason=reason or "(no reason given)"),
                         max_tokens=_AGENT_MAX_TOKENS,
                     )
-            except AgentRequestFailed:
-                break
-            revised = self._parse_code_fix(revised_answer)
+            except AgentRequestFailed as exc:
+                return fix, False, f"(re-examination request failed: {exc})"
+
+            decision_obj = self._parse_json_obj(recheck_answer) or {}
+            decision = str(decision_obj.get("decision", "")).strip().lower()
+            note = str(decision_obj.get("reason", "") or decision_obj.get("explanation", "")).strip()
+            if decision == "keep":
+                return fix, True, f"kept by the agent after re-examination: {note or '(no reason given)'}"
+            if decision == "drop":
+                return fix, False, f"dropped by the agent after re-examination: {note or '(no reason given)'}"
+            revised = self._parse_code_fix(recheck_answer)
             if revised is None:
-                break
+                # No usable decision: treat the check as unconfirmed rather
+                # than applying a fix nobody stood behind.
+                return fix, False, (reason or "(the check did not pass and the agent did not respond usably)")
             fix = revised
         return fix, False, (reason or "(verification did not clearly pass after retries)")
 
@@ -7157,6 +7202,31 @@ class PulseCLI:
             fix = revised
         return fix, False, evidence or "loss did not improve after retries"
 
+    def _service_tool_requests(self, answer: str) -> str:
+        """Run any directives the model put in `answer` (GREP:/VIEW:/CALC:
+        and the extended toolset) and return their combined output, or ""
+        if it asked for nothing. Same servicing pass 2 gets -- shared so
+        that asking for context works wherever the model does it."""
+        notes = []
+        try:
+            (_clean, calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
+             sensitivity_args, normal_start_args, grep_patterns, view_requests) = self._extract_directives(answer)
+            if calc_exprs or promote_names or grep_patterns or view_requests:
+                note = self._apply_directives(
+                    calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
+                    sensitivity_args, normal_start_args, grep_patterns, view_requests,
+                )
+                if note:
+                    notes.append(note)
+            _clean2, new_requests = self._extract_new_directives(answer)
+            if new_requests:
+                note = self._apply_new_directives(new_requests)
+                if note:
+                    notes.append(note)
+        except Exception as exc:  # a malformed directive must not end the fix
+            _pulse_log(f"TOOL REQUEST servicing failed: {exc!r}")
+        return "\n\n".join(n for n in notes if n)
+
     def _run_sweep_and_maybe_recurse(self, include_code: bool, _depth: int) -> None:
         """PASS 5: re-read everything for OTHER, unrelated errors. If any
         turn up, ask the user whether to fix those too (PASS 6 recurses
@@ -7334,6 +7404,34 @@ class PulseCLI:
                     _PASS3_IMPLEMENT_TMPL.format(diagnosis=full_answer), max_tokens=_AGENT_MAX_TOKENS
                 )
             fix = self._parse_code_fix(fix_answer)
+
+            # Wanting to see more code is not a failed fix. Pass 2 already
+            # services GREP:/VIEW:/REPL: and friends; this pass used to
+            # accept nothing but the finished JSON, so a model that asked
+            # for context ("let me look at lines 295-305") ended the whole
+            # pipeline with the bug undiagnosed. Answer what it asked for
+            # and let it try again, a bounded number of times.
+            for _round in range(_MAX_FIX_TOOL_ROUNDS):
+                if fix is not None:
+                    break
+                print(f"[3] Fix (not final)\n{fix_answer}\n")
+                self.agent_history.append({"role": "assistant", "content": fix_answer})
+                note = self._service_tool_requests(fix_answer)
+                if note:
+                    print(f"[tool results]\n{note}\n")
+                    self.agent_history.append({"role": "user", "content": note})
+                else:
+                    self.agent_history.append({"role": "user", "content": _PASS3_NO_TOOLS_NOTE})
+                try:
+                    with _Spinner("Developing & implementing fix"):
+                        fix_answer = self._call_model(
+                            _PASS3_IMPLEMENT_TMPL.format(diagnosis=full_answer),
+                            max_tokens=_AGENT_MAX_TOKENS,
+                        )
+                except AgentRequestFailed:
+                    break
+                fix = self._parse_code_fix(fix_answer)
+
             if fix is None:
                 print(f"[3] Fix\n{fix_answer}\n")
                 full_answer += f"\n\n{fix_answer}"
@@ -7343,8 +7441,16 @@ class PulseCLI:
             # Pass 4: verify the fix's math/logic before handing it to the
             # user; revise and re-check on failure (bounded retries).
             fix, verify_ok, verify_reason = self._verify_fix_with_retries(fix, full_answer)
-            status = "passed" if verify_ok else "did not clearly pass -- applying best effort"
+            status = "passed" if verify_ok else "not confirmed -- fix NOT applied"
             print(f"[4] Verification {status}: {verify_reason}\n")
+            if not verify_ok:
+                # Nobody stood behind this edit: the check flagged it and the
+                # agent, shown that finding, did not confirm it. Writing it
+                # anyway is how a working program gets broken after the real
+                # fix has already landed.
+                result = f"{full_answer}\n\n(Fix not applied: {verify_reason})"
+                self.agent_history.append({"role": "assistant", "content": full_answer})
+                return result
 
             self.agent_history.append({"role": "assistant", "content": full_answer})
             apply_result = self._apply_code_fix(fix)
@@ -7460,6 +7566,16 @@ class PulseCLI:
 
         if not isinstance(payload, dict):
             return None
+
+        if not ("old" in payload and "new" in payload):
+            # Some models wrap the object they were asked for in an envelope
+            # ({"pulse_analysis": {...}, "json": {"old": [...], ...}}). The
+            # schema is right, it is just one level down -- take it rather
+            # than throwing a usable fix away over packaging.
+            for value in payload.values():
+                if isinstance(value, dict) and "old" in value and "new" in value:
+                    payload = value
+                    break
 
         old, new, explanation = payload.get("old"), payload.get("new"), payload.get("explanation")
         files = payload.get("files")
@@ -8342,7 +8458,12 @@ class PulseCLI:
             ]
 
         def _history(name):
-            return _finite(self.scalar_histories.get(name, []))
+            # Epoch-level metrics first: under Keras, loss/accuracy arrive
+            # once per epoch through the fit hook and land in
+            # epoch_scalar_histories, while scalar_histories (step-level
+            # sampling) can stay empty for the whole run. Reading only the
+            # latter meant a Keras run had nothing to detect on at all.
+            return _finite(self._history_for_detector(name))
 
         def _find_history(*names):
             """
@@ -8763,6 +8884,44 @@ class PulseCLI:
                     f"{val_first:.4g} → {val_last:.4g}. "
                     "Training loss is not translating into improving "
                     "validation performance."
+                )
+
+        # ------------------------------------------------------------
+        # 2b. The run never learned anything
+        #
+        # Every check above looks for training going *wrong* -- a spike, a
+        # regression, a plateau after progress. A run that is simply not
+        # learning (loss flat from the first epoch to the last) trips none
+        # of them, which is how a zeroed initializer, dropout(1.0) or a
+        # far-too-large learning rate can train to the end unremarked.
+        #
+        # Only the whole-run shape is used: the loss at the end vs at the
+        # start. Improvement of any size keeps this quiet, so a run that
+        # simply converges to a poor result is NOT flagged (Pulse has no
+        # way to know what result was achievable).
+        # ------------------------------------------------------------
+
+        loss_name, loss_hist = _find_history("loss", "train_loss")
+
+        if loss_hist and len(loss_hist) >= 10:
+            span = max(2, len(loss_hist) // 5)
+            start_mean = sum(loss_hist[:span]) / span
+            end_mean = sum(loss_hist[-span:]) / span
+
+            if start_mean > 0 and end_mean >= start_mean * 0.98:
+                accuracy_note = ""
+                for acc_name in ("accuracy", "val_accuracy", "acc", "categorical_accuracy"):
+                    acc_hist = _history(acc_name)
+                    if len(acc_hist) >= 10 and max(acc_hist) - min(acc_hist) < 0.01:
+                        accuracy_note = (
+                            f", and '{acc_name}' never moved from {acc_hist[-1]:.4g}"
+                        )
+                        break
+
+                reasons.append(
+                    f"'{loss_name}' is no better at the end of the run than at the start "
+                    f"({start_mean:.4g} → {end_mean:.4g} over {len(loss_hist)} epochs)"
+                    f"{accuracy_note} -- the model does not appear to be learning"
                 )
 
         # ------------------------------------------------------------
