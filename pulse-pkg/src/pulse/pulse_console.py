@@ -156,7 +156,13 @@ def discover(extra_roots: Optional[List[str]] = None) -> List[Dict[str, Any]]:
             if info and info["session_id"] not in seen:
                 seen[info["session_id"]] = info
 
-    return sorted(seen.values(), key=lambda s: s.get("last_seen") or 0, reverse=True)
+    # Ordered by when each run STARTED, not by which wrote most recently. Two live runs
+    # take turns being the most recent writer, so a list sorted by activity reorders
+    # between the moment you read a number and the moment you type it, and `pulse watch 2`
+    # attaches to whichever one happened to flush last. Start time does not move.
+    return sorted(seen.values(),
+                  key=lambda s: (s.get("started") or 0, s.get("session_id") or ""),
+                  reverse=True)
 
 
 def _describe_session(directory: str) -> Optional[Dict[str, Any]]:

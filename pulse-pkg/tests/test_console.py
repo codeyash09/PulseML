@@ -95,6 +95,19 @@ class DiscoveryTest(unittest.TestCase):
         found = console._scan_for_spools(os.path.join(self.tmp, "proj"))
         self.assertEqual(found, [])
 
+    def test_the_order_does_not_change_between_calls(self):
+        # Two live runs take turns being the most recent writer. Ordering by activity
+        # means the list reorders between reading a number and typing it, so
+        # `pulse watch 2` attaches to the wrong run.
+        for name in ("one", "two", "three"):
+            self._session(name)
+            time.sleep(0.01)
+        os.chdir(self.tmp)
+        first = [s["session_id"] for s in console.discover()]
+        for _ in range(3):
+            time.sleep(0.05)
+            self.assertEqual([s["session_id"] for s in console.discover()], first)
+
     def test_duplicates_from_both_sources_collapse(self):
         self._session("epsilon")
         os.chdir(os.path.join(self.tmp, "runs"))
