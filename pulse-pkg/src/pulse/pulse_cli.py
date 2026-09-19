@@ -1318,6 +1318,12 @@ _RESTART_CHILD_ENV = "PULSE_RESTART_CHILD"
 # restart again on its own, so without a cap the chain nests indefinitely.
 _RESTART_DEPTH_ENV = "PULSE_RESTART_DEPTH"
 _MAX_RESTART_DEPTH = 3
+# Set by `pulse run` (cli.py). A script run that way has no auto_track() in the file on
+# disk -- `pulse run` adds it in memory -- so re-running the file directly would restart it
+# with nothing watching. When set, this is called as hook(python_exe, script_path,
+# script_args) and returns the argv to restart with (`pulse run` again). None: the
+# original behaviour, `python script.py`, for scripts that call auto_track() themselves.
+_RESTART_ARGV_HOOK = None
 _RESTART_FEEDBACK_MAX_CHARS = 20000
 
 
@@ -5649,6 +5655,8 @@ class PulseCLI:
         # which may be the stale path this whole resolution step exists
         # to route around.
         argv = [python_exe, script_path] + sys.argv[1:]
+        if _RESTART_ARGV_HOOK is not None:
+            argv = _RESTART_ARGV_HOOK(python_exe, script_path, sys.argv[1:]) or argv
         # Only the child gets the marker (not this process's os.environ):
         # if every retry fails and this process keeps running the old code,
         # its own later crashes must still go through the agent as normal.
