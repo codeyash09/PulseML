@@ -93,6 +93,7 @@ from pulse.pulse_backend import (
     to_numpy, shape_of, tensor_kind, is_trackable, describe_tensor,
     statistics as backend_statistics, scalar_value,
 )
+from pulse import pulse_detect as _pulse_detect
 
 import multiprocessing as mp
 
@@ -6186,76 +6187,40 @@ class Dashboard:
         Also flags any matrix/tensor (track or lotrack) whose latest
         stats show nan/inf.
         """
-        reasons = []
+        histories = {}
+        tensor_stats = {}
         for name, stats in manifest.items():
-            if "error" in stats:
+            if not isinstance(stats, dict) or "error" in stats:
                 continue
             if stats.get("kind") != "scalar":
                 nan = stats.get("nan", 0) or 0
                 inf = stats.get("inf", 0) or 0
                 if nan or inf:
-                    reasons.append(f"'{name}' has nan={nan} inf={inf}")
+                    tensor_stats[name] = {"nan": nan, "inf": inf}
                 continue
-
+            recent = list(stats.get("recent") or [])
             latest = stats.get("latest_value")
-            if latest is not None and isinstance(latest, (int, float)) and not math.isfinite(latest):
-                reasons.append(f"'{name}' just went non-finite (NaN/inf): {latest}")
-                continue
-            if latest is None:
-                continue
+            # `recent` is mirrored into the manifest a beat before latest_value is
+            # written, so the newest reading can be missing from it.
+            if latest is not None and (not recent or recent[-1] != latest):
+                recent.append(latest)
+            if recent:
+                histories[name] = recent
 
-            recent = [v for v in (stats.get("recent") or []) if v is not None and math.isfinite(v)]
-
-            if _looks_like_loss(name) or _looks_like_metric(name):
-                if len(recent) >= 6 and len(set(recent[-6:])) == 1:
-                    reasons.append(
-                        f"'{name}' has been exactly frozen at {recent[-1]:.6g} for its last "
-                        f"{len(recent[-6:])} observations -- not just slow-moving, but bit-for-bit "
-                        "unchanged, which usually means something isn't actually running each step "
-                        "rather than the model just learning slowly"
-                    )
-
-            if _looks_like_loss(name) and len(recent) >= 5:
-                baseline = min(recent[:-1])
-                if baseline > 0 and latest > baseline * self.explosion_multiplier:
-                    reasons.append(
-                        f"'{name}' spiked to {latest:.4g}, "
-                        f"{latest / baseline:.1f}x its recent minimum ({baseline:.4g})"
-                    )
-
-            if _looks_like_grad_or_weight_norm(name) and len(recent) >= 5:
-                previous = recent[:-1]
-                baseline = sum(previous) / len(previous)
-                if baseline > 1e-12:
-                    if latest > baseline * self.explosion_multiplier:
-                        reasons.append(
-                            f"'{name}' spiked to {latest:.4g}, {latest / baseline:.1f}x its recent "
-                            f"average ({baseline:.4g}) -- looks like exploding gradients/weights"
-                        )
-                    elif latest < baseline / self.explosion_multiplier:
-                        reasons.append(
-                            f"'{name}' collapsed to {latest:.4g} from a recent average of "
-                            f"{baseline:.4g} -- looks like vanishing gradients"
-                        )
-
-            if _looks_like_learning_rate(name) and len(recent) >= 2:
-                prev_lr = recent[-2]
-                if prev_lr and prev_lr > 0 and latest > 0:
-                    ratio = latest / prev_lr
-                    if ratio >= 10.0 or ratio <= 0.1:
-                        reasons.append(
-                            f"'{name}' jumped from {prev_lr:.4g} to {latest:.4g} ({ratio:.3g}x) "
-                            "between consecutive observations -- possible scheduler misconfiguration"
-                        )
-
-            if _looks_like_metric(name) and len(recent) == 2 and max(recent) >= 0.999:
-                reasons.append(
-                    f"'{name}' already hit {max(recent):.4g} within its first 2 observations -- "
-                    "(near-)perfect accuracy this early is a classic symptom of data leakage rather "
-                    "than genuinely fast learning"
-                )
-
-        return "; ".join(reasons) if reasons else None
+        engine = getattr(self, "_detector", None)
+        if engine is None:
+            engine = _pulse_detect.DetectionEngine(sensitivity=0.3)
+            self._detector = engine
+        engine.overrides = ({"explosion_multiplier": self.explosion_multiplier}
+                            if getattr(self, "explosion_multiplier", None) else {})
+        try:
+            raised = engine.update(histories, tensor_stats=tensor_stats or None)["raised"]
+        except Exception as exc:
+            _pulse_log(f"GUI DETECTOR ERROR {type(exc).__name__}: {exc}")
+            return None
+        actionable = [f for f in raised
+                      if f.severity in (_pulse_detect.CRITICAL, _pulse_detect.WARNING)]
+        return "; ".join(f.message for f in actionable) if actionable else None
 
     def _trigger_auto_intervention(self, problem):
         """Pause the user's training loop and hand the problem to the agent.

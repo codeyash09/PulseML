@@ -47,6 +47,21 @@ METRIC_NAME_HINTS = ("acc", "accuracy", "f1", "auc", "precision", "recall", "iou
                      "bleu", "rouge", "map", "mrr", "r2", "score")
 NORM_NAME_HINTS = ("grad_norm", "gradnorm", "grad_scale", "weight_norm", "param_norm", "update_norm")
 LR_NAME_HINTS = ("lr", "learning_rate", "learningrate", "step_size")
+# Objectives that are not progress measures. In adversarial and reinforcement learning
+# the loss is a moving target by construction: a generator loss rises precisely when
+# the discriminator gets better, and a policy loss follows whatever the current
+# advantage estimate happens to be. "It went up" and "it stopped going down" are
+# meaningless for these, and the checks that say so are turned off for them -- while
+# NaN, a frozen value and a hundredfold spike stay on, because those are real anywhere.
+# What carries the signal in RL is the reward, and that is checked like any other score.
+MOVING_TARGET_HINTS = ("policy_loss", "value_loss", "actor_loss", "critic_loss", "q_loss",
+                       "td_error", "entropy_loss", "g_loss", "d_loss", "gen_loss",
+                       "disc_loss", "generator_loss", "discriminator_loss", "adversarial")
+# How long a step takes is not a loss, a score, a norm or a learning rate, so nothing
+# looked at it -- and a run whose step time climbs all the way through is leaking, and
+# usually ends as an out-of-memory kill several hours in.
+TIME_NAME_HINTS = ("step_time", "batch_time", "iter_time", "epoch_time", "elapsed_per",
+                   "sec_per_step", "secs_per_step", "ms_per_batch", "ms_per_step", "time_per")
 VAL_PREFIXES = ("val", "valid", "validation", "test", "eval", "dev")
 
 
@@ -73,6 +88,17 @@ def looks_like_lr(name: str) -> bool:
     low = _lower(name).replace("-", "_")
     return low in LR_NAME_HINTS or any(low.endswith("_" + hint) or low.startswith(hint + "_")
                                        for hint in LR_NAME_HINTS)
+
+
+def looks_like_moving_target(name: str) -> bool:
+    """Is this an objective whose direction carries no information?"""
+    low = _lower(name).replace("-", "_")
+    return any(hint in low for hint in MOVING_TARGET_HINTS)
+
+
+def looks_like_step_time(name: str) -> bool:
+    low = _lower(name).replace("-", "_")
+    return any(hint in low for hint in TIME_NAME_HINTS)
 
 
 def is_validation(name: str) -> bool:
@@ -140,9 +166,35 @@ class Finding:
         return f"<Finding {self.severity} {self.check}:{self.variable} {self.message!r}>"
 
 
+def _as_float(value: Any) -> Optional[float]:
+    """The number this reading stands for, or None if it is not a number.
+
+    Testing `isinstance(value, (int, float))` is the obvious way to write this and it
+    is wrong for the values training loops actually produce: numpy's float32 is not a
+    Python float (float64 is, by inheritance, which is what hides the bug), and neither
+    is a 0-dim array or a torch scalar. A run reporting float32 -- the default dtype in
+    Keras and common in PyTorch -- had every reading discarded, so nothing was ever
+    checked, including whether the loss had gone NaN.
+
+    Strings stay excluded on purpose: float("nan") succeeds, and a metric that arrived
+    as text is a formatting accident, not a reading to draw conclusions from.
+    """
+    if isinstance(value, bool) or isinstance(value, (str, bytes, bytearray)):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        number = float(value)
+    except Exception:
+        # Deliberately everything: __float__ belongs to the caller's object, it can
+        # raise whatever it likes, and none of it is worth taking a training run down for.
+        return None
+    return number
+
+
 def _finite(history: Sequence[Any]) -> List[float]:
-    return [float(v) for v in history if isinstance(v, (int, float)) and not isinstance(v, bool)
-            and math.isfinite(float(v))]
+    numbers = (_as_float(v) for v in history)
+    return [v for v in numbers if v is not None and math.isfinite(v)]
 
 
 def _mean(values: Sequence[float]) -> float:
@@ -172,32 +224,39 @@ def _stdev(values: Sequence[float]) -> float:
 
 
 def _trend(values: Sequence[float]) -> tuple:
-    """Least-squares slope per reading, and how many standard errors it is from flat.
+    """Slope per reading, its significance, and how much of the movement it explains.
 
     Comparing the first half of a window to the second half asks two readings' worth of
     questions of the data; a fitted slope uses all of them, which is what tells a real
     climb apart from noise that happened to land high at the end.
+
+    The third number matters as much as the second. A significant slope only says the
+    line is not flat -- fit a line to a sine wave and you get one. The fraction of the
+    variance the line accounts for is what says the run is actually going one way, and
+    a policy loss swinging around zero fails it.
     """
     n = len(values)
     if n < 4:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
     values, scale = _scaled(values)
     mean_x = (n - 1) / 2.0
     mean_y = _mean(values)
     sxx = sum((i - mean_x) ** 2 for i in range(n))
     sxy = sum((i - mean_x) * (values[i] - mean_y) for i in range(n))
     if sxx <= 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
     slope = sxy / sxx
     residuals = [values[i] - (mean_y + slope * (i - mean_x)) for i in range(n)]
-    if n <= 2:
-        return slope * scale, 0.0
-    scatter = (sum(r ** 2 for r in residuals) / (n - 2)) ** 0.5
+    total = sum((v - mean_y) ** 2 for v in values)
+    unexplained = sum(r ** 2 for r in residuals)
+    explained = 1.0 - (unexplained / total) if total > 0 else 0.0
+    scatter = (unexplained / (n - 2)) ** 0.5
     standard_error = scatter / (sxx ** 0.5)
-    # The t-statistic is scale-free; the slope is reported in the caller's own units.
+    # The t-statistic and the explained fraction are scale-free; the slope is reported
+    # in the caller's own units.
     if standard_error <= 0:
-        return slope * scale, 99.0 if slope else 0.0
-    return slope * scale, slope / standard_error
+        return slope * scale, (99.0 if slope else 0.0), (1.0 if slope else 0.0)
+    return slope * scale, slope / standard_error, explained
 
 
 def _lag1(values: Sequence[float]) -> float:
@@ -369,9 +428,9 @@ class DetectionEngine:
     def _check_variable(self, name: str, history: List[Any], t: Dict[str, float],
                         step: Optional[int]) -> Iterable[Finding]:
         out: List[Finding] = []
-        raw_last = history[-1] if history else None
-        if isinstance(raw_last, (int, float)) and not isinstance(raw_last, bool) and not math.isfinite(float(raw_last)):
-            kind = "NaN" if math.isnan(float(raw_last)) else "infinite"
+        raw_last = _as_float(history[-1]) if history else None
+        if raw_last is not None and not math.isfinite(raw_last):
+            kind = "NaN" if math.isnan(raw_last) else "infinite"
             out.append(Finding("nonfinite", name, CRITICAL,
                                f"{name} is {kind}; every step from here is wasted compute",
                                step, {"value": str(raw_last), "points": len(history)}, 1.0))
@@ -386,7 +445,29 @@ class DetectionEngine:
 
         # Frozen: the same bits over and over. A loss that does not move at all is
         # usually a detached graph or an optimizer that never steps.
-        if (is_loss or is_metric) and len(values) >= 6 and len(set(values[-6:])) == 1:
+        # The same readings coming round again, bit for bit. Two floats from real
+        # arithmetic do not repeat a whole sequence by chance, so this means the same
+        # data is going through the same weights: an exhausted iterator being re-used,
+        # or per-epoch state being reset. Cheap to check and impossible to fake.
+        if (is_loss or is_metric) and len(values) >= 12:
+            for period in range(2, min(13, len(values) // 3 + 1)):
+                tail = values[-period:]
+                if len(set(tail)) == 1:
+                    break            # that is "frozen", and it is reported as frozen
+                if tail == values[-2 * period:-period] == values[-3 * period:-2 * period]:
+                    out.append(Finding("repeating", name, WARNING,
+                                       f"{name} is repeating the same {period} readings exactly "
+                                       f"({', '.join(f'{v:g}' for v in tail)}): the same data is "
+                                       f"going through the model every time",
+                                       step, {"period": period, "cycle": tail}, 0.9))
+                    break
+
+        # A metric on a small evaluation set is quantised -- 197 right out of 200 is
+        # exactly 0.985 every time -- so a good model's score repeats bit-for-bit for
+        # epochs on end. That is the metric having converged, not the run having died,
+        # and it is only "frozen" when the model is not already doing well.
+        frozen_matters = is_loss or not getattr(self, "_already_good", False)
+        if frozen_matters and (is_loss or is_metric) and len(values) >= 6 and len(set(values[-6:])) == 1:
             out.append(Finding("frozen", name, WARNING,
                                f"{name} has been exactly {latest:g} for {min(len(values), 6)} readings",
                                step, {"value": latest}, 0.85))
@@ -416,6 +497,20 @@ class DetectionEngine:
                                            step, {"latest": latest, "previous": previous,
                                                   "baseline": baseline, "vanished": vanished}, 0.7))
 
+            # A norm does not have to spike to be wrong. Weights growing steadily all
+            # run -- no weight decay, or an instability building -- never trip a
+            # multiple-of-recent-average test, because the average climbs with them.
+            if len(values) >= 15:
+                window = values[-max(15, len(values) // 2):]
+                slope, slope_t, explained = _trend(window)
+                growth = (window[-1] - window[0]) / (abs(window[0]) or 1.0)
+                if slope > 0 and slope_t > 4.0 and explained > 0.7 and growth > 0.5:
+                    out.append(Finding("norm_growth", name, WARNING,
+                                       f"{name} has grown steadily all run: {window[0]:g} to "
+                                       f"{window[-1]:g} over its last {len(window)} readings",
+                                       step, {"from": window[0], "to": window[-1], "slope": slope},
+                                       _confidence(slope_t, 4.0, len(values))))
+
         if looks_like_lr(name) and len(values) >= 2:
             previous = values[-2]
             if previous > 0 and latest > 0:
@@ -424,6 +519,18 @@ class DetectionEngine:
                     out.append(Finding("lr_jump", name, WARNING,
                                        f"{name} changed by {ratio:.3g}x in one step ({previous:g} -> {latest:g})",
                                        step, {"from": previous, "to": latest, "ratio": ratio}, 0.75))
+
+        if looks_like_step_time(name) and len(values) >= 15:
+            window = values[-max(15, len(values) // 2):]
+            slope, slope_t, explained = _trend(window)
+            growth = (window[-1] - window[0]) / (abs(window[0]) or 1.0)
+            if slope > 0 and slope_t > 6.0 and explained > 0.8 and growth > 0.5:
+                out.append(Finding("slowing_down", name, WARNING,
+                                   f"{name} has grown {100 * growth:.0f}% over its last "
+                                   f"{len(window)} readings ({window[0]:g} to {window[-1]:g}): "
+                                   f"something is accumulating, and the run gets slower every step",
+                                   step, {"from": window[0], "to": window[-1], "growth": growth},
+                                   _confidence(slope_t, 6.0, len(values))))
 
         if is_loss:
             out.extend(self._check_loss(name, values, t, step))
@@ -436,6 +543,10 @@ class DetectionEngine:
         out: List[Finding] = []
         latest = values[-1]
         window = values[-20:]
+        # For a generator or a policy loss, everything below this point -- the plateau,
+        # the bouncing, the climb, the "no better than when it started" -- is normal
+        # behaviour rather than evidence, so only the spike check runs.
+        directionless = looks_like_moving_target(name)
 
         if len(values) >= 5:
             # The floor is the low end of the recent readings, not the single lowest one:
@@ -454,7 +565,7 @@ class DetectionEngine:
                                    step, {"latest": latest, "baseline": baseline},
                                    _confidence(latest / baseline, t["explosion_multiplier"], len(values))))
 
-        if len(values) >= 8:
+        if len(values) >= 8 and not directionless:
             scale = _mean([abs(v) for v in window]) or 1.0
             if (max(window) - min(window)) <= scale * t["plateau_range_frac"]:
                 out.append(Finding("plateau", name, WARNING,
@@ -487,7 +598,7 @@ class DetectionEngine:
                                    _confidence(flips, t["oscillation_flip_threshold"], len(values))))
 
         window_size = max(10, min(int(t["stagnation_window"]), len(values) // 3))
-        if len(values) >= 12 and len(values) >= window_size:
+        if len(values) >= 12 and len(values) >= window_size and not directionless:
             recent = values[-window_size:]
             scale = _mean([abs(v) for v in recent]) or 1.0
             spread = (max(recent) - min(recent)) / scale
@@ -513,12 +624,17 @@ class DetectionEngine:
         # frozen, and it is not stagnant: it is training, in the wrong direction. The
         # rise has to be sustained and to clear the curve's own noise, so that a warmup
         # or a schedule restart lifting the loss for a few epochs does not read as one.
-        if len(values) >= 15:
+        if len(values) >= 15 and not directionless:
             span = max(5, len(values) // 4)
             early, late = _mean(values[:span]), _mean(values[-span:])
             rise = late - early
-            slope, slope_t = _trend(values[-max(15, len(values) // 2):])
-            if early > 0 and rise > early * t["divergence_train_frac"] and slope > 0 and slope_t > 4.0:
+            slope, slope_t, explained = _trend(values[-max(15, len(values) // 2):])
+            # Over less than one period a sine is a straight line, so a significant
+            # slope alone flags any slowly oscillating quantity -- an RL policy loss
+            # measures 6 standard errors and explains 75% of its own variance while
+            # going nowhere. Real divergences measured 16 to 59, explaining over 90%.
+            if (abs(early) > 0 and rise > abs(early) * t["divergence_train_frac"]
+                    and slope > 0 and slope_t > 6.0 and explained > 0.8):
                 severity = CRITICAL if late > early * 2 else WARNING
                 out.append(Finding("divergence", name, severity,
                                    f"{name} is climbing, not falling: {early:.4g} over its first {span} "
@@ -528,14 +644,19 @@ class DetectionEngine:
 
         # "Never learned": the end is no better than the beginning. Every other check
         # looks for training going wrong; this one is for training that never started.
-        if len(values) >= 10:
+        if len(values) >= 10 and not directionless:
             span = max(2, len(values) // 5)
             start, end = _mean(values[:span]), _mean(values[-span:])
             # The best the run ever *held*, not the single luckiest reading: one noisy
             # epoch dipping below the opening is not the run having learned something,
             # and taking it for one made this check a coin flip on any noisy curve.
             best = _lowest_sustained(values, span)
-            never_improved = best >= start * t["never_learned_ratio"]
+            # Expressed as a distance rather than a ratio, because a ratio changes
+            # direction with the sign: an ELBO or a log-likelihood sitting flat at -3.2
+            # forever passed `end >= start * 0.98` trivially, so this check was blind to
+            # every objective that reports a negative number.
+            worth_noticing = abs(start) * (1.0 - t["never_learned_ratio"])
+            never_improved = (start - best) < worth_noticing
             # "This run is not learning" is the harshest thing here, so only say it when
             # the readings are steady enough to have shown an improvement had there been
             # one. On a curve that swings by more than it has moved -- the first few
@@ -544,8 +665,8 @@ class DetectionEngine:
             se = _stdev(values[:span] + values[-span:]) * (2.0 / span) ** 0.5
             precise_enough = 3.0 * se < start * 0.10
             improved_measurably = (start - end) > 3.0 * se
-            if (start > 0 and precise_enough and not improved_measurably
-                    and end >= start * t["never_learned_ratio"] and never_improved):
+            if (abs(start) > 0 and precise_enough and not improved_measurably
+                    and (start - end) < worth_noticing and never_improved):
                 out.append(Finding("never_learned", name, CRITICAL,
                                    f"{name} is no better than when it started ({start:.4g} -> {end:.4g} "
                                    f"over {len(values)} readings): this run is not learning",
@@ -586,6 +707,17 @@ class DetectionEngine:
                                f"{name} reached {max(values):.4g} within {len(values)} readings, "
                                f"which usually means the labels are reachable from the inputs",
                                step, {"value": max(values), "points": len(values)}, 0.7))
+        # A leak does not have to be obvious in the first two epochs: one that takes ten
+        # to saturate looks like fast learning on the way up and is only visible once
+        # the score sits at the ceiling and stays there. On validation, that is not a
+        # model that has learned the task, it is a model that can see the answer.
+        elif (is_validation(name) and len(values) >= 8
+                and min(values[-8:]) >= t["perfect_metric"]):
+            out.append(Finding("suspiciously_perfect", name, WARNING,
+                               f"{name} has been a perfect {values[-1]:.4g} for its last 8 readings: "
+                               f"a validation score that stops at the ceiling usually means the "
+                               f"labels are reachable from the inputs",
+                               step, {"value": values[-1], "points": len(values)}, 0.7))
         if len(values) >= 10:
             quarter = max(2, len(values) // 4)
             early, late = _mean(values[:quarter]), _mean(values[-quarter:])
@@ -595,13 +727,57 @@ class DetectionEngine:
                                    step, {"early": early, "late": late}, 0.6))
         return out
 
+    def _check_metric_against_loss(self, histories: Dict[str, Sequence[Any]],
+                                   losses: Dict[str, List[float]], train: Optional[str],
+                                   t: Dict[str, float], step: Optional[int]) -> Iterable[Finding]:
+        """The loss is coming down. Is the thing you actually care about moving?
+
+        These can come apart, and when they do the loss is the one that lies: a model
+        fitting shuffled labels drives its training loss down for fifty epochs while
+        accuracy sits at chance, and every check that watches the loss alone sees a
+        healthy run. Reported on its own because the fix is never in the optimiser --
+        it is in the labels, the metric, or what the two are computed over.
+        """
+        out: List[Finding] = []
+        if not train or getattr(self, "_already_good", False):
+            return out
+        loss_values = losses[train]
+        if len(loss_values) < 12:
+            return out
+        span = max(3, len(loss_values) // 4)
+        loss_early, loss_late = _mean(loss_values[:span]), _mean(loss_values[-span:])
+        if loss_early <= 0 or (loss_early - loss_late) / loss_early < 0.2:
+            return out          # the loss has not really moved either; other checks own that
+
+        for name, history in histories.items():
+            if not looks_like_metric(name):
+                continue
+            values = _finite(list(history))
+            if len(values) < 12:
+                continue
+            metric_span = max(3, len(values) // 4)
+            early, late = _mean(values[:metric_span]), _mean(values[-metric_span:])
+            scale = max(abs(early), _stdev(values), 1e-12)
+            if abs(late - early) / scale < t["stagnation_frac"]:
+                out.append(Finding("metric_not_improving", name, WARNING,
+                                   f"{train} has come down {100 * (loss_early - loss_late) / loss_early:.0f}% "
+                                   f"({loss_early:.4g} to {loss_late:.4g}) while {name} has not moved "
+                                   f"({early:.4g} to {late:.4g}): the loss is improving on something "
+                                   f"{name} does not measure",
+                                   step, {"loss_early": loss_early, "loss_late": loss_late,
+                                          "metric_early": early, "metric_late": late}, 0.8))
+        return out
+
     def _check_pairs(self, histories: Dict[str, Sequence[Any]], t: Dict[str, float],
                      step: Optional[int]) -> Iterable[Finding]:
-        """Checks that need two histories at once: train loss against validation loss."""
+        """Checks that need two histories at once: a loss against validation, or a score."""
         out: List[Finding] = []
         losses = {name: _finite(list(hist)) for name, hist in histories.items() if looks_like_loss(name)}
         train = next((name for name in losses if not is_validation(name)), None)
         val = next((name for name in losses if is_validation(name)), None)
+
+        out.extend(self._check_metric_against_loss(histories, losses, train, t, step))
+
         if not train or not val:
             return out
         train_hist, val_hist = losses[train], losses[val]
