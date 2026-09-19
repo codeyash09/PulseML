@@ -334,9 +334,57 @@ def _bootstrap_pulse_config(script_path):
     Interactively create pulse_config.json when Pulse needs an AI
     provider but no usable configuration exists.
 
-    The configuration is stored beside the user's training script.
+    IMPORTANT:
+        If pulse_config.json already exists beside the training script,
+        this function DOES NOT prompt, modify, or overwrite it.
+
+    The provider list comes directly from Pulse's real PROVIDERS registry
+    in pulse_cli.py.
+
+    The configuration format matches PulseCLI._load_config(), which
+    expects top-level keys such as:
+
+        {
+            "agent": "Google AI Studio (Gemini 3.5 Flash-Lite)",
+            "api_key": "...",
+            "autofix": true,
+            "tos_accepted": true
+        }
+
     The training script itself is never modified.
     """
+    from pulse.pulse_cli import PROVIDERS
+
+    config_path = os.path.join(
+        os.path.dirname(
+            os.path.abspath(script_path)
+        ),
+        "pulse_config.json",
+    )
+
+    # ------------------------------------------------------------
+    # EXISTING CONFIGURATION
+    #
+    # This check MUST happen before any setup prompts.
+    # ------------------------------------------------------------
+
+    if os.path.isfile(config_path):
+        print()
+        print(
+            f"[Pulse] Existing configuration found: "
+            f"{config_path}"
+        )
+        print(
+            "[Pulse] Reusing existing configuration."
+        )
+        print()
+
+        return True
+
+    # ------------------------------------------------------------
+    # FIRST-TIME SETUP
+    # ------------------------------------------------------------
+
     print()
     print("=" * 64)
     print("Pulse first-time setup")
@@ -347,10 +395,8 @@ def _bootstrap_pulse_config(script_path):
         "Pulse needs an AI provider to repair this Python syntax error."
     )
     print(
-        "Your API key will be stored in pulse_config.json in this"
-    )
-    print(
-        "training project's directory."
+        "Your configuration will be stored in pulse_config.json in "
+        "this training project's directory."
     )
     print()
 
@@ -389,31 +435,48 @@ def _bootstrap_pulse_config(script_path):
 
     # ------------------------------------------------------------
     # Provider
+    #
+    # Use Pulse's ACTUAL provider registry.
+    # Do not maintain a second provider list here.
     # ------------------------------------------------------------
 
     print()
     print(
-        "Supported provider examples:"
-    )
-    print(
-        "  gemini"
-    )
-    print(
-        "  openai"
-    )
-    print(
-        "  anthropic"
-    )
-    print(
-        "  openrouter"
-    )
-    print(
-        "  local"
+        "Available AI providers:"
     )
     print()
 
+    provider_names = list(
+        PROVIDERS.keys()
+    )
+
+    for index, provider_name in enumerate(
+        provider_names,
+        start=1,
+    ):
+        info = PROVIDERS[
+            provider_name
+        ]
+
+        suffix = ""
+
+        if info.get("local"):
+            suffix = " [local]"
+
+        elif info.get("openrouter"):
+            suffix = " [OpenRouter]"
+
+        elif info.get("custom"):
+            suffix = " [custom]"
+
+        print(
+            f"  {index}. {provider_name}{suffix}"
+        )
+
+    print()
+
     try:
-        provider = input(
+        provider_choice = input(
             "AI provider: "
         ).strip()
     except (EOFError, KeyboardInterrupt):
@@ -423,29 +486,126 @@ def _bootstrap_pulse_config(script_path):
         )
         return False
 
-    if not provider:
+    try:
+        provider_index = int(
+            provider_choice
+        ) - 1
+    except ValueError:
+        print()
         print(
-            "[Pulse] No provider selected."
+            "[Pulse] Invalid provider selection."
         )
         return False
 
-    # ------------------------------------------------------------
-    # API key
-    # ------------------------------------------------------------
-
-    api_key = ""
-
-    if provider.lower() not in (
-        "local",
-        "ollama",
-        "lmstudio",
-        "llama.cpp",
+    if (
+        provider_index < 0
+        or provider_index >= len(provider_names)
     ):
+        print()
+        print(
+            "[Pulse] Invalid provider selection."
+        )
+        return False
+
+    provider = provider_names[
+        provider_index
+    ]
+
+    provider_info = PROVIDERS[
+        provider
+    ]
+
+    # ------------------------------------------------------------
+    # Build the config using Pulse's existing config semantics.
+    # ------------------------------------------------------------
+
+    config = {
+        "agent": provider,
+        "autofix": True,
+        "tos_accepted": True,
+    }
+
+    # ------------------------------------------------------------
+    # LOCAL PROVIDER
+    # ------------------------------------------------------------
+
+    if provider_info.get("local"):
+        print()
+
+        model_hint = provider_info.get(
+            "model_hint",
+            "model name",
+        )
+
+        default_api_base = provider_info.get(
+            "default_api_base",
+            "",
+        )
+
+        try:
+            model_name = input(
+                f"Model ({model_hint}): "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            print(
+                "[Pulse] Setup cancelled."
+            )
+            return False
+
+        if not model_name:
+            print(
+                "[Pulse] No local model name entered."
+            )
+            return False
+
+        try:
+            api_base = input(
+                f"API base [{default_api_base}]: "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            print(
+                "[Pulse] Setup cancelled."
+            )
+            return False
+
+        if not api_base:
+            api_base = default_api_base
+
+        config["model"] = model_name
+        config["api_base"] = api_base
+
+    # ------------------------------------------------------------
+    # OPENROUTER
+    # ------------------------------------------------------------
+
+    elif provider_info.get("openrouter"):
         print()
 
         try:
+            model_name = input(
+                "OpenRouter model slug "
+                "(e.g. deepseek/deepseek-v4-flash): "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            print(
+                "[Pulse] Setup cancelled."
+            )
+            return False
+
+        if not model_name:
+            print(
+                "[Pulse] No OpenRouter model entered."
+            )
+            return False
+
+        config["model"] = model_name
+
+        try:
             api_key = getpass.getpass(
-                "API key: "
+                "OpenRouter API key: "
             ).strip()
         except (EOFError, KeyboardInterrupt):
             print()
@@ -460,30 +620,98 @@ def _bootstrap_pulse_config(script_path):
             )
             return False
 
+        config["api_key"] = api_key
+
     # ------------------------------------------------------------
-    # Write configuration
+    # CUSTOM PROVIDER
     # ------------------------------------------------------------
 
-    config_path = os.path.join(
-        os.path.dirname(
-            os.path.abspath(script_path)
-        ),
-        "pulse_config.json",
-    )
+    elif provider_info.get("custom"):
+        print()
 
-    config = {
-        "agent": {
-            "provider": provider,
-        },
-        "api_key": api_key,
-        "autofix": True,
-        "tos_accepted": True,
-    }
+        try:
+            provider_model = input(
+                "Provider/model: "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            print(
+                "[Pulse] Setup cancelled."
+            )
+            return False
+
+        if not provider_model:
+            print(
+                "[Pulse] No provider/model entered."
+            )
+            return False
+
+        # Pulse's custom-provider branch receives the provider/model
+        # through the agent configuration.
+        config["agent"] = provider_model
+
+        try:
+            api_key = getpass.getpass(
+                "API key: "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            print(
+                "[Pulse] API key entry cancelled."
+            )
+            return False
+
+        if api_key:
+            config["api_key"] = api_key
+
+    # ------------------------------------------------------------
+    # STANDARD CLOUD PROVIDER
+    # ------------------------------------------------------------
+
+    else:
+        env_key = provider_info.get(
+            "env_key"
+        )
+
+        if not env_key:
+            print(
+                f"[Pulse] Provider '{provider}' does not define "
+                "an API-key environment variable."
+            )
+            return False
+
+        print()
+
+        try:
+            api_key = getpass.getpass(
+                f"{env_key}: "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            print(
+                "[Pulse] API key entry cancelled."
+            )
+            return False
+
+        if not api_key:
+            print(
+                f"[Pulse] No {env_key} entered."
+            )
+            return False
+
+        config["api_key"] = api_key
+
+    # ------------------------------------------------------------
+    # WRITE CONFIGURATION
+    #
+    # Use exclusive creation so an existing file can NEVER be
+    # overwritten accidentally, even in a race between processes.
+    # ------------------------------------------------------------
 
     try:
         with open(
             config_path,
-            "w",
+            "x",
             encoding="utf-8",
         ) as config_file:
             json.dump(
@@ -492,6 +720,21 @@ def _bootstrap_pulse_config(script_path):
                 indent=2,
             )
             config_file.write("\n")
+
+    except FileExistsError:
+        # Another process created the configuration after our
+        # initial existence check. Never overwrite it.
+        print()
+        print(
+            f"[Pulse] Configuration already exists: "
+            f"{config_path}"
+        )
+        print(
+            "[Pulse] Reusing the existing configuration."
+        )
+        print()
+
+        return True
 
     except OSError as exc:
         print(
@@ -644,8 +887,14 @@ def main():
                 # ----------------------------------------------------
                 # First-run setup.
                 #
-                # If no usable AI agent is configured, interactively
-                # create pulse_config.json and then reload it.
+                # IMPORTANT:
+                #
+                # _load_config() is called by set_code_text().
+                # Therefore, if a config already exists, Pulse should
+                # already have loaded it and this setup is skipped.
+                #
+                # If no usable agent exists, create the config and
+                # then explicitly reload it.
                 # ----------------------------------------------------
 
                 if not getattr(
@@ -664,10 +913,18 @@ def main():
                             "Pulse setup was not completed."
                         )
 
+                    # The config was just created, so reload it.
+                    #
+                    # If it already existed, _bootstrap_pulse_config()
+                    # did not modify it; reloading it is harmless and
+                    # guarantees the current config is authoritative.
                     pulse._load_config()
 
+                # ----------------------------------------------------
                 # Initialize the configured provider using Pulse's
-                # existing provider-selection machinery.
+                # EXISTING provider-selection machinery.
+                # ----------------------------------------------------
+
                 if not pulse._select_agent_provider_and_key(
                     initial=True
                 ):
