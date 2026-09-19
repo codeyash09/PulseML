@@ -1,73 +1,123 @@
-# pulse/cli.py
-import sys
-import os
-import ast
-import json
-import getpass
-import tempfile
-import subprocess
-import time
+"""
+The `pulse` command.
 
+    pulse                          attach to a run on this machine (the console)
+    pulse run [options] script.py [script args...]
+
+`pulse run` is `python script.py` with Pulse switched on. It is not a second Pulse. It
+does not ask its own questions, write its own config, or pick its own agent: the script
+is started with `auto_track()` already called, so everything that happens next is what
+happens when you put `auto_track()` in the script yourself -- Pulse Cloud sign-in or
+login, the workspace, the agent and its key, tracking, the crash handler, fixes and
+restarts. Nothing in this file decides how Pulse behaves; it only starts the script.
+
+How the script is started, and why:
+
+* `auto_track()` is added to the *parsed* script, in memory, and the result is compiled
+  under the script's real filename and run in this process with the same `__main__`,
+  `sys.argv`, `sys.path[0]` and working directory that `python script.py` would give it.
+  Nothing is written next to your code, so tracebacks show your file and your line
+  numbers, `__file__` is your file, and when Pulse fixes something it edits the file you
+  wrote, not a copy of it.
+* The working directory is the directory you ran `pulse` from, exactly like
+  `python path/to/script.py`. `--cwd DIR` runs the script somewhere else.
+* Running in this process (not a subprocess) is what lets Pulse's Ctrl+C handling, its
+  prompts and its crash hook behave as they do for a script that calls `auto_track()`.
+
+A syntax error is the one thing normal Pulse cannot handle, because Python refuses to
+run a file that does not parse and `auto_track()` never gets called. `pulse run` covers
+that gap by handing the error to the same machinery a runtime crash goes through:
+normal Pulse setup first (so you sign in, pick a workspace and an agent as usual), then
+the agent diagnoses and fixes the file, then Pulse restarts the script to apply the fix,
+and the restarted run is tracked like any other.
+"""
+import ast
+import builtins
+import os
+import sys
+import tokenize
+import traceback
+import types
+
+USAGE = """\
+Pulse - a live ML training debugger.
+
+  pulse                          attach to the run on this machine (interactive)
+  pulse watch [n|id|name]        attach to a particular run
+  pulse sessions                 list the runs Pulse knows about
+  pulse run [options] <script.py> [script args]
+                                 run a script under Pulse, like `python script.py`
+
+options for `pulse run` (before the script; everything after it is the script's):
+  --stream                       stream to a separate brain instead of tracking in-process
+  --cwd DIR                      run the script in DIR (default: the directory you ran
+                                 `pulse` from, as with `python path/to/script.py`)
+
+options for `pulse` / `pulse watch`:
+  --model <id>                   the agent to think with (or set PULSE_MODEL)
+
+`pulse run` sets Pulse up exactly as auto_track() does -- sign-in, workspace, agent --
+and if the script has a syntax error, Pulse fixes it and restarts the run to apply it.
+"""
+
+_RUN_MODE = "cli"          # what the injected auto_track() is given; "stream" for --stream
+
+
+# ---------------------------------------------------------------------------------------
+# Adding auto_track() to a parsed script
+# ---------------------------------------------------------------------------------------
 
 class PulseASTInjector(ast.NodeTransformer):
-    """Inject Pulse auto-tracking into the user's training script.
+    """Add one `auto_track(mode=...)` call to a parsed module.
 
-    `mode` is what the injected auto_track() is given. "cli" is the original
-    behaviour and stays the default. "stream" starts the light monitor instead, so
-    the run streams to a brain elsewhere and nothing blocks training -- that is what
-    `pulse run --stream` uses, and what the `pulse` console attaches to.
+    `mode` is what the call is given: "cli" is normal Pulse, "stream" starts the light
+    monitor instead. The call is written as `__import__("pulse").auto_track(...)`, so it
+    binds no name in the script's namespace and cannot collide with anything the script
+    defines, and it carries the line number of the statement it sits in front of, so no
+    other line number in the script moves.
+
+    Where it goes: first thing inside the script's own top-level `if __name__ ==
+    "__main__":` block if it has one, otherwise right after the last top-level import.
     """
 
     def __init__(self, mode="cli"):
-        self.has_main_block = False
         self.mode = mode
 
-    def _make_auto_track_call(self):
-        return ast.Expr(
+    def _make_auto_track_call(self, anchor):
+        call = ast.Expr(
             value=ast.Call(
-                func=ast.Name(id="auto_track", ctx=ast.Load()),
+                func=ast.Attribute(
+                    value=ast.Call(
+                        func=ast.Name(id="__import__", ctx=ast.Load()),
+                        args=[ast.Constant(value="pulse")],
+                        keywords=[],
+                    ),
+                    attr="auto_track",
+                    ctx=ast.Load(),
+                ),
                 args=[],
-                keywords=[
-                    ast.keyword(
-                        arg="mode",
-                        value=ast.Constant(
-                            value=self.mode,
-                        ),
-                    )
-                ],
+                keywords=[ast.keyword(arg="mode", value=ast.Constant(value=self.mode))],
             )
         )
+        ast.copy_location(call, anchor)
+        ast.fix_missing_locations(call)
+        return call
 
     @staticmethod
     def _find_import_insert_idx(body):
-        """
-        Insert after the last top-level import.
-
-        If there are no imports, preserve a module docstring by inserting
-        after it rather than before it.
-        """
+        """After the last top-level import; failing that, after a module docstring."""
         idx = 0
-
         for i, child in enumerate(body):
-            if isinstance(
-                child,
-                (
-                    ast.Import,
-                    ast.ImportFrom,
-                ),
-            ):
+            if isinstance(child, (ast.Import, ast.ImportFrom)):
                 idx = i + 1
-
         if idx == 0 and body:
             first = body[0]
-
             if (
                 isinstance(first, ast.Expr)
                 and isinstance(first.value, ast.Constant)
                 and isinstance(first.value.value, str)
             ):
                 idx = 1
-
         return idx
 
     @staticmethod
@@ -78,1271 +128,358 @@ class PulseASTInjector(ast.NodeTransformer):
             and isinstance(test.ops[0], ast.Eq)
         ):
             return False
-
-        left = test.left
-        right = test.comparators[0]
+        left, right = test.left, test.comparators[0]
 
         def is_dunder_name(node):
-            return (
-                isinstance(node, ast.Name)
-                and node.id == "__name__"
-            )
+            return isinstance(node, ast.Name) and node.id == "__name__"
 
         def is_main_string(node):
-            return (
-                isinstance(node, ast.Constant)
-                and node.value == "__main__"
-            )
+            return isinstance(node, ast.Constant) and node.value == "__main__"
 
-        return (
-            (
-                is_dunder_name(left)
-                and is_main_string(right)
-            )
-            or
-            (
-                is_dunder_name(right)
-                and is_main_string(left)
-            )
+        return (is_dunder_name(left) and is_main_string(right)) or (
+            is_dunder_name(right) and is_main_string(left)
         )
-
-    def visit_If(self, node):
-        self.generic_visit(node)
-
-        if self._is_name_main_guard(node.test):
-            self.has_main_block = True
-
-            # auto_track() must be the first thing executed inside
-            # the training script's __main__ block.
-            node.body.insert(
-                0,
-                self._make_auto_track_call(),
-            )
-
-        return node
 
     def visit_Module(self, node):
-        # Visit children first so we can detect a __main__ guard.
-        self.generic_visit(node)
+        if not node.body:
+            return node                     # an empty script has nothing to track
 
-        insert_idx = self._find_import_insert_idx(
-            node.body
+        # Only the script's own top-level guard. One nested in a function is not the
+        # entry point, and a second top-level guard must not start tracking twice.
+        guard = next(
+            (s for s in node.body
+             if isinstance(s, ast.If) and self._is_name_main_guard(s.test)),
+            None,
         )
+        if guard is not None:
+            guard.body.insert(0, self._make_auto_track_call(guard.body[0]))
+            return node
 
-        pulse_import = ast.ImportFrom(
-            module="pulse",
-            names=[
-                ast.alias(
-                    name="auto_track",
-                    asname=None,
-                )
-            ],
-            level=0,
-        )
-
-        # Inject the import into the TRAINING SCRIPT.
-        node.body.insert(
-            insert_idx,
-            pulse_import,
-        )
-
-        # If there is no __main__ guard, the training script executes
-        # top-to-bottom, so start tracking immediately after imports.
-        if not self.has_main_block:
-            node.body.insert(
-                insert_idx + 1,
-                self._make_auto_track_call(),
-            )
-
+        idx = self._find_import_insert_idx(node.body)
+        anchor = node.body[idx] if idx < len(node.body) else node.body[-1]
+        node.body.insert(idx, self._make_auto_track_call(anchor))
         return node
 
 
 def _already_uses_pulse(tree):
-    """
-    Do not instrument a script that already imports Pulse.
-    """
+    """A script that already imports Pulse is running it its own way; leave it alone."""
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if (
-                    alias.name == "pulse"
-                    or alias.name.startswith("pulse.")
-                ):
+                if alias.name == "pulse" or alias.name.startswith("pulse."):
                     return True
-
         elif isinstance(node, ast.ImportFrom):
-            if (
-                node.module
-                and (
-                    node.module == "pulse"
-                    or node.module.startswith("pulse.")
-                )
-            ):
+            if node.module and (node.module == "pulse" or node.module.startswith("pulse.")):
                 return True
-
     return False
 
 
-def _write_instrumented_script(tree, script_path):
-    """
-    Write the transformed training script to a temporary .py file in the
-    SAME DIRECTORY as the original training script.
+# ---------------------------------------------------------------------------------------
+# Becoming `python script.py`
+# ---------------------------------------------------------------------------------------
 
-    Keeping it beside the original preserves normal Python import behavior
-    for the training project.
+def _set_process_view(script_path, script_args):
+    """Make this process look like `python script.py args...` to anything that asks.
+
+    Pulse asks: a restart re-runs `[python, script_path] + sys.argv[1:]`. The script
+    asks: `sys.argv`, and imports of its sibling modules through `sys.path[0]`.
     """
-    fd, temp_path = tempfile.mkstemp(
-        prefix=".pulse_instrumented_",
-        suffix=".py",
-        dir=os.path.dirname(script_path),
-        text=True,
-    )
+    # `python link.py` puts the directory of the file the link points to first on the path,
+    # not the directory of the link, so the script's sibling modules are found beside the
+    # real file. (`__file__` and sys.argv[0] stay as typed, also as under python.)
+    script_dir = os.path.dirname(os.path.realpath(script_path))
+    sys.argv = [script_path] + list(script_args)
+    if not sys.path or sys.path[0] != script_dir:
+        sys.path.insert(0, script_dir)
+
+
+def _exit_code(exc):
+    """The exit status `python` would use for a SystemExit."""
+    code = exc.code
+    if code is None:
+        return 0
+    if isinstance(code, int):
+        return code
+    print(code, file=sys.stderr)
+    return 1
+
+
+def _execute(code, script_path):
+    """Run compiled script code as `__main__`. Returns the exit status.
+
+    An exception that escapes is handed to `sys.excepthook`, because that is what the
+    interpreter would do for an uncaught one -- and it is where Pulse's crash handler
+    lives. The frames of this function are cut off first so the hook sees a traceback
+    that starts in the script, as it would under `python script.py`.
+    """
+    main_module = types.ModuleType("__main__")
+    main_module.__file__ = script_path
+    main_module.__builtins__ = builtins
+    sys.modules["__main__"] = main_module
 
     try:
-        os.close(fd)
-
-        ast.fix_missing_locations(tree)
-
-        # Validate the transformed tree before writing it.
-        compile(
-            tree,
-            filename=script_path,
-            mode="exec",
-        )
-
-        # Convert the transformed AST back into source.
-        #
-        # This path is ONLY used when the original source successfully
-        # parsed. Syntax-error files never reach this function.
-        instrumented_source = ast.unparse(tree)
-
-        with open(
-            temp_path,
-            "w",
-            encoding="utf-8",
-            newline="",
-        ) as f:
-            f.write(instrumented_source)
-            f.write("\n")
-
-        return temp_path
-
-    except Exception:
+        exec(code, main_module.__dict__)
+    except SystemExit as exc:
+        return _exit_code(exc)
+    except BaseException:
+        exc_type, exc_value, tb = sys.exc_info()
+        while tb is not None and tb.tb_frame.f_code is _execute.__code__:
+            tb = tb.tb_next
+        exc_value = exc_value.with_traceback(tb)
         try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
+            sys.excepthook(exc_type, exc_value, tb)
+        except SystemExit as hook_exit:
+            # The interpreter honours a SystemExit raised from inside the hook, and Pulse
+            # uses one: a fix that restarted the script and the restart succeeded.
+            return _exit_code(hook_exit)
+        except BaseException:
+            print("Error in sys.excepthook:", file=sys.stderr)
+            traceback.print_exc()
+            print("\nOriginal exception was:", file=sys.stderr)
+            traceback.print_exception(exc_type, exc_value, tb)
+        return 130 if issubclass(exc_type, KeyboardInterrupt) else 1
+    finally:
+        # The script is over, and so is anything Pulse's tracer had to watch. Left
+        # installed it is still called for every frame during interpreter teardown, when
+        # a late __del__ (multiprocessing connections, say) runs after `os.path` has been
+        # cleared and the tracer's first line raises "'NoneType' has no attribute
+        # 'normcase'". After the crash hook above, so a crash is still handled with it.
+        sys.settrace(None)
+    return 0
 
-        raise
+
+# ---------------------------------------------------------------------------------------
+# Restarting under `pulse run`
+# ---------------------------------------------------------------------------------------
+
+# After Pulse fixes something it restarts the script to apply the fix. Normally that is
+# `python script.py`, and it is tracked again because the script itself calls
+# auto_track(). Under `pulse run` the file on disk has no auto_track() in it -- it is
+# added in memory -- so a plain re-run would restart the script with nobody watching.
+# Pulse asks this hook how to restart, and the answer is `pulse run` again.
+_CHILD_BOOT = (
+    "import sys; sys.path.insert(0, {root!r}); "
+    "from pulse.cli import main; sys.exit(main({head!r} + sys.argv[1:]))"
+)
 
 
-def _write_raw_instrumented_script(
-    source_code,
-    script_path,
-    mode="cli",
-):
+def _restart_argv(python_exe, script_path, script_args):
+    # -c with an explicit path rather than `-m pulse`: the restart has to find this same
+    # package whatever directory the run is in, including under --cwd, and whether Pulse
+    # is installed or being run from a checkout.
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    head = ["run"] + (["--stream"] if _RUN_MODE == "stream" else [])
+    return [python_exe, "-c", _CHILD_BOOT.format(root=root, head=head),
+            script_path] + list(script_args)
+
+
+# ---------------------------------------------------------------------------------------
+# Syntax errors
+# ---------------------------------------------------------------------------------------
+
+def _make_syntax_repair_cli():
+    """PulseCLI, minus two behaviours that are wrong for a script that does not parse.
+
+    Everything else is inherited untouched, including setup, the agent pipeline, fix
+    logging (/log, /revert) and `_restart_process`.
+
+    * The empirical check runs a probe of the training loop and reverts the fix if the
+      loss does not fall. A file that has not run yet has no loss to measure, and the
+      syntax error is already known to be gone: the automatic lint gate compiles the file
+      before it is written.
+    * The git autostash stashes the working tree before a fix is written -- including,
+      here, the very file being repaired, which is uncommitted precisely because the
+      person is editing it.
     """
-    Fallback instrumentation for a training script that contains
-    a syntax error.
+    from .pulse_cli import PulseCLI
 
-    IMPORTANT:
-        This function intentionally does NOT parse or compile the
-        user's source code.
+    class _SyntaxRepairCLI(PulseCLI):
+        def _verify_fix_empirically(self, fix, diagnosis):
+            return fix, None, "syntax fix: the file compiles, and there is no loss to measure yet"
 
-    Pulse is placed at the very beginning of the temporary script
-    so auto_track() starts before Python reaches the user's broken
-    training code.
+        def _git_autostash(self):
+            return None
 
-    The original training script is never modified.
+    return _SyntaxRepairCLI()
+
+
+def _repair_and_restart(script_path, source, exc):
+    """Fix a syntax error the way Pulse fixes a crash, and restart to apply it.
+
+    Returns the exit status. On success it does not get that far: the restarted run
+    finishes and Pulse exits with its status from inside the crash handler.
     """
-    fd, temp_path = tempfile.mkstemp(
-        prefix=".pulse_instrumented_",
-        suffix=".py",
-        dir=os.path.dirname(script_path),
-        text=True,
-    )
+    from .pulse import _install_cli_excepthook
 
+    name = os.path.basename(script_path)
+    print(f"[Pulse] {name} has a syntax error (line {exc.lineno}); "
+          "Pulse can't track a script Python won't run.")
+
+    cli = _make_syntax_repair_cli()
+    cli.set_code_text(source, script_path=script_path)
+    cli.print_banner()
     try:
-        with os.fdopen(
-            fd,
-            "w",
-            encoding="utf-8",
-            newline="",
-        ) as f:
-            # Pulse MUST come first.
-            f.write(
-                "from pulse import auto_track\n"
-            )
-            f.write(
-                f'auto_track(mode="{mode}")\n\n'
-            )
-
-            # Then preserve the user's source exactly.
-            f.write(source_code)
-
-        return temp_path
-
-    except Exception:
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-
-        raise
-
-
-def _run_training_script(
-    script_path,
-    script_dir,
-    args,
-    real_script_path=None,
-):
-    """
-    Execute a training script as a normal Python subprocess.
-
-    The training script itself owns the auto_track() call because
-    instrumentation has already been injected into the temporary
-    training script.
-    """
-    command = [
-        sys.executable,
-        script_path,
-        *args,
-    ]
-
-    env = os.environ.copy()
-
-    # What actually runs is a temporary instrumented copy, so anything that asks the
-    # interpreter which file it is in gets a name like .pulse_instrumented_ab12cd.py
-    # in a directory that is deleted afterwards. Pulse records this instead, so a
-    # watcher shows the user's own script and edits the file the run came from.
-    if real_script_path:
-        env["PULSE_SCRIPT_PATH"] = os.path.abspath(real_script_path)
-
-    # Make the original training directory importable exactly as it
-    # normally would be when executing:
-    #
-    #     python train.py
-    #
-    existing_pythonpath = env.get(
-        "PYTHONPATH",
-        "",
-    )
-
-    if existing_pythonpath:
-        env["PYTHONPATH"] = (
-            script_dir
-            + os.pathsep
-            + existing_pythonpath
-        )
-    else:
-        env["PYTHONPATH"] = script_dir
-
-    return subprocess.run(
-        command,
-        cwd=script_dir,
-        env=env,
-    )
-
-
-# How long to wait before asking the provider again when a repair request comes back
-# rate-limited. The script has not started yet, so there is nothing to keep alive and
-# nothing racing: waiting is free, and giving up leaves the user with a broken file.
-_REPAIR_RETRY_DELAYS = (5, 15, 45)
-
-
-def _bootstrap_pulse_config(script_path):
-    """
-    Interactively create pulse_config.json when Pulse needs an AI
-    provider but no usable configuration exists.
-
-    IMPORTANT:
-        If pulse_config.json already exists beside the training script,
-        this function DOES NOT prompt, modify, or overwrite it.
-
-    The provider list comes directly from Pulse's real PROVIDERS registry
-    in pulse_cli.py.
-
-    The configuration format matches PulseCLI._load_config(), which
-    expects top-level keys such as:
-
-        {
-            "agent": "Google AI Studio (Gemini 3.5 Flash-Lite)",
-            "api_key": "...",
-            "autofix": true,
-            "tos_accepted": true
-        }
-
-    The training script itself is never modified.
-    """
-    from pulse.pulse_cli import PROVIDERS
-
-    config_path = os.path.join(
-        os.path.dirname(
-            os.path.abspath(script_path)
-        ),
-        "pulse_config.json",
-    )
-
-    # ------------------------------------------------------------
-    # EXISTING CONFIGURATION
-    #
-    # This check MUST happen before any setup prompts.
-    # ------------------------------------------------------------
-
-    if os.path.isfile(config_path):
-        print()
-        print(
-            f"[Pulse] Existing configuration found: "
-            f"{config_path}"
-        )
-        print(
-            "[Pulse] Reusing existing configuration."
-        )
-        print()
-
-        return True
-
-    # ------------------------------------------------------------
-    # FIRST-TIME SETUP
-    # ------------------------------------------------------------
-
-    print()
-    print("=" * 64)
-    print("Pulse first-time setup")
-    print("=" * 64)
-    print()
-
-    print(
-        "Pulse needs an AI provider to repair this Python syntax error."
-    )
-    print(
-        "Your configuration will be stored in pulse_config.json in "
-        "this training project's directory."
-    )
-    print()
-
-    # ------------------------------------------------------------
-    # Terms of Service
-    # ------------------------------------------------------------
-
-    print(
-        "Before continuing, you must agree to Pulse's Terms of Service."
-    )
-    print()
-
-    try:
-        tos_response = input(
-            "Do you agree to the Pulse Terms of Service? [y/N]: "
-        ).strip().lower()
+        # The same setup auto_track() does: sign in or log in, workspace, agent.
+        cli.interactive_setup()
     except (EOFError, KeyboardInterrupt):
-        print()
-        print(
-            "[Pulse] Setup cancelled."
-        )
-        return False
+        print("\n[Pulse] Setup cancelled -- the syntax error was not fixed.")
+        traceback.print_exception(type(exc), exc, None)
+        return 1
 
-    if tos_response not in (
-        "y",
-        "yes",
-    ):
-        print()
-        print(
-            "[Pulse] Terms of Service were not accepted."
-        )
-        print(
-            "[Pulse] Cannot continue without accepting the Terms of Service."
-        )
-        return False
+    # From here it is the normal crash path. The hook prints the error, records the
+    # crash, asks the agent (retrying a rate limit in the foreground), and when a fix
+    # lands Pulse restarts the script itself -- through _restart_argv, so the restarted
+    # run is tracked. tb=None: there is no script frame to show, only the error, and the
+    # frames of this function are not the user's code.
+    _install_cli_excepthook(cli)
+    try:
+        sys.excepthook(type(exc), exc, None)
+    except SystemExit as restart_exit:
+        return _exit_code(restart_exit)
 
-    # ------------------------------------------------------------
-    # Provider
-    #
-    # Use Pulse's ACTUAL provider registry.
-    # Do not maintain a second provider list here.
-    # ------------------------------------------------------------
+    # The hook returned: no agent, a declined prompt, no fix, or a restart that gave up.
+    print(f"[Pulse] {name} still has a syntax error and was not started.")
+    return 1
 
-    print()
-    print(
-        "Available AI providers:"
-    )
-    print()
 
-    provider_names = list(
-        PROVIDERS.keys()
-    )
+# ---------------------------------------------------------------------------------------
+# pulse run
+# ---------------------------------------------------------------------------------------
 
-    for index, provider_name in enumerate(
-        provider_names,
-        start=1,
-    ):
-        info = PROVIDERS[
-            provider_name
-        ]
+class _UsageError(Exception):
+    pass
 
-        suffix = ""
 
-        if info.get("local"):
-            suffix = " [local]"
+def _parse_run_args(args):
+    """(stream, cwd, script, script_args). Options end at the first non-option: what
+    follows is the script and its own arguments, which are never inspected."""
+    stream, cwd, i = False, None, 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            i += 1
+            break
+        if not arg.startswith("-"):
+            break
+        if arg == "--stream":
+            stream = True
+        elif arg == "--cwd":
+            if i + 1 >= len(args):
+                raise _UsageError("--cwd needs a directory")
+            cwd = args[i + 1]
+            i += 1
+        elif arg.startswith("--cwd="):
+            cwd = arg.split("=", 1)[1]
+        elif arg in ("-h", "--help"):
+            raise _UsageError("")
+        else:
+            raise _UsageError(f"unknown option {arg!r} (options for the script go after its name)")
+        i += 1
+    if i >= len(args):
+        raise _UsageError("no script given")
+    return stream, cwd, args[i], args[i + 1:]
 
-        elif info.get("openrouter"):
-            suffix = " [OpenRouter]"
 
-        elif info.get("custom"):
-            suffix = " [custom]"
+def run_script(script, script_args, stream=False, cwd=None):
+    """Run `script` under Pulse. Returns the exit status."""
+    global _RUN_MODE
+    from . import pulse_cli
 
-        print(
-            f"  {index}. {provider_name}{suffix}"
-        )
+    _RUN_MODE = "stream" if stream else "cli"
 
-    print()
+    # Resolved against where the command was typed, before --cwd can move us.
+    script_path = os.path.abspath(script)
+    if not os.path.isfile(script_path):
+        print(f"Error: training script '{script}' not found.")
+        return 1
+
+    if cwd is not None:
+        cwd = os.path.abspath(cwd)
+        if not os.path.isdir(cwd):
+            print(f"Error: --cwd '{cwd}' is not a directory.")
+            return 1
+        os.chdir(cwd)
 
     try:
-        provider_choice = input(
-            "AI provider: "
-        ).strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        print(
-            "[Pulse] Setup cancelled."
-        )
-        return False
+        with tokenize.open(script_path) as handle:      # honours a coding cookie / BOM
+            source = handle.read()
+    except (SyntaxError, UnicodeDecodeError, LookupError) as exc:
+        print(f"Error: cannot decode '{script_path}': {exc}")
+        return 1
+
+    pulse_cli._RESTART_ARGV_HOOK = _restart_argv
+    _set_process_view(script_path, script_args)
+
+    # A run that Pulse itself restarted reports back to the process that restarted it,
+    # which owns the retry loop and feeds the output to the agent. It must not start a
+    # repair of its own.
+    restarted_by_pulse = os.environ.get(pulse_cli._RESTART_CHILD_ENV) == "1"
 
     try:
-        provider_index = int(
-            provider_choice
-        ) - 1
-    except ValueError:
-        print()
-        print(
-            "[Pulse] Invalid provider selection."
-        )
-        return False
+        tree = ast.parse(source, filename=script_path)
+        # Some syntax errors (`return` outside a function...) are only found by compile().
+        compile(tree, script_path, "exec", dont_inherit=True)
+    except SyntaxError as exc:
+        # The frames that led here are this file's and the parser's, not the user's. Python
+        # shows a syntax error as just the offending line, so show that and only that.
+        exc.__traceback__ = None
+        if restarted_by_pulse:
+            traceback.print_exception(type(exc), exc, None)
+            return 1
+        return _repair_and_restart(script_path, source, exc)
+    except ValueError as exc:                           # e.g. null bytes, on older Pythons
+        print(f"Error: cannot parse '{script_path}': {exc}")
+        return 1
 
-    if (
-        provider_index < 0
-        or provider_index >= len(provider_names)
-    ):
-        print()
-        print(
-            "[Pulse] Invalid provider selection."
-        )
-        return False
-
-    provider = provider_names[
-        provider_index
-    ]
-
-    provider_info = PROVIDERS[
-        provider
-    ]
-
-    # ------------------------------------------------------------
-    # Build the config using Pulse's existing config semantics.
-    # ------------------------------------------------------------
-
-    config = {
-        "agent": provider,
-        "autofix": True,
-        "tos_accepted": True,
-    }
-
-    # ------------------------------------------------------------
-    # LOCAL PROVIDER
-    # ------------------------------------------------------------
-
-    if provider_info.get("local"):
-        print()
-
-        model_hint = provider_info.get(
-            "model_hint",
-            "model name",
-        )
-
-        default_api_base = provider_info.get(
-            "default_api_base",
-            "",
-        )
-
-        try:
-            model_name = input(
-                f"Model ({model_hint}): "
-            ).strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            print(
-                "[Pulse] Setup cancelled."
-            )
-            return False
-
-        if not model_name:
-            print(
-                "[Pulse] No local model name entered."
-            )
-            return False
-
-        try:
-            api_base = input(
-                f"API base [{default_api_base}]: "
-            ).strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            print(
-                "[Pulse] Setup cancelled."
-            )
-            return False
-
-        if not api_base:
-            api_base = default_api_base
-
-        config["model"] = model_name
-        config["api_base"] = api_base
-
-    # ------------------------------------------------------------
-    # OPENROUTER
-    # ------------------------------------------------------------
-
-    elif provider_info.get("openrouter"):
-        print()
-
-        try:
-            model_name = input(
-                "OpenRouter model slug "
-                "(e.g. deepseek/deepseek-v4-flash): "
-            ).strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            print(
-                "[Pulse] Setup cancelled."
-            )
-            return False
-
-        if not model_name:
-            print(
-                "[Pulse] No OpenRouter model entered."
-            )
-            return False
-
-        config["model"] = model_name
-
-        try:
-            api_key = getpass.getpass(
-                "OpenRouter API key: "
-            ).strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            print(
-                "[Pulse] API key entry cancelled."
-            )
-            return False
-
-        if not api_key:
-            print(
-                "[Pulse] No API key entered."
-            )
-            return False
-
-        config["api_key"] = api_key
-
-    # ------------------------------------------------------------
-    # CUSTOM PROVIDER
-    # ------------------------------------------------------------
-
-    elif provider_info.get("custom"):
-        print()
-
-        try:
-            provider_model = input(
-                "Provider/model: "
-            ).strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            print(
-                "[Pulse] Setup cancelled."
-            )
-            return False
-
-        if not provider_model:
-            print(
-                "[Pulse] No provider/model entered."
-            )
-            return False
-
-        # Pulse's custom-provider branch receives the provider/model
-        # through the agent configuration.
-        config["agent"] = provider_model
-
-        try:
-            api_key = getpass.getpass(
-                "API key: "
-            ).strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            print(
-                "[Pulse] API key entry cancelled."
-            )
-            return False
-
-        if api_key:
-            config["api_key"] = api_key
-
-    # ------------------------------------------------------------
-    # STANDARD CLOUD PROVIDER
-    # ------------------------------------------------------------
-
+    if _already_uses_pulse(tree):
+        if not restarted_by_pulse:
+            print(f"[Pulse] {os.path.basename(script_path)} already uses Pulse; running it as it is.")
     else:
-        env_key = provider_info.get(
-            "env_key"
-        )
+        PulseASTInjector(mode=_RUN_MODE).visit(tree)
+        if not restarted_by_pulse:
+            print(f"[Pulse] Running {os.path.basename(script_path)} under Pulse.")
 
-        if not env_key:
-            print(
-                f"[Pulse] Provider '{provider}' does not define "
-                "an API-key environment variable."
-            )
-            return False
-
-        print()
-
-        try:
-            api_key = getpass.getpass(
-                f"{env_key}: "
-            ).strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            print(
-                "[Pulse] API key entry cancelled."
-            )
-            return False
-
-        if not api_key:
-            print(
-                f"[Pulse] No {env_key} entered."
-            )
-            return False
-
-        config["api_key"] = api_key
-
-    # ------------------------------------------------------------
-    # WRITE CONFIGURATION
-    #
-    # Use exclusive creation so an existing file can NEVER be
-    # overwritten accidentally, even in a race between processes.
-    # ------------------------------------------------------------
-
-    try:
-        with open(
-            config_path,
-            "x",
-            encoding="utf-8",
-        ) as config_file:
-            json.dump(
-                config,
-                config_file,
-                indent=2,
-            )
-            config_file.write("\n")
-
-    except FileExistsError:
-        # Another process created the configuration after our
-        # initial existence check. Never overwrite it.
-        print()
-        print(
-            f"[Pulse] Configuration already exists: "
-            f"{config_path}"
-        )
-        print(
-            "[Pulse] Reusing the existing configuration."
-        )
-        print()
-
-        return True
-
-    except OSError as exc:
-        print(
-            f"[Pulse] Could not create "
-            f"'{config_path}': {exc}"
-        )
-        return False
-
-    print()
-    print(
-        f"[Pulse] Configuration saved to "
-        f"{config_path}"
-    )
-    print(
-        "[Pulse] This setup will be reused on future runs."
-    )
-    print()
-
-    return True
+    # dont_inherit: nothing from this file's own __future__ imports may leak into the script.
+    code = compile(tree, script_path, "exec", dont_inherit=True)
+    return _execute(code, script_path)
 
 
-# What the injected auto_track() is given. `pulse run` leaves this at "cli", the
-# original single-process behaviour; `pulse run --stream` switches it.
-_TRACK_MODE = "cli"
-
-USAGE = """\
-Pulse - a live ML training debugger.
-
-  pulse                      attach to the run on this machine (interactive)
-  pulse watch [n|id|name]    attach to a particular run
-  pulse sessions             list the runs Pulse knows about
-  pulse run <script.py>      start a script under Pulse, checking it first
-  pulse run --stream <s.py>  start it streaming, for the console to watch
-
-  --model <id>               the agent to think with (or set PULSE_MODEL)
-
-The console needs a run to watch. Start one with `pulse run train.py`, or call
-auto_track(mode="stream") from inside a script you launch yourself.
-"""
-
-
-def main():
-    """`pulse run ...` starts a script; everything else opens the console.
-
-    `run` is left exactly as it was: it is the path that instruments and repairs a
-    script, and it is what the installed console script has always done. The console
-    is the other direction -- a run that is already going, found rather than launched.
-    """
-    argv = sys.argv[1:]
+def main(argv=None):
+    """`pulse ...`. Returns the exit status; the console script and `python -m pulse`
+    both pass it to sys.exit."""
+    argv = list(sys.argv[1:] if argv is None else argv)
 
     if argv and argv[0] in ("-h", "--help", "help"):
         print(USAGE)
-        sys.exit(0)
+        return 0
+    if argv and argv[0] in ("-V", "--version"):
+        from . import __version__
+        print(f"pulse {__version__}")
+        return 0
 
-    if not argv or argv[0] in ("watch", "attach", "console", "sessions"):
-        from .pulse_console import main as console_main
-        sys.exit(console_main(argv))
-
-    if argv[0] != "run" or len(argv) < 2:
-        print(USAGE)
-        sys.exit(1)
-
-    global _TRACK_MODE
-    # Only before the script path: everything after it belongs to the training script,
-    # and scanning the whole list silently ate a user's own --stream flag and changed
-    # how their run was instrumented.
-    head = []
-    for index, argument in enumerate(argv[1:], start=1):
-        if not argument.startswith("-"):
-            head = argv[1:index]
-            break
-    else:
-        head = argv[1:]
-    if "--stream" in head:
-        _TRACK_MODE = "stream"
-        argv = [a for i, a in enumerate(argv) if not (a == "--stream" and i <= len(head))]
-        sys.argv = [sys.argv[0]] + argv
-    if len(argv) < 2:
-        print(USAGE)
-        sys.exit(1)
-
-    script_path = sys.argv[2]
-
-    if not os.path.exists(script_path):
-        print(
-            f"Error: Training script "
-            f"'{script_path}' not found."
-        )
-        sys.exit(1)
-
-    script_path = os.path.abspath(
-        script_path
-    )
-
-    if not os.path.isfile(script_path):
-        print(
-            f"Error: Training script "
-            f"'{script_path}' is not a file."
-        )
-        sys.exit(1)
-
-    script_dir = os.path.dirname(
-        script_path
-    )
-
-    with open(
-        script_path,
-        "r",
-        encoding="utf-8",
-    ) as f:
-        source_code = f.read()
-
-    temp_path = None
-
-    try:
-        # ============================================================
-        # PATH 1: NORMAL / VALID PYTHON
-        # ============================================================
-        #
-        # If the training script is valid Python, use the deterministic
-        # AST instrumentation path.
-        #
-        # This preserves the existing behavior.
-        #
+    if argv and argv[0] == "run":
         try:
-            tree = ast.parse(
-                source_code,
-                filename=script_path,
-            )
-
-        except SyntaxError as exc:
-            # ========================================================
-            # PATH 2: SYNTAX ERROR REPAIR
-            # ========================================================
-            #
-            # IMPORTANT:
-            #
-            # Python parses the ENTIRE file before executing line 1.
-            # Therefore putting auto_track() before broken Python does
-            # NOT work.
-            #
-            # Instead:
-            #
-            #   broken source
-            #       ->
-            #   temporary repair copy
-            #       ->
-            #   existing PulseCLI repair machinery
-            #       ->
-            #   valid source
-            #       ->
-            #   AST instrumentation
-            #       ->
-            #   training process
-            #
-            # The original training script is NEVER modified.
-            # ========================================================
-
-            print(
-                f"[Pulse] Syntax error detected in "
-                f"{os.path.basename(script_path)} "
-                f"at line {exc.lineno}."
-            )
-
-            # --------------------------------------------------------
-            # Create a temporary working copy.
-            # --------------------------------------------------------
-
-            fd, repair_path = tempfile.mkstemp(
-                prefix=".pulse_repair_",
-                suffix=".py",
-                dir=script_dir,
-                text=True,
-            )
-
-            try:
-                with os.fdopen(
-                    fd,
-                    "w",
-                    encoding="utf-8",
-                    newline="",
-                ) as f:
-                    f.write(source_code)
-
-                # ----------------------------------------------------
-                # Use Pulse's EXISTING repair engine.
-                #
-                # Import locally so valid-script behavior and startup
-                # remain unchanged.
-                # ----------------------------------------------------
-
-                from pulse.pulse_cli import PulseCLI
-
-                pulse = PulseCLI()
-
-                # _apply_code_fix() writes to self.script_path.
-                # Therefore point it at the temporary copy.
-                pulse.set_code_text(
-                    source_code,
-                    script_path=repair_path,
-                )
-
-                # Applying a fix normally restarts the training loop so the
-                # running process picks it up. There is no training loop yet
-                # here -- the script has never started -- and that restart
-                # re-executed the temporary repair copy directly, taking over
-                # from this function: the validation, instrumentation and run
-                # below were all skipped, and the user's own file was left
-                # broken with the fix stranded in a temp file. This repair
-                # decides for itself when the run starts.
-                pulse._suppress_auto_restart = True
-
-                # ----------------------------------------------------
-                # First-run setup.
-                #
-                # IMPORTANT:
-                #
-                # _load_config() is called by set_code_text().
-                # Therefore, if a config already exists, Pulse should
-                # already have loaded it and this setup is skipped.
-                #
-                # If no usable agent exists, create the config and
-                # then explicitly reload it.
-                # ----------------------------------------------------
-
-                if not getattr(
-                    pulse,
-                    "agent_provider",
-                    None,
-                ) or not getattr(
-                    pulse,
-                    "agent_key",
-                    None,
-                ):
-                    # With no terminal there is nobody to answer the setup
-                    # prompts below, so a CI job or a piped shell stopped here
-                    # with "setup was not completed" and the syntax error was
-                    # never fixed. Pulse already has a documented headless
-                    # path -- PULSE_PROVIDER plus that provider's API key env
-                    # var -- so try that first when there is no tty. In a
-                    # terminal nothing changes: setup runs exactly as below.
-                    if not sys.stdin or not sys.stdin.isatty():
-                        pulse.non_interactive = True
-                        try:
-                            pulse._select_agent_provider_and_key(
-                                initial=True
-                            )
-                        except (EOFError, KeyboardInterrupt):
-                            pass
-
-                if not getattr(
-                    pulse,
-                    "agent_provider",
-                    None,
-                ) or not getattr(
-                    pulse,
-                    "agent_key",
-                    None,
-                ):
-                    if not _bootstrap_pulse_config(
-                        script_path
-                    ):
-                        raise RuntimeError(
-                            "Pulse setup was not completed."
-                        )
-
-                    # The config was just created, so reload it.
-                    #
-                    # If it already existed, _bootstrap_pulse_config()
-                    # did not modify it; reloading it is harmless and
-                    # guarantees the current config is authoritative.
-                    pulse._load_config()
-
-                # ----------------------------------------------------
-                # Initialize the configured provider using Pulse's
-                # EXISTING provider-selection machinery.
-                # ----------------------------------------------------
-
-                if not pulse._select_agent_provider_and_key(
-                    initial=True
-                ):
-                    raise RuntimeError(
-                        "Pulse could not initialize the configured "
-                        "AI provider."
-                    )
-
-                error_text = (
-                    f"SyntaxError: {exc.msg} "
-                    f"(line {exc.lineno}"
-                )
-
-                if exc.offset is not None:
-                    error_text += (
-                        f", column {exc.offset}"
-                    )
-
-                error_text += ")"
-
-                question = (
-                    "The training script cannot start because Python "
-                    "reports this syntax error:\n\n"
-                    f"{error_text}\n\n"
-                    "Diagnose and fix ONLY this syntax error.\n\n"
-                    "IMPORTANT:\n"
-                    "- Do NOT rewrite the entire file.\n"
-                    "- Do NOT return the entire script.\n"
-                    "- Do NOT change unrelated code.\n"
-                    "- Make the smallest possible surgical edit.\n"
-                    "- Return the normal Pulse old/new code-fix format."
-                )
-
-                print(
-                    "[Pulse] Sending the syntax error through "
-                    "the existing repair pipeline..."
-                )
-
-                result = pulse.ask_agent(
-                    question,
-                    include_code=True,
-                )
-
-                # A rate limit is not a failed repair. The crash handler in
-                # pulse.py already retries these rather than giving up on the
-                # run, and without the same treatment here one busy minute at
-                # the provider turned into "the repair pipeline did not apply
-                # a fix" and the script was left broken.
-                for delay in _REPAIR_RETRY_DELAYS:
-                    if not getattr(
-                        pulse,
-                        "_last_call_failed_transiently",
-                        False,
-                    ):
-                        break
-                    print(
-                        f"[Pulse] The agent was unreachable "
-                        f"(rate limit or a transient error) -- "
-                        f"retrying in {delay}s..."
-                    )
-                    time.sleep(delay)
-                    result = pulse.ask_agent(
-                        question,
-                        include_code=True,
-                    )
-
-                if not getattr(
-                    pulse,
-                    "_fix_applied_this_turn",
-                    False,
-                ):
-                    if getattr(
-                        pulse,
-                        "_last_call_failed_transiently",
-                        False,
-                    ):
-                        raise RuntimeError(
-                            "Pulse could not reach the AI provider to fix "
-                            "the syntax error (rate limited or unavailable "
-                            "after retries). The script is unchanged -- "
-                            "try again shortly."
-                        )
-
-                    raise RuntimeError(
-                        "Pulse's existing repair pipeline did not "
-                        "apply a syntax-error fix.\n\n"
-                        f"Agent response:\n{result}"
-                    )
-
-                # ----------------------------------------------------
-                # Read the ACTUAL repaired temporary file.
-                # ----------------------------------------------------
-
-                with open(
-                    repair_path,
-                    "r",
-                    encoding="utf-8",
-                ) as f:
-                    repaired_source = f.read()
-
-                # ----------------------------------------------------
-                # Hard validation: the agent's output must really
-                # produce syntactically-valid Python.
-                # ----------------------------------------------------
-
-                compile(
-                    repaired_source,
-                    filename=repair_path,
-                    mode="exec",
-                )
-
-                print(
-                    "[Pulse] Syntax error repaired successfully."
-                )
-
-                # The repair happened on a temporary copy, which is what gets
-                # instrumented and run. Leaving it there means the user never
-                # receives the fix: `python train.py` still fails, and the next
-                # `pulse run` pays the agent to find the same missing bracket
-                # again. Every other fix Pulse makes is written to the real
-                # file and logged for /revert, so this one is too.
-                try:
-                    with open(
-                        script_path,
-                        "w",
-                        encoding="utf-8",
-                    ) as original:
-                        original.write(repaired_source)
-
-                    print(
-                        f"[Pulse] Wrote the fix to "
-                        f"{os.path.basename(script_path)} "
-                        f"(/log to see it, /revert to undo)."
-                    )
-
-                except OSError as write_error:
-                    # A read-only checkout is a good reason not to run, but not
-                    # a good reason to refuse to train: the repaired copy is
-                    # still perfectly runnable.
-                    print(
-                        f"[Pulse] Could not write the fix back to "
-                        f"{script_path}: {write_error}\n"
-                        f"[Pulse] Running the repaired copy instead -- "
-                        f"the file on disk is still broken."
-                    )
-
-                # ----------------------------------------------------
-                # Parse the repaired source.
-                # ----------------------------------------------------
-
-                repaired_tree = ast.parse(
-                    repaired_source,
-                    filename=repair_path,
-                )
-
-                # ----------------------------------------------------
-                # Now use the SAME deterministic AST instrumentation
-                # used for normal valid Python.
-                # ----------------------------------------------------
-
-                transformer = PulseASTInjector(mode=_TRACK_MODE)
-
-                modified_tree = transformer.visit(
-                    repaired_tree
-                )
-
-                ast.fix_missing_locations(
-                    modified_tree
-                )
-
-                print(
-                    f"[Pulse] Automatically instrumenting "
-                    f"{script_path}"
-                )
-
-                instrumented_path = _write_instrumented_script(
-                    modified_tree,
-                    repair_path,
-                )
-
-                try:
-                    print(
-                        f"[Pulse] Starting "
-                        f"{os.path.basename(script_path)}..."
-                    )
-
-                    result = _run_training_script(
-                        instrumented_path,
-                        script_dir,
-                        sys.argv[3:],
-                        real_script_path=script_path,
-                    )
-
-                finally:
-                    try:
-                        os.unlink(
-                            instrumented_path
-                        )
-                    except OSError:
-                        pass
-
-                if result.returncode != 0:
-                    print(
-                        f"[Pulse] Training script exited "
-                        f"with code {result.returncode}"
-                    )
-
-                sys.exit(
-                    result.returncode
-                )
-
-            finally:
-                try:
-                    os.unlink(
-                        repair_path
-                    )
-                except OSError:
-                    pass
-
-        # ============================================================
-        # VALID PYTHON: CHECK WHETHER PULSE IS ALREADY IMPORTED
-        # ============================================================
-
-        if _already_uses_pulse(tree):
-            print(
-                f"[Pulse] {script_path} already imports Pulse. "
-                f"Running it normally."
-            )
-
-            result = _run_training_script(
-                script_path,
-                script_dir,
-                sys.argv[3:],
-                real_script_path=script_path,
-            )
-
-            sys.exit(
-                result.returncode
-            )
-
-        # ============================================================
-        # VALID PYTHON: AST INSTRUMENTATION
-        # ============================================================
-
-        transformer = PulseASTInjector(mode=_TRACK_MODE)
-
-        modified_tree = transformer.visit(
-            tree
-        )
-
-        ast.fix_missing_locations(
-            modified_tree
-        )
-
-        print(
-            f"[Pulse] Automatically instrumenting "
-            f"{script_path}"
-        )
-
-        temp_path = _write_instrumented_script(
-            modified_tree,
-            script_path,
-        )
-
-        print(
-            f"[Pulse] Starting "
-            f"{os.path.basename(script_path)}..."
-        )
-
-        result = _run_training_script(
-            temp_path,
-            script_dir,
-            sys.argv[3:],
-            real_script_path=script_path,
-        )
-
-        if result.returncode != 0:
-            print(
-                f"[Pulse] Training script exited "
-                f"with code {result.returncode}"
-            )
-
-        sys.exit(
-            result.returncode
-        )
-
-    except KeyboardInterrupt:
-        print(
-            "\n[Pulse] Interrupted."
-        )
-        sys.exit(130)
-
-    except Exception as exc:
-        print(
-            f"\n[Pulse Error] Failed to run "
-            f"'{script_path}': {exc}"
-        )
-        raise
-
-    finally:
-        if temp_path:
-            try:
-                os.unlink(
-                    temp_path
-                )
-            except OSError:
-                pass
+            stream, cwd, script, script_args = _parse_run_args(argv[1:])
+        except _UsageError as problem:
+            if str(problem):
+                print(f"pulse run: {problem}\n")
+            print(USAGE)
+            return 1 if str(problem) else 0
+        try:
+            return run_script(script, script_args, stream=stream, cwd=cwd)
+        except KeyboardInterrupt:
+            print("\n[Pulse] Interrupted.")
+            return 130
+
+    # Bare `pulse`, watch, attach, console, sessions -- and `pulse --model X` -- are the
+    # console. Anything else that is not a command is a mistake worth showing usage for.
+    if not argv or argv[0] in ("watch", "attach", "console", "sessions") or argv[0].startswith("-"):
+        from .pulse_console import main as console_main
+        return console_main(argv)
+
+    print(USAGE)
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
