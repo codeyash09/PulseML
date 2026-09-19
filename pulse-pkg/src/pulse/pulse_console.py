@@ -756,7 +756,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not sessions:
         print("  Nothing to watch yet. Start a run with either:\n")
-        print("    pulse run train.py            (no changes to your script)")
+        print("    pulse run --stream train.py   (no changes to your script)")
         print("    auto_track(mode=\"stream\")     (from inside it)\n")
         idle = unmonitored_python_processes()
         if idle:
@@ -765,7 +765,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             for process in idle[:5]:
                 print(f"    pid {process['pid']:<8} {os.path.basename(process['script'])}"
                       f"   {dim('started ' + ago(process['started']))}")
-            print(dim("\n  Restart one under `pulse run` to watch it.\n"))
+            print(dim("\n  Restart one under `pulse run --stream` to watch it.\n"))
         return 1
 
     session = pick_session(sessions, wanted)
