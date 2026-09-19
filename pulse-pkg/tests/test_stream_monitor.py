@@ -4,6 +4,7 @@ Run: python -m unittest discover -s pulse-pkg/tests -v
 """
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -62,6 +63,7 @@ class ScalarTensor:
 class StreamTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pulse-stream-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def test_frames_round_trip_in_order(self):
         writer = stream.StreamWriter(self.tmp, flush_seconds=0.01)
@@ -144,6 +146,7 @@ class StreamTest(unittest.TestCase):
 class MonitorTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pulse-monitor-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def _monitor(self, **kwargs):
         kwargs.setdefault("interval", 0.0)
@@ -255,3 +258,147 @@ class MonitorTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class FlushTest(unittest.TestCase):
+    """flush() is for the one moment somebody is waiting to read what was just written."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pulse-flush-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _writer(self, **kwargs):
+        writer = stream.StreamWriter(self.tmp, **kwargs)
+        self.addCleanup(writer.close)
+        return writer
+
+    def test_what_was_emitted_is_readable_straight_after(self):
+        # The writer batches, so without flush the reader sees nothing for flush_seconds.
+        writer = self._writer(flush_seconds=30.0)
+        writer.emit(stream.KIND_SCALARS, {"step": 7, "values": {"loss": 0.5}})
+        self.assertTrue(writer.flush(timeout=5.0), "flush timed out")
+        frames = stream.StreamReader(self.tmp).poll()
+        steps = [f.get("step") for f in frames if f.get("kind") == stream.KIND_SCALARS]
+        self.assertEqual(steps, [7], f"the frame was not on disk after flush: {frames}")
+
+    def test_without_flush_a_batching_writer_holds_it(self):
+        # Establishes that the test above is testing something.
+        writer = self._writer(flush_seconds=30.0)
+        writer.emit(stream.KIND_SCALARS, {"step": 7, "values": {"loss": 0.5}})
+        time.sleep(0.2)
+        frames = stream.StreamReader(self.tmp).poll()
+        self.assertEqual([f for f in frames if f.get("kind") == stream.KIND_SCALARS], [])
+
+    def test_flush_with_nothing_queued_returns_promptly(self):
+        writer = self._writer(flush_seconds=30.0)
+        started = time.monotonic()
+        self.assertTrue(writer.flush(timeout=5.0))
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_flushing_a_closed_writer_is_not_a_crash(self):
+        writer = stream.StreamWriter(self.tmp)
+        writer.close()
+        self.assertFalse(writer.flush(timeout=0.5))
+
+    def test_flush_does_not_lose_later_frames(self):
+        writer = self._writer(flush_seconds=30.0)
+        writer.emit(stream.KIND_SCALARS, {"step": 1, "values": {"loss": 1.0}})
+        writer.flush(timeout=5.0)
+        writer.emit(stream.KIND_SCALARS, {"step": 2, "values": {"loss": 0.9}})
+        writer.flush(timeout=5.0)
+        frames = stream.StreamReader(self.tmp).poll()
+        steps = [f.get("step") for f in frames if f.get("kind") == stream.KIND_SCALARS]
+        self.assertEqual(steps, [1, 2])
+
+
+class SudoOwnershipTest(unittest.TestCase):
+    """`sudo pulse` writes into the user's directory, so what it writes must be theirs.
+
+    Watching a run Pulse did not start needs root. The spool goes beside the script --
+    in the user's own project -- and root-owned files there are ones they cannot delete
+    and a later `pulse` without sudo cannot read: their run goes invisible in a
+    directory they cannot clean up.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pulse-sudo-own-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.chowned = []
+
+    def _pretend_root(self, uid=4242, gid=4343):
+        """Run as if we were root under sudo, recording what would be handed back."""
+        import unittest.mock as mock
+        return (mock.patch.object(os, "geteuid", return_value=0, create=True),
+                mock.patch.dict(os.environ, {"SUDO_UID": str(uid), "SUDO_GID": str(gid)}),
+                mock.patch.object(os, "chown",
+                                  side_effect=lambda p, u, g: self.chowned.append((p, u, g))))
+
+    def test_the_spool_is_handed_back_to_the_user(self):
+        import contextlib
+        directory = os.path.join(self.tmp, "proj", ".pulse_stream", "s1")
+        with contextlib.ExitStack() as stack:
+            for patch in self._pretend_root():
+                stack.enter_context(patch)
+            writer = stream.StreamWriter(directory)
+            writer.write_state({"step": 1})
+            writer.close()
+
+        owned = {path for path, _, _ in self.chowned}
+        self.assertIn(directory, owned, f"the spool directory stayed root's: {owned}")
+        self.assertIn(os.path.join(directory, "events.jsonl"), owned,
+                      f"events.jsonl stayed root's: {owned}")
+        self.assertTrue(any(p.endswith("state.json") or ".tmp-" in p for p in owned),
+                        f"the state file stayed root's: {owned}")
+        for _, uid, gid in self.chowned:
+            self.assertEqual((uid, gid), (4242, 4343))
+
+    def test_every_directory_level_it_created_is_handed_back(self):
+        import contextlib
+        directory = os.path.join(self.tmp, "deep", "er", ".pulse_stream", "s1")
+        with contextlib.ExitStack() as stack:
+            for patch in self._pretend_root():
+                stack.enter_context(patch)
+            stream.StreamWriter(directory).close()
+        owned = {path for path, _, _ in self.chowned}
+        self.assertIn(os.path.join(self.tmp, "deep"), owned,
+                      f"an intermediate directory stayed root's: {owned}")
+
+    def test_a_directory_that_already_existed_is_left_alone(self):
+        # Not ours to give away: it was there before, owned by whoever owns it.
+        import contextlib
+        existing = os.path.join(self.tmp, "proj")
+        os.makedirs(existing)
+        with contextlib.ExitStack() as stack:
+            for patch in self._pretend_root():
+                stack.enter_context(patch)
+            stream.StreamWriter(os.path.join(existing, ".pulse_stream", "s1")).close()
+        self.assertNotIn(existing, {path for path, _, _ in self.chowned})
+
+    def test_nothing_is_chowned_when_not_running_under_sudo(self):
+        import unittest.mock as mock
+        with mock.patch.object(os, "chown",
+                               side_effect=AssertionError("chown outside sudo")):
+            stream.StreamWriter(os.path.join(self.tmp, "plain", "s1")).close()
+
+    def test_root_without_sudo_env_changes_nothing(self):
+        # Genuinely logged in as root: there is no other user to hand anything to.
+        import unittest.mock as mock
+        env = {k: v for k, v in os.environ.items() if k not in ("SUDO_UID", "SUDO_GID")}
+        with mock.patch.object(os, "geteuid", return_value=0, create=True), \
+             mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(os, "chown", side_effect=AssertionError("chown as real root")):
+            stream.StreamWriter(os.path.join(self.tmp, "asroot", "s1")).close()
+
+    def test_a_chown_that_fails_does_not_break_the_run(self):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            for patch in self._pretend_root()[:2]:
+                stack.enter_context(patch)
+            import unittest.mock as mock
+            stack.enter_context(mock.patch.object(os, "chown",
+                                                  side_effect=OSError("read-only mount")))
+            writer = stream.StreamWriter(os.path.join(self.tmp, "ro", "s1"))
+            writer.emit(stream.KIND_SCALARS, {"step": 1, "values": {"loss": 1.0}})
+            writer.close()
+        frames = stream.StreamReader(os.path.join(self.tmp, "ro", "s1")).poll()
+        self.assertTrue(any(f.get("kind") == stream.KIND_SCALARS for f in frames))

@@ -432,9 +432,59 @@ Pulse can pause training when configured detection logic identifies serious nume
 
 ---
 
+## The `pulse` command
+
+Pulse does not have to be written into a script. Installing it puts a `pulse` command on
+the path, which starts runs and attaches to ones already going.
+
+```bash
+pulse run --stream train.py      # start train.py under Pulse, unmodified
+pulse                            # attach to the run on this machine
+pulse train.py                   # attach to the run of that script
+pulse sessions                   # list the runs Pulse knows about
+```
+
+`pulse run` starts a run; without it, a script name means the run that is **already
+going**. If several runs match, Pulse lists them and asks which.
+
+`--stream` puts the monitor in the training process and the agent in yours, so the run
+keeps going whether or not anyone is watching it, and attaching costs the run nothing.
+Without it the run is tracked in the terminal it was started from, as before.
+
+### Watching a run you did not start under Pulse
+
+A process cannot be made to report on itself after the fact, so Pulse reads it from the
+outside with [py-spy](https://github.com/benfred/py-spy) (`pip install py-spy`). That is
+ptrace, which Linux allows only for a parent process or root:
+
+```bash
+sudo pulse train.py              # finds the process running train.py
+sudo pulse attach --pid 12345    # when you already know the id
+```
+
+Two limits are worth knowing before relying on it. It reads **function locals**, so a
+loop written at the top level of a script reports nothing — the values are module
+globals, which cannot be read this way. And it **samples**, about once a second, so a
+spike between two samples is not seen. A run started under `pulse run` has neither
+problem, because Pulse is inside it.
+
+If `sudo pulse` says `command not found`, sudo is the reason: it replaces `PATH` with its
+own `secure_path`, which does not include the `~/.local/bin` that `pip install --user`
+puts the command in. Run this once per machine:
+
+```bash
+pulse install-sudo
+```
+
+It asks sudo to place a small launcher in `/usr/local/bin` that runs your own install
+with your home directory. (Without it, `sudo env "PATH=$PATH" "HOME=$HOME" pulse ...`
+works too — Pulse prints that command when it needs it.)
+
+---
+
 ## CLI
 
-Useful commands include:
+Once Pulse is attached to a run, these commands control it:
 
 ```text
 /help

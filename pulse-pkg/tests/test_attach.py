@@ -123,6 +123,7 @@ class StreamingTest(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pulse-attach-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         os.environ["PULSE_HOME"] = os.path.join(self.tmp, ".pulse")
         self.addCleanup(os.environ.pop, "PULSE_HOME", None)
 
@@ -184,6 +185,7 @@ class LiveAttachTest(unittest.TestCase):
         if attach.needs_root() and not attach.sudo_is_passwordless():
             self.skipTest("reading another process needs root here, and sudo would prompt")
         self.tmp = tempfile.mkdtemp(prefix="pulse-live-attach-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def test_reads_a_running_process_it_did_not_start(self):
         script = os.path.join(self.tmp, "train.py")

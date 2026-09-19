@@ -6,6 +6,7 @@ have caught auto_track() crashing on a machine without TensorFlow.
 import glob
 import json
 import os
+import shutil
 import site
 import subprocess
 import sys
@@ -78,6 +79,7 @@ def read(directory, rounds=3):
 class StreamModeTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pulse-e2e-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def test_a_healthy_run_streams_and_raises_nothing(self):
         result, directory = run_training(self.tmp, lr=0.01)

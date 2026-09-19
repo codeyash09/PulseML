@@ -48,6 +48,7 @@ Pulse - a live ML training debugger.
   pulse <script.py>              watch the run of that script that is already going
   sudo pulse <script.py>         watch a run started outside Pulse (finds the process)
   sudo pulse attach --pid N      the same, when you already know the process id
+  pulse install-sudo             make `sudo pulse` work (once, per machine -- see below)
   pulse run [options] <script.py> [script args]
                                  START a script under Pulse, like `python script.py`
 
@@ -62,6 +63,10 @@ options for `pulse` / `pulse watch`:
 
 `pulse run` sets Pulse up exactly as auto_track() does -- sign-in, workspace, agent --
 and if the script has a syntax error, Pulse fixes it and restarts the run to apply it.
+
+Watching a run Pulse did not start means reading another process's memory, which needs
+root. `sudo pulse` reports "command not found" on a pip install, because sudo replaces
+PATH with its own and pip installs into ~/.local/bin: `pulse install-sudo` fixes that.
 """
 
 _RUN_MODE = "cli"          # what the injected auto_track() is given; "stream" for --stream
@@ -559,7 +564,7 @@ def main(argv=None):
         print(f"pulse {__version__}")
         return 0
 
-    console_commands = ("watch", "attach", "console", "sessions")
+    console_commands = ("watch", "attach", "console", "sessions", "install-sudo")
     launch_options = ("--stream", "--cwd", "--again")
 
     # `run` starts a run. Without it, a script name means "the run of this script that is

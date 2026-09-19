@@ -1,6 +1,7 @@
 """Tests for the interactive console: finding runs, choosing one, and the views."""
 import glob
 import os
+import shutil
 import site
 import subprocess
 import sys
@@ -8,6 +9,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(os.path.dirname(HERE), "src")
@@ -26,6 +28,19 @@ TRAIN = textwrap.dedent("""\
         time.sleep(0.02)
     print("done")
 """)
+
+
+def _remove_tree(path):
+    """rmtree, retried: a child being killed can recreate files under the directory
+    between the walk and the unlink -- its spool, or a font cache in the fake HOME --
+    which left a directory behind on every run. Patient, because under a full-suite
+    load the child takes longer to go than it does on its own."""
+    for attempt in range(6):
+        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.exists(path):
+            return
+        time.sleep(0.25 * (attempt + 1))
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _kill_group(process):
@@ -57,6 +72,10 @@ def child_env(home):
 class DiscoveryTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pulse-console-")
+        # Restore the cwd BEFORE the directory goes: a test that chdirs into its
+        # own temp dir otherwise leaves the whole process in a deleted one.
+        self.addCleanup(_remove_tree, self.tmp)
+        self.addCleanup(os.chdir, os.getcwd())
         self.home = os.path.join(self.tmp, "home")
         os.environ["PULSE_HOME"] = os.path.join(self.home, ".pulse")
         self.addCleanup(os.environ.pop, "PULSE_HOME", None)
@@ -225,6 +244,10 @@ class EndToEndTest(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pulse-console-e2e-")
+        # Restore the cwd BEFORE the directory goes: a test that chdirs into its
+        # own temp dir otherwise leaves the whole process in a deleted one.
+        self.addCleanup(_remove_tree, self.tmp)
+        self.addCleanup(os.chdir, os.getcwd())
         self.proj = os.path.join(self.tmp, "proj")
         os.makedirs(self.proj)
         self.home = os.path.join(self.tmp, "home")
@@ -312,6 +335,10 @@ class DispatchTest(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pulse-dispatch-")
+        # Restore the cwd BEFORE the directory goes: a test that chdirs into its
+        # own temp dir otherwise leaves the whole process in a deleted one.
+        self.addCleanup(_remove_tree, self.tmp)
+        self.addCleanup(os.chdir, os.getcwd())
         with open(os.path.join(self.tmp, "train.py"), "w", encoding="utf-8") as handle:
             handle.write("loss = 1.0\n")
         self.calls = []
@@ -417,9 +444,17 @@ class WatchByNameTest(unittest.TestCase):
         output = buffer.getvalue()
         self.assertEqual(status, 1)
         self.assertEqual(calls, {}, "it attached anyway")
-        self.assertIn("sudo pulse train.py", output)
         self.assertIn("ptrace", output)
         self.assertIn("ptrace_scope is 1", output)
+        # The suggested command has to name the script the user asked about. It used to
+        # be built from sys.argv, so it repeated whatever arguments this process happened
+        # to be started with -- under the test runner, "sudo pulse discover -s tests".
+        suggestion = [line for line in output.splitlines() if "sudo" in line and "env" not in line
+                      or line.strip().startswith("sudo env")]
+        self.assertTrue(suggestion, f"no sudo command was printed:\n{output}")
+        self.assertTrue(any(line.rstrip().endswith("train.py") for line in suggestion),
+                        f"the sudo command did not name train.py:\n{output}")
+        self.assertNotIn("--pid", output, "it fell back to asking for a pid")
 
     def test_missing_pyspy_says_how_to_get_it(self):
         import io, contextlib
@@ -485,6 +520,10 @@ class AlreadyRunningTest(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pulse-already-")
+        # Restore the cwd BEFORE the directory goes: a test that chdirs into its
+        # own temp dir otherwise leaves the whole process in a deleted one.
+        self.addCleanup(_remove_tree, self.tmp)
+        self.addCleanup(os.chdir, os.getcwd())
         self.script = os.path.join(self.tmp, "train.py")
         with open(self.script, "w", encoding="utf-8") as handle:
             handle.write("import time\nfor i in range(600):\n    time.sleep(0.05)\n")
@@ -593,6 +632,10 @@ class StreamFlagReachesTheScriptTest(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pulse-streamflag-")
+        # Restore the cwd BEFORE the directory goes: a test that chdirs into its
+        # own temp dir otherwise leaves the whole process in a deleted one.
+        self.addCleanup(_remove_tree, self.tmp)
+        self.addCleanup(os.chdir, os.getcwd())
         self.proj = os.path.join(self.tmp, "proj")
         os.makedirs(self.proj)
         self.home = os.path.join(self.tmp, "home")
@@ -639,6 +682,10 @@ class StreamFlagReachesTheScriptTest(unittest.TestCase):
 class OldWaysStillWorkTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pulse-oldways-")
+        # Restore the cwd BEFORE the directory goes: a test that chdirs into its
+        # own temp dir otherwise leaves the whole process in a deleted one.
+        self.addCleanup(_remove_tree, self.tmp)
+        self.addCleanup(os.chdir, os.getcwd())
         self.home = os.path.join(self.tmp, "home")
 
     def test_pulse_run_without_stream_still_uses_the_original_mode(self):
@@ -674,6 +721,231 @@ class OldWaysStillWorkTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("done", result.stdout)
         self.assertTrue(glob.glob(os.path.join(self.tmp, ".pulse_stream", "*")))
+
+
+class SudoCommandTest(unittest.TestCase):
+    """The command Pulse prints for sudo has to be one that works when pasted.
+
+    `sudo pulse ...` is the obvious suggestion and it fails on a pip install: sudo
+    replaces PATH with secure_path, which has no ~/.local/bin, so the shell says
+    "pulse: command not found" -- which is exactly what happened to the user. Spelling
+    out the full path fails differently: root's Python does not read the user's
+    site-packages, so it dies on numpy instead.
+    """
+
+    def setUp(self):
+        import unittest.mock as mock
+        self.mock = mock
+
+    def test_short_form_when_a_launcher_is_where_sudo_looks(self):
+        mock = self.mock
+        with mock.patch.object(console, "pulse_on_secure_path", return_value=True):
+            self.assertEqual(console.sudo_relaunch_command(["train.py"]),
+                             ["sudo", "pulse", "train.py"])
+
+    def test_carries_path_and_home_when_pulse_is_only_in_local_bin(self):
+        mock = self.mock
+        with mock.patch.object(console, "pulse_on_secure_path", return_value=False), \
+             mock.patch.object(sys, "argv", ["/home/me/.local/bin/pulse", "train.py"]):
+            command = console.sudo_relaunch_command(["train.py"])
+        self.assertEqual(command[:2], ["sudo", "env"])
+        self.assertTrue(any(part.startswith("PATH=") for part in command),
+                        f"PATH is not carried across, so pulse stays unfindable: {command}")
+        self.assertTrue(any(part.startswith("HOME=") for part in command),
+                        f"HOME is not carried across, so numpy stays unfindable: {command}")
+        self.assertEqual(command[-1], "train.py")
+        self.assertIn("/home/me/.local/bin/pulse", command)
+
+    def test_a_module_invocation_relaunches_as_a_module(self):
+        mock = self.mock
+        with mock.patch.object(console, "pulse_on_secure_path", return_value=False), \
+             mock.patch.object(sys, "argv", ["/home/me/pulseml/pulse-pkg/src/pulse/cli.py", "t.py"]):
+            command = console.sudo_relaunch_command(["t.py"])
+        self.assertIn("-m", command)
+        self.assertEqual(command[command.index("-m") + 1], "pulse")
+
+    def test_it_does_not_repeat_the_hosts_own_arguments(self):
+        mock = self.mock
+        with mock.patch.object(sys, "argv", ["pulse", "discover", "-s", "tests"]):
+            self.assertNotIn("discover", console.sudo_relaunch_command(["train.py"]))
+
+
+class InstallSudoTest(unittest.TestCase):
+    """`pulse install-sudo` puts a launcher where sudo will actually look.
+
+    It has to run as the user, not under sudo -- if `sudo pulse` worked there would be
+    nothing to install -- and it must never overwrite an unrelated /usr/local/bin/pulse.
+    """
+
+    def setUp(self):
+        import unittest.mock as mock
+        self.mock = mock
+        self.tmp = tempfile.mkdtemp(prefix="pulse-install-")
+        # Restore the cwd BEFORE the directory goes: a test that chdirs into its
+        # own temp dir otherwise leaves the whole process in a deleted one.
+        self.addCleanup(_remove_tree, self.tmp)
+        self.addCleanup(os.chdir, os.getcwd())
+        self.target = os.path.join(self.tmp, "usr-local-bin-pulse")
+        self.home = os.path.join(self.tmp, "home")
+        os.makedirs(os.path.join(self.home, ".local", "bin"))
+        open(os.path.join(self.home, ".local", "bin", "pulse"), "w").close()
+
+    def _install(self, returncode=0, which=None):
+        mock = self.mock
+        calls = {}
+        user_pulse = os.path.join(self.home, ".local", "bin", "pulse")
+
+        def fake_run(command, *a, **k):
+            calls["command"] = command
+            if returncode == 0:                      # do what `sudo install` would do
+                shutil.copyfile(command[-2], command[-1])
+            return SimpleNamespace(returncode=returncode)
+
+        with mock.patch.object(os.path, "expanduser", return_value=self.home), \
+             mock.patch.object(console.shutil, "which",
+                               return_value=user_pulse if which is None else which), \
+             mock.patch.object(sys, "argv", ["pulse", "install-sudo"]), \
+             mock.patch("subprocess.run", fake_run):
+            status = console.install_sudo_launcher(self.target)
+        return status, calls
+
+    def test_it_writes_a_launcher_that_runs_the_users_own_install(self):
+        status, calls = self._install()
+        self.assertEqual(status, 0)
+        self.assertEqual(calls["command"][:2], ["sudo", "install"],
+                         "it tried to write to /usr/local/bin without sudo")
+        with open(self.target, encoding="utf-8") as handle:
+            script = handle.read()
+        self.assertTrue(script.startswith("#!/bin/sh"))
+        self.assertIn("SUDO_USER", script,
+                      "the launcher cannot find the real user's home, so it runs as root's")
+        self.assertIn(os.path.join(self.home, ".local", "bin", "pulse"), script)
+
+    def test_the_launcher_points_at_an_absolute_path_not_a_lookup(self):
+        # /usr/local/bin is on every PATH, so a launcher that looks `pulse` up on PATH
+        # finds itself and execs itself until the process table gives out.
+        self._install()
+        with open(self.target, encoding="utf-8") as handle:
+            script = handle.read()
+        self.assertNotIn("exec env HOME=\"$REAL_HOME\" pulse", script)
+        self.assertIn(os.path.join(self.home, ".local", "bin", "pulse"), script)
+
+    def test_it_refuses_to_point_the_launcher_at_itself(self):
+        mock = self.mock
+        with mock.patch.object(os.path, "expanduser", return_value=self.home), \
+             mock.patch.object(console.shutil, "which", return_value=self.target), \
+             mock.patch.object(sys, "argv", ["pulse"]), \
+             mock.patch("subprocess.run",
+                        side_effect=AssertionError("installed a launcher that execs itself")):
+            self.assertEqual(console.install_sudo_launcher(self.target), 1)
+
+    def test_a_venv_install_is_pointed_at_rather_than_assumed(self):
+        venv_pulse = os.path.join(self.tmp, "venv", "bin", "pulse")
+        os.makedirs(os.path.dirname(venv_pulse))
+        open(venv_pulse, "w").close()
+        os.chmod(venv_pulse, 0o755)
+        status, _ = self._install(which=venv_pulse)
+        self.assertEqual(status, 0)
+        with open(self.target, encoding="utf-8") as handle:
+            self.assertIn(venv_pulse, handle.read(),
+                          "a venv install was ignored in favour of an assumed ~/.local/bin")
+
+    def test_the_launcher_is_valid_shell(self):
+        self._install()
+        result = subprocess.run(["sh", "-n", self.target], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def _run_launcher(self, home, *args, env=None):
+        """Run the generated launcher for real, against a stand-in pulse."""
+        environment = dict(os.environ, HOME=home, **(env or {}))
+        environment.pop("SUDO_USER", None)
+        if env and "SUDO_USER" in env:
+            environment["SUDO_USER"] = env["SUDO_USER"]
+        return subprocess.run(["sh", self.target, *args], capture_output=True,
+                              text=True, env=environment, timeout=30)
+
+    def test_the_launcher_passes_home_and_arguments_through(self):
+        target_pulse = os.path.join(self.home, ".local", "bin", "pulse")
+        with open(target_pulse, "w", encoding="utf-8") as handle:
+            handle.write('#!/bin/sh\necho "HOME=[$HOME] ARGS=[$*]"\n')
+        os.chmod(target_pulse, 0o755)
+        self._install()
+        result = self._run_launcher(self.home, "train.py", "--model", "x")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"HOME=[{self.home}]", result.stdout)
+        self.assertIn("ARGS=[train.py --model x]", result.stdout,
+                      "the launcher mangled the arguments")
+
+    def test_a_home_with_spaces_survives(self):
+        spaced = os.path.join(self.tmp, "home with spaces")
+        os.makedirs(os.path.join(spaced, ".local", "bin"))
+        target_pulse = os.path.join(spaced, ".local", "bin", "pulse")
+        with open(target_pulse, "w", encoding="utf-8") as handle:
+            handle.write('#!/bin/sh\necho "HOME=[$HOME] ARGS=[$*]"\n')
+        os.chmod(target_pulse, 0o755)
+        self._install(which=target_pulse)
+        result = self._run_launcher(spaced, "a b")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"HOME=[{spaced}]", result.stdout)
+        self.assertIn("ARGS=[a b]", result.stdout)
+
+    def test_a_launcher_whose_pulse_is_gone_says_so_instead_of_looping(self):
+        self._install()
+        os.unlink(os.path.join(self.home, ".local", "bin", "pulse"))
+        result = self._run_launcher(self.home, "--version")
+        self.assertEqual(result.returncode, 127)
+        self.assertIn("install-sudo", result.stderr,
+                      "it failed without saying how to fix it")
+
+    def test_running_it_twice_is_not_an_error(self):
+        self._install()
+        status, calls = self._install()
+        self.assertEqual(status, 0)
+        self.assertEqual(calls, {}, "it reinstalled over its own launcher")
+
+    def test_it_refuses_to_overwrite_someone_elses_pulse(self):
+        with open(self.target, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\n# a different pulse entirely\n")
+        status, calls = self._install()
+        self.assertEqual(status, 1)
+        self.assertEqual(calls, {}, "it overwrote an unrelated /usr/local/bin/pulse")
+        with open(self.target, encoding="utf-8") as handle:
+            self.assertIn("a different pulse entirely", handle.read())
+
+    def test_a_missing_user_install_is_reported_rather_than_linked_to(self):
+        os.unlink(os.path.join(self.home, ".local", "bin", "pulse"))
+        mock = self.mock
+        with mock.patch.object(os.path, "expanduser", return_value=self.home), \
+             mock.patch.object(console.shutil, "which", return_value=None), \
+             mock.patch.object(sys, "argv", ["pulse"]):
+            self.assertEqual(console.install_sudo_launcher(self.target), 1)
+        self.assertFalse(os.path.exists(self.target),
+                         "it installed a launcher pointing at a pulse that is not there")
+
+    def test_an_out_of_date_launcher_is_repointed(self):
+        # Reinstalling Pulse somewhere else leaves the launcher aimed at a path that is
+        # gone. Its own launcher is ours to update; anything else is not.
+        self._install()
+        moved = os.path.join(self.tmp, "elsewhere", "bin", "pulse")
+        os.makedirs(os.path.dirname(moved))
+        open(moved, "w").close()
+        status, calls = self._install(which=moved)
+        self.assertEqual(status, 0)
+        self.assertTrue(calls, "the stale launcher was left pointing at a dead path")
+        with open(self.target, encoding="utf-8") as handle:
+            self.assertIn(moved, handle.read())
+
+    def test_sudo_refusing_is_reported_and_leaves_nothing(self):
+        status, _ = self._install(returncode=1)
+        self.assertEqual(status, 1)
+        self.assertFalse(os.path.exists(self.target))
+
+    def test_the_command_is_reachable_from_the_cli(self):
+        mock = self.mock
+        from pulse import cli
+        with mock.patch.object(console, "install_sudo_launcher", return_value=0) as installer:
+            self.assertEqual(cli.main(["install-sudo"]), 0)
+        self.assertTrue(installer.called, "`pulse install-sudo` did not reach the installer")
 
 
 if __name__ == "__main__":

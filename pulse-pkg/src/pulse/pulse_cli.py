@@ -355,14 +355,30 @@ _original_input = builtins.input
 
 def safe_print(*args, **kwargs):
     with _io_lock:
-        # Move cursor to column 0 and clear line before printing background text
-        sys.stdout.write("\r\033[K")
+        # Move cursor to column 0 and clear the line, so a line Pulse is drawing in the
+        # background is not left half-overwritten. Only on a terminal: importing Pulse
+        # replaces print for the WHOLE program, so when the output is a pipe or a file
+        # this used to put "\r\033[K" in front of every line the user's own script
+        # printed -- escape codes in their logs, their CSVs and their piped output.
+        stream = kwargs.get("file") or sys.stdout
+        try:
+            decorate = stream is sys.stdout and stream.isatty()
+        except (AttributeError, ValueError):
+            decorate = False
+        if decorate:
+            stream.write("\r\033[K")
         _original_print(*args, **kwargs)
 
 def safe_input(prompt=""):
-    # Clear formatting and force prompt to a clean new line
-    sys.stdout.write("\033[0m\n\r\033[K")
-    sys.stdout.flush()
+    # Clear formatting and force prompt to a clean new line -- on a terminal only; with
+    # stdin piped there is no cursor to move and the codes would land in the output.
+    try:
+        interactive = sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        interactive = False
+    if interactive:
+        sys.stdout.write("\033[0m\n\r\033[K")
+        sys.stdout.flush()
     
     # Hold the lock while waiting for user input
     with _io_lock:

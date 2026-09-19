@@ -1,6 +1,7 @@
 """Tests for the brain: stream ingest, the wake-up audit, and risk-adaptive scheduling."""
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -53,6 +54,7 @@ class DecisionParsingTest(unittest.TestCase):
 class ScheduleTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pulse-schedule-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.path = os.path.join(self.tmp, "schedule.json")
 
     def test_interval_is_clamped_both_ways(self):
@@ -111,6 +113,7 @@ class DownsampleTest(unittest.TestCase):
 class BrainIngestTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pulse-brain-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def _write(self, frames):
         writer = stream.StreamWriter(self.tmp, flush_seconds=0.01)
@@ -176,6 +179,7 @@ class BrainIngestTest(unittest.TestCase):
 class AuditTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pulse-audit-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         writer = stream.StreamWriter(self.tmp, flush_seconds=0.01)
         for i in range(60):
             writer.emit(stream.KIND_SCALARS, {"step": i, "values": {"loss": 1.0 / (i + 1) ** 0.5}})

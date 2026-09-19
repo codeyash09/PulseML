@@ -57,6 +57,10 @@ KIND_EVENT = "event"        # {"event": str, ...} - tripwires, crashes, lint fin
 KIND_DROP = "drop"          # {"dropped": int} - frames lost to backpressure
 KIND_BYE = "bye"            # clean shutdown
 
+# Not a frame: a marker put on the writer's queue by flush(), asking the writer thread to
+# put what it is holding on disk now and say when it has.
+_FLUSH = object()
+
 # Control messages (brain -> monitor).
 CONTROL_PAUSE = "pause"
 CONTROL_RESUME = "resume"
@@ -96,7 +100,7 @@ def registry_dir() -> str:
 def register_session(session_id: str, directory: str, info: Dict[str, Any]) -> Optional[str]:
     """Announce a run. Best effort: a read-only or missing home must not stop training."""
     try:
-        os.makedirs(registry_dir(), exist_ok=True)
+        _makedirs(registry_dir())
         path = os.path.join(registry_dir(), f"{session_id}.json")
         _atomic_write_json(path, dict(info, session_id=session_id,
                                       directory=os.path.abspath(directory)))
@@ -153,14 +157,59 @@ def session_dir_for(script_path: Optional[str], session_id: str) -> str:
     return os.path.join(base, ".pulse_stream", session_id)
 
 
+def _invoking_user() -> Optional[tuple]:
+    """(uid, gid) of the person who ran sudo, when we are root because of it.
+
+    Watching a run Pulse did not start needs root, so `sudo pulse` writes the spool --
+    into the user's own project directory. Left as root's, those files are ones they
+    cannot delete and a later `pulse` without sudo cannot read: their own run goes
+    invisible, in a directory they cannot clean up.
+    """
+    if os.name != "posix" or not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return None
+    try:
+        return int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"])
+    except (KeyError, ValueError):
+        return None
+
+
+def _hand_back(path: str) -> None:
+    """Give a file or directory we made as root to the user who asked for it."""
+    owner = _invoking_user()
+    if owner is None:
+        return
+    try:
+        os.chown(path, owner[0], owner[1])
+    except OSError:
+        pass            # a different filesystem, or it vanished: not worth failing over
+
+
+def _makedirs(path: str) -> None:
+    """makedirs, handing back every level we actually created."""
+    if os.path.isdir(path):
+        return
+    missing = []
+    current = path
+    while current and not os.path.isdir(current):
+        missing.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    os.makedirs(path, exist_ok=True)
+    for created in missing:
+        _hand_back(created)
+
+
 def _atomic_write_json(path: str, payload: Any) -> None:
     """Replace path with payload. A reader either sees the old file or the new one."""
     directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
+    _makedirs(directory)
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, default=str)
+        _hand_back(tmp)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -203,8 +252,9 @@ class StreamWriter:
         self._closed = False
         self._control_offset = 0
 
-        os.makedirs(self.directory, exist_ok=True)
+        _makedirs(self.directory)
         self._handle = open(self.events_path, "a", encoding="utf-8")
+        _hand_back(self.events_path)
         self._thread = threading.Thread(target=self._run, name="pulse-stream-writer", daemon=True)
         self._thread.start()
 
@@ -301,6 +351,12 @@ class StreamWriter:
                     except OSError:
                         pass
                     return
+                if isinstance(item, tuple) and item and item[0] is _FLUSH:
+                    # Somebody is waiting to read what has been emitted so far.
+                    self._flush(pending)
+                    last_flush = time.monotonic()
+                    item[1].set()
+                    continue
                 pending.append(self._encode(item))
             if pending and (time.monotonic() - last_flush >= self.flush_seconds or len(pending) >= 256):
                 self._flush(pending)
@@ -350,6 +406,27 @@ class StreamWriter:
                 self._on_error(exc)
             except Exception:
                 pass
+
+    def flush(self, timeout: float = 1.0) -> bool:
+        """Wait, briefly, for what is queued to reach the file. True if it did.
+
+        Frames are written by a background thread on its own schedule, so a reader that
+        looks immediately after an emit sees nothing. That is right during training --
+        the run must never wait on the spool -- and wrong at the one moment somebody is
+        waiting for the first sample to appear before a status line is drawn.
+
+        The writer thread does the flushing, because only it knows what it is still
+        holding: an empty queue does not mean an empty buffer. Bounded and advisory --
+        a writer thread that is stuck must not hang the caller.
+        """
+        if self._closed or not self._thread.is_alive():
+            return False
+        done = threading.Event()
+        try:
+            self._queue.put_nowait((_FLUSH, done))
+        except queue.Full:
+            return False
+        return done.wait(max(0.0, timeout))
 
     # ---------------------------------------------------------------- shutdown
 
@@ -472,10 +549,13 @@ class StreamReader:
     def send_control(self, action: str, **fields: Any) -> None:
         """Ask the monitor for something. Appends a line; the monitor polls for it."""
         message = dict(fields, action=action, t=time.time())
-        os.makedirs(self.directory, exist_ok=True)
+        _makedirs(self.directory)
+        existed = os.path.exists(self.control_path)
         with open(self.control_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(message, ensure_ascii=False, default=str) + "\n")
             handle.flush()
+        if not existed:
+            _hand_back(self.control_path)
 
 
 def list_sessions(root: Optional[str] = None) -> List[Dict[str, Any]]:
