@@ -10,13 +10,19 @@ import time
 
 
 class PulseASTInjector(ast.NodeTransformer):
-    """Inject Pulse auto-tracking into the user's training script."""
+    """Inject Pulse auto-tracking into the user's training script.
 
-    def __init__(self):
+    `mode` is what the injected auto_track() is given. "cli" is the original
+    behaviour and stays the default. "stream" starts the light monitor instead, so
+    the run streams to a brain elsewhere and nothing blocks training -- that is what
+    `pulse run --stream` uses, and what the `pulse` console attaches to.
+    """
+
+    def __init__(self, mode="cli"):
         self.has_main_block = False
+        self.mode = mode
 
-    @staticmethod
-    def _make_auto_track_call():
+    def _make_auto_track_call(self):
         return ast.Expr(
             value=ast.Call(
                 func=ast.Name(id="auto_track", ctx=ast.Load()),
@@ -25,7 +31,7 @@ class PulseASTInjector(ast.NodeTransformer):
                     ast.keyword(
                         arg="mode",
                         value=ast.Constant(
-                            value="cli",
+                            value=self.mode,
                         ),
                     )
                 ],
@@ -233,6 +239,7 @@ def _write_instrumented_script(tree, script_path):
 def _write_raw_instrumented_script(
     source_code,
     script_path,
+    mode="cli",
 ):
     """
     Fallback instrumentation for a training script that contains
@@ -267,7 +274,7 @@ def _write_raw_instrumented_script(
                 "from pulse import auto_track\n"
             )
             f.write(
-                'auto_track(mode="cli")\n\n'
+                f'auto_track(mode="{mode}")\n\n'
             )
 
             # Then preserve the user's source exactly.
@@ -288,6 +295,7 @@ def _run_training_script(
     script_path,
     script_dir,
     args,
+    real_script_path=None,
 ):
     """
     Execute a training script as a normal Python subprocess.
@@ -303,6 +311,13 @@ def _run_training_script(
     ]
 
     env = os.environ.copy()
+
+    # What actually runs is a temporary instrumented copy, so anything that asks the
+    # interpreter which file it is in gets a name like .pulse_instrumented_ab12cd.py
+    # in a directory that is deleted afterwards. Pulse records this instead, so a
+    # watcher shows the user's own script and edits the file the run came from.
+    if real_script_path:
+        env["PULSE_SCRIPT_PATH"] = os.path.abspath(real_script_path)
 
     # Make the original training directory importable exactly as it
     # normally would be when executing:
@@ -763,11 +778,54 @@ def _bootstrap_pulse_config(script_path):
     return True
 
 
+# What the injected auto_track() is given. `pulse run` leaves this at "cli", the
+# original single-process behaviour; `pulse run --stream` switches it.
+_TRACK_MODE = "cli"
+
+USAGE = """\
+Pulse - a live ML training debugger.
+
+  pulse                      attach to the run on this machine (interactive)
+  pulse watch [n|id|name]    attach to a particular run
+  pulse sessions             list the runs Pulse knows about
+  pulse run <script.py>      start a script under Pulse, checking it first
+  pulse run --stream <s.py>  start it streaming, for the console to watch
+
+  --model <id>               the agent to think with (or set PULSE_MODEL)
+
+The console needs a run to watch. Start one with `pulse run train.py`, or call
+auto_track(mode="stream") from inside a script you launch yourself.
+"""
+
+
 def main():
-    if len(sys.argv) < 3 or sys.argv[1] != "run":
-        print(
-            "Usage: pulse run <script.py> [args]"
-        )
+    """`pulse run ...` starts a script; everything else opens the console.
+
+    `run` is left exactly as it was: it is the path that instruments and repairs a
+    script, and it is what the installed console script has always done. The console
+    is the other direction -- a run that is already going, found rather than launched.
+    """
+    argv = sys.argv[1:]
+
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        sys.exit(0)
+
+    if not argv or argv[0] in ("watch", "attach", "console", "sessions"):
+        from .pulse_console import main as console_main
+        sys.exit(console_main(argv))
+
+    if argv[0] != "run" or len(argv) < 2:
+        print(USAGE)
+        sys.exit(1)
+
+    global _TRACK_MODE
+    if "--stream" in argv:
+        _TRACK_MODE = "stream"
+        argv = [a for a in argv if a != "--stream"]
+        sys.argv = [sys.argv[0]] + argv
+    if len(argv) < 2:
+        print(USAGE)
         sys.exit(1)
 
     script_path = sys.argv[2]
@@ -1127,7 +1185,7 @@ def main():
                 # used for normal valid Python.
                 # ----------------------------------------------------
 
-                transformer = PulseASTInjector()
+                transformer = PulseASTInjector(mode=_TRACK_MODE)
 
                 modified_tree = transformer.visit(
                     repaired_tree
@@ -1157,6 +1215,7 @@ def main():
                         instrumented_path,
                         script_dir,
                         sys.argv[3:],
+                        real_script_path=script_path,
                     )
 
                 finally:
@@ -1199,6 +1258,7 @@ def main():
                 script_path,
                 script_dir,
                 sys.argv[3:],
+                real_script_path=script_path,
             )
 
             sys.exit(
@@ -1209,7 +1269,7 @@ def main():
         # VALID PYTHON: AST INSTRUMENTATION
         # ============================================================
 
-        transformer = PulseASTInjector()
+        transformer = PulseASTInjector(mode=_TRACK_MODE)
 
         modified_tree = transformer.visit(
             tree
@@ -1238,6 +1298,7 @@ def main():
             temp_path,
             script_dir,
             sys.argv[3:],
+            real_script_path=script_path,
         )
 
         if result.returncode != 0:

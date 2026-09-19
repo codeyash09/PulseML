@@ -71,6 +71,61 @@ _DEFAULT_FLUSH_SECONDS = 0.25
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
 
 
+def registry_dir() -> str:
+    """Where every run on this machine announces itself.
+
+    The spool lives beside the training script, which is right for keeping a run's
+    record with the code it describes, and useless for finding it: `pulse` typed in
+    some other directory has no way to guess where that script was. So a monitor also
+    drops a pointer here, and the console can list every run on the machine without
+    being told where to look.
+    """
+    base = os.environ.get("PULSE_HOME", "").strip() or os.path.join(
+        os.path.expanduser("~"), ".pulse")
+    return os.path.join(base, "sessions")
+
+
+def register_session(session_id: str, directory: str, info: Dict[str, Any]) -> Optional[str]:
+    """Announce a run. Best effort: a read-only or missing home must not stop training."""
+    try:
+        os.makedirs(registry_dir(), exist_ok=True)
+        path = os.path.join(registry_dir(), f"{session_id}.json")
+        _atomic_write_json(path, dict(info, session_id=session_id,
+                                      directory=os.path.abspath(directory)))
+        return path
+    except OSError:
+        return None
+
+
+def unregister_session(session_id: str) -> None:
+    try:
+        os.unlink(os.path.join(registry_dir(), f"{session_id}.json"))
+    except OSError:
+        pass
+
+
+def registered_sessions() -> List[Dict[str, Any]]:
+    """Every run this machine knows about, newest first, with dead pointers dropped."""
+    directory = registry_dir()
+    if not os.path.isdir(directory):
+        return []
+    out = []
+    for name in os.listdir(directory):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(directory, name), "r", encoding="utf-8") as handle:
+                entry = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(entry, dict) or not entry.get("directory"):
+            continue
+        if not os.path.isdir(entry["directory"]):
+            continue        # the spool was deleted; the pointer is stale
+        out.append(entry)
+    return sorted(out, key=lambda e: e.get("started") or 0, reverse=True)
+
+
 def session_dir_for(script_path: Optional[str], session_id: str) -> str:
     """Where a run's spool lives.
 

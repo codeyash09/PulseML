@@ -1,0 +1,258 @@
+"""Tests for the interactive console: finding runs, choosing one, and the views."""
+import glob
+import os
+import site
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SRC = os.path.join(os.path.dirname(HERE), "src")
+sys.path.insert(0, SRC)
+
+from pulse import pulse_console as console      # noqa: E402
+from pulse import pulse_stream as stream        # noqa: E402
+from pulse.pulse_monitor import Monitor         # noqa: E402
+
+TRAIN = textwrap.dedent("""\
+    import time
+    loss = 2.0
+    for step in range({steps}):
+        loss = loss * {factor} + 0.001
+        grad_norm = loss * 0.5
+        time.sleep(0.02)
+    print("done")
+""")
+
+
+def child_env(home):
+    os.makedirs(home, exist_ok=True)
+    return dict(os.environ,
+                PYTHONPATH=os.pathsep.join(
+                    p for p in (SRC, site.getusersitepackages(),
+                                os.environ.get("PYTHONPATH", "")) if p),
+                HOME=home, PULSE_HOME=os.path.join(home, ".pulse"),
+                PULSE_LOGGING="0", NO_COLOR="1")
+
+
+class DiscoveryTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pulse-console-")
+        self.home = os.path.join(self.tmp, "home")
+        os.environ["PULSE_HOME"] = os.path.join(self.home, ".pulse")
+        self.addCleanup(os.environ.pop, "PULSE_HOME", None)
+
+    def _session(self, name, *, finished=False, step=10, loss=0.5, pid=None):
+        directory = os.path.join(self.tmp, "runs", ".pulse_stream", name)
+        monitor = Monitor(directory=directory, session_id=name,
+                          script_path=os.path.join(self.tmp, f"{name}.py"),
+                          interval=0.0, tensor_interval=0.0)
+        monitor.observe_locals({"loss": loss, "step": step})
+        monitor.snapshot_state({"finished": finished})
+        if finished:
+            monitor.close()
+        else:
+            monitor.writer.close()
+        if pid is not None:                      # pretend it belongs to another process
+            stream._atomic_write_json(os.path.join(directory, "session.json"),
+                                      {"session_id": name, "pid": pid,
+                                       "script": os.path.join(self.tmp, f"{name}.py"),
+                                       "started": time.time()})
+        return directory
+
+    def test_finds_a_run_from_anywhere_via_the_registry(self):
+        self._session("alpha")
+        os.chdir(self.tmp)                        # not the run's directory
+        found = console.discover()
+        self.assertEqual([s["session_id"] for s in found], ["alpha"])
+        self.assertEqual(found[0]["step"], 10)
+        self.assertAlmostEqual(found[0]["loss"], 0.5)
+
+    def test_finds_a_run_by_scanning_when_the_registry_is_empty(self):
+        self._session("beta")
+        stream.unregister_session("beta")
+        os.chdir(os.path.join(self.tmp, "runs"))
+        found = console.discover()
+        self.assertEqual([s["session_id"] for s in found], ["beta"])
+
+    def test_a_finished_run_is_not_live(self):
+        self._session("gamma", finished=True)
+        os.chdir(self.tmp)
+        self.assertEqual(console.discover()[0]["status"], "finished")
+
+    def test_a_run_whose_process_is_gone_is_not_live(self):
+        self._session("delta", pid=999999)        # a pid that cannot exist
+        os.chdir(self.tmp)
+        self.assertEqual(console.discover()[0]["status"], "ended")
+
+    def test_scan_skips_heavy_directories(self):
+        junk = os.path.join(self.tmp, "proj", "node_modules", ".pulse_stream", "nope")
+        os.makedirs(junk, exist_ok=True)
+        open(os.path.join(junk, "events.jsonl"), "w").close()
+        found = console._scan_for_spools(os.path.join(self.tmp, "proj"))
+        self.assertEqual(found, [])
+
+    def test_duplicates_from_both_sources_collapse(self):
+        self._session("epsilon")
+        os.chdir(os.path.join(self.tmp, "runs"))
+        self.assertEqual(len([s for s in console.discover() if s["session_id"] == "epsilon"]), 1)
+
+
+class PickTest(unittest.TestCase):
+    SESSIONS = [
+        {"session_id": "20260918-1000-aaa", "status": "live", "script": "/x/train.py"},
+        {"session_id": "20260918-0900-bbb", "status": "finished", "script": "/x/tune.py"},
+    ]
+
+    def test_a_single_live_run_is_chosen_without_asking(self):
+        self.assertEqual(console.pick_session(self.SESSIONS, None)["session_id"],
+                         "20260918-1000-aaa")
+
+    def test_two_live_runs_need_an_answer(self):
+        both = [dict(s, status="live") for s in self.SESSIONS]
+        self.assertIsNone(console.pick_session(both, None))
+
+    def test_pick_by_index_id_and_script_name(self):
+        self.assertEqual(console.pick_session(self.SESSIONS, "2")["session_id"],
+                         "20260918-0900-bbb")
+        self.assertEqual(console.pick_session(self.SESSIONS, "20260918-0900-bbb")["script"],
+                         "/x/tune.py")
+        self.assertEqual(console.pick_session(self.SESSIONS, "tune.py")["script"], "/x/tune.py")
+
+    def test_an_unknown_name_picks_nothing(self):
+        self.assertIsNone(console.pick_session(self.SESSIONS, "nosuchthing"))
+
+    def test_the_only_run_is_chosen_even_when_it_has_ended(self):
+        one = [dict(self.SESSIONS[1])]
+        self.assertEqual(console.pick_session(one, None)["session_id"], "20260918-0900-bbb")
+
+
+class SparklineTest(unittest.TestCase):
+    def test_flat_series(self):
+        self.assertEqual(console.sparkline([1.0] * 5), "▁" * 5)
+
+    def test_rising_series_ends_higher_than_it_starts(self):
+        line = console.sparkline([float(i) for i in range(20)])
+        self.assertLess(console.SPARK.index(line[0]), console.SPARK.index(line[-1]))
+
+    def test_long_series_is_compressed_to_the_width(self):
+        self.assertEqual(len(console.sparkline([float(i) for i in range(5000)], width=40)), 40)
+
+    def test_empty_series(self):
+        self.assertEqual(console.sparkline([]), "")
+
+
+class EndToEndTest(unittest.TestCase):
+    """A real streaming run, discovered and driven from a different directory."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pulse-console-e2e-")
+        self.proj = os.path.join(self.tmp, "proj")
+        os.makedirs(self.proj)
+        self.home = os.path.join(self.tmp, "home")
+
+    def _start_run(self, steps=4000, factor=0.999):
+        script = os.path.join(self.proj, "train.py")
+        with open(script, "w", encoding="utf-8") as handle:
+            handle.write(TRAIN.format(steps=steps, factor=factor))
+        process = subprocess.Popen([sys.executable, "-m", "pulse", "run", "--stream", "train.py"],
+                                   cwd=self.proj, env=child_env(self.home),
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(process.kill)
+        for _ in range(100):                     # wait for the stream to appear
+            if glob.glob(os.path.join(self.proj, ".pulse_stream", "*", "state.json")):
+                return process, script
+            time.sleep(0.2)
+        self.fail("the run never produced a stream: " + (process.stdout.read() or "")[-800:])
+
+    def test_console_attaches_from_another_directory_and_reports(self):
+        self._start_run()
+        time.sleep(2)
+        result = subprocess.run([sys.executable, "-m", "pulse"],
+                                cwd=self.tmp,                 # NOT the project directory
+                                env=child_env(self.home), input="/status\n/vars\n/cd\n/quit\n",
+                                capture_output=True, text=True, timeout=180)
+        out = result.stdout
+        self.assertIn("train.py", out)
+        self.assertIn("Attached to", out)
+        self.assertIn("loss", out)
+        self.assertIn(self.proj, out, "the console did not anchor to the script's directory")
+
+    def test_run_command_records_the_users_script_not_the_temp_copy(self):
+        _, script = self._start_run()
+        time.sleep(1.5)
+        os.chdir(self.tmp)
+        os.environ["PULSE_HOME"] = os.path.join(self.home, ".pulse")
+        self.addCleanup(os.environ.pop, "PULSE_HOME", None)
+        sessions = console.discover()
+        self.assertTrue(sessions, "no session discovered")
+        self.assertEqual(sessions[0]["script"], script)
+        self.assertNotIn("instrumented", sessions[0]["script"])
+
+    def test_a_live_run_reports_its_progress_without_being_closed(self):
+        self._start_run()
+        time.sleep(3)
+        os.chdir(self.tmp)
+        os.environ["PULSE_HOME"] = os.path.join(self.home, ".pulse")
+        self.addCleanup(os.environ.pop, "PULSE_HOME", None)
+        session = console.discover()[0]
+        self.assertEqual(session["status"], "live")
+        self.assertGreater(session["step"] or 0, 0, "a live run reported no steps")
+
+    def test_sessions_command_lists_the_run(self):
+        self._start_run()
+        time.sleep(2)
+        result = subprocess.run([sys.executable, "-m", "pulse", "sessions"],
+                                cwd=self.tmp, env=child_env(self.home),
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("train.py", result.stdout)
+        self.assertIn("live", result.stdout)
+
+    def test_with_no_runs_it_says_how_to_start_one(self):
+        empty_home = os.path.join(self.tmp, "empty-home")
+        result = subprocess.run([sys.executable, "-m", "pulse"],
+                                cwd=self.tmp, env=child_env(empty_home),
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("pulse run train.py", result.stdout)
+        self.assertIn('auto_track(mode="stream")', result.stdout)
+
+
+class OldWaysStillWorkTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pulse-oldways-")
+        self.home = os.path.join(self.tmp, "home")
+
+    def test_pulse_run_without_stream_still_uses_the_original_mode(self):
+        from pulse.cli import PulseASTInjector
+        import ast
+        injected = ast.unparse(PulseASTInjector()._make_auto_track_call())
+        self.assertEqual(injected, "auto_track(mode='cli')")
+        streaming = ast.unparse(PulseASTInjector(mode="stream")._make_auto_track_call())
+        self.assertEqual(streaming, "auto_track(mode='stream')")
+
+    def test_auto_track_stream_mode_is_still_reachable_directly(self):
+        script = os.path.join(self.tmp, "direct.py")
+        with open(script, "w", encoding="utf-8") as handle:
+            handle.write(textwrap.dedent("""\
+                from pulse import auto_track
+                auto_track(mode="stream")
+                loss = 1.0
+                for step in range(20):
+                    loss *= 0.9
+                print("done")
+            """))
+        result = subprocess.run([sys.executable, script], cwd=self.tmp,
+                                env=child_env(self.home), capture_output=True,
+                                text=True, timeout=180)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("done", result.stdout)
+        self.assertTrue(glob.glob(os.path.join(self.tmp, ".pulse_stream", "*")))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -152,6 +152,8 @@ class Monitor:
         self._last_sample = 0.0
         self._last_tensor_sample = 0.0
         self._last_control_poll = 0.0
+        self._last_snapshot = 0.0
+        self.snapshot_interval = 5.0
         self._last_values: Dict[str, float] = {}
         self._known_tensors: Dict[str, Dict[str, Any]] = {}
         self._requested: set = set()        # names the brain asked to see in full
@@ -174,6 +176,13 @@ class Monitor:
             "session_id": self.session_id,
             "script": os.path.abspath(script_path) if script_path else None,
             "pid": os.getpid(),
+        })
+        # Tell the machine this run exists, so `pulse` typed anywhere can find it.
+        stream.register_session(self.session_id, self.directory, {
+            "script": os.path.abspath(script_path) if script_path else None,
+            "pid": os.getpid(),
+            "started": self._started,
+            "cwd": os.getcwd(),
         })
 
     # ------------------------------------------------------------------ hot path
@@ -240,6 +249,13 @@ class Monitor:
         if now - self._last_control_poll >= 1.0:
             self._last_control_poll = now
             self._handle_control()
+
+        if now - self._last_snapshot >= self.snapshot_interval:
+            # Keep state.json current while the run is going, not only at the end. It is
+            # what a watcher reads to say where a live run has got to without replaying
+            # the whole stream, and a run that never snapshots looks like it has no steps.
+            self._last_snapshot = now
+            self.snapshot_state()
 
         self._samples += 1
         self._observe_seconds += time.perf_counter() - started
