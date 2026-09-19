@@ -385,64 +385,219 @@ def main():
 
         except SyntaxError as exc:
             # ========================================================
-            # PATH 2: SYNTAX ERROR FALLBACK
+            # PATH 2: SYNTAX ERROR REPAIR
             # ========================================================
             #
-            # DO NOT terminate Pulse here.
+            # IMPORTANT:
             #
-            # ast.parse() cannot process broken Python, so we bypass
-            # AST instrumentation entirely.
+            # Python parses the ENTIRE file before executing line 1.
+            # Therefore putting auto_track() before broken Python does
+            # NOT work.
             #
-            # Instead, create a temporary training script with:
+            # Instead:
             #
-            #     from pulse import auto_track
-            #     auto_track(mode="cli")
+            #   broken source
+            #       ->
+            #   temporary repair copy
+            #       ->
+            #   existing PulseCLI repair machinery
+            #       ->
+            #   valid source
+            #       ->
+            #   AST instrumentation
+            #       ->
+            #   training process
             #
-            # at the very top.
-            #
-            # The original source follows untouched.
-            #
+            # The original training script is NEVER modified.
+            # ========================================================
+
             print(
                 f"[Pulse] Syntax error detected in "
                 f"{os.path.basename(script_path)} "
                 f"at line {exc.lineno}."
             )
 
-            print(
-                "[Pulse] AST instrumentation unavailable. "
-                "Using direct instrumentation fallback."
+            # --------------------------------------------------------
+            # Create a temporary working copy.
+            # --------------------------------------------------------
+
+            fd, repair_path = tempfile.mkstemp(
+                prefix=".pulse_repair_",
+                suffix=".py",
+                dir=script_dir,
+                text=True,
             )
 
-            temp_path = _write_raw_instrumented_script(
-                source_code,
-                script_path,
-            )
+            try:
+                with os.fdopen(
+                    fd,
+                    "w",
+                    encoding="utf-8",
+                    newline="",
+                ) as f:
+                    f.write(source_code)
 
-            print(
-                f"[Pulse] Automatically instrumenting "
-                f"{script_path}"
-            )
+                # ----------------------------------------------------
+                # Use Pulse's EXISTING repair engine.
+                #
+                # Import locally so valid-script behavior and startup
+                # remain unchanged.
+                # ----------------------------------------------------
 
-            print(
-                f"[Pulse] Starting "
-                f"{os.path.basename(script_path)}..."
-            )
+                from pulse.pulse_cli import PulseCLI
 
-            result = _run_training_script(
-                temp_path,
-                script_dir,
-                sys.argv[3:],
-            )
+                pulse = PulseCLI()
 
-            if result.returncode != 0:
-                print(
-                    f"[Pulse] Training script exited "
-                    f"with code {result.returncode}"
+                # _apply_code_fix() writes to self.script_path.
+                # Therefore point it at the temporary copy.
+                pulse.set_code_text(
+                    source_code,
+                    script_path=repair_path,
                 )
 
-            sys.exit(
-                result.returncode
-            )
+                error_text = (
+                    f"SyntaxError: {exc.msg} "
+                    f"(line {exc.lineno}"
+                )
+
+                if exc.offset is not None:
+                    error_text += (
+                        f", column {exc.offset}"
+                    )
+
+                error_text += ")"
+
+                question = (
+                    "The training script cannot start because Python "
+                    "reports this syntax error:\n\n"
+                    f"{error_text}\n\n"
+                    "Diagnose and fix ONLY this syntax error.\n\n"
+                    "IMPORTANT:\n"
+                    "- Do NOT rewrite the entire file.\n"
+                    "- Do NOT return the entire script.\n"
+                    "- Do NOT change unrelated code.\n"
+                    "- Make the smallest possible surgical edit.\n"
+                    "- Return the normal Pulse old/new code-fix format."
+                )
+
+                print(
+                    "[Pulse] Sending the syntax error through "
+                    "the existing repair pipeline..."
+                )
+
+                result = pulse.ask_agent(
+                    question,
+                    include_code=True,
+                )
+
+                if not getattr(
+                    pulse,
+                    "_fix_applied_this_turn",
+                    False,
+                ):
+                    raise RuntimeError(
+                        "Pulse's existing repair pipeline did not "
+                        "apply a syntax-error fix.\n\n"
+                        f"Agent response:\n{result}"
+                    )
+
+                # ----------------------------------------------------
+                # Read the ACTUAL repaired temporary file.
+                # ----------------------------------------------------
+
+                with open(
+                    repair_path,
+                    "r",
+                    encoding="utf-8",
+                ) as f:
+                    repaired_source = f.read()
+
+                # ----------------------------------------------------
+                # Hard validation: the agent's output must really
+                # produce syntactically-valid Python.
+                # ----------------------------------------------------
+
+                compile(
+                    repaired_source,
+                    filename=repair_path,
+                    mode="exec",
+                )
+
+                print(
+                    "[Pulse] Syntax error repaired successfully."
+                )
+
+                # ----------------------------------------------------
+                # Parse the repaired source.
+                # ----------------------------------------------------
+
+                repaired_tree = ast.parse(
+                    repaired_source,
+                    filename=repair_path,
+                )
+
+                # ----------------------------------------------------
+                # Now use the SAME deterministic AST instrumentation
+                # used for normal valid Python.
+                # ----------------------------------------------------
+
+                transformer = PulseASTInjector()
+
+                modified_tree = transformer.visit(
+                    repaired_tree
+                )
+
+                ast.fix_missing_locations(
+                    modified_tree
+                )
+
+                print(
+                    f"[Pulse] Automatically instrumenting "
+                    f"{script_path}"
+                )
+
+                instrumented_path = _write_instrumented_script(
+                    modified_tree,
+                    repair_path,
+                )
+
+                try:
+                    print(
+                        f"[Pulse] Starting "
+                        f"{os.path.basename(script_path)}..."
+                    )
+
+                    result = _run_training_script(
+                        instrumented_path,
+                        script_dir,
+                        sys.argv[3:],
+                    )
+
+                finally:
+                    try:
+                        os.unlink(
+                            instrumented_path
+                        )
+                    except OSError:
+                        pass
+
+                if result.returncode != 0:
+                    print(
+                        f"[Pulse] Training script exited "
+                        f"with code {result.returncode}"
+                    )
+
+                sys.exit(
+                    result.returncode
+                )
+
+            finally:
+                try:
+                    os.unlink(
+                        repair_path
+                    )
+                except OSError:
+                    pass
 
         # ============================================================
         # VALID PYTHON: CHECK WHETHER PULSE IS ALREADY IMPORTED
