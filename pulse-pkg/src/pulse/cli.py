@@ -820,9 +820,19 @@ def main():
         sys.exit(1)
 
     global _TRACK_MODE
-    if "--stream" in argv:
+    # Only before the script path: everything after it belongs to the training script,
+    # and scanning the whole list silently ate a user's own --stream flag and changed
+    # how their run was instrumented.
+    head = []
+    for index, argument in enumerate(argv[1:], start=1):
+        if not argument.startswith("-"):
+            head = argv[1:index]
+            break
+    else:
+        head = argv[1:]
+    if "--stream" in head:
         _TRACK_MODE = "stream"
-        argv = [a for a in argv if a != "--stream"]
+        argv = [a for i, a in enumerate(argv) if not (a == "--stream" and i <= len(head))]
         sys.argv = [sys.argv[0]] + argv
     if len(argv) < 2:
         print(USAGE)

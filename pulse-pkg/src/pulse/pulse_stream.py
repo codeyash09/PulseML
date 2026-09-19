@@ -80,8 +80,16 @@ def registry_dir() -> str:
     drops a pointer here, and the console can list every run on the machine without
     being told where to look.
     """
-    base = os.environ.get("PULSE_HOME", "").strip() or os.path.join(
-        os.path.expanduser("~"), ".pulse")
+    base = os.environ.get("PULSE_HOME", "").strip()
+    if not base:
+        home = os.path.expanduser("~")
+        if home == "~" or not os.path.isabs(home):
+            # No HOME and no passwd entry: the usual shape of a container run started
+            # with --user 1234:1234. expanduser hands back the literal "~", and joining
+            # it produced a RELATIVE path, so Pulse created a directory actually named
+            # "~" inside the training job's working directory -- often a mounted volume.
+            home = tempfile.gettempdir()
+        base = os.path.join(home, ".pulse")
     return os.path.join(base, "sessions")
 
 
@@ -380,6 +388,7 @@ class StreamReader:
         self._last_seq = 0
         self.gaps = 0               # frames the writer told us it dropped
         self.rotations = 0
+        self._lock = threading.Lock()
 
     def session(self) -> Dict[str, Any]:
         return self._read_json(self.session_path)
@@ -397,7 +406,17 @@ class StreamReader:
             return {}
 
     def poll(self) -> List[Dict[str, Any]]:
-        """Every complete frame written since the last poll."""
+        """Every complete frame written since the last poll.
+
+        Serialised: the console reads on a background thread while the main thread can
+        ask for the same reader, and two threads sharing one offset each read the whole
+        file and then each advance it, so every frame lands in the history twice and the
+        doubled offset then looks like a rotation.
+        """
+        with self._lock:
+            return self._poll()
+
+    def _poll(self) -> List[Dict[str, Any]]:
         try:
             size = os.path.getsize(self.events_path)
         except OSError:

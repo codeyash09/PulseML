@@ -28,6 +28,7 @@ Three rules keep it that way:
 """
 from __future__ import annotations
 
+import _thread
 import atexit
 import math
 import os
@@ -41,6 +42,10 @@ from . import pulse_stream as stream
 
 # Values that are worth a device sync to read, in elements.
 _SMALL_ELEMENT_LIMIT = 4
+
+# Bounds on the sampling interval the brain may ask for.
+MIN_INTERVAL = 0.01
+MAX_INTERVAL = 60.0
 
 # Names that are never interesting, whatever they hold.
 _BORING_NAMES = frozenset({
@@ -154,6 +159,7 @@ class Monitor:
         self._last_control_poll = 0.0
         self._last_snapshot = 0.0
         self.snapshot_interval = 5.0
+        self._sticky: Dict[str, Any] = {}
         self._last_values: Dict[str, float] = {}
         self._known_tensors: Dict[str, Dict[str, Any]] = {}
         self._requested: set = set()        # names the brain asked to see in full
@@ -194,6 +200,14 @@ class Monitor:
         it skips, which is the overwhelming majority of them.
         """
         now = time.monotonic()
+
+        # Before the interval gate, always: a long interval must never make the monitor
+        # unreachable. This used to sit after the early return, so `/interval 3600`
+        # locked the brain out for an hour with no way to take it back.
+        if now - self._last_control_poll >= 1.0:
+            self._last_control_poll = now
+            self._handle_control()
+
         if now - self._last_sample < self.interval:
             return
         self._last_sample = now
@@ -246,14 +260,10 @@ class Monitor:
         if self._pending_probe:
             self._answer_probes(local_vars)
 
-        if now - self._last_control_poll >= 1.0:
-            self._last_control_poll = now
-            self._handle_control()
-
+        # After sampling, so the snapshot describes this sample rather than the state
+        # before it: taken first, the very first snapshot said step 0 with no values,
+        # and a live run read as "no steps" until the next one was due.
         if now - self._last_snapshot >= self.snapshot_interval:
-            # Keep state.json current while the run is going, not only at the end. It is
-            # what a watcher reads to say where a live run has got to without replaying
-            # the whole stream, and a run that never snapshots looks like it has no steps.
             self._last_snapshot = now
             self.snapshot_state()
 
@@ -330,9 +340,14 @@ class Monitor:
                     self._requested.discard(str(name))
             elif action == stream.CONTROL_SET_INTERVAL:
                 try:
-                    self.interval = max(0.0, float(message.get("interval", self.interval)))
+                    wanted = float(message.get("interval", self.interval))
                 except (TypeError, ValueError):
-                    pass
+                    continue
+                if not math.isfinite(wanted):
+                    continue
+                # Bounded on both sides. Unbounded, one `/interval 1e9` (or inf) put the
+                # monitor beyond reach of the next control message for the rest of the run.
+                self.interval = min(MAX_INTERVAL, max(MIN_INTERVAL, wanted))
             elif action == stream.CONTROL_PAUSE:
                 self._paused = True
                 self.event("paused", reason=message.get("reason") or "")
@@ -344,6 +359,17 @@ class Monitor:
             elif action == stream.CONTROL_STOP:
                 self._stop_requested = True
                 self.event("stop_requested", reason=message.get("reason") or "")
+                self.snapshot_state({"stop_requested": True})
+                # Actually stop it. This used to set a flag that only the sampler thread
+                # read, and reading it made the sampler exit -- so "stop" left training
+                # running at full speed and destroyed Pulse's ability to watch it, while
+                # telling the user it had worked. interrupt_main raises KeyboardInterrupt
+                # in the training thread, which is what Ctrl-C does: the loop unwinds,
+                # finally blocks run, and the excepthook still records the ending.
+                try:
+                    _thread.interrupt_main()
+                except Exception as exc:
+                    self.event("stop_failed", error=f"{type(exc).__name__}: {exc}")
 
     @property
     def stop_requested(self) -> bool:
@@ -356,7 +382,14 @@ class Monitor:
     # ------------------------------------------------------------------ bookkeeping
 
     def snapshot_state(self, extra: Optional[Dict[str, Any]] = None) -> None:
-        """Replace state.json so a brain attaching late starts from something real."""
+        """Replace state.json so a brain attaching late starts from something real.
+
+        Flags like `crashed` stick: the crash hook records one and then closes the
+        monitor, and close() writes another snapshot. Rebuilding the dict from scratch
+        each time meant `finished` landed on top of `crashed` two lines later, and every
+        run that died of a CUDA OOM was listed as having finished normally.
+        """
+        self._sticky.update(extra or {})
         self.writer.write_state({
             "session_id": self.session_id,
             "script": os.path.abspath(self.script_path) if self.script_path else None,
@@ -365,7 +398,7 @@ class Monitor:
             "scalars": dict(self._last_values),
             "tensors": dict(self._known_tensors),
             "cost": self.cost(),
-            **(extra or {}),
+            **self._sticky,
         })
 
     def cost(self) -> Dict[str, Any]:
@@ -382,6 +415,9 @@ class Monitor:
         self.snapshot_state({"finished": True})
         self.event("finished", cost=self.cost())
         self.writer.close()
+        # The spool stays for later reading; the machine-wide pointer does not, or every
+        # run ever started is opened and parsed by every `pulse` from then on.
+        stream.unregister_session(self.session_id)
 
 
 # ---------------------------------------------------------------------------------------
@@ -439,8 +475,6 @@ def _sample_loop(monitor: "Monitor", thread_id: int, depth: int, interval: float
                 monitor.event("sampler_error", error=f"{type(exc).__name__}: {exc}")
             except Exception:
                 pass
-        if monitor.stop_requested:
-            return
 
 
 def attach(

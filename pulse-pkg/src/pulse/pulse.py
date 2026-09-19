@@ -6798,6 +6798,8 @@ def _start_stream_monitor(caller_frame, throttle_interval):
     # a name nobody recognises in a directory that gets deleted. It tells us the real
     # one through the environment; fall back to the frame for a direct auto_track().
     script_path = os.environ.get("PULSE_SCRIPT_PATH", "").strip() or None
+    if script_path and not os.path.isfile(script_path):
+        script_path = None      # a leftover export from another run should not relabel this one
     if not script_path:
         try:
             script_path = os.path.abspath(caller_frame.f_code.co_filename)

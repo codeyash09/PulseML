@@ -29,6 +29,7 @@ still works, and `python -m pulse.brain <dir>` still works for a non-interactive
 """
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import sys
@@ -40,6 +41,8 @@ from . import pulse_detect as detect
 from . import pulse_stream as stream
 
 LIVE_WINDOW_SECONDS = 30.0        # no new frames for this long and a run is not "live"
+MIN_SAMPLE_INTERVAL = 0.01
+MAX_SAMPLE_INTERVAL = 60.0
 
 
 # ---------------------------------------------------------------------------------------
@@ -90,6 +93,8 @@ def ago(timestamp: Optional[float]) -> str:
 def compact(value: Optional[float]) -> str:
     if value is None:
         return "-"
+    if isinstance(value, float) and not math.isfinite(value):
+        return "NaN" if value != value else ("inf" if value > 0 else "-inf")
     magnitude = abs(value)
     if magnitude and (magnitude < 1e-3 or magnitude >= 1e6):
         return f"{value:.3e}"
@@ -297,7 +302,7 @@ HELP = """\
   /attach <n|id>     watch a different run
   /cd                print the directory this run's file lives in
   /interval <sec>    ask the monitor to sample faster or slower
-  /stop              ask the training process to stop
+  /stop              stop the training run (like Ctrl-C in its terminal)
   /quiet, /loud      stop or resume printing findings as they happen
   /help, /quit
 
@@ -308,7 +313,14 @@ SPARK = "▁▂▃▄▅▆▇█"
 
 
 def sparkline(values: List[float], width: int = 48) -> str:
-    numbers = [float(v) for v in values if isinstance(v, (int, float))]
+    """A curve as one line of block characters. Non-finite readings are dropped.
+
+    A loss going NaN is the failure this whole tool exists to catch, and it used to
+    take the console down with it: inf makes the range inf, (v-low)/inf is nan, and
+    int(nan) raises, so /status and /curve died at the worst possible moment.
+    """
+    numbers = [float(v) for v in values
+               if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)]
     if not numbers:
         return ""
     if len(numbers) > width:
@@ -335,7 +347,8 @@ class Console:
         self.agent = agent
         self.quiet = False
         self.running = True
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()          # serialises writes to the terminal
+        self._brain_lock = threading.RLock()   # the pump writes what the views read
         self._thread: Optional[threading.Thread] = None
         self.brain.on_finding = self._announce
 
@@ -358,25 +371,65 @@ class Console:
     def _pump(self) -> None:
         while self.running:
             try:
-                self.brain.poll_once()
+                with self._brain_lock:
+                    result = self.brain.poll_once()
             except Exception as exc:
                 self._print(dim(f"  (monitor read failed: {type(exc).__name__}: {exc})"))
+            else:
+                self._report_audit(result.get("audit"))
             time.sleep(0.5)
+
+    def _report_audit(self, record: Optional[Dict[str, Any]]) -> None:
+        """Show a scheduled audit. It is paid for; it should not vanish.
+
+        poll_once runs the audit when one is due -- a real model call with the whole run
+        in the prompt -- and the pump used to throw the answer away, so with --model set
+        the console spent a call every fifteen minutes and showed nothing.
+        """
+        if not record or record.get("status") in (None, "skipped", "busy"):
+            return
+        if record.get("status") == "error":
+            self._print(red(f"\n  audit failed: {record.get('error')}"))
+            return
+        text = (record.get("text") or "").strip()
+        if text:
+            self._print("\n" + bold("  audit") + "\n  " + text.replace("\n", "\n  "))
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Copies of everything a view reads, taken while the pump cannot be writing.
+
+        The pump adds history keys and raises findings on its own thread; the views
+        iterated those same dicts, so a new variable appearing -- a val_loss at the
+        first eval -- while someone typed /status raised RuntimeError: dictionary
+        changed size during iteration, out of the command loop and out of the program.
+        """
+        with self._brain_lock:
+            return {
+                "step": self.brain.step,
+                "histories": {k: list(v) for k, v in self.brain.histories.items()},
+                "tensors": dict(self.brain.tensors),
+                "findings": list(self.brain.engine.current()),
+                "finished": self.brain.finished,
+                "gaps": self.brain.reader.gaps,
+            }
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._pump, name="pulse-console-brain", daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, join: bool = False) -> None:
         self.running = False
+        if join and self._thread is not None:
+            self._thread.join(timeout=2.0)
 
     # -------------------------------------------------------------- views
 
     def status_line(self) -> str:
+        state = self.snapshot()
         brain = self.brain
-        findings = brain.engine.current()
-        bits = [f"step {brain.step:,}" if brain.step else "no steps yet"]
-        for name, history in brain.histories.items():
+        findings = state["findings"]
+        bits = [f"step {state['step']:,}" if state["step"] else "no steps yet"]
+        for name, history in state["histories"].items():
             if detect.looks_like_loss(name) and history:
                 bits.append(f"{name} {compact(history[-1])}")
                 break
@@ -387,7 +440,7 @@ class Console:
             bits.append(green("healthy"))
         if brain.agent is not None:
             bits.append(f"next audit in {int(brain.schedule.seconds_remaining() / 60)} min")
-        if brain.finished:
+        if state["finished"]:
             bits.append(dim("run finished"))
         return " · ".join(bits)
 
@@ -400,13 +453,13 @@ class Console:
         return self.session.get("cwd") or self.session["directory"]
 
     def show_status(self) -> None:
-        brain = self.brain
+        state = self.snapshot()
         print(f"\n  {bold(os.path.basename(self.session.get('script') or '?'))}   "
               f"{dim(self.workdir)}")
         print(f"  {self.status_line()}")
-        if brain.reader.gaps:
-            print(dim(f"  {brain.reader.gaps} sample(s) dropped under load"))
-        tracked = {k: v for k, v in brain.histories.items() if len(v) > 1}
+        if state["gaps"]:
+            print(dim(f"  {state['gaps']} sample(s) dropped under load"))
+        tracked = {k: v for k, v in state["histories"].items() if len(v) > 1}
         if tracked:
             print()
             for name, history in list(tracked.items())[:8]:
@@ -414,7 +467,7 @@ class Console:
         print()
 
     def show_findings(self) -> None:
-        findings = self.brain.engine.current()
+        findings = self.snapshot()["findings"]
         if not findings:
             print("\n  " + green("Nothing wrong that the checks can see.") + "\n")
             return
@@ -428,25 +481,29 @@ class Console:
         print()
 
     def show_curve(self, name: str) -> None:
-        history = self.brain.histories.get(name)
+        histories = self.snapshot()["histories"]
+        history = histories.get(name)
         if not history:
-            matches = [k for k in self.brain.histories if name.lower() in k.lower()]
+            matches = [k for k in histories if name.lower() in k.lower()]
             if len(matches) == 1:
-                name, history = matches[0], self.brain.histories[matches[0]]
+                name, history = matches[0], histories[matches[0]]
             else:
                 print(f"\n  No value called {name!r}. Try /vars.\n")
                 return
-        print(f"\n  {bold(name)}  {len(history)} readings")
+        finite = [v for v in history if math.isfinite(v)]
+        print(f"\n  {bold(name)}  {len(history)} readings"
+              + (dim(f"  ({len(history) - len(finite)} not finite)") if len(finite) != len(history) else ""))
         print(f"  first {compact(history[0])}   last {compact(history[-1])}   "
-              f"min {compact(min(history))}   max {compact(max(history))}")
+              f"min {compact(min(finite) if finite else None)}   "
+              f"max {compact(max(finite) if finite else None)}")
         print(f"  {sparkline(history, min(shutil.get_terminal_size((80, 24)).columns - 6, 70))}\n")
 
     def show_vars(self) -> None:
-        brain = self.brain
+        state = self.snapshot()
         print()
-        for name, history in sorted(brain.histories.items()):
+        for name, history in sorted(state["histories"].items()):
             print(f"  {name:<22} {len(history):>6} readings   last {compact(history[-1])}")
-        for name, meta in sorted(brain.tensors.items()):
+        for name, meta in sorted(state["tensors"].items()):
             shape = "x".join(str(d) for d in (meta.get("shape") or []))
             print(dim(f"  {name:<22} tensor {shape} {meta.get('dtype', '')} "
                       f"on {meta.get('device', 'cpu')}"))
@@ -472,7 +529,8 @@ class Console:
         if self.agent is None:
             print("\n  No model configured. Start with --model, or set PULSE_MODEL.\n")
             return
-        pack = self.brain.evidence(include_code=True)
+        with self._brain_lock:
+            pack = self.brain.evidence(include_code=True)
         prompt = (
             "You are Pulse, watching a training run for someone who is sitting at a "
             "terminal looking at it with you. Answer their question from the evidence "
@@ -492,7 +550,8 @@ class Console:
             print("\n  No model configured, so there is nothing to audit with.\n")
             return
         print(dim("\n  auditing the whole run...\n"))
-        record = self.brain.audit()
+        with self._brain_lock:
+            record = self.brain.audit()
         if record.get("status") == "busy":
             print(dim("  an audit is already running; its answer will print here\n"))
             return
@@ -506,6 +565,15 @@ class Console:
     def send_control(self, action: str, **fields: Any) -> None:
         self.brain.reader.send_control(action, **fields)
         print(dim(f"\n  asked the run to {action}\n"))
+
+
+def confirm(question: str) -> bool:
+    """Ask before doing something to someone's training run."""
+    try:
+        return input(f"  {question} [y/N] ").strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
 
 
 def render_session_list(sessions: List[Dict[str, Any]], attached: Optional[str] = None) -> None:
@@ -554,8 +622,8 @@ def run_console(session: Dict[str, Any], sessions: List[Dict[str, Any]],
         pass
 
     console = Console(session, agent=agent, sensitivity=sensitivity)
-    console.start()
     console.brain.poll_once()        # so the first status line has something in it
+    console.start()                  # only now: two threads on one reader read it twice
 
     script = session.get("script") or "?"
     directory = console.workdir
@@ -610,14 +678,29 @@ def run_console(session: Dict[str, Any], sessions: List[Dict[str, Any]],
                 render_session_list(sessions, attached=session["session_id"])
                 print()
                 continue
-            console.stop()
-            return run_console(chosen, sessions, agent=agent, sensitivity=sensitivity)
+            console.stop(join=True)      # its pump must not print into the next session
+            session = chosen
+            console = Console(session, agent=agent, sensitivity=sensitivity)
+            console.brain.poll_once()
+            console.start()
+            directory = console.workdir
+            print(f"\nAttached to {bold(os.path.basename(session.get('script') or '?'))}  "
+                  f"{dim(directory)}")
+            print(f"{console.status_line()}\n")
         elif command == "interval":
             try:
-                console.send_control(stream.CONTROL_SET_INTERVAL, interval=float(argument))
+                seconds = float(argument)
             except (TypeError, ValueError):
                 print("\n  /interval takes a number of seconds, e.g. /interval 0.5\n")
+                continue
+            if not math.isfinite(seconds) or not (MIN_SAMPLE_INTERVAL <= seconds <= MAX_SAMPLE_INTERVAL):
+                print(f"\n  /interval takes {MIN_SAMPLE_INTERVAL:g} to {MAX_SAMPLE_INTERVAL:g} "
+                      f"seconds. Longer than that and the run would stop answering.\n")
+                continue
+            console.send_control(stream.CONTROL_SET_INTERVAL, interval=seconds)
         elif command == "stop":
+            if not confirm("Stop the training run?"):
+                continue
             console.send_control(stream.CONTROL_STOP, reason="asked from the Pulse console")
         elif command == "quiet":
             console.quiet = True
@@ -639,16 +722,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     command = argv[0] if argv and not argv[0].startswith("-") else ""
     if command in ("watch", "attach", "console", "sessions"):
         argv = argv[1:]
-    wanted = next((a for a in argv if not a.startswith("-")), None)
-
-    model = ""
-    for flag in ("--model", "-m"):
-        if flag in argv:
-            index = argv.index(flag)
-            if index + 1 < len(argv):
-                model = argv[index + 1]
-                if wanted == model:
-                    wanted = None
+    # Walk the arguments once, so the value of --model is never mistaken for the run
+    # being asked for: `pulse watch --model gpt-5 2` has to attach to run 2.
+    model, wanted, skip = "", None, False
+    for index, argument in enumerate(argv):
+        if skip:
+            skip = False
+            continue
+        if argument in ("--model", "-m"):
+            model = argv[index + 1] if index + 1 < len(argv) else ""
+            skip = True
+        elif argument.startswith("--model="):
+            model = argument.split("=", 1)[1]
+        elif not argument.startswith("-") and wanted is None:
+            wanted = argument
     model = model or os.environ.get("PULSE_MODEL", "")
 
     sessions = discover()

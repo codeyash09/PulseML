@@ -28,6 +28,22 @@ TRAIN = textwrap.dedent("""\
 """)
 
 
+def _kill_group(process):
+    """Kill the launcher and anything it started."""
+    import signal
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except (OSError, AttributeError):
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=5)
+    except Exception:
+        pass
+
+
 def child_env(home):
     os.makedirs(home, exist_ok=True)
     return dict(os.environ,
@@ -217,10 +233,14 @@ class EndToEndTest(unittest.TestCase):
         script = os.path.join(self.proj, "train.py")
         with open(script, "w", encoding="utf-8") as handle:
             handle.write(TRAIN.format(steps=steps, factor=factor))
+        # Its own process group: `pulse run` spawns the instrumented copy as a CHILD, so
+        # killing only the parent leaves a training process running on the machine after
+        # the test has finished. Several were still going after an earlier run.
         process = subprocess.Popen([sys.executable, "-m", "pulse", "run", "--stream", "train.py"],
                                    cwd=self.proj, env=child_env(self.home),
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        self.addCleanup(process.kill)
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                   start_new_session=True)
+        self.addCleanup(_kill_group, process)
         for _ in range(100):                     # wait for the stream to appear
             if glob.glob(os.path.join(self.proj, ".pulse_stream", "*", "state.json")):
                 return process, script
@@ -279,6 +299,53 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("pulse run train.py", result.stdout)
         self.assertIn('auto_track(mode="stream")', result.stdout)
+
+
+class ArgumentScopingTest(unittest.TestCase):
+    """Pulse's own flags stop at the script path; after it, they are the script's."""
+
+    def _parse(self, argv):
+        import unittest.mock as mock
+        from pulse import cli
+        cli._TRACK_MODE = "cli"
+        with mock.patch.object(cli.sys, "argv", ["pulse"] + argv), \
+             mock.patch.object(cli, "_run_pulse_run", create=True):
+            head = []
+            inner = argv
+            for index, argument in enumerate(inner[1:], start=1):
+                if not argument.startswith("-"):
+                    head = inner[1:index]
+                    break
+            else:
+                head = inner[1:]
+            return head
+
+    def test_stream_before_the_script_is_pulses(self):
+        self.assertIn("--stream", self._parse(["run", "--stream", "train.py"]))
+
+    def test_stream_after_the_script_is_the_scripts(self):
+        self.assertNotIn("--stream", self._parse(["run", "train.py", "--stream"]))
+
+    def test_console_model_value_is_not_mistaken_for_a_run(self):
+        import unittest.mock as mock
+        seen = {}
+
+        def fake_run_console(session, sessions, agent=None, sensitivity=0.3):
+            seen["session"] = session
+            return 0
+
+        sessions = [
+            {"session_id": "aaa", "status": "live", "script": "/x/one.py", "started": 2,
+             "directory": "/d1"},
+            {"session_id": "bbb", "status": "live", "script": "/x/two.py", "started": 1,
+             "directory": "/d2"},
+        ]
+        with mock.patch.object(console, "discover", return_value=sessions), \
+             mock.patch.object(console, "run_console", fake_run_console), \
+             mock.patch.object(console, "build_litellm_agent", create=True, return_value=None):
+            console.main(["watch", "--model", "some/model", "2"])
+        self.assertEqual(seen["session"]["session_id"], "bbb",
+                         "the model id was taken as the run to attach to")
 
 
 class OldWaysStillWorkTest(unittest.TestCase):
