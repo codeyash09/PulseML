@@ -100,11 +100,50 @@ def compact(value: Optional[float]) -> str:
 # Finding the runs
 # ---------------------------------------------------------------------------------------
 
+_STILL_ACTIVE = 259                     # Windows: GetExitCodeProcess for a running process
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
 def _pid_alive(pid: Optional[int]) -> bool:
+    """Is that process still there? Asks; never touches it.
+
+    `os.kill(pid, 0)` is the usual POSIX way to ask, and on Windows it is not a
+    question at all: any signal other than CTRL_C_EVENT or CTRL_BREAK_EVENT goes to
+    TerminateProcess, so the "probe" kills the process. Listing your runs must not
+    stop them, so Windows gets a real query instead.
+    """
     if not pid:
         return False
     try:
-        os.kill(int(pid), 0)        # signal 0: existence check, changes nothing
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        # Not a process id. On POSIX, os.kill(-1, ...) addresses every process the
+        # caller may signal and os.kill(0, ...) the whole process group, so a corrupt
+        # or negative entry must be rejected before it reaches a syscall, not after.
+        return False
+
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return False
+                return code.value == _STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False            # no answer is not a reason to touch the process
+
+    try:
+        os.kill(pid, 0)             # POSIX signal 0: existence check, changes nothing
         return True
     except (OSError, ValueError, TypeError):
         return False

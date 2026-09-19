@@ -114,6 +114,25 @@ class DiscoveryTest(unittest.TestCase):
         self.assertEqual(len([s for s in console.discover() if s["session_id"] == "epsilon"]), 1)
 
 
+class LivenessProbeTest(unittest.TestCase):
+    def test_windows_never_reaches_os_kill(self):
+        # os.kill(pid, 0) on Windows is TerminateProcess: listing runs would kill them.
+        import unittest.mock as mock
+        with mock.patch.object(os, "name", "nt"), \
+             mock.patch.object(os, "kill", side_effect=AssertionError("os.kill on Windows")):
+            self.assertFalse(console._pid_alive(999999))   # no ctypes here: answers False
+
+    def test_posix_probe_says_yes_for_this_process(self):
+        if os.name == "nt":
+            self.skipTest("POSIX branch")
+        self.assertTrue(console._pid_alive(os.getpid()))
+        self.assertFalse(console._pid_alive(999999))
+
+    def test_nonsense_pids_are_not_alive(self):
+        for value in (None, 0, "", "abc", -1):
+            self.assertFalse(console._pid_alive(value), value)
+
+
 class PickTest(unittest.TestCase):
     SESSIONS = [
         {"session_id": "20260918-1000-aaa", "status": "live", "script": "/x/train.py"},
