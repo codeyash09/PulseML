@@ -3,23 +3,27 @@
 `pulse run train.py` is the only place this can be done. Pulse normally attaches from
 inside the script, and a syntax error in the script itself happens before any of it
 runs: Python compiles the whole file first, so the process dies at compile time and
-`import pulse` never executes. cli.py handles that by repairing a copy, instrumenting
-it and running it.
+`import pulse` never executes.
 
-Three things had to be true for that to work, and each of them is a way it silently
-did not: the agent has to be reachable without a terminal, a rate limit must not be
-mistaken for a failed repair, and applying the fix must not hand control to Pulse's
-restart machinery -- which re-ran the temporary copy and skipped everything after it,
-leaving the user's own file broken with the fix stranded in a temp file.
+cli.py handles that by handing the error to the same machinery that handles a crash
+during training -- PulseCLI's excepthook, which asks the agent, writes the fix to the
+file and restarts the run. Four things have to be true for that to be right, and each
+of them is a way it can silently not be:
 
-No agent is called here.
+  * A file that does not compile must never be run anyway.
+  * The fix has to reach the user's own file, not a copy of it.
+  * The restart has to come back under `pulse run`, or the restarted run is untracked.
+  * A run Pulse itself restarted must not start a second repair -- the parent owns the
+    retry loop, and two of them fight over the same file.
+
+No agent is called here: the CLI the repair drives is faked, and the fake writes the
+fix the way a real one would.
 """
 import os
 import sys
 import tempfile
 import textwrap
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -27,121 +31,202 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), "src"))
 
 from pulse import cli  # noqa: E402
 
-BROKEN = "def train():\n    total = 0\n    for i in range(3):\n        total += 1 / (i + 1\n    return total\n"
+BROKEN = ("def train():\n"
+          "    total = 0\n"
+          "    for i in range(3):\n"
+          "        total += 1 / (i + 1\n"
+          "    return total\n")
 FIXED = BROKEN.replace("(i + 1", "(i + 1)")
 
 
-class FakePulseCLI:
-    """Enough of PulseCLI to watch how the repair path drives it."""
-
-    instances = []
+class FakeRepairCLI:
+    """Enough of PulseCLI to watch how cli.py drives the repair."""
 
     def __init__(self):
-        self.agent_provider = "test"
-        self.agent_key = "key"
-        self.non_interactive = False
-        self._suppress_auto_restart = False
-        self._fix_applied_this_turn = False
-        self._last_call_failed_transiently = False
+        self.source = None
         self.script_path = None
-        self.asked = []
-        self.transient_for = 0
-        FakePulseCLI.instances.append(self)
+        self.banner = False
+        self.setup_calls = 0
+        self.setup_raises = None
 
     def set_code_text(self, source, script_path=None):
-        self.script_path = script_path
+        self.source, self.script_path = source, script_path
 
-    def _load_config(self):
-        pass
+    def print_banner(self):
+        self.banner = True
 
-    def _select_agent_provider_and_key(self, initial=False):
-        return True
-
-    def ask_agent(self, question, include_code=False):
-        self.asked.append(question)
-        if self.transient_for >= len(self.asked):
-            self._last_call_failed_transiently = True
-            return "rate limited"
-        self._last_call_failed_transiently = False
-        self._fix_applied_this_turn = True
-        with open(self.script_path, "w", encoding="utf-8") as handle:
-            handle.write(FIXED)
-        return "fixed"
+    def interactive_setup(self):
+        self.setup_calls += 1
+        if self.setup_raises is not None:
+            raise self.setup_raises
 
 
-def run_repair(work, script_name="train.py", **cli_attrs):
-    """Drive cli.main() over a broken script with the agent faked out."""
+def drive_repair(work, *, outcome="fix", setup_raises=None, script_name="train.py"):
+    """Run `pulse run <broken script>` with the agent side faked out.
+
+    `outcome` is what the excepthook does: "fix" writes the repair and raises SystemExit
+    the way a successful restart does, "nothing" returns without fixing anything.
+    Returns (path, status, fake_cli, executed).
+    """
     path = os.path.join(work, script_name)
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(BROKEN)
-    FakePulseCLI.instances = []
 
-    def make():
-        fake = FakePulseCLI()
-        for name, value in cli_attrs.items():
-            setattr(fake, name, value)
-        return fake
+    fake = FakeRepairCLI()
+    fake.setup_raises = setup_raises
 
-    fake_module = mock.MagicMock()
-    fake_module.PulseCLI = make
-    with mock.patch.dict(sys.modules, {"pulse.pulse_cli": fake_module}), \
-            mock.patch.object(cli, "_run_training_script",
-                              return_value=SimpleNamespace(returncode=0)) as ran, \
-            mock.patch.object(cli, "time") as clock, \
-            mock.patch.object(sys, "argv", ["pulse", "run", path]):
-        clock.sleep.return_value = None
-        try:
-            cli.main()
-            error = None
-        except SystemExit as exit_request:
-            # A clean exit is how a finished run leaves; only a non-zero one is news.
-            error = None if exit_request.code in (0, None) else exit_request
-        except BaseException as exc:      # cli.main reports and re-raises
-            error = exc
-    return path, ran, error
+    def install_hook(driven_cli):
+        def hook(exc_type, exc_value, tb):
+            if outcome == "fix":
+                # What PulseCLI does with a fix: write it to the file it was given, then
+                # restart. The restart replaces this process, so it leaves as SystemExit.
+                with open(driven_cli.script_path, "w", encoding="utf-8") as handle:
+                    handle.write(FIXED)
+                raise SystemExit(0)
+
+        sys.excepthook = hook
+
+    original_hook = sys.excepthook
+    executed = []
+    try:
+        with mock.patch.object(cli, "_make_syntax_repair_cli", return_value=fake), \
+             mock.patch("pulse.pulse._install_cli_excepthook", install_hook), \
+             mock.patch.object(cli, "_execute",
+                               side_effect=lambda *a, **k: executed.append(a) or 0):
+            status = cli.run_script(path, [])
+    finally:
+        sys.excepthook = original_hook
+    return path, status, fake, executed
 
 
-class SyntaxRepair(unittest.TestCase):
-    def test_the_users_own_file_is_repaired_not_just_a_temp_copy(self):
+class RepairRouting(unittest.TestCase):
+    """Which way a script that does not compile goes."""
+
+    def test_a_file_that_does_not_compile_is_never_run(self):
         with tempfile.TemporaryDirectory() as work:
-            path, ran, error = run_repair(work)
-            with open(path) as handle:
+            _, _, _, executed = drive_repair(work, outcome="nothing")
+            self.assertEqual(executed, [], "a file with a syntax error was executed anyway")
+
+    def test_a_script_that_compiles_is_run_without_any_repair(self):
+        with tempfile.TemporaryDirectory() as work:
+            path = os.path.join(work, "fine.py")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("loss = 1.0\nfor step in range(3):\n    loss *= 0.9\n")
+            with mock.patch.object(cli, "_repair_and_restart",
+                                   side_effect=AssertionError("repaired a valid file")), \
+                 mock.patch.object(cli, "_execute", return_value=0):
+                self.assertEqual(cli.run_script(path, []), 0)
+
+    def test_a_run_pulse_restarted_does_not_start_a_second_repair(self):
+        # The parent process owns the retry loop and feeds the output back to the agent.
+        # A child that repairs as well means two of them writing the same file.
+        from pulse import pulse_cli
+        with tempfile.TemporaryDirectory() as work:
+            path = os.path.join(work, "train.py")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(BROKEN)
+            with mock.patch.dict(os.environ, {pulse_cli._RESTART_CHILD_ENV: "1"}), \
+                 mock.patch.object(cli, "_repair_and_restart",
+                                   side_effect=AssertionError("the child repaired too")):
+                self.assertEqual(cli.run_script(path, []), 1)
+
+
+class RepairReachesTheUsersFile(unittest.TestCase):
+    """The failure this was written for: the fix landed somewhere the user never sees."""
+
+    def test_the_repair_is_given_the_users_own_path(self):
+        with tempfile.TemporaryDirectory() as work:
+            path, _, fake, _ = drive_repair(work)
+            self.assertEqual(fake.script_path, path,
+                             "the repair was pointed at a copy, so the fix cannot reach "
+                             "the file the user runs")
+            self.assertEqual(fake.source, BROKEN)
+
+    def test_the_users_own_file_ends_up_repaired(self):
+        with tempfile.TemporaryDirectory() as work:
+            path, status, _, _ = drive_repair(work)
+            with open(path, encoding="utf-8") as handle:
                 repaired = handle.read()
-            compile(repaired, path, "exec")          # raises if it is still broken
+            compile(repaired, path, "exec")        # raises if it is still broken
             self.assertIn("(i + 1)", repaired)
-            self.assertTrue(ran.called, "the repaired script was never run")
+            self.assertEqual(status, 0, "a repaired-and-restarted run did not report success")
 
-    def test_the_restart_machinery_does_not_take_over_the_repair(self):
-        """Applying a fix normally restarts the run. There is no run yet."""
-        with tempfile.TemporaryDirectory() as work:
-            run_repair(work)
-            self.assertTrue(FakePulseCLI.instances, "no PulseCLI was built for the repair")
-            self.assertTrue(FakePulseCLI.instances[0]._suppress_auto_restart,
-                            "the repair let Pulse restart into a half-repaired temp file")
+    def test_the_restart_comes_back_under_pulse_run_on_the_real_script(self):
+        # A plain `python train.py` restart would apply the fix and lose the tracking:
+        # under `pulse run` the auto_track call is added in memory, not written to disk.
+        argv = cli._restart_argv("/usr/bin/python3", "/home/me/proj/train.py", ["--epochs", "2"])
+        self.assertEqual(argv[0], "/usr/bin/python3")
+        self.assertIn("/home/me/proj/train.py", argv)
+        self.assertEqual(argv[-3:], ["/home/me/proj/train.py", "--epochs", "2"])
+        self.assertIn("'run'", " ".join(argv), "the restart does not go back through pulse run")
 
-    def test_a_rate_limit_is_retried_rather_than_called_a_failed_repair(self):
-        with tempfile.TemporaryDirectory() as work:
-            path, ran, error = run_repair(work, transient_for=2)
-            self.assertIsNone(error, "a transient provider error aborted the repair")
-            self.assertGreaterEqual(len(FakePulseCLI.instances[0].asked), 3)
-            with open(path) as handle:
-                compile(handle.read(), path, "exec")
 
-    def test_a_provider_that_stays_down_is_reported_as_such(self):
+class RepairGivesUpHonestly(unittest.TestCase):
+    def test_no_fix_means_the_script_is_not_started(self):
         with tempfile.TemporaryDirectory() as work:
-            _, ran, error = run_repair(work, transient_for=99)
-            self.assertIsNotNone(error)
-            self.assertIn("could not reach", str(error).lower())
-            self.assertFalse(ran.called, "a file that does not compile was run anyway")
+            path, status, _, executed = drive_repair(work, outcome="nothing")
+            self.assertEqual(status, 1)
+            self.assertEqual(executed, [])
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), BROKEN, "the file was changed anyway")
 
-    def test_no_terminal_still_reaches_the_agent(self):
-        """A CI job has no tty; it must use PULSE_PROVIDER rather than stop at a prompt."""
+    def test_cancelling_setup_is_not_a_crash(self):
+        for interruption in (EOFError(), KeyboardInterrupt()):
+            with self.subTest(interruption=type(interruption).__name__):
+                with tempfile.TemporaryDirectory() as work:
+                    _, status, fake, executed = drive_repair(work, setup_raises=interruption)
+                    self.assertEqual(status, 1)
+                    self.assertEqual(executed, [])
+                    self.assertEqual(fake.setup_calls, 1)
+
+    def test_a_missing_script_is_reported_before_any_of_this(self):
         with tempfile.TemporaryDirectory() as work:
-            with mock.patch.object(cli, "_bootstrap_pulse_config") as bootstrap:
-                bootstrap.return_value = False       # would raise "setup was not completed"
-                run_repair(work, agent_provider=None, agent_key=None)
-            self.assertTrue(FakePulseCLI.instances[0].non_interactive,
-                            "the repair did not switch to non-interactive without a tty")
+            self.assertEqual(cli.run_script(os.path.join(work, "nope.py"), []), 1)
+
+
+class RepairCLIDropsWhatNeedsARun(unittest.TestCase):
+    """Two of PulseCLI's safeguards are wrong for a file that has never run."""
+
+    def _repair_cli(self):
+        class Base:
+            def __init__(self):
+                self.stashed = False
+
+            def _verify_fix_empirically(self, fix, diagnosis):
+                raise AssertionError("ran the training loop to check a file that never ran")
+
+            def _git_autostash(self):
+                raise AssertionError("stashed the very file being repaired")
+
+        module = mock.MagicMock()
+        module.PulseCLI = Base
+        with mock.patch.dict(sys.modules, {"pulse.pulse_cli": module}):
+            return cli._make_syntax_repair_cli()
+
+    def test_the_empirical_check_is_skipped(self):
+        # It runs a probe of the training loop and reverts the fix if the loss does not
+        # fall. There is no loss yet, and the syntax error is already known to be gone.
+        repair_cli = self._repair_cli()
+        fix, reverted, note = repair_cli._verify_fix_empirically("the fix", "the diagnosis")
+        self.assertEqual(fix, "the fix")
+        self.assertIsNone(reverted)
+        self.assertIn("compiles", note)
+
+    def test_the_git_autostash_is_skipped(self):
+        # It stashes the working tree before writing a fix -- including the file being
+        # repaired, which is uncommitted precisely because someone is editing it.
+        self.assertIsNone(self._repair_cli()._git_autostash())
+
+    def test_both_overrides_still_override_something(self):
+        """The tests above fake the base class, so they cannot see this going stale.
+
+        If PulseCLI renames either method, the subclass quietly stops overriding it and
+        the repair starts running the checks again -- passing tests the whole way.
+        """
+        from pulse.pulse_cli import PulseCLI
+        for name in ("_verify_fix_empirically", "_git_autostash"):
+            self.assertTrue(hasattr(PulseCLI, name),
+                            f"the repair overrides PulseCLI.{name}, which no longer exists")
 
 
 class EntryPoint(unittest.TestCase):
@@ -151,4 +236,4 @@ class EntryPoint(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)
