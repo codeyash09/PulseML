@@ -139,6 +139,42 @@ class QuietOutputTest(unittest.TestCase):
         result = run("import pulse\nprint('a', 'b', sep='-', end='!')\n")
         self.assertEqual(result.stdout, "a-b!")
 
+    def test_a_terminal_still_gets_the_line_cleared(self):
+        """The other side of it: on a tty the decoration has to still happen.
+
+        Without this, a change that made the check permanently False would pass every
+        other test here -- they all check the non-tty case.
+        """
+        import pty
+
+        code = ("import pulse, sys\n"
+                "from pulse.pulse_cli import safe_print\n"
+                "print('ON A TTY', sys.stdout.isatty())\n")
+        pid, fd = pty.fork()
+        if pid == 0:                                  # child: stdout IS a terminal
+            env = dict(os.environ,
+                       PYTHONPATH=os.pathsep.join(
+                           p for p in (SRC, site.getusersitepackages(),
+                                       os.environ.get("PYTHONPATH", "")) if p),
+                       PULSE_LOGGING="0", NO_COLOR="1")
+            os.execve(sys.executable, [sys.executable, "-c", code], env)
+        output = b""
+        try:
+            while True:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    break
+                output += chunk
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+            os.waitpid(pid, 0)
+        text = output.decode("utf-8", "replace")
+        self.assertIn("ON A TTY True", text, f"the pty did not look like a terminal: {text!r}")
+        self.assertIn("\033[K", text,
+                      f"on a real terminal the line is no longer cleared: {text!r}")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

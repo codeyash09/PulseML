@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import math
 import os
+import shlex
 import shutil
 import sys
 import threading
@@ -606,18 +607,48 @@ def report_unmonitored(processes: List[Dict[str, Any]], limit: int = 5) -> None:
         print(f"\n  Watch one:           pulse attach --pid {first}\n")
 
 
-def pulse_on_secure_path() -> bool:
-    """Is there a `pulse` in one of the directories sudo will actually search?
+# Where sudo looks. It replaces PATH with its own secure_path, so a `pulse` in
+# ~/.local/bin -- where pip puts it -- is invisible to it.
+SECURE_PATH = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin")
 
-    sudo replaces PATH with its own secure_path, so a `pulse` in ~/.local/bin -- where
-    pip puts it -- is invisible to it.
-    """
-    for directory in ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin",
-                      "/sbin", "/bin"):
+
+def secure_path_pulse() -> Optional[str]:
+    """The `pulse` sudo would find, if there is one."""
+    for directory in SECURE_PATH:
         candidate = os.path.join(directory, "pulse")
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return True
-    return False
+            return candidate
+    return None
+
+
+def pulse_on_secure_path() -> bool:
+    """Is there a `pulse` in one of the directories sudo will actually search?"""
+    return secure_path_pulse() is not None
+
+
+def world_writable_by_others(path: str) -> Optional[str]:
+    """Is `path` one that somebody other than its owner and root could replace?
+
+    The launcher makes root exec this file. That is fine when only its owner can write
+    it -- they are the person running sudo. It is not fine if the file, or a directory
+    on the way to it, is writable by others: then anyone who can write there chooses
+    what root runs. Returns the offending path, or None.
+    """
+    current = os.path.abspath(path)
+    seen = set()
+    while current and current not in seen:
+        seen.add(current)
+        try:
+            info = os.lstat(current)
+        except OSError:
+            return None
+        if info.st_mode & 0o002 and not (info.st_mode & 0o1000):
+            return current          # world-writable and not sticky
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return None
 
 
 LAUNCHER_PATH = "/usr/local/bin/pulse"
@@ -637,10 +668,26 @@ LAUNCHER_TEMPLATE = """#!/bin/sh
 # numpy. Carrying the real user's HOME across leaves both findable.
 PULSE={pulse}
 
+# Started empty deliberately: without this the test below reads whatever REAL_HOME the
+# caller happened to export, and this file is on every user's PATH, not just sudo's.
+REAL_HOME=
 if [ -n "$SUDO_USER" ]; then
-    REAL_HOME=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+    # getent on Linux; dscl on macOS, which has no getent. head: a host with both files
+    # and LDAP can answer twice.
+    if command -v getent >/dev/null 2>&1; then
+        REAL_HOME=$(getent passwd "$SUDO_USER" 2>/dev/null | head -n 1 | cut -d: -f6)
+    elif command -v dscl >/dev/null 2>&1; then
+        REAL_HOME=$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null \\
+                    | sed 's/^NFSHomeDirectory: //')
+    fi
+    if [ -z "$REAL_HOME" ]; then
+        echo "pulse: cannot find the home directory of '$SUDO_USER'." >&2
+        echo "pulse: without it Pulse runs with root's, and will not find your install." >&2
+        exit 1
+    fi
+else
+    REAL_HOME="$HOME"
 fi
-[ -n "$REAL_HOME" ] || REAL_HOME="$HOME"
 
 if [ ! -x "$PULSE" ]; then
     echo "pulse: $PULSE is gone (reinstalled elsewhere?)." >&2
@@ -653,8 +700,6 @@ exec env HOME="$REAL_HOME" "$PULSE" "$@"
 
 def launcher_text(pulse_path: str) -> str:
     """The launcher script, pointing at a particular pulse."""
-    import shlex
-
     return LAUNCHER_TEMPLATE.format(pulse=shlex.quote(pulse_path))
 
 
@@ -683,7 +728,6 @@ def install_sudo_launcher(target: str = LAUNCHER_PATH) -> int:
     the way round it has to be -- if `sudo pulse` worked there would be nothing to fix --
     and it means the launcher can record who the real user is.
     """
-    import shlex
     import subprocess
     import tempfile
 
@@ -702,10 +746,39 @@ def install_sudo_launcher(target: str = LAUNCHER_PATH) -> int:
         print("  Install Pulse properly first:   pip install --user pulseml\n")
         return 1
 
+    # The long form works and needs no launcher, so say it here: after the launcher is
+    # in place sudo_hint() shortens to `sudo pulse`, which would be circular advice in
+    # the refusal below.
+    long_form = " ".join(shlex.quote(part) for part in _sudo_env_command([]))
+
+    exposed = world_writable_by_others(user_pulse)
+    if exposed:
+        # The launcher would make root exec this. If anyone can write it, anyone
+        # chooses what root runs.
+        print(f"\n  Refusing to install: {exposed} is writable by anybody.")
+        print(f"  A launcher would make root run {user_pulse}, so whoever can write")
+        print("  there would decide what root runs. Fix the permissions first.\n")
+        return 1
+
+    existing_elsewhere = secure_path_pulse()
+    if existing_elsewhere and os.path.abspath(existing_elsewhere) != os.path.abspath(target):
+        # /usr/local/bin comes before /usr/bin on every PATH, so installing here would
+        # shadow a system-wide pulse for every user on the machine.
+        print(f"\n  There is already a pulse sudo can find: {existing_elsewhere}")
+        print("  `sudo pulse` should work as it is. Installing a launcher would shadow")
+        print("  that one for everybody on this machine, so this is leaving it alone.\n")
+        return 0
+
     launcher = launcher_text(user_pulse)
-    if os.path.exists(target):
-        with open(target, encoding="utf-8", errors="replace") as handle:
-            existing = handle.read()
+    if os.path.lexists(target):
+        try:
+            with open(target, encoding="utf-8", errors="replace") as handle:
+                existing = handle.read()
+        except OSError as exc:
+            # A directory, or root-owned and unreadable: either way not ours to replace.
+            print(f"\n  {target} is in the way and cannot be read ({exc.strerror}).")
+            print(f"  Use:   {long_form}\n")
+            return 1
         if existing == launcher:
             print(f"\n  Already installed at {target} -- `sudo pulse` works.\n")
             return 0
@@ -713,7 +786,7 @@ def install_sudo_launcher(target: str = LAUNCHER_PATH) -> int:
             print(f"\n  Updating the launcher at {target} to point at {user_pulse}.\n")
         else:
             print(f"\n  {target} exists and is not this launcher; leaving it alone.")
-            print(f"  Use:   {sudo_hint([])}\n")
+            print(f"  Use:   {long_form}\n")
             return 1
     else:
         print(f"\n  Writing a launcher to {target} so `sudo pulse` works.")
@@ -763,18 +836,34 @@ def sudo_relaunch_command(args: Optional[List[str]] = None) -> List[str]:
     # -- makes the short form correct, and anything longer is noise.
     if pulse_on_secure_path():
         return ["sudo", "pulse"] + args
+    return _sudo_env_command(args)
 
+
+def _sudo_env_command(args: List[str]) -> List[str]:
+    """The long form: works with no launcher, by carrying PATH and HOME across."""
     home = os.path.expanduser("~")
-    entry = sys.argv[0] or "pulse"
+    entry = (sys.argv[0] if sys.argv else "") or "pulse"
     return (["sudo", "env", f"PATH={os.environ.get('PATH', '')}", f"HOME={home}"]
             + ([sys.executable, "-m", "pulse"] if entry.endswith(".py") else [entry])
-            + args)
+            + list(args))
 
 
 def sudo_hint(args: Optional[List[str]] = None) -> str:
-    import shlex
-
     return " ".join(shlex.quote(part) for part in sudo_relaunch_command(args))
+
+
+def _can_ask() -> bool:
+    """Is there a person at both ends to ask a question of?
+
+    stdin alone is not enough. Under `redirect_stdout` -- which is how the tests drive
+    these paths -- the prompt is written into a buffer nobody sees while input() blocks
+    on a terminal that was never told anything was wanted. That hangs a test run with
+    no output at all, and answering it would exec sudo over the test runner.
+    """
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
 
 
 def offer_sudo(args: Optional[List[str]] = None) -> bool:
@@ -784,7 +873,7 @@ def offer_sudo(args: Optional[List[str]] = None) -> bool:
     if not pulse_on_secure_path():
         # The long form is what works today; the short one is one command away.
         print(dim("  (`pulse install-sudo` makes plain `sudo pulse ...` work instead)\n"))
-    if not sys.stdin.isatty():
+    if not _can_ask():
         return False
     if not confirm("Run that now?"):
         return False

@@ -360,10 +360,10 @@ def safe_print(*args, **kwargs):
         # replaces print for the WHOLE program, so when the output is a pipe or a file
         # this used to put "\r\033[K" in front of every line the user's own script
         # printed -- escape codes in their logs, their CSVs and their piped output.
-        stream = kwargs.get("file") or sys.stdout
+        stream = kwargs["file"] if kwargs.get("file") is not None else sys.stdout
         try:
             decorate = stream is sys.stdout and stream.isatty()
-        except (AttributeError, ValueError):
+        except (AttributeError, ValueError, OSError):
             decorate = False
         if decorate:
             stream.write("\r\033[K")

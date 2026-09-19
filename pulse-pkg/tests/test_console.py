@@ -801,9 +801,12 @@ class InstallSudoTest(unittest.TestCase):
                 shutil.copyfile(command[-2], command[-1])
             return SimpleNamespace(returncode=returncode)
 
+        empty = os.path.join(self.tmp, "no-system-pulse")
+        os.makedirs(empty, exist_ok=True)
         with mock.patch.object(os.path, "expanduser", return_value=self.home), \
              mock.patch.object(console.shutil, "which",
                                return_value=user_pulse if which is None else which), \
+             mock.patch.object(console, "SECURE_PATH", (empty,)), \
              mock.patch.object(sys, "argv", ["pulse", "install-sudo"]), \
              mock.patch("subprocess.run", fake_run):
             status = console.install_sudo_launcher(self.target)
@@ -832,8 +835,11 @@ class InstallSudoTest(unittest.TestCase):
 
     def test_it_refuses_to_point_the_launcher_at_itself(self):
         mock = self.mock
+        empty = os.path.join(self.tmp, "no-system-pulse")
+        os.makedirs(empty, exist_ok=True)
         with mock.patch.object(os.path, "expanduser", return_value=self.home), \
              mock.patch.object(console.shutil, "which", return_value=self.target), \
+             mock.patch.object(console, "SECURE_PATH", (empty,)), \
              mock.patch.object(sys, "argv", ["pulse"]), \
              mock.patch("subprocess.run",
                         side_effect=AssertionError("installed a launcher that execs itself")):
@@ -855,14 +861,27 @@ class InstallSudoTest(unittest.TestCase):
         result = subprocess.run(["sh", "-n", self.target], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def _run_launcher(self, home, *args, env=None):
+    def _run_launcher(self, home, *args, env=None, path=None):
         """Run the generated launcher for real, against a stand-in pulse."""
-        environment = dict(os.environ, HOME=home, **(env or {}))
+        environment = dict(os.environ, HOME=home)
         environment.pop("SUDO_USER", None)
-        if env and "SUDO_USER" in env:
-            environment["SUDO_USER"] = env["SUDO_USER"]
-        return subprocess.run(["sh", self.target, *args], capture_output=True,
+        environment.pop("REAL_HOME", None)
+        if path is not None:
+            environment["PATH"] = path
+        environment.update(env or {})
+        # /bin/sh by absolute path: a test that strips PATH to hide getent would
+        # otherwise fail to find the shell rather than exercising the launcher.
+        return subprocess.run(["/bin/sh", self.target, *args], capture_output=True,
                               text=True, env=environment, timeout=30)
+
+    def _stub_pulse(self, home):
+        """A stand-in `pulse` that reports the HOME and arguments it was given."""
+        os.makedirs(os.path.join(home, ".local", "bin"), exist_ok=True)
+        path = os.path.join(home, ".local", "bin", "pulse")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write('#!/bin/sh\necho "HOME=[$HOME] ARGS=[$*]"\n')
+        os.chmod(path, 0o755)
+        return path
 
     def test_the_launcher_passes_home_and_arguments_through(self):
         target_pulse = os.path.join(self.home, ".local", "bin", "pulse")
@@ -897,6 +916,47 @@ class InstallSudoTest(unittest.TestCase):
         self.assertIn("install-sudo", result.stderr,
                       "it failed without saying how to fix it")
 
+    # ---- the sudo path itself: the reason the launcher exists ----
+
+    def test_under_sudo_it_uses_the_invoking_users_home_not_roots(self):
+        # The whole point. SUDO_USER is set and HOME is root's, as sudo leaves them.
+        import pwd
+        me = pwd.getpwuid(os.getuid())
+        # Point the launcher at a stub, then ask it to resolve OUR home from SUDO_USER.
+        stub = self._stub_pulse(self.home)
+        self._install(which=stub)
+        result = self._run_launcher("/root", env={"SUDO_USER": me.pw_name})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"HOME=[{me.pw_dir}]", result.stdout,
+                      "the launcher did not resolve the real user's home from SUDO_USER")
+        self.assertNotIn("HOME=[/root]", result.stdout)
+
+    def test_an_inherited_REAL_HOME_is_ignored(self):
+        # /usr/local/bin/pulse is on every user's plain PATH, where SUDO_USER is unset.
+        # Reading whatever REAL_HOME the caller exported would let it choose the home.
+        self._stub_pulse(self.home)
+        self._install()
+        result = self._run_launcher(self.home, env={"REAL_HOME": "/somewhere-else"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"HOME=[{self.home}]", result.stdout)
+        self.assertNotIn("somewhere-else", result.stdout,
+                         "an exported REAL_HOME decided where Pulse looked")
+
+    def test_it_refuses_rather_than_silently_using_roots_home(self):
+        # No getent and no dscl -- a container, or macOS with a stripped PATH. Falling
+        # back to root's HOME is the exact failure the launcher exists to prevent, and
+        # it fails silently: Pulse then cannot find the user's install.
+        import pwd
+        self._stub_pulse(self.home)
+        self._install()
+        bare = os.path.join(self.tmp, "empty-bin")
+        os.makedirs(bare, exist_ok=True)
+        result = self._run_launcher("/root", path=bare,
+                                    env={"SUDO_USER": pwd.getpwuid(os.getuid()).pw_name})
+        self.assertNotEqual(result.returncode, 0,
+                            "it ran with root's HOME instead of saying it could not tell")
+        self.assertIn("home directory", result.stderr.lower())
+
     def test_running_it_twice_is_not_an_error(self):
         self._install()
         status, calls = self._install()
@@ -915,8 +975,11 @@ class InstallSudoTest(unittest.TestCase):
     def test_a_missing_user_install_is_reported_rather_than_linked_to(self):
         os.unlink(os.path.join(self.home, ".local", "bin", "pulse"))
         mock = self.mock
+        empty = os.path.join(self.tmp, "no-system-pulse")
+        os.makedirs(empty, exist_ok=True)
         with mock.patch.object(os.path, "expanduser", return_value=self.home), \
              mock.patch.object(console.shutil, "which", return_value=None), \
+             mock.patch.object(console, "SECURE_PATH", (empty,)), \
              mock.patch.object(sys, "argv", ["pulse"]):
             self.assertEqual(console.install_sudo_launcher(self.target), 1)
         self.assertFalse(os.path.exists(self.target),
@@ -946,6 +1009,99 @@ class InstallSudoTest(unittest.TestCase):
         with mock.patch.object(console, "install_sudo_launcher", return_value=0) as installer:
             self.assertEqual(cli.main(["install-sudo"]), 0)
         self.assertTrue(installer.called, "`pulse install-sudo` did not reach the installer")
+
+    def test_it_does_not_shadow_a_pulse_sudo_can_already_find(self):
+        # /usr/local/bin comes before /usr/bin on every PATH. Installing over a
+        # system-wide pulse would redirect it for everybody on the machine.
+        mock = self.mock
+        system_bin = os.path.join(self.tmp, "usr-bin")
+        os.makedirs(system_bin)
+        system_pulse = os.path.join(system_bin, "pulse")
+        open(system_pulse, "w").close()
+        os.chmod(system_pulse, 0o755)
+        with mock.patch.object(os.path, "expanduser", return_value=self.home), \
+             mock.patch.object(console, "SECURE_PATH", (system_bin,)), \
+             mock.patch.object(console.shutil, "which",
+                               return_value=os.path.join(self.home, ".local", "bin", "pulse")), \
+             mock.patch.object(sys, "argv", ["pulse"]), \
+             mock.patch("subprocess.run",
+                        side_effect=AssertionError("shadowed a system-wide pulse")):
+            self.assertEqual(console.install_sudo_launcher(self.target), 0)
+        self.assertFalse(os.path.exists(self.target))
+
+    def test_an_unreadable_target_is_reported_not_a_traceback(self):
+        mock = self.mock
+        os.makedirs(self.target)               # a directory where the file should go
+        empty = os.path.join(self.tmp, "no-system-pulse")
+        os.makedirs(empty, exist_ok=True)
+        with mock.patch.object(os.path, "expanduser", return_value=self.home), \
+             mock.patch.object(console.shutil, "which",
+                               return_value=os.path.join(self.home, ".local", "bin", "pulse")), \
+             mock.patch.object(console, "SECURE_PATH", (empty,)), \
+             mock.patch.object(sys, "argv", ["pulse"]), \
+             mock.patch("subprocess.run",
+                        side_effect=AssertionError("installed over a directory")):
+            self.assertEqual(console.install_sudo_launcher(self.target), 1)
+
+    def test_the_refusal_does_not_suggest_the_command_that_just_failed(self):
+        # `sudo pulse` is what the blocking file would run. Telling the user to use it
+        # is circular; the long form works without any launcher.
+        import io, contextlib
+        mock = self.mock
+        with open(self.target, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\n# something else\n")
+        os.chmod(self.target, 0o755)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self._install()
+        printed = buffer.getvalue()
+        self.assertIn("sudo env", printed,
+                      f"it did not offer the command that works:\n{printed}")
+
+    def test_it_refuses_when_anybody_could_rewrite_the_target_pulse(self):
+        # The launcher makes root exec that file. If anyone can write it, anyone
+        # decides what root runs.
+        mock = self.mock
+        exposed_dir = os.path.join(self.tmp, "exposed")
+        os.makedirs(exposed_dir)
+        exposed = os.path.join(exposed_dir, "pulse")
+        open(exposed, "w").close()
+        os.chmod(exposed, 0o777)
+        empty = os.path.join(self.tmp, "no-system-pulse")
+        os.makedirs(empty, exist_ok=True)
+        with mock.patch.object(os.path, "expanduser", return_value=self.home), \
+             mock.patch.object(console.shutil, "which", return_value=exposed), \
+             mock.patch.object(console, "SECURE_PATH", (empty,)), \
+             mock.patch.object(sys, "argv", ["pulse"]), \
+             mock.patch("subprocess.run",
+                        side_effect=AssertionError("installed a world-writable target")):
+            self.assertEqual(console.install_sudo_launcher(self.target), 1)
+
+
+class AskingBeforeSudoTest(unittest.TestCase):
+    """offer_sudo must not ask a question nobody can see."""
+
+    def test_it_does_not_prompt_when_stdout_is_redirected(self):
+        # Under redirect_stdout the prompt lands in a buffer while input() blocks on a
+        # terminal that was never told anything was wanted: a test run hangs with no
+        # output, and answering it would exec sudo over the test runner.
+        import io, contextlib, unittest.mock as mock
+        buffer = io.StringIO()
+        with mock.patch.object(sys.stdin, "isatty", return_value=True), \
+             mock.patch.object(console, "confirm",
+                               side_effect=AssertionError("prompted into a buffer")), \
+             mock.patch.object(os, "execvp",
+                               side_effect=AssertionError("replaced the test runner")), \
+             contextlib.redirect_stdout(buffer):
+            self.assertFalse(console.offer_sudo(["train.py"]))
+        self.assertIn("sudo", buffer.getvalue())
+
+    def test_it_does_not_prompt_without_a_terminal_on_stdin(self):
+        import io, contextlib, unittest.mock as mock
+        with mock.patch.object(console, "confirm",
+                               side_effect=AssertionError("prompted with no tty")), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(console.offer_sudo(["train.py"]))
 
 
 if __name__ == "__main__":

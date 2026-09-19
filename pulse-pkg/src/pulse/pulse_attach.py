@@ -185,6 +185,25 @@ def describe_readiness(pid: int) -> Dict[str, Any]:
     return report
 
 
+def spool_dir_for(script: Optional[str], session_id: str) -> str:
+    """Where an attached run's spool goes.
+
+    Beside the script normally, so it sits with the code it describes and the console
+    finds it without being told.
+
+    Not under sudo. There the script path came out of the target process's memory, and
+    we are root: a process that says its file is `/etc/cron.d/x` would have root create
+    directories and files there, and hand them to whoever asked. Anybody who can start a
+    Python process can say that. So when root-because-of-sudo, the spool goes under the
+    invoking user's own home -- a path the kernel told us, not one the target did.
+    """
+    home = stream.invoking_user_home()
+    if home is not None:
+        return os.path.join(home, ".pulse", "attached", session_id)
+    base = os.path.dirname(os.path.abspath(script)) if script else os.getcwd()
+    return os.path.join(base, ".pulse_stream", session_id)
+
+
 class AttachedMonitor:
     """Samples another process and writes an ordinary Pulse stream for it."""
 
@@ -203,8 +222,7 @@ class AttachedMonitor:
             script = script_of(threads) if threads else None
         self.script = script
         self.session_id = session_id or (time.strftime("%Y%m%d-%H%M%S") + f"-pid{self.pid}")
-        base = os.path.dirname(os.path.abspath(script)) if script else os.getcwd()
-        self.directory = directory or os.path.join(base, ".pulse_stream", self.session_id)
+        self.directory = directory or spool_dir_for(script, self.session_id)
         self.writer = stream.StreamWriter(self.directory)
         self.samples = 0
         self.errors = 0

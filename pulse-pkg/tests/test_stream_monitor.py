@@ -256,9 +256,6 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("per_sample_ms", cost)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
 
 class FlushTest(unittest.TestCase):
     """flush() is for the one moment somebody is waiting to read what was just written."""
@@ -312,12 +309,11 @@ class FlushTest(unittest.TestCase):
 
 
 class SudoOwnershipTest(unittest.TestCase):
-    """`sudo pulse` writes into the user's directory, so what it writes must be theirs.
+    """`sudo pulse` writes as root, so what it writes must end up the user's.
 
-    Watching a run Pulse did not start needs root. The spool goes beside the script --
-    in the user's own project -- and root-owned files there are ones they cannot delete
-    and a later `pulse` without sudo cannot read: their run goes invisible in a
-    directory they cannot clean up.
+    Watching a run Pulse did not start needs root. The spool it writes would otherwise
+    be root-owned files in the user's own directory: ones they cannot delete, and that
+    a later `pulse` without sudo cannot read -- their run goes invisible.
     """
 
     def setUp(self):
@@ -326,40 +322,81 @@ class SudoOwnershipTest(unittest.TestCase):
         self.chowned = []
 
     def _pretend_root(self, uid=4242, gid=4343):
-        """Run as if we were root under sudo, recording what would be handed back."""
+        """Run as if root under sudo, recording what would be handed back."""
         import unittest.mock as mock
+
+        def fake_chown(path, u, g, follow_symlinks=True):
+            self.chowned.append((path, u, g, follow_symlinks))
+
+        def fake_fchown(fd, u, g):
+            self.chowned.append((os.readlink("/proc/self/fd/%d" % fd)
+                                 if os.path.exists("/proc/self/fd/%d" % fd) else fd, u, g, False))
+
+        env = {"SUDO_UID": str(uid), "SUDO_GID": str(gid)}
         return (mock.patch.object(os, "geteuid", return_value=0, create=True),
-                mock.patch.dict(os.environ, {"SUDO_UID": str(uid), "SUDO_GID": str(gid)}),
-                mock.patch.object(os, "chown",
-                                  side_effect=lambda p, u, g: self.chowned.append((p, u, g))))
+                mock.patch.dict(os.environ, env),
+                mock.patch.object(os, "chown", fake_chown),
+                mock.patch.object(os, "fchown", fake_fchown))
+
+    def _as_root(self, stack):
+        for patch in self._pretend_root():
+            stack.enter_context(patch)
 
     def test_the_spool_is_handed_back_to_the_user(self):
         import contextlib
         directory = os.path.join(self.tmp, "proj", ".pulse_stream", "s1")
         with contextlib.ExitStack() as stack:
-            for patch in self._pretend_root():
-                stack.enter_context(patch)
+            self._as_root(stack)
             writer = stream.StreamWriter(directory)
             writer.write_state({"step": 1})
             writer.close()
 
-        owned = {path for path, _, _ in self.chowned}
+        owned = {str(path) for path, _, _, _ in self.chowned}
         self.assertIn(directory, owned, f"the spool directory stayed root's: {owned}")
-        self.assertIn(os.path.join(directory, "events.jsonl"), owned,
-                      f"events.jsonl stayed root's: {owned}")
-        self.assertTrue(any(p.endswith("state.json") or ".tmp-" in p for p in owned),
+        self.assertTrue(any("events.jsonl" in str(p) for p in owned),
+                        f"events.jsonl stayed root's: {owned}")
+        self.assertTrue(any("state.json" in str(p) or ".tmp-" in str(p) for p in owned),
                         f"the state file stayed root's: {owned}")
-        for _, uid, gid in self.chowned:
+        for _, uid, gid, _ in self.chowned:
             self.assertEqual((uid, gid), (4242, 4343))
+
+    def test_nothing_is_chowned_through_a_symlink(self):
+        """The whole point: as root, never follow a link somebody else chose.
+
+        On the attach path the spool directory is derived from the script path, and that
+        came out of the target process's memory. A process that claims its file lives in
+        /etc would otherwise have root chown /etc files to whoever asked.
+        """
+        import contextlib
+        directory = os.path.join(self.tmp, "proj", ".pulse_stream", "s1")
+        with contextlib.ExitStack() as stack:
+            self._as_root(stack)
+            stream.StreamWriter(directory).close()
+        for path, _, _, follow in self.chowned:
+            self.assertFalse(follow, f"{path} was chowned following symlinks")
+
+    def test_an_events_file_that_is_a_symlink_is_refused(self):
+        # O_NOFOLLOW: appending through it would let root write anywhere.
+        directory = os.path.join(self.tmp, "proj", ".pulse_stream", "s1")
+        os.makedirs(directory)
+        victim = os.path.join(self.tmp, "victim.txt")
+        with open(victim, "w", encoding="utf-8") as handle:
+            handle.write("untouched")
+        os.symlink(victim, os.path.join(directory, "events.jsonl"))
+
+        with self.assertRaises(OSError):
+            stream.StreamWriter(directory)
+        with open(victim, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "untouched",
+                             "root wrote through a symlink into another file")
 
     def test_every_directory_level_it_created_is_handed_back(self):
         import contextlib
         directory = os.path.join(self.tmp, "deep", "er", ".pulse_stream", "s1")
         with contextlib.ExitStack() as stack:
-            for patch in self._pretend_root():
-                stack.enter_context(patch)
+            self._as_root(stack)
             stream.StreamWriter(directory).close()
-        owned = {path for path, _, _ in self.chowned}
+        owned = {str(path) for path, _, _, _ in self.chowned}
         self.assertIn(os.path.join(self.tmp, "deep"), owned,
                       f"an intermediate directory stayed root's: {owned}")
 
@@ -369,10 +406,9 @@ class SudoOwnershipTest(unittest.TestCase):
         existing = os.path.join(self.tmp, "proj")
         os.makedirs(existing)
         with contextlib.ExitStack() as stack:
-            for patch in self._pretend_root():
-                stack.enter_context(patch)
+            self._as_root(stack)
             stream.StreamWriter(os.path.join(existing, ".pulse_stream", "s1")).close()
-        self.assertNotIn(existing, {path for path, _, _ in self.chowned})
+        self.assertNotIn(existing, {str(p) for p, _, _, _ in self.chowned})
 
     def test_nothing_is_chowned_when_not_running_under_sudo(self):
         import unittest.mock as mock
@@ -389,16 +425,68 @@ class SudoOwnershipTest(unittest.TestCase):
              mock.patch.object(os, "chown", side_effect=AssertionError("chown as real root")):
             stream.StreamWriter(os.path.join(self.tmp, "asroot", "s1")).close()
 
+    def test_a_sudo_uid_that_disagrees_with_sudo_user_is_not_believed(self):
+        # The environment of a root process is not evidence. If SUDO_USER says one
+        # person and SUDO_UID another, something has been tampered with.
+        import unittest.mock as mock
+        import pwd
+        me = pwd.getpwuid(os.getuid())
+        with mock.patch.object(os, "geteuid", return_value=0, create=True), \
+             mock.patch.dict(os.environ, {"SUDO_USER": me.pw_name,
+                                          "SUDO_UID": str(me.pw_uid + 1),
+                                          "SUDO_GID": "0"}):
+            self.assertIsNone(stream._invoking_user())
+
+    def test_sudo_uid_zero_is_not_a_user_to_hand_anything_to(self):
+        import unittest.mock as mock
+        with mock.patch.object(os, "geteuid", return_value=0, create=True), \
+             mock.patch.dict(os.environ, {"SUDO_UID": "0", "SUDO_GID": "0"}):
+            self.assertIsNone(stream._invoking_user())
+
     def test_a_chown_that_fails_does_not_break_the_run(self):
         import contextlib
+        import unittest.mock as mock
         with contextlib.ExitStack() as stack:
             for patch in self._pretend_root()[:2]:
                 stack.enter_context(patch)
-            import unittest.mock as mock
             stack.enter_context(mock.patch.object(os, "chown",
+                                                  side_effect=OSError("read-only mount")))
+            stack.enter_context(mock.patch.object(os, "fchown",
                                                   side_effect=OSError("read-only mount")))
             writer = stream.StreamWriter(os.path.join(self.tmp, "ro", "s1"))
             writer.emit(stream.KIND_SCALARS, {"step": 1, "values": {"loss": 1.0}})
             writer.close()
         frames = stream.StreamReader(os.path.join(self.tmp, "ro", "s1")).poll()
         self.assertTrue(any(f.get("kind") == stream.KIND_SCALARS for f in frames))
+
+
+class AttachedSpoolLocationTest(unittest.TestCase):
+    """Under sudo the spool must not go where the watched process says.
+
+    pulse_attach reads the script path out of the target process's memory. As root that
+    is a path an unprivileged process chose, so it decides nothing about the filesystem.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pulse-spool-where-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_normally_the_spool_sits_beside_the_script(self):
+        from pulse import pulse_attach as attach
+        import unittest.mock as mock
+        with mock.patch.object(stream, "invoking_user_home", return_value=None):
+            where = attach.spool_dir_for("/home/me/proj/train.py", "s1")
+        self.assertEqual(where, os.path.join("/home/me/proj", ".pulse_stream", "s1"))
+
+    def test_under_sudo_it_goes_to_the_users_home_instead(self):
+        from pulse import pulse_attach as attach
+        import unittest.mock as mock
+        home = os.path.join(self.tmp, "home")
+        os.makedirs(home)
+        with mock.patch.object(stream, "invoking_user_home", return_value=home):
+            where = attach.spool_dir_for("/etc/cron.d/anything", "s1")
+        self.assertTrue(where.startswith(home),
+                        f"root was pointed at a path the watched process chose: {where}")
+        self.assertNotIn("cron.d", where)
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

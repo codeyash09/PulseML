@@ -7,6 +7,7 @@ import glob
 import json
 import os
 import shutil
+import signal
 import site
 import subprocess
 import sys
@@ -62,10 +63,32 @@ def run_training(workdir, lr, steps=600, timeout=180):
                PULSE_LOGGING="0", LR=str(lr), STEPS=str(steps),
                HOME=os.path.join(workdir, "home"))
     os.makedirs(env["HOME"], exist_ok=True)
-    result = subprocess.run([sys.executable, script], cwd=workdir, env=env,
-                            capture_output=True, text=True, timeout=timeout)
+    result = _run_in_its_own_group([sys.executable, script], cwd=workdir, env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, timeout=timeout)
     sessions = glob.glob(os.path.join(workdir, ".pulse_stream", "*"))
     return result, (sorted(sessions)[-1] if sessions else None)
+
+
+def _run_in_its_own_group(argv, **kwargs):
+    """subprocess.run, but a timeout kills the whole group, not just the direct child.
+
+    Pulse spawns a brain of its own, so killing the launcher leaves a training process
+    running with its working directory already deleted. One was found still going,
+    reparented to init, after a previous run.
+    """
+    timeout = kwargs.pop("timeout", None)
+    process = subprocess.Popen(argv, start_new_session=True, **kwargs)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except (OSError, AttributeError):
+            process.kill()
+        stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(argv, timeout, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
 
 def read(directory, rounds=3):
@@ -136,8 +159,9 @@ class StreamModeTest(unittest.TestCase):
                        p for p in (SRC, site.getusersitepackages(), os.environ.get("PYTHONPATH", "")) if p),
                    PULSE_LOGGING="0", HOME=os.path.join(self.tmp, "home2"))
         os.makedirs(env["HOME"], exist_ok=True)
-        subprocess.run([sys.executable, script], cwd=self.tmp, env=env,
-                       capture_output=True, text=True, timeout=120)
+        _run_in_its_own_group([sys.executable, script], cwd=self.tmp, env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, timeout=120)
         directory = sorted(glob.glob(os.path.join(self.tmp, ".pulse_stream", "*")))[-1]
         brain = read(directory)
         crashes = [e for e in brain.events if e.get("event") == "crash"]

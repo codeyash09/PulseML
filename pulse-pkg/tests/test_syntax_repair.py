@@ -89,7 +89,12 @@ def drive_repair(work, *, outcome="fix", setup_raises=None, script_name="train.p
     original_hook = sys.excepthook
     executed = []
     try:
-        with mock.patch.object(cli, "_make_syntax_repair_cli", return_value=fake), \
+        # _set_process_view rewrites sys.argv and prepends the script's directory to
+        # sys.path, permanently. Left alone, each test leaves sys.argv[0] pointing at a
+        # file in a deleted temp directory -- which other code here reads.
+        with mock.patch.object(sys, "argv", list(sys.argv)), \
+             mock.patch.object(sys, "path", list(sys.path)), \
+             mock.patch.object(cli, "_make_syntax_repair_cli", return_value=fake), \
              mock.patch("pulse.pulse._install_cli_excepthook", install_hook), \
              mock.patch.object(cli, "_execute",
                                side_effect=lambda *a, **k: executed.append(a) or 0):
@@ -142,14 +147,41 @@ class RepairReachesTheUsersFile(unittest.TestCase):
                              "the file the user runs")
             self.assertEqual(fake.source, BROKEN)
 
-    def test_the_users_own_file_ends_up_repaired(self):
+    def test_a_successful_repair_reports_the_restarted_runs_status(self):
+        # Not "the file ends up fixed": the fix is written by this test's own fake hook,
+        # so asserting on the content would only check the test's own constant. What is
+        # worth pinning is that the SystemExit a restart leaves by becomes the exit
+        # status of `pulse run`, rather than being swallowed into a failure.
         with tempfile.TemporaryDirectory() as work:
-            path, status, _, _ = drive_repair(work)
-            with open(path, encoding="utf-8") as handle:
-                repaired = handle.read()
-            compile(repaired, path, "exec")        # raises if it is still broken
-            self.assertIn("(i + 1)", repaired)
-            self.assertEqual(status, 0, "a repaired-and-restarted run did not report success")
+            _, status, _, executed = drive_repair(work)
+            self.assertEqual(status, 0)
+            self.assertEqual(executed, [],
+                             "it ran the script itself as well as restarting it")
+
+    def test_the_restart_hook_is_installed_before_anything_can_use_it(self):
+        # Pulse asks this hook how to restart. Unset, a fix restarts with plain
+        # `python script.py` and the restarted run is untracked -- under `pulse run` the
+        # auto_track call is added in memory, never written to the file.
+        from pulse import pulse_cli
+        with tempfile.TemporaryDirectory() as work:
+            seen = {}
+
+            def capture(*a, **k):
+                seen["hook"] = pulse_cli._RESTART_ARGV_HOOK
+                raise SystemExit(0)
+
+            path = os.path.join(work, "train.py")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(BROKEN)
+            with mock.patch.object(sys, "argv", list(sys.argv)), \
+                 mock.patch.object(sys, "path", list(sys.path)), \
+                 mock.patch.object(cli, "_repair_and_restart", capture):
+                try:
+                    cli.run_script(path, [])
+                except SystemExit:
+                    pass
+        self.assertIs(seen.get("hook"), cli._restart_argv,
+                      "the restart hook was not wired up, so a fix would restart untracked")
 
     def test_the_restart_comes_back_under_pulse_run_on_the_real_script(self):
         # A plain `python train.py` restart would apply the fix and lose the tracking:

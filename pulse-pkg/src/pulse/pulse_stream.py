@@ -160,45 +160,105 @@ def session_dir_for(script_path: Optional[str], session_id: str) -> str:
 def _invoking_user() -> Optional[tuple]:
     """(uid, gid) of the person who ran sudo, when we are root because of it.
 
-    Watching a run Pulse did not start needs root, so `sudo pulse` writes the spool --
-    into the user's own project directory. Left as root's, those files are ones they
-    cannot delete and a later `pulse` without sudo cannot read: their own run goes
-    invisible, in a directory they cannot clean up.
+    Watching a run Pulse did not start needs root, so `sudo pulse` writes the spool as
+    root. Left as root's, those files are ones the user cannot delete and a later
+    `pulse` without sudo cannot read: their own run goes invisible, in a directory they
+    cannot clean up.
+
+    SUDO_UID is only believed if it agrees with SUDO_USER's entry in the password
+    database -- the environment of a root process is not evidence on its own.
     """
     if os.name != "posix" or not hasattr(os, "geteuid") or os.geteuid() != 0:
         return None
     try:
-        return int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"])
+        uid = int(os.environ["SUDO_UID"])
+        gid = int(os.environ["SUDO_GID"])
     except (KeyError, ValueError):
         return None
+    if uid == 0:
+        return None
+    name = os.environ.get("SUDO_USER", "")
+    if name:
+        try:
+            import pwd
+
+            if pwd.getpwnam(name).pw_uid != uid:
+                return None
+        except (ImportError, KeyError):
+            return None
+    return uid, gid
 
 
-def _hand_back(path: str) -> None:
-    """Give a file or directory we made as root to the user who asked for it."""
+def invoking_user_home() -> Optional[str]:
+    """The sudo user's home, from the password database rather than the environment."""
+    owner = _invoking_user()
+    if owner is None:
+        return None
+    try:
+        import pwd
+
+        home = pwd.getpwuid(owner[0]).pw_dir
+    except (ImportError, KeyError):
+        return None
+    return home if home and os.path.isdir(home) else None
+
+
+def _hand_back(path: str, fd: Optional[int] = None) -> None:
+    """Give a file or directory we made as root to the user who asked for it.
+
+    Never through a symlink. As root this runs against paths that, on the attach path,
+    came out of another process's memory: following one would let anybody who can start
+    a Python process hand themselves ownership of any file on the machine.
+    """
     owner = _invoking_user()
     if owner is None:
         return
     try:
-        os.chown(path, owner[0], owner[1])
-    except OSError:
+        if fd is not None:
+            os.fchown(fd, owner[0], owner[1])
+        else:
+            os.chown(path, owner[0], owner[1], follow_symlinks=False)
+    except (OSError, NotImplementedError):
         pass            # a different filesystem, or it vanished: not worth failing over
 
 
 def _makedirs(path: str) -> None:
-    """makedirs, handing back every level we actually created."""
+    """makedirs, handing back only the levels we actually created.
+
+    Level by level with mkdir rather than makedirs: mkdir does not follow a symlink for
+    the last component, and a level that already existed is somebody else's to own.
+    """
     if os.path.isdir(path):
         return
     missing = []
-    current = path
+    current = os.path.abspath(path)
     while current and not os.path.isdir(current):
         missing.append(current)
         parent = os.path.dirname(current)
         if parent == current:
             break
         current = parent
-    os.makedirs(path, exist_ok=True)
-    for created in missing:
-        _hand_back(created)
+    for directory in reversed(missing):
+        try:
+            os.mkdir(directory, 0o755)
+        except FileExistsError:
+            continue                    # someone else got there; not ours to hand over
+        except OSError:
+            os.makedirs(path, exist_ok=True)
+            return
+        _hand_back(directory)
+
+
+def _open_append(path: str):
+    """Open for appending without ever following a symlink at the final component."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o644)
+    try:
+        _hand_back(path, fd=fd)
+        return os.fdopen(fd, "a", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _atomic_write_json(path: str, payload: Any) -> None:
@@ -208,8 +268,9 @@ def _atomic_write_json(path: str, payload: Any) -> None:
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            _hand_back(tmp, fd=handle.fileno())
             json.dump(payload, handle, ensure_ascii=False, default=str)
-        _hand_back(tmp)
+        # os.replace onto a symlink replaces the link itself, not what it points at.
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -253,8 +314,7 @@ class StreamWriter:
         self._control_offset = 0
 
         _makedirs(self.directory)
-        self._handle = open(self.events_path, "a", encoding="utf-8")
-        _hand_back(self.events_path)
+        self._handle = _open_append(self.events_path)
         self._thread = threading.Thread(target=self._run, name="pulse-stream-writer", daemon=True)
         self._thread.start()
 
@@ -275,8 +335,13 @@ class StreamWriter:
             # Drop the oldest rather than the newest: the brain cares far more about
             # what is happening now than about a frame from a second ago.
             try:
-                self._queue.get_nowait()
-                self._dropped += 1
+                oldest = self._queue.get_nowait()
+                if isinstance(oldest, tuple) and oldest and oldest[0] is _FLUSH:
+                    # Not a frame, and somebody is waiting on it: release them rather
+                    # than leaving flush() to sit out its whole timeout.
+                    oldest[1].set()
+                else:
+                    self._dropped += 1
             except queue.Empty:
                 pass
             try:
@@ -550,12 +615,9 @@ class StreamReader:
         """Ask the monitor for something. Appends a line; the monitor polls for it."""
         message = dict(fields, action=action, t=time.time())
         _makedirs(self.directory)
-        existed = os.path.exists(self.control_path)
-        with open(self.control_path, "a", encoding="utf-8") as handle:
+        with _open_append(self.control_path) as handle:
             handle.write(json.dumps(message, ensure_ascii=False, default=str) + "\n")
             handle.flush()
-        if not existed:
-            _hand_back(self.control_path)
 
 
 def list_sessions(root: Optional[str] = None) -> List[Dict[str, Any]]:
