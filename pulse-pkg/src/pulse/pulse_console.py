@@ -606,46 +606,62 @@ def report_unmonitored(processes: List[Dict[str, Any]], limit: int = 5) -> None:
         print(f"\n  Watch one:           pulse attach --pid {first}\n")
 
 
-def explain_no_match(wanted: str) -> None:
-    """Why there is nothing to watch for this name, and what to do about it.
+def watch_by_name(wanted: str, model: str = "") -> int:
+    """No Pulse run of this name -- so find the process itself and watch that.
 
-    The unhelpful answer is "nothing matches". Usually the script IS running -- just
-    started with plain `python`, which Pulse can only watch from outside.
+    Looking the pid up by hand is work the tool can do: there is exactly one process
+    running that file nearly every time. `sudo pulse train.py` is the whole command.
     """
+    from . import pulse_attach as attach
+
     name = os.path.basename(wanted)
     running = [p for p in unmonitored_python_processes()
                if os.path.basename(p["script"]) == name]
-    print(f"\n  No Pulse run for {name!r}.\n")
-    if not running:
-        print(f"  Start it with:   pulse run --stream {name}\n")
-        return
-    from . import pulse_attach as attach
 
-    pids = ", ".join(str(p["pid"]) for p in running)
-    first = running[0]["pid"]
-    print(f"  It IS running (pid {pids}), started outside Pulse.\n")
-    report = attach.describe_readiness(first)
+    if not running:
+        print(f"\n  No Pulse run for {name!r}, and no process running it either.\n")
+        print(f"  Start it with:   pulse run --stream {name}\n")
+        return 1
+
+    if len(running) > 1:
+        pids = ", ".join(str(p["pid"]) for p in running)
+        print(f"\n  {len(running)} processes are running {name!r} (pid {pids}).")
+        print("  Which one?\n")
+        for process in running:
+            print(f"    sudo pulse attach --pid {process['pid']}"
+                  f"   {dim('started ' + ago(process['started']))}")
+        print()
+        return 1
+
+    pid = running[0]["pid"]
+    report = attach.describe_readiness(pid)
+
     if not report["pyspy"]:
-        print("  Pulse can still watch it from outside, by reading its memory, but that")
-        print("  needs py-spy:    pip install py-spy")
-        print(f"  then:            sudo pulse attach --pid {first}\n")
-    elif report["needs_root"]:
+        print(f"\n  {name} is running (pid {pid}), started outside Pulse.\n")
+        print("  Pulse can watch it from outside by reading its memory, which needs py-spy:\n")
+        print("      pip install py-spy\n")
+        print(f"  Or restart it under Pulse:   pulse run --stream {name}\n")
+        return 1
+
+    if report["needs_root"]:
         scope = report.get("ptrace_scope")
-        print("  Pulse can watch it from outside, by reading its memory. That is ptrace,")
-        print(f"  and Linux allows it only for a parent process or root"
-              f"{f' (ptrace_scope is {scope})' if scope is not None else ''}, so it needs sudo:\n")
-        print(f"      sudo pulse attach --pid {first}\n")
+        print(f"\n  {name} is running (pid {pid}), started outside Pulse.\n")
+        print("  Watching it means reading another process's memory. That is ptrace, and")
+        print(f"  Linux allows it only for a parent process or root"
+              f"{f' (ptrace_scope is {scope})' if scope is not None else ''}. So:\n")
+        print(f"      sudo pulse {name}\n")
         if report.get("passwordless_sudo") is False:
-            print(dim("  (sudo will ask for your password)\n"))
-    elif not report["ok"]:
-        print(f"  Pulse cannot read it: {report['reason']}\n")
-    else:
-        print(f"  Watch it:        pulse attach --pid {first}\n")
-    if report.get("ok") and report.get("locals_visible") is False:
-        print(dim("  Note: its loop runs at the top level of the script, and values there"))
-        print(dim("  are module globals, which cannot be read from outside. A loop inside"))
-        print(dim("  a function can be. Started under Pulse, either shape works.\n"))
-    print(f"  Or restart it under Pulse:   pulse run --stream {name}\n")
+            print(dim("  (it will ask for your password)\n"))
+        print(f"  Or restart it under Pulse:   pulse run --stream {name}\n")
+        return 1
+
+    if not report["ok"]:
+        print(f"\n  {name} is running (pid {pid}), but Pulse cannot read it:")
+        print(f"  {report['reason']}\n")
+        print(f"  Restart it under Pulse instead:   pulse run --stream {name}\n")
+        return 1
+
+    return attach_to_pid(pid, model=model)
 
 
 def attach_to_pid(pid: int, model: str = "") -> int:
@@ -909,8 +925,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         report_unmonitored(idle)
         return 1
     # Even with runs of our own: a run started outside Pulse is the one people are
-    # looking for when they say it "doesn't see" their run.
-    report_unmonitored(idle)
+    # looking for when they say it "doesn't see" their run. Skipped when they named a
+    # script, because the answer about THAT script is more useful than a list of others.
+    if not wanted:
+        report_unmonitored(idle)
 
     session = pick_session(sessions, wanted)
     if session is None:
@@ -928,7 +946,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             # other runs going the number would pick a different one.
             print("\n  pulse watch " + (shown[0].get("session_id") or "<id>") + "\n")
         elif wanted:
-            explain_no_match(wanted)
+            return watch_by_name(wanted, model=model)
         else:
             print("\n  Which one? `pulse watch <number>`\n")
         return 1

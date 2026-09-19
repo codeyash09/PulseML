@@ -373,6 +373,85 @@ class DispatchTest(unittest.TestCase):
         self.assertIn("console", self.calls[0])
 
 
+class WatchByNameTest(unittest.TestCase):
+    """`pulse train.py` when there is no Pulse run of that name, only the process.
+
+    Looking the pid up by hand is work the tool can do, so `sudo pulse train.py` has to
+    be the whole command.
+    """
+
+    def _process(self, pid, script="/x/train.py", started=0.0):
+        return {"pid": pid, "script": script, "cmdline": f"python3 {script}",
+                "started": started}
+
+    def _run(self, processes, readiness, attached=None):
+        import unittest.mock as mock
+        calls = {}
+
+        def fake_attach(pid, model=""):
+            calls["pid"] = pid
+            return 0
+
+        with mock.patch.object(console, "unmonitored_python_processes", return_value=processes), \
+             mock.patch("pulse.pulse_attach.describe_readiness", return_value=readiness), \
+             mock.patch.object(console, "attach_to_pid", fake_attach):
+            status = console.watch_by_name("train.py")
+        return status, calls
+
+    def test_one_readable_process_is_attached_without_a_pid(self):
+        status, calls = self._run(
+            [self._process(4242)],
+            {"ok": True, "pyspy": "/usr/bin/py-spy", "needs_root": False,
+             "ptrace_scope": 0, "locals_visible": True, "reason": ""})
+        self.assertEqual(status, 0)
+        self.assertEqual(calls.get("pid"), 4242, "it did not attach to the one process")
+
+    def test_needing_root_says_sudo_pulse_script_not_a_pid(self):
+        import io, contextlib
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            status, calls = self._run(
+                [self._process(4242)],
+                {"ok": False, "pyspy": "/usr/bin/py-spy", "needs_root": True,
+                 "ptrace_scope": 1, "passwordless_sudo": True, "reason": "Permission Denied"})
+        output = buffer.getvalue()
+        self.assertEqual(status, 1)
+        self.assertEqual(calls, {}, "it attached anyway")
+        self.assertIn("sudo pulse train.py", output)
+        self.assertIn("ptrace", output)
+        self.assertIn("ptrace_scope is 1", output)
+
+    def test_missing_pyspy_says_how_to_get_it(self):
+        import io, contextlib
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            status, _ = self._run([self._process(4242)],
+                                  {"ok": False, "pyspy": None, "needs_root": True,
+                                   "reason": "py-spy is not installed"})
+        self.assertEqual(status, 1)
+        self.assertIn("pip install py-spy", buffer.getvalue())
+
+    def test_several_processes_ask_which(self):
+        import io, contextlib
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            status, calls = self._run([self._process(1), self._process(2)],
+                                      {"ok": True, "pyspy": "/usr/bin/py-spy",
+                                       "needs_root": False, "locals_visible": True})
+        self.assertEqual(status, 1)
+        self.assertEqual(calls, {}, "it guessed between two processes")
+        self.assertIn("--pid 1", buffer.getvalue())
+        self.assertIn("--pid 2", buffer.getvalue())
+
+    def test_nothing_running_says_how_to_start_it(self):
+        import io, contextlib
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            status, _ = self._run([], {"ok": False, "pyspy": None, "needs_root": True})
+        self.assertEqual(status, 1)
+        self.assertIn("pulse run --stream train.py", buffer.getvalue())
+
+
 class SelectionTest(unittest.TestCase):
     """Choosing between runs when a name matches more than one."""
 
