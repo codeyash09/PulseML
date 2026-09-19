@@ -6794,17 +6794,14 @@ def _start_stream_monitor(caller_frame, throttle_interval):
     """
     from . import pulse_monitor
 
-    # `pulse run` executes a temporary instrumented copy, so the caller's filename is
-    # a name nobody recognises in a directory that gets deleted. It tells us the real
-    # one through the environment; fall back to the frame for a direct auto_track().
-    script_path = os.environ.get("PULSE_SCRIPT_PATH", "").strip() or None
-    if script_path and not os.path.isfile(script_path):
-        script_path = None      # a leftover export from another run should not relabel this one
-    if not script_path:
-        try:
-            script_path = os.path.abspath(caller_frame.f_code.co_filename)
-        except (AttributeError, OSError):
-            pass
+    # The caller's frame is the script itself: `pulse run` compiles the script under its
+    # real filename and runs it in this process, so under `pulse run` and under a direct
+    # auto_track() alike this is the file the person wrote, at its real path.
+    script_path = None
+    try:
+        script_path = os.path.abspath(caller_frame.f_code.co_filename)
+    except (AttributeError, OSError):
+        pass
     try:
         interval = float(throttle_interval)
     except (TypeError, ValueError):
