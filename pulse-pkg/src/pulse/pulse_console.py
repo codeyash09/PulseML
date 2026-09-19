@@ -166,11 +166,14 @@ def _scan_for_spools(root: str, max_depth: int = 4) -> List[str]:
             continue
         dirnames[:] = [d for d in dirnames if d not in skip and not d.startswith(".pulse_stream")]
         candidate = os.path.join(current, ".pulse_stream")
-        if os.path.isdir(candidate):
-            for name in sorted(os.listdir(candidate)):
-                session = os.path.join(candidate, name)
-                if os.path.isfile(os.path.join(session, "events.jsonl")):
-                    found.append(session)
+        try:
+            names = sorted(os.listdir(candidate))
+        except OSError:
+            continue        # not a directory, unreadable, or deleted since os.walk saw it
+        for name in names:
+            session = os.path.join(candidate, name)
+            if os.path.isfile(os.path.join(session, "events.jsonl")):
+                found.append(session)
     return found
 
 

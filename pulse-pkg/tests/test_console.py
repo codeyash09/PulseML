@@ -108,6 +108,33 @@ class DiscoveryTest(unittest.TestCase):
             time.sleep(0.05)
             self.assertEqual([s["session_id"] for s in console.discover()], first)
 
+    def test_a_directory_vanishing_mid_scan_is_not_a_crash(self):
+        # A cleanup job, or somebody deleting .pulse_stream while `pulse` is looking:
+        # os.walk has already reported the directory when the read of it fails.
+        import unittest.mock as mock
+        os.makedirs(os.path.join(self.tmp, "p", ".pulse_stream", "s1"))
+        open(os.path.join(self.tmp, "p", ".pulse_stream", "s1", "events.jsonl"), "w").close()
+        real_listdir = os.listdir
+
+        def racy_listdir(path, *a, **k):
+            if str(path).endswith(".pulse_stream"):
+                raise FileNotFoundError(2, "No such file or directory", str(path))
+            return real_listdir(path, *a, **k)
+
+        with mock.patch.object(os, "listdir", racy_listdir):
+            self.assertEqual(console._scan_for_spools(os.path.join(self.tmp, "p")), [])
+
+    def test_a_real_spool_is_still_found(self):
+        os.makedirs(os.path.join(self.tmp, "q", ".pulse_stream", "s2"))
+        open(os.path.join(self.tmp, "q", ".pulse_stream", "s2", "events.jsonl"), "w").close()
+        found = console._scan_for_spools(os.path.join(self.tmp, "q"))
+        self.assertEqual([os.path.basename(p) for p in found], ["s2"])
+
+    def test_an_unreadable_registry_is_not_a_crash(self):
+        import unittest.mock as mock
+        with mock.patch.object(os, "listdir", side_effect=PermissionError("nope")):
+            self.assertEqual(stream.registered_sessions(), [])
+
     def test_duplicates_from_both_sources_collapse(self):
         self._session("epsilon")
         os.chdir(os.path.join(self.tmp, "runs"))

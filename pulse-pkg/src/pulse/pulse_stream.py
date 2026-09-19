@@ -107,10 +107,12 @@ def unregister_session(session_id: str) -> None:
 def registered_sessions() -> List[Dict[str, Any]]:
     """Every run this machine knows about, newest first, with dead pointers dropped."""
     directory = registry_dir()
-    if not os.path.isdir(directory):
-        return []
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []           # no registry yet, unreadable, or removed while we looked
     out = []
-    for name in os.listdir(directory):
+    for name in names:
         if not name.endswith(".json"):
             continue
         try:
