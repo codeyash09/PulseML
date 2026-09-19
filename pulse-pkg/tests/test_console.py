@@ -297,7 +297,7 @@ class EndToEndTest(unittest.TestCase):
                                 cwd=self.tmp, env=child_env(empty_home),
                                 capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("pulse run train.py", result.stdout)
+        self.assertIn("pulse run --stream train.py", result.stdout)
         self.assertIn('auto_track(mode="stream")', result.stdout)
 
 
@@ -348,18 +348,92 @@ class ArgumentScopingTest(unittest.TestCase):
                          "the model id was taken as the run to attach to")
 
 
+class StreamFlagReachesTheScriptTest(unittest.TestCase):
+    """--stream has to win even when the script calls auto_track() itself.
+
+    `pulse run` only injects auto_track into a script that does not already have one, so
+    a script written the way the README shows was run as it is, in the default cli mode,
+    with --stream doing nothing: no spool, and `pulse` reporting no runs on the machine.
+    """
+
+    OWN_CALL = textwrap.dedent("""\
+        from pulse import auto_track
+        import time
+
+        auto_track()                 # exactly as the README documents it
+
+        loss = 2.0
+        for step in range(200):
+            loss = loss * 0.99 + 0.001
+            time.sleep(0.02)
+        print("done")
+    """)
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pulse-streamflag-")
+        self.proj = os.path.join(self.tmp, "proj")
+        os.makedirs(self.proj)
+        self.home = os.path.join(self.tmp, "home")
+
+    def test_a_script_with_its_own_auto_track_still_streams(self):
+        script = os.path.join(self.proj, "train.py")
+        with open(script, "w", encoding="utf-8") as handle:
+            handle.write(self.OWN_CALL)
+        process = subprocess.Popen(
+            [sys.executable, "-m", "pulse", "run", "--stream", "train.py"],
+            cwd=self.proj, env=child_env(self.home), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        self.addCleanup(_kill_group, process)
+        for _ in range(100):
+            if glob.glob(os.path.join(self.proj, ".pulse_stream", "*", "events.jsonl")):
+                break
+            time.sleep(0.2)
+        else:
+            self.fail("--stream was ignored for a script that calls auto_track itself: "
+                      + (process.stdout.read() or "")[-600:])
+
+        os.chdir(self.tmp)
+        os.environ["PULSE_HOME"] = os.path.join(self.home, ".pulse")
+        self.addCleanup(os.environ.pop, "PULSE_HOME", None)
+        sessions = console.discover()
+        self.assertTrue(sessions, "the run streamed but was not discoverable")
+        self.assertEqual(os.path.basename(sessions[0]["script"] or ""), "train.py")
+
+    def test_without_the_flag_the_script_keeps_its_own_mode(self):
+        # The old behaviour has to survive: no --stream, no PULSE_MODE forced.
+        from pulse import cli
+        import unittest.mock as mock
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PULSE_MODE", None)
+            with mock.patch.object(cli, "_execute", return_value=0), \
+                 mock.patch.object(cli, "_set_process_view"):
+                script = os.path.join(self.proj, "plain.py")
+                with open(script, "w", encoding="utf-8") as handle:
+                    handle.write("loss = 1.0\n")
+                cli.run_script(script, [], stream=False)
+            self.assertNotEqual(os.environ.get("PULSE_MODE"), "stream")
+
+
 class OldWaysStillWorkTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pulse-oldways-")
         self.home = os.path.join(self.tmp, "home")
 
     def test_pulse_run_without_stream_still_uses_the_original_mode(self):
+        # Behavioural rather than signature-coupled: inject into a real script and read
+        # the mode back out of the tree.
         from pulse.cli import PulseASTInjector
         import ast
-        injected = ast.unparse(PulseASTInjector()._make_auto_track_call())
-        self.assertEqual(injected, "auto_track(mode='cli')")
-        streaming = ast.unparse(PulseASTInjector(mode="stream")._make_auto_track_call())
-        self.assertEqual(streaming, "auto_track(mode='stream')")
+
+        def injected_mode(mode):
+            tree = ast.parse("import time\nloss = 1.0\nfor i in range(3):\n    loss *= 0.9\n")
+            PulseASTInjector(mode=mode).visit(tree)
+            source = ast.unparse(tree)
+            self.assertIn("auto_track", source)
+            return source
+
+        self.assertIn("'cli'", injected_mode("cli"))
+        self.assertIn("'stream'", injected_mode("stream"))
 
     def test_auto_track_stream_mode_is_still_reachable_directly(self):
         script = os.path.join(self.tmp, "direct.py")

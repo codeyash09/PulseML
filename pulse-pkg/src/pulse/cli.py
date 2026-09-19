@@ -386,6 +386,15 @@ def run_script(script, script_args, stream=False, cwd=None):
     from . import pulse_cli
 
     _RUN_MODE = "stream" if stream else "cli"
+    if stream:
+        # --stream has to reach the auto_track() call whatever wrote it. Injection only
+        # happens for a script that does NOT already call auto_track, so a script written
+        # the way the README shows -- `from pulse import auto_track; auto_track()` -- was
+        # run as it is, in the default cli mode, with --stream silently doing nothing: no
+        # spool, and `pulse` reporting no runs on the machine. auto_track already honours
+        # this variable ahead of its own argument, so it covers the user's own call, a
+        # call inside a helper module, and the injected one alike.
+        os.environ["PULSE_MODE"] = "stream"
 
     # Resolved against where the command was typed, before --cwd can move us.
     script_path = os.path.abspath(script)
@@ -433,7 +442,9 @@ def run_script(script, script_args, stream=False, cwd=None):
 
     if _already_uses_pulse(tree):
         if not restarted_by_pulse:
-            print(f"[Pulse] {os.path.basename(script_path)} already uses Pulse; running it as it is.")
+            how = " (streaming, because of --stream)" if stream else ""
+            print(f"[Pulse] {os.path.basename(script_path)} already calls Pulse; "
+                  f"running it as it is{how}.")
     else:
         PulseASTInjector(mode=_RUN_MODE).visit(tree)
         if not restarted_by_pulse:
