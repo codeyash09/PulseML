@@ -2,6 +2,8 @@
 import sys
 import os
 import ast
+import json
+import getpass
 import tempfile
 import subprocess
 
@@ -327,6 +329,190 @@ def _run_training_script(
     )
 
 
+def _bootstrap_pulse_config(script_path):
+    """
+    Interactively create pulse_config.json when Pulse needs an AI
+    provider but no usable configuration exists.
+
+    The configuration is stored beside the user's training script.
+    The training script itself is never modified.
+    """
+    print()
+    print("=" * 64)
+    print("Pulse first-time setup")
+    print("=" * 64)
+    print()
+
+    print(
+        "Pulse needs an AI provider to repair this Python syntax error."
+    )
+    print(
+        "Your API key will be stored in pulse_config.json in this"
+    )
+    print(
+        "training project's directory."
+    )
+    print()
+
+    # ------------------------------------------------------------
+    # Terms of Service
+    # ------------------------------------------------------------
+
+    print(
+        "Before continuing, you must agree to Pulse's Terms of Service."
+    )
+    print()
+
+    try:
+        tos_response = input(
+            "Do you agree to the Pulse Terms of Service? [y/N]: "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        print(
+            "[Pulse] Setup cancelled."
+        )
+        return False
+
+    if tos_response not in (
+        "y",
+        "yes",
+    ):
+        print()
+        print(
+            "[Pulse] Terms of Service were not accepted."
+        )
+        print(
+            "[Pulse] Cannot continue without accepting the Terms of Service."
+        )
+        return False
+
+    # ------------------------------------------------------------
+    # Provider
+    # ------------------------------------------------------------
+
+    print()
+    print(
+        "Supported provider examples:"
+    )
+    print(
+        "  gemini"
+    )
+    print(
+        "  openai"
+    )
+    print(
+        "  anthropic"
+    )
+    print(
+        "  openrouter"
+    )
+    print(
+        "  local"
+    )
+    print()
+
+    try:
+        provider = input(
+            "AI provider: "
+        ).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        print(
+            "[Pulse] Setup cancelled."
+        )
+        return False
+
+    if not provider:
+        print(
+            "[Pulse] No provider selected."
+        )
+        return False
+
+    # ------------------------------------------------------------
+    # API key
+    # ------------------------------------------------------------
+
+    api_key = ""
+
+    if provider.lower() not in (
+        "local",
+        "ollama",
+        "lmstudio",
+        "llama.cpp",
+    ):
+        print()
+
+        try:
+            api_key = getpass.getpass(
+                "API key: "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            print(
+                "[Pulse] API key entry cancelled."
+            )
+            return False
+
+        if not api_key:
+            print(
+                "[Pulse] No API key entered."
+            )
+            return False
+
+    # ------------------------------------------------------------
+    # Write configuration
+    # ------------------------------------------------------------
+
+    config_path = os.path.join(
+        os.path.dirname(
+            os.path.abspath(script_path)
+        ),
+        "pulse_config.json",
+    )
+
+    config = {
+        "agent": {
+            "provider": provider,
+        },
+        "api_key": api_key,
+        "autofix": True,
+        "tos_accepted": True,
+    }
+
+    try:
+        with open(
+            config_path,
+            "w",
+            encoding="utf-8",
+        ) as config_file:
+            json.dump(
+                config,
+                config_file,
+                indent=2,
+            )
+            config_file.write("\n")
+
+    except OSError as exc:
+        print(
+            f"[Pulse] Could not create "
+            f"'{config_path}': {exc}"
+        )
+        return False
+
+    print()
+    print(
+        f"[Pulse] Configuration saved to "
+        f"{config_path}"
+    )
+    print(
+        "[Pulse] This setup will be reused on future runs."
+    )
+    print()
+
+    return True
+
+
 def main():
     if len(sys.argv) < 3 or sys.argv[1] != "run":
         print(
@@ -454,6 +640,41 @@ def main():
                     source_code,
                     script_path=repair_path,
                 )
+
+                # ----------------------------------------------------
+                # First-run setup.
+                #
+                # If no usable AI agent is configured, interactively
+                # create pulse_config.json and then reload it.
+                # ----------------------------------------------------
+
+                if not getattr(
+                    pulse,
+                    "agent_provider",
+                    None,
+                ) or not getattr(
+                    pulse,
+                    "agent_key",
+                    None,
+                ):
+                    if not _bootstrap_pulse_config(
+                        script_path
+                    ):
+                        raise RuntimeError(
+                            "Pulse setup was not completed."
+                        )
+
+                    pulse._load_config()
+
+                # Initialize the configured provider using Pulse's
+                # existing provider-selection machinery.
+                if not pulse._select_agent_provider_and_key(
+                    initial=True
+                ):
+                    raise RuntimeError(
+                        "Pulse could not initialize the configured "
+                        "AI provider."
+                    )
 
                 error_text = (
                     f"SyntaxError: {exc.msg} "
