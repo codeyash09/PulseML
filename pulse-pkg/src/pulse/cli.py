@@ -6,6 +6,7 @@ import json
 import getpass
 import tempfile
 import subprocess
+import time
 
 
 class PulseASTInjector(ast.NodeTransformer):
@@ -327,6 +328,12 @@ def _run_training_script(
         cwd=script_dir,
         env=env,
     )
+
+
+# How long to wait before asking the provider again when a repair request comes back
+# rate-limited. The script has not started yet, so there is nothing to keep alive and
+# nothing racing: waiting is free, and giving up leaves the user with a broken file.
+_REPAIR_RETRY_DELAYS = (5, 15, 45)
 
 
 def _bootstrap_pulse_config(script_path):
@@ -884,6 +891,16 @@ def main():
                     script_path=repair_path,
                 )
 
+                # Applying a fix normally restarts the training loop so the
+                # running process picks it up. There is no training loop yet
+                # here -- the script has never started -- and that restart
+                # re-executed the temporary repair copy directly, taking over
+                # from this function: the validation, instrumentation and run
+                # below were all skipped, and the user's own file was left
+                # broken with the fix stranded in a temp file. This repair
+                # decides for itself when the run starts.
+                pulse._suppress_auto_restart = True
+
                 # ----------------------------------------------------
                 # First-run setup.
                 #
@@ -896,6 +913,31 @@ def main():
                 # If no usable agent exists, create the config and
                 # then explicitly reload it.
                 # ----------------------------------------------------
+
+                if not getattr(
+                    pulse,
+                    "agent_provider",
+                    None,
+                ) or not getattr(
+                    pulse,
+                    "agent_key",
+                    None,
+                ):
+                    # With no terminal there is nobody to answer the setup
+                    # prompts below, so a CI job or a piped shell stopped here
+                    # with "setup was not completed" and the syntax error was
+                    # never fixed. Pulse already has a documented headless
+                    # path -- PULSE_PROVIDER plus that provider's API key env
+                    # var -- so try that first when there is no tty. In a
+                    # terminal nothing changes: setup runs exactly as below.
+                    if not sys.stdin or not sys.stdin.isatty():
+                        pulse.non_interactive = True
+                        try:
+                            pulse._select_agent_provider_and_key(
+                                initial=True
+                            )
+                        except (EOFError, KeyboardInterrupt):
+                            pass
 
                 if not getattr(
                     pulse,
@@ -968,11 +1010,46 @@ def main():
                     include_code=True,
                 )
 
+                # A rate limit is not a failed repair. The crash handler in
+                # pulse.py already retries these rather than giving up on the
+                # run, and without the same treatment here one busy minute at
+                # the provider turned into "the repair pipeline did not apply
+                # a fix" and the script was left broken.
+                for delay in _REPAIR_RETRY_DELAYS:
+                    if not getattr(
+                        pulse,
+                        "_last_call_failed_transiently",
+                        False,
+                    ):
+                        break
+                    print(
+                        f"[Pulse] The agent was unreachable "
+                        f"(rate limit or a transient error) -- "
+                        f"retrying in {delay}s..."
+                    )
+                    time.sleep(delay)
+                    result = pulse.ask_agent(
+                        question,
+                        include_code=True,
+                    )
+
                 if not getattr(
                     pulse,
                     "_fix_applied_this_turn",
                     False,
                 ):
+                    if getattr(
+                        pulse,
+                        "_last_call_failed_transiently",
+                        False,
+                    ):
+                        raise RuntimeError(
+                            "Pulse could not reach the AI provider to fix "
+                            "the syntax error (rate limited or unavailable "
+                            "after retries). The script is unchanged -- "
+                            "try again shortly."
+                        )
+
                     raise RuntimeError(
                         "Pulse's existing repair pipeline did not "
                         "apply a syntax-error fix.\n\n"
@@ -1004,6 +1081,37 @@ def main():
                 print(
                     "[Pulse] Syntax error repaired successfully."
                 )
+
+                # The repair happened on a temporary copy, which is what gets
+                # instrumented and run. Leaving it there means the user never
+                # receives the fix: `python train.py` still fails, and the next
+                # `pulse run` pays the agent to find the same missing bracket
+                # again. Every other fix Pulse makes is written to the real
+                # file and logged for /revert, so this one is too.
+                try:
+                    with open(
+                        script_path,
+                        "w",
+                        encoding="utf-8",
+                    ) as original:
+                        original.write(repaired_source)
+
+                    print(
+                        f"[Pulse] Wrote the fix to "
+                        f"{os.path.basename(script_path)} "
+                        f"(/log to see it, /revert to undo)."
+                    )
+
+                except OSError as write_error:
+                    # A read-only checkout is a good reason not to run, but not
+                    # a good reason to refuse to train: the repaired copy is
+                    # still perfectly runnable.
+                    print(
+                        f"[Pulse] Could not write the fix back to "
+                        f"{script_path}: {write_error}\n"
+                        f"[Pulse] Running the repaired copy instead -- "
+                        f"the file on disk is still broken."
+                    )
 
                 # ----------------------------------------------------
                 # Parse the repaired source.
