@@ -301,6 +301,149 @@ class EndToEndTest(unittest.TestCase):
         self.assertIn('auto_track(mode="stream")', result.stdout)
 
 
+class DispatchTest(unittest.TestCase):
+    """What `pulse ...` does with each shape of command line.
+
+    The rule: `run` starts a run, and without it a script name means the run of that
+    script that is already going. `pulse --stream train.py` -- a launch option with no
+    `run` -- used to open the console, which ignored both the flag and the script and
+    reported nothing to watch while the script sat there unstarted.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pulse-dispatch-")
+        with open(os.path.join(self.tmp, "train.py"), "w", encoding="utf-8") as handle:
+            handle.write("loss = 1.0\n")
+        self.calls = []
+        os.chdir(self.tmp)
+
+    def _dispatch(self, argv):
+        import unittest.mock as mock
+        from pulse import cli
+
+        def fake_run_script(script, script_args, stream=False, cwd=None, again=False):
+            self.calls.append({"run": script, "args": script_args, "stream": stream,
+                               "again": again})
+            return 0
+
+        def fake_console(argv):
+            self.calls.append({"console": list(argv)})
+            return 0
+
+        with mock.patch.object(cli, "run_script", fake_run_script), \
+             mock.patch("pulse.pulse_console.main", fake_console):
+            return cli.main(argv)
+
+    def test_run_starts_a_run(self):
+        self._dispatch(["run", "--stream", "train.py"])
+        self.assertEqual(self.calls, [{"run": "train.py", "args": [], "stream": True,
+                                       "again": False}])
+
+    def test_run_passes_the_scripts_own_arguments_through(self):
+        self._dispatch(["run", "train.py", "--epochs", "3"])
+        self.assertEqual(self.calls[0]["args"], ["--epochs", "3"])
+
+    def test_a_bare_script_name_watches_rather_than_starts(self):
+        self._dispatch(["train.py"])
+        self.assertEqual(self.calls, [{"console": ["train.py"]}])
+
+    def test_a_launch_option_without_run_is_explained_not_guessed(self):
+        status = self._dispatch(["--stream", "train.py"])
+        self.assertEqual(status, 1)
+        self.assertEqual(self.calls, [], "it started or watched something instead of asking")
+
+    def test_again_reaches_run_script(self):
+        self._dispatch(["run", "--again", "--stream", "train.py"])
+        self.assertTrue(self.calls[0]["again"])
+
+    def test_bare_pulse_is_the_console(self):
+        self._dispatch([])
+        self.assertIn("console", self.calls[0])
+
+    def test_sessions_is_the_console(self):
+        self._dispatch(["sessions"])
+        self.assertIn("console", self.calls[0])
+
+    def test_model_flag_alone_is_the_console(self):
+        self._dispatch(["--model", "some/model"])
+        self.assertIn("console", self.calls[0])
+
+    def test_watch_by_script_name_is_the_console(self):
+        self._dispatch(["watch", "train.py"])
+        self.assertIn("console", self.calls[0])
+
+
+class SelectionTest(unittest.TestCase):
+    """Choosing between runs when a name matches more than one."""
+
+    def _sessions(self, *specs):
+        return [{"session_id": f"id-{i}", "script": f"/x/{script}", "status": status,
+                 "started": i, "directory": f"/d{i}"}
+                for i, (script, status) in enumerate(specs, 1)]
+
+    def test_a_script_name_finds_its_run(self):
+        sessions = self._sessions(("train.py", "live"), ("other.py", "live"))
+        self.assertEqual(console.pick_session(sessions, "train.py")["script"], "/x/train.py")
+
+    def test_the_live_one_wins_over_a_finished_one_of_the_same_script(self):
+        sessions = self._sessions(("train.py", "finished"), ("train.py", "live"))
+        self.assertEqual(console.pick_session(sessions, "train.py")["status"], "live")
+
+    def test_two_live_runs_of_one_script_are_ambiguous(self):
+        sessions = self._sessions(("train.py", "live"), ("train.py", "live"))
+        self.assertIsNone(console.pick_session(sessions, "train.py"))
+        self.assertEqual(len(console.matching_sessions(sessions, "train.py")), 2)
+
+    def test_a_name_that_matches_nothing(self):
+        sessions = self._sessions(("train.py", "live"))
+        self.assertIsNone(console.pick_session(sessions, "nope.py"))
+        self.assertEqual(console.matching_sessions(sessions, "nope.py"), [])
+
+
+class AlreadyRunningTest(unittest.TestCase):
+    """Starting a second copy of a script that is already training is not what
+    "watch my run" means: it competes for the same GPU and the console shows two."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pulse-already-")
+        self.script = os.path.join(self.tmp, "train.py")
+        with open(self.script, "w", encoding="utf-8") as handle:
+            handle.write("import time\nfor i in range(600):\n    time.sleep(0.05)\n")
+
+    def _start(self, cwd, argument):
+        process = subprocess.Popen([sys.executable, argument], cwd=cwd,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+        self.addCleanup(_kill_group, process)
+        time.sleep(1.5)
+        return process
+
+    def test_finds_a_copy_started_with_a_relative_path(self):
+        from pulse.cli import already_running
+        if not os.path.isdir("/proc"):
+            self.skipTest("/proc only")
+        process = self._start(self.tmp, "train.py")
+        found = already_running(self.script)
+        self.assertIn(process.pid, [pid for pid, _ in found])
+
+    def test_a_same_named_file_elsewhere_is_not_a_match(self):
+        from pulse.cli import already_running
+        if not os.path.isdir("/proc"):
+            self.skipTest("/proc only")
+        other = os.path.join(self.tmp, "other")
+        os.makedirs(other)
+        with open(os.path.join(other, "train.py"), "w", encoding="utf-8") as handle:
+            handle.write("import time\nfor i in range(600):\n    time.sleep(0.05)\n")
+        process = self._start(other, "train.py")
+        found = already_running(self.script)          # asking about the FIRST train.py
+        self.assertNotIn(process.pid, [pid for pid, _ in found],
+                         "an unrelated file with the same name was treated as this run")
+
+    def test_nothing_running_is_nothing_found(self):
+        from pulse.cli import already_running
+        self.assertEqual(already_running(self.script), [])
+
+
 class ArgumentScopingTest(unittest.TestCase):
     """Pulse's own flags stop at the script path; after it, they are the script's."""
 

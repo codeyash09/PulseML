@@ -567,6 +567,26 @@ class Console:
         print(dim(f"\n  asked the run to {action}\n"))
 
 
+def explain_no_match(wanted: str) -> None:
+    """Why there is nothing to watch for this name, and what to do about it.
+
+    The unhelpful answer is "nothing matches". Usually the script IS running -- just
+    started with plain `python`, which Pulse cannot join afterwards.
+    """
+    name = os.path.basename(wanted)
+    running = [p for p in unmonitored_python_processes()
+               if os.path.basename(p["script"]) == name]
+    print(f"\n  No Pulse run for {name!r}.\n")
+    if running:
+        pids = ", ".join(str(p["pid"]) for p in running)
+        print(f"  It IS running (pid {pids}), but it was started outside Pulse, and Pulse")
+        print("  cannot join a run it did not start: reading another process's variables")
+        print("  needs ptrace, which the kernel allows only for a parent process or root.\n")
+        print(f"  Stop it and start it again with:   pulse run --stream {name}\n")
+    else:
+        print(f"  Start it with:   pulse run --stream {name}\n")
+
+
 def confirm(question: str) -> bool:
     """Ask before doing something to someone's training run."""
     try:
@@ -590,19 +610,29 @@ def render_session_list(sessions: List[Dict[str, Any]], attached: Optional[str] 
               f"{step:<14} {loss:<18} {paint(when)}")
 
 
+def matching_sessions(sessions: List[Dict[str, Any]], wanted: str) -> List[Dict[str, Any]]:
+    """Every run that answers to `wanted`: an index, an id, or a script name."""
+    if wanted.isdigit() and 1 <= int(wanted) <= len(sessions):
+        return [sessions[int(wanted) - 1]]
+    exact = [s for s in sessions if s.get("session_id") == wanted]
+    if exact:
+        return exact
+    name = os.path.basename(wanted)
+    return [s for s in sessions
+            if wanted in (s.get("session_id") or "")
+            or name == os.path.basename(s.get("script") or "")
+            or wanted in os.path.basename(s.get("script") or "")]
+
+
 def pick_session(sessions: List[Dict[str, Any]], wanted: Optional[str]) -> Optional[Dict[str, Any]]:
     """Resolve what the user asked for: an index, a session id, a script name, or nothing."""
     if wanted:
-        if wanted.isdigit() and 1 <= int(wanted) <= len(sessions):
-            return sessions[int(wanted) - 1]
-        for session in sessions:
-            if session["session_id"] == wanted:
-                return session
-        matches = [s for s in sessions
-                   if wanted in (s.get("session_id") or "")
-                   or wanted in os.path.basename(s.get("script") or "")]
+        matches = matching_sessions(sessions, wanted)
         if len(matches) == 1:
             return matches[0]
+        live = [s for s in matches if s["status"] in ("live", "stalled")]
+        if len(live) == 1:
+            return live[0]          # several runs of one script, only one still going
         return None
     live = [s for s in sessions if s["status"] in ("live", "stalled")]
     if len(live) == 1:
@@ -770,8 +800,21 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     session = pick_session(sessions, wanted)
     if session is None:
-        if wanted:
-            print(f"\n  Nothing matches {wanted!r}.\n")
+        matches = matching_sessions(sessions, wanted) if wanted else [
+            s for s in sessions if s["status"] in ("live", "stalled")]
+        if len(matches) > 1:
+            # Live ones first: if any are still going, an ended run is not what "watch
+            # my run" means.
+            live = [s for s in matches if s["status"] in ("live", "stalled")]
+            shown = live or matches
+            print(f"\n  {len(shown)} runs match{' ' + repr(wanted) if wanted else ''}. Which one?\n")
+            render_session_list(shown)
+            # By id, not by number: the numbers above are positions in THIS list, while
+            # `pulse watch 2` counts through every run on the machine, so on a box with
+            # other runs going the number would pick a different one.
+            print("\n  pulse watch " + (shown[0].get("session_id") or "<id>") + "\n")
+        elif wanted:
+            explain_no_match(wanted)
         else:
             print("\n  Which one? `pulse watch <number>`\n")
         return 1
