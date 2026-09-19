@@ -216,6 +216,29 @@ class AuditTest(unittest.TestCase):
         self.assertGreaterEqual(brain.schedule.interval, MIN_INTERVAL_SECONDS)
         self.assertTrue(brain.schedule.next_at > time.time())
 
+    def test_two_audits_at_once_do_not_both_call_the_model(self):
+        import threading
+        started, release = threading.Event(), threading.Event()
+
+        class Slow:
+            calls = 0
+
+            def __call__(self, prompt):
+                Slow.calls += 1
+                started.set()
+                release.wait(5)
+                return reply()
+
+        brain = Brain(self.tmp, agent=Slow())
+        worker = threading.Thread(target=brain.audit, kwargs={"include_code": False})
+        worker.start()
+        started.wait(5)
+        second = brain.audit(include_code=False)      # the console's /audit, mid-flight
+        release.set()
+        worker.join(5)
+        self.assertEqual(second["status"], "busy")
+        self.assertEqual(Slow.calls, 1, "the model was called twice for one audit")
+
     def test_audit_without_an_agent_is_skipped_not_faked(self):
         brain = Brain(self.tmp)
         self.assertEqual(brain.audit()["status"], "skipped")

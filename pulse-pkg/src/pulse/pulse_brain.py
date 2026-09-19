@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -236,6 +237,10 @@ class Brain:
         self.audits: List[Dict[str, Any]] = []
         self.fixes: List[Dict[str, Any]] = []
         self.last_status = "unknown"
+        # The console polls on a background thread while the person can type /audit on
+        # the main one, so two audits can start at once: two model calls billed, both
+        # writing the schedule, and the later answer silently winning.
+        self._audit_lock = threading.Lock()
 
     # ------------------------------------------------------------------ ingest
 
@@ -396,6 +401,14 @@ class Brain:
 
     def audit(self, include_code: bool = True) -> Dict[str, Any]:
         """The wake-up pass: re-read everything and look for what the checks cannot see."""
+        if not self._audit_lock.acquire(blocking=False):
+            return {"status": "busy", "reason": "an audit is already running"}
+        try:
+            return self._audit(include_code)
+        finally:
+            self._audit_lock.release()
+
+    def _audit(self, include_code: bool) -> Dict[str, Any]:
         pack = self.evidence(include_code=include_code)
         prompt = AUDIT_PROMPT.format(evidence=self.render_evidence(pack),
                                      min_minutes=MIN_INTERVAL_SECONDS / 60.0,

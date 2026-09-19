@@ -490,6 +490,9 @@ class Console:
             return
         print(dim("\n  auditing the whole run...\n"))
         record = self.brain.audit()
+        if record.get("status") == "busy":
+            print(dim("  an audit is already running; its answer will print here\n"))
+            return
         if record.get("status") in ("error", "skipped"):
             print(red(f"  {record.get('error') or record.get('reason')}\n"))
             return
