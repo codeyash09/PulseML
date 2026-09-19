@@ -189,6 +189,11 @@ def discover(extra_roots: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     anywhere, and a scan of the working directory finds runs whose registry entry never
     got written (a read-only home, a different user, an older Pulse).
     """
+    def is_empty_and_over(info: Dict[str, Any]) -> bool:
+        """A run that ended without ever reporting a number is not worth listing."""
+        return (info.get("status") in ("ended", "finished", "crashed")
+                and not info.get("step") and not info.get("scalars"))
+
     seen: Dict[str, Dict[str, Any]] = {}
 
     for entry in stream.registered_sessions():
@@ -207,7 +212,7 @@ def discover(extra_roots: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     # take turns being the most recent writer, so a list sorted by activity reorders
     # between the moment you read a number and the moment you type it, and `pulse watch 2`
     # attaches to whichever one happened to flush last. Start time does not move.
-    return sorted(seen.values(),
+    return sorted((s for s in seen.values() if not is_empty_and_over(s)),
                   key=lambda s: (s.get("started") or 0, s.get("session_id") or ""),
                   reverse=True)
 
@@ -567,24 +572,127 @@ class Console:
         print(dim(f"\n  asked the run to {action}\n"))
 
 
+def report_unmonitored(processes: List[Dict[str, Any]], limit: int = 5) -> None:
+    """List runs Pulse can see but is not watching, and say what it would take.
+
+    These used to be mentioned only when there were no Pulse runs at all, so somebody
+    with one finished run and one just started outside Pulse was told about the finished
+    one and never about the one they cared about.
+    """
+    if not processes:
+        return
+    from . import pulse_attach as attach
+
+    print(dim(f"\n  {len(processes)} Python run(s) not watched by Pulse:"))
+    for process in processes[:limit]:
+        print(dim(f"    pid {process['pid']:<8} {os.path.basename(process['script'])}"
+                  f"   started {ago(process['started'])}"))
+    if len(processes) > limit:
+        print(dim(f"    ... and {len(processes) - limit} more"))
+
+    first = processes[0]["pid"]
+    if not attach.pyspy_path():
+        print("\n  Pulse can watch one of these from outside, by reading its memory, but")
+        print("  that needs py-spy:   pip install py-spy")
+        print(f"  then:                sudo pulse attach --pid {first}\n")
+        return
+    scope = attach.ptrace_scope()
+    if attach.needs_root():
+        print("\n  To watch one of these Pulse has to read another process's memory, and")
+        print(f"  Linux only allows that for a parent process or root"
+              f"{f' (ptrace_scope is {scope})' if scope is not None else ''}.")
+        print(f"  So it needs sudo:    sudo pulse attach --pid {first}\n")
+    else:
+        print(f"\n  Watch one:           pulse attach --pid {first}\n")
+
+
 def explain_no_match(wanted: str) -> None:
     """Why there is nothing to watch for this name, and what to do about it.
 
     The unhelpful answer is "nothing matches". Usually the script IS running -- just
-    started with plain `python`, which Pulse cannot join afterwards.
+    started with plain `python`, which Pulse can only watch from outside.
     """
     name = os.path.basename(wanted)
     running = [p for p in unmonitored_python_processes()
                if os.path.basename(p["script"]) == name]
     print(f"\n  No Pulse run for {name!r}.\n")
-    if running:
-        pids = ", ".join(str(p["pid"]) for p in running)
-        print(f"  It IS running (pid {pids}), but it was started outside Pulse, and Pulse")
-        print("  cannot join a run it did not start: reading another process's variables")
-        print("  needs ptrace, which the kernel allows only for a parent process or root.\n")
-        print(f"  Stop it and start it again with:   pulse run --stream {name}\n")
-    else:
+    if not running:
         print(f"  Start it with:   pulse run --stream {name}\n")
+        return
+    from . import pulse_attach as attach
+
+    pids = ", ".join(str(p["pid"]) for p in running)
+    first = running[0]["pid"]
+    print(f"  It IS running (pid {pids}), started outside Pulse.\n")
+    report = attach.describe_readiness(first)
+    if not report["pyspy"]:
+        print("  Pulse can still watch it from outside, by reading its memory, but that")
+        print("  needs py-spy:    pip install py-spy")
+        print(f"  then:            sudo pulse attach --pid {first}\n")
+    elif report["needs_root"]:
+        scope = report.get("ptrace_scope")
+        print("  Pulse can watch it from outside, by reading its memory. That is ptrace,")
+        print(f"  and Linux allows it only for a parent process or root"
+              f"{f' (ptrace_scope is {scope})' if scope is not None else ''}, so it needs sudo:\n")
+        print(f"      sudo pulse attach --pid {first}\n")
+        if report.get("passwordless_sudo") is False:
+            print(dim("  (sudo will ask for your password)\n"))
+    elif not report["ok"]:
+        print(f"  Pulse cannot read it: {report['reason']}\n")
+    else:
+        print(f"  Watch it:        pulse attach --pid {first}\n")
+    if report.get("ok") and report.get("locals_visible") is False:
+        print(dim("  Note: its loop runs at the top level of the script, and values there"))
+        print(dim("  are module globals, which cannot be read from outside. A loop inside"))
+        print(dim("  a function can be. Started under Pulse, either shape works.\n"))
+    print(f"  Or restart it under Pulse:   pulse run --stream {name}\n")
+
+
+def attach_to_pid(pid: int, model: str = "") -> int:
+    """Watch a process Pulse did not start, by sampling it from outside."""
+    from . import pulse_attach as attach
+
+    report = attach.describe_readiness(pid)
+    if not report["ok"]:
+        print(f"\n  Cannot read pid {pid}: {report['reason']}\n")
+        if not report["pyspy"]:
+            print("  Install it:   pip install py-spy\n")
+        elif report["needs_root"] and not os.geteuid() == 0:
+            scope = report.get("ptrace_scope")
+            print("  Reading another process's memory is ptrace, which Linux allows only")
+            print(f"  for a parent process or root"
+                  f"{f' (ptrace_scope is {scope})' if scope is not None else ''}. Try:\n")
+            print(f"      sudo pulse attach --pid {pid}\n")
+        return 1
+
+    monitor = attach.AttachedMonitor(pid)
+    first = monitor.sample_once()
+    monitor.snapshot()          # so the console has a step and a value to show at once
+    if not first:
+        print(f"\n  pid {pid} can be read, but no numbers came back.")
+        print("  Its loop is probably at the top level of the script, where the values are")
+        print("  module globals; those cannot be read from outside. A loop inside a")
+        print("  function can be, and a run started under Pulse always can.\n")
+        monitor.discard()
+        return 1
+    monitor.start()
+    print(f"\n  Watching pid {pid} from outside"
+          f"{' (' + os.path.basename(monitor.script) + ')' if monitor.script else ''}: "
+          f"{', '.join(sorted(first))}")
+    print(dim(f"  Sampled {1 / monitor.interval:g} time(s) a second through py-spy; a spike "
+              f"between samples is not seen.\n"))
+
+    session = _describe_session(monitor.directory) or {
+        "session_id": monitor.session_id, "directory": monitor.directory,
+        "script": monitor.script, "status": "live", "step": 0}
+    agent = None
+    if model:
+        from .pulse_brain import build_litellm_agent
+        agent = build_litellm_agent(model)
+    try:
+        return run_console(session, [session], agent=agent)
+    finally:
+        monitor.stop()
 
 
 def confirm(question: str) -> bool:
@@ -768,6 +876,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             wanted = argument
     model = model or os.environ.get("PULSE_MODEL", "")
 
+    if "--pid" in argv:
+        index = argv.index("--pid")
+        try:
+            pid = int(argv[index + 1])
+        except (IndexError, ValueError):
+            print("\n  --pid needs a process id, e.g. pulse attach --pid 12345\n")
+            return 1
+        return attach_to_pid(pid, model=model)
+
     sessions = discover()
     if command == "sessions":
         if not sessions:
@@ -784,19 +901,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     if sessions:
         render_session_list(sessions)
 
+    idle = unmonitored_python_processes()
     if not sessions:
-        print("  Nothing to watch yet. Start a run with either:\n")
+        print("  Nothing Pulse is watching yet. Start a run with either:\n")
         print("    pulse run --stream train.py   (no changes to your script)")
-        print("    auto_track(mode=\"stream\")     (from inside it)\n")
-        idle = unmonitored_python_processes()
-        if idle:
-            print("  These Python processes are running but not monitored, and Pulse")
-            print("  cannot attach to a process that did not start with it:\n")
-            for process in idle[:5]:
-                print(f"    pid {process['pid']:<8} {os.path.basename(process['script'])}"
-                      f"   {dim('started ' + ago(process['started']))}")
-            print(dim("\n  Restart one under `pulse run --stream` to watch it.\n"))
+        print("    auto_track(mode=\"stream\")     (from inside it)")
+        report_unmonitored(idle)
         return 1
+    # Even with runs of our own: a run started outside Pulse is the one people are
+    # looking for when they say it "doesn't see" their run.
+    report_unmonitored(idle)
 
     session = pick_session(sessions, wanted)
     if session is None:

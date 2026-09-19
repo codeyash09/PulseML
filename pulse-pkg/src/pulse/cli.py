@@ -46,6 +46,7 @@ Pulse - a live ML training debugger.
   pulse watch [n|id|name]        attach to a particular run
   pulse sessions                 list the runs Pulse knows about
   pulse <script.py>              watch the run of that script that is already going
+  sudo pulse attach --pid N      watch a run started outside Pulse, by sampling it
   pulse run [options] <script.py> [script args]
                                  START a script under Pulse, like `python script.py`
 
