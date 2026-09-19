@@ -85,9 +85,21 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap, LogNorm
 
-import tkinter as tk
-from tkinter import ttk, Toplevel, scrolledtext, simpledialog, messagebox
-from PIL import Image, ImageTk
+# The GUI's toolkit, optional on purpose. tkinter is not a pip package: it ships with
+# the interpreter on desktop installs and is absent from most server and container
+# images, including a plain `apt install python3` box. Importing it at module scope made
+# `import pulse` fail outright on exactly the machines Pulse is written for -- a headless
+# GPU box, a container, an SSH session -- even though those runs never open a window.
+# _determine_mode already falls back to cli when tkinter cannot start.
+try:
+    import tkinter as tk
+    from tkinter import ttk, Toplevel, scrolledtext, simpledialog, messagebox
+    from PIL import Image, ImageTk
+    HAS_TK = True
+except ImportError:
+    tk = ttk = Toplevel = scrolledtext = simpledialog = messagebox = None
+    Image = ImageTk = None
+    HAS_TK = False
 
 from pulse.pulse_backend import (
     to_numpy, shape_of, tensor_kind, is_trackable, describe_tensor,
@@ -3650,2236 +3662,2259 @@ def _auto_rollback_after_failed_restarts_gui(script_path, chain_start_commit_id)
     return bool(restored)
 
 
-class ChatPanel(tk.Frame):
-    def __init__(self, parent, get_manifest_fn, get_code_fn=None, script_path=None, on_code_change=None, promote_fn=None, get_extra_files_fn=None, initial_provider=None, restart_fn=None, exec_fn=None):
-        super().__init__(parent, bg=PANEL)
-        self.get_manifest_fn = get_manifest_fn
-        self.get_code_fn = get_code_fn
-        self.script_path = script_path
-        self.on_code_change = on_code_change
-        self.promote_fn = promote_fn  # (var_name) -> None, switches a lotrack var to full tracking
-        self.get_extra_files_fn = get_extra_files_fn  # () -> {path: text} for other local project files
-        self.restart_fn = restart_fn  # (provider_name) -> None, restarts the whole training process
-        self.exec_fn = exec_fn  # (kind, arg) -> result str; runs an EXEC-style directive in the live training process
-        # Lazily-initialized {path: text} snapshot of "the last checkpoint
-        # that didn't crash" for CHANGELOG -- see _run_changelog.
-        self._changelog_baseline = None
-        # (rank, local_rank, world_size, session_key) -- set by Dashboard
-        # right after construction when running under a multi-GPU/
-        # multi-process launch; defaults to "not distributed".
-        self.dist_info = (0, 0, 1, None)
-        # Per-session id (fresh every time this ChatPanel is constructed,
-        # i.e. every process start) used to identify "this run" in the
-        # local run-history file -- see _run_runcompare.
-        self._run_id = str(uuid.uuid4())[:8]
-        # Running token/cost accounting across every agent call this
-        # session -- see _record_usage / _run_cost.
-        self._token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0, "cost_usd": 0.0}
-        # Background retry queue for agent calls that fail only due to a
-        # transient error (rate limit, timeout, provider blip) after
-        # exhausting _call_model's own in-call retries -- see
-        # _queue_agent_retry / _ensure_retry_ticker. Training itself is
-        # never blocked on any of this.
-        self._last_call_failed_transiently = False
-        self._pending_agent_retry = None
-        self._retry_ticker_started = False
-        # id of the most recently recorded .pulse_history commit -- lets
-        # Dashboard._restart_training know exactly what to roll back to
-        # if the fix that triggered a restart keeps crashing (see
-        # _auto_rollback_after_failed_restarts_gui).
-        self._last_commit_id = None
-        self._label_for_path = {}
-        self._path_for_label = {}
-        self.history = []
-        self.session_keys = {}
-        # Set whenever a code fix is actually written to disk during the
-        # current top-level _ask() call -- checked once at the end of that
-        # call to decide whether to trigger a restart (see _ask/PASS 3-6).
-        self._fix_applied_this_turn = False
+_CHAT_PANEL_CLS = None
 
-        head = tk.Frame(self, bg=PANEL)
-        head.pack(fill=tk.X, padx=14, pady=(14, 6))
 
-        self.dot = tk.Canvas(head, width=8, height=8, bg=PANEL, highlightthickness=0)
-        self.dot_id = self.dot.create_oval(1, 1, 7, 7, fill=TEAL, outline="")
-        self.dot.pack(side=tk.LEFT, padx=(0, 8))
-        tk.Label(head, text="PULSE AI ANALYST", bg=PANEL, fg=TEXT, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+def _chat_panel_class():
+    """Build the chat panel against tkinter, the first time one is actually needed.
 
-        self.provider_var = tk.StringVar(value=initial_provider or list(PROVIDERS.keys())[0])
-        self.provider_dropdown = tk.OptionMenu(head, self.provider_var, *PROVIDERS.keys(), command=self._on_provider_change)
-        self.provider_dropdown.config(bg=CARD, fg=TEXT, activebackground=CARD_HOVER, activeforeground=TEXT,
-                                       relief="flat", highlightthickness=0, font=("Segoe UI", 9))
-        self.provider_dropdown["menu"].config(bg=CARD, fg=TEXT, activebackground=ORANGE, activeforeground="#0a0a0a")
-        self.provider_dropdown.pack(side=tk.RIGHT)
+    It cannot be defined at module scope: subclassing tk.Frame evaluates tk.Frame at
+    import time, so on a machine without tkinter `import pulse` died on the class
+    statement rather than on anything the user asked for.
+    """
+    global _CHAT_PANEL_CLS
+    if _CHAT_PANEL_CLS is not None:
+        return _CHAT_PANEL_CLS
+    if not HAS_TK:
+        raise RuntimeError(
+            "Pulse's dashboard needs tkinter, which this Python does not have. "
+            "Use the CLI (auto_track(mode=\"cli\") or mode=\"stream\"), or install it: "
+            "apt install python3-tk / brew install python-tk.")
 
-        self.status_label = tk.Label(head, text="", bg=PANEL, fg=AMBER, font=FONT_MONO)
-        self.status_label.pack(side=tk.RIGHT, padx=(0, 10))
-        self._spinner_text = {"value": None}
-        self._spinner = _SpinnerLabel(self.status_label, lambda: self._spinner_text["value"])
+    class ChatPanel(tk.Frame):
+        def __init__(self, parent, get_manifest_fn, get_code_fn=None, script_path=None, on_code_change=None, promote_fn=None, get_extra_files_fn=None, initial_provider=None, restart_fn=None, exec_fn=None):
+            super().__init__(parent, bg=PANEL)
+            self.get_manifest_fn = get_manifest_fn
+            self.get_code_fn = get_code_fn
+            self.script_path = script_path
+            self.on_code_change = on_code_change
+            self.promote_fn = promote_fn  # (var_name) -> None, switches a lotrack var to full tracking
+            self.get_extra_files_fn = get_extra_files_fn  # () -> {path: text} for other local project files
+            self.restart_fn = restart_fn  # (provider_name) -> None, restarts the whole training process
+            self.exec_fn = exec_fn  # (kind, arg) -> result str; runs an EXEC-style directive in the live training process
+            # Lazily-initialized {path: text} snapshot of "the last checkpoint
+            # that didn't crash" for CHANGELOG -- see _run_changelog.
+            self._changelog_baseline = None
+            # (rank, local_rank, world_size, session_key) -- set by Dashboard
+            # right after construction when running under a multi-GPU/
+            # multi-process launch; defaults to "not distributed".
+            self.dist_info = (0, 0, 1, None)
+            # Per-session id (fresh every time this ChatPanel is constructed,
+            # i.e. every process start) used to identify "this run" in the
+            # local run-history file -- see _run_runcompare.
+            self._run_id = str(uuid.uuid4())[:8]
+            # Running token/cost accounting across every agent call this
+            # session -- see _record_usage / _run_cost.
+            self._token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0, "cost_usd": 0.0}
+            # Background retry queue for agent calls that fail only due to a
+            # transient error (rate limit, timeout, provider blip) after
+            # exhausting _call_model's own in-call retries -- see
+            # _queue_agent_retry / _ensure_retry_ticker. Training itself is
+            # never blocked on any of this.
+            self._last_call_failed_transiently = False
+            self._pending_agent_retry = None
+            self._retry_ticker_started = False
+            # id of the most recently recorded .pulse_history commit -- lets
+            # Dashboard._restart_training know exactly what to roll back to
+            # if the fix that triggered a restart keeps crashing (see
+            # _auto_rollback_after_failed_restarts_gui).
+            self._last_commit_id = None
+            self._label_for_path = {}
+            self._path_for_label = {}
+            self.history = []
+            self.session_keys = {}
+            # Set whenever a code fix is actually written to disk during the
+            # current top-level _ask() call -- checked once at the end of that
+            # call to decide whether to trigger a restart (see _ask/PASS 3-6).
+            self._fix_applied_this_turn = False
 
-        self.transcript = scrolledtext.ScrolledText(
-            self, wrap=tk.WORD, state="disabled", height=24,
-            bg=CARD, fg=TEXT, insertbackground=TEXT,
-            relief="flat", bd=0, padx=10, pady=10,
-            font=FONT_UI, highlightthickness=1, highlightbackground=BORDER,
-        )
-        self.transcript.tag_configure("who_user", foreground=TEAL, font=FONT_UI_BOLD)
-        self.transcript.tag_configure("who_ai", foreground=ORANGE, font=FONT_UI_BOLD)
-        self.transcript.tag_configure("bold", font=FONT_UI_BOLD)
-        self.transcript.tag_configure("heading", font=("Segoe UI", 11, "bold"), foreground=AMBER)
-        self.transcript.tag_configure("inline_code", font=FONT_MONO, background=CARD_HOVER, foreground=TEAL)
-        self.transcript.tag_configure("code_block", font=FONT_MONO, background=CARD_HOVER, lmargin1=10, lmargin2=10)
-        self.transcript.tag_configure("math", font=("Cambria Math", 10), foreground=AMBER)
-        self.transcript.tag_configure("find_match", background=FIND_MATCH)
-        self.transcript.tag_configure("find_current", background=FIND_MATCH_CUR)
-        self.transcript.pack(fill=tk.BOTH, expand=True, padx=14, pady=8)
+            head = tk.Frame(self, bg=PANEL)
+            head.pack(fill=tk.X, padx=14, pady=(14, 6))
 
-        self._find_matches = []
-        self._find_idx = -1
-        self._find_frame = None
-        self.transcript.bind("<Control-f>", lambda e: self._open_find_bar())
-        self.bind_all("<Control-f>", lambda e: self._open_find_bar())
+            self.dot = tk.Canvas(head, width=8, height=8, bg=PANEL, highlightthickness=0)
+            self.dot_id = self.dot.create_oval(1, 1, 7, 7, fill=TEAL, outline="")
+            self.dot.pack(side=tk.LEFT, padx=(0, 8))
+            tk.Label(head, text="PULSE AI ANALYST", bg=PANEL, fg=TEXT, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
 
-        entry_frame = tk.Frame(self, bg=PANEL)
-        entry_frame.pack(fill=tk.X, padx=14, pady=(0, 14))
+            self.provider_var = tk.StringVar(value=initial_provider or list(PROVIDERS.keys())[0])
+            self.provider_dropdown = tk.OptionMenu(head, self.provider_var, *PROVIDERS.keys(), command=self._on_provider_change)
+            self.provider_dropdown.config(bg=CARD, fg=TEXT, activebackground=CARD_HOVER, activeforeground=TEXT,
+                                           relief="flat", highlightthickness=0, font=("Segoe UI", 9))
+            self.provider_dropdown["menu"].config(bg=CARD, fg=TEXT, activebackground=ORANGE, activeforeground="#0a0a0a")
+            self.provider_dropdown.pack(side=tk.RIGHT)
 
-        send_btn = tk.Button(
-            entry_frame, text="Send", command=self.send,
-            bg=ORANGE, fg="#0a0a0a", activebackground=AMBER, activeforeground="#0a0a0a",
-            relief="flat", font=FONT_UI_BOLD, padx=14, bd=0, cursor="hand2",
-        )
-        send_btn.pack(side=tk.RIGHT)
+            self.status_label = tk.Label(head, text="", bg=PANEL, fg=AMBER, font=FONT_MONO)
+            self.status_label.pack(side=tk.RIGHT, padx=(0, 10))
+            self._spinner_text = {"value": None}
+            self._spinner = _SpinnerLabel(self.status_label, lambda: self._spinner_text["value"])
 
-        self.send_code_var = tk.BooleanVar(value=True)
-        code_check = tk.Checkbutton(
-            entry_frame, text="Send Code", variable=self.send_code_var,
-            bg=PANEL, fg=TEXT_DIM, selectcolor=CARD,
-            activebackground=PANEL, activeforeground=TEXT,
-            font=FONT_MONO, bd=0, highlightthickness=0, cursor="hand2",
-        )
-        code_check.pack(side=tk.RIGHT, padx=8)
+            self.transcript = scrolledtext.ScrolledText(
+                self, wrap=tk.WORD, state="disabled", height=24,
+                bg=CARD, fg=TEXT, insertbackground=TEXT,
+                relief="flat", bd=0, padx=10, pady=10,
+                font=FONT_UI, highlightthickness=1, highlightbackground=BORDER,
+            )
+            self.transcript.tag_configure("who_user", foreground=TEAL, font=FONT_UI_BOLD)
+            self.transcript.tag_configure("who_ai", foreground=ORANGE, font=FONT_UI_BOLD)
+            self.transcript.tag_configure("bold", font=FONT_UI_BOLD)
+            self.transcript.tag_configure("heading", font=("Segoe UI", 11, "bold"), foreground=AMBER)
+            self.transcript.tag_configure("inline_code", font=FONT_MONO, background=CARD_HOVER, foreground=TEAL)
+            self.transcript.tag_configure("code_block", font=FONT_MONO, background=CARD_HOVER, lmargin1=10, lmargin2=10)
+            self.transcript.tag_configure("math", font=("Cambria Math", 10), foreground=AMBER)
+            self.transcript.tag_configure("find_match", background=FIND_MATCH)
+            self.transcript.tag_configure("find_current", background=FIND_MATCH_CUR)
+            self.transcript.pack(fill=tk.BOTH, expand=True, padx=14, pady=8)
 
-        self.entry = tk.Entry(
-            entry_frame, bg=CARD, fg=TEXT, insertbackground=TEXT,
-            relief="flat", font=FONT_UI, highlightthickness=1,
-            highlightbackground=BORDER, highlightcolor=ORANGE,
-        )
-        self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6, padx=(0, 8))
-        self.entry.bind("<Return>", lambda e: self.send())
+            self._find_matches = []
+            self._find_idx = -1
+            self._find_frame = None
+            self.transcript.bind("<Control-f>", lambda e: self._open_find_bar())
+            self.bind_all("<Control-f>", lambda e: self._open_find_bar())
 
-        self._update_status_indicator()
+            entry_frame = tk.Frame(self, bg=PANEL)
+            entry_frame.pack(fill=tk.X, padx=14, pady=(0, 14))
 
-    def _open_find_bar(self):
-        if getattr(self, "_find_frame", None) is not None:
+            send_btn = tk.Button(
+                entry_frame, text="Send", command=self.send,
+                bg=ORANGE, fg="#0a0a0a", activebackground=AMBER, activeforeground="#0a0a0a",
+                relief="flat", font=FONT_UI_BOLD, padx=14, bd=0, cursor="hand2",
+            )
+            send_btn.pack(side=tk.RIGHT)
+
+            self.send_code_var = tk.BooleanVar(value=True)
+            code_check = tk.Checkbutton(
+                entry_frame, text="Send Code", variable=self.send_code_var,
+                bg=PANEL, fg=TEXT_DIM, selectcolor=CARD,
+                activebackground=PANEL, activeforeground=TEXT,
+                font=FONT_MONO, bd=0, highlightthickness=0, cursor="hand2",
+            )
+            code_check.pack(side=tk.RIGHT, padx=8)
+
+            self.entry = tk.Entry(
+                entry_frame, bg=CARD, fg=TEXT, insertbackground=TEXT,
+                relief="flat", font=FONT_UI, highlightthickness=1,
+                highlightbackground=BORDER, highlightcolor=ORANGE,
+            )
+            self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6, padx=(0, 8))
+            self.entry.bind("<Return>", lambda e: self.send())
+
+            self._update_status_indicator()
+
+        def _open_find_bar(self):
+            if getattr(self, "_find_frame", None) is not None:
+                self._find_entry.focus_set()
+                return
+            self._find_frame = tk.Frame(self, bg=PANEL)
+            self._find_frame.pack(fill=tk.X, padx=14, pady=(0, 6))
+            self._find_var = tk.StringVar()
+            self._find_entry = tk.Entry(self._find_frame, textvariable=self._find_var, bg=CARD, fg=TEXT,
+                                         insertbackground=TEXT, relief="flat", font=FONT_UI)
+            self._find_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
+            self._find_entry.bind("<Return>", lambda e: self._find_next())
+            self._find_entry.bind("<KeyRelease>", lambda e: self._run_find())
+            tk.Button(self._find_frame, text="↓", command=self._find_next, bg=CARD, fg=TEXT,
+                      relief="flat", bd=0).pack(side=tk.LEFT, padx=2)
+            tk.Button(self._find_frame, text="✕", command=self._close_find_bar, bg=CARD, fg=TEXT,
+                      relief="flat", bd=0).pack(side=tk.LEFT, padx=2)
             self._find_entry.focus_set()
-            return
-        self._find_frame = tk.Frame(self, bg=PANEL)
-        self._find_frame.pack(fill=tk.X, padx=14, pady=(0, 6))
-        self._find_var = tk.StringVar()
-        self._find_entry = tk.Entry(self._find_frame, textvariable=self._find_var, bg=CARD, fg=TEXT,
-                                     insertbackground=TEXT, relief="flat", font=FONT_UI)
-        self._find_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
-        self._find_entry.bind("<Return>", lambda e: self._find_next())
-        self._find_entry.bind("<KeyRelease>", lambda e: self._run_find())
-        tk.Button(self._find_frame, text="↓", command=self._find_next, bg=CARD, fg=TEXT,
-                  relief="flat", bd=0).pack(side=tk.LEFT, padx=2)
-        tk.Button(self._find_frame, text="✕", command=self._close_find_bar, bg=CARD, fg=TEXT,
-                  relief="flat", bd=0).pack(side=tk.LEFT, padx=2)
-        self._find_entry.focus_set()
 
-    def _close_find_bar(self):
-        self.transcript.tag_remove("find_match", "1.0", tk.END)
-        self.transcript.tag_remove("find_current", "1.0", tk.END)
-        self._find_frame.destroy()
-        self._find_frame = None
+        def _close_find_bar(self):
+            self.transcript.tag_remove("find_match", "1.0", tk.END)
+            self.transcript.tag_remove("find_current", "1.0", tk.END)
+            self._find_frame.destroy()
+            self._find_frame = None
 
-    def _run_find(self):
-        query = self._find_var.get()
-        self.transcript.tag_remove("find_match", "1.0", tk.END)
-        self.transcript.tag_remove("find_current", "1.0", tk.END)
-        self._find_matches = []
-        self._find_idx = -1
-        if not query:
-            return
-        start = "1.0"
-        while True:
-            pos = self.transcript.search(query, start, stopindex=tk.END, nocase=True)
-            if not pos:
-                break
-            end = f"{pos}+{len(query)}c"
-            self.transcript.tag_add("find_match", pos, end)
-            self._find_matches.append((pos, end))
-            start = end
-        if self._find_matches:
-            self._find_idx = 0
+        def _run_find(self):
+            query = self._find_var.get()
+            self.transcript.tag_remove("find_match", "1.0", tk.END)
+            self.transcript.tag_remove("find_current", "1.0", tk.END)
+            self._find_matches = []
+            self._find_idx = -1
+            if not query:
+                return
+            start = "1.0"
+            while True:
+                pos = self.transcript.search(query, start, stopindex=tk.END, nocase=True)
+                if not pos:
+                    break
+                end = f"{pos}+{len(query)}c"
+                self.transcript.tag_add("find_match", pos, end)
+                self._find_matches.append((pos, end))
+                start = end
+            if self._find_matches:
+                self._find_idx = 0
+                self._goto_current_match()
+
+        def _goto_current_match(self):
+            self.transcript.tag_remove("find_current", "1.0", tk.END)
+            if not self._find_matches:
+                return
+            pos, end = self._find_matches[self._find_idx]
+            self.transcript.tag_add("find_current", pos, end)
+            self.transcript.see(pos)
+
+        def _find_next(self):
+            if not self._find_matches:
+                self._run_find()
+                return
+            self._find_idx = (self._find_idx + 1) % len(self._find_matches)
             self._goto_current_match()
 
-    def _goto_current_match(self):
-        self.transcript.tag_remove("find_current", "1.0", tk.END)
-        if not self._find_matches:
-            return
-        pos, end = self._find_matches[self._find_idx]
-        self.transcript.tag_add("find_current", pos, end)
-        self.transcript.see(pos)
-
-    def _find_next(self):
-        if not self._find_matches:
-            self._run_find()
-            return
-        self._find_idx = (self._find_idx + 1) % len(self._find_matches)
-        self._goto_current_match()
-
-    def _has_active_key(self, provider_name):
+        def _has_active_key(self, provider_name):
         
-        env_var = PROVIDERS[provider_name]["env_key"]
-        if env_var is None:
-            return True
-        return bool(os.environ.get(env_var) or self.session_keys.get(provider_name))
+            env_var = PROVIDERS[provider_name]["env_key"]
+            if env_var is None:
+                return True
+            return bool(os.environ.get(env_var) or self.session_keys.get(provider_name))
 
-    def _update_status_indicator(self):
-        has_key = self._has_active_key(self.provider_var.get())
-        self.dot.itemconfig(self.dot_id, fill=TEAL if has_key else AMBER)
+        def _update_status_indicator(self):
+            has_key = self._has_active_key(self.provider_var.get())
+            self.dot.itemconfig(self.dot_id, fill=TEAL if has_key else AMBER)
 
-    def _on_provider_change(self, selection):
-        if PROVIDERS.get(selection, {}).get("custom"):
-            model_string = simpledialog.askstring(
-                "Custom Model", "Model string (e.g. openai/gpt-6-astra):", parent=self
-            )
-            if not model_string or "/" not in model_string:
-                # Cancelled or invalid -- fall back to whatever provider was
-                # active before this selection instead of leaving the
-                # sentinel entry selected with nothing behind it.
-                self.provider_var.set(list(PROVIDERS.keys())[0])
-                self._update_status_indicator()
-                return
-            env_var = simpledialog.askstring(
-                "Env Var", "Env var name for the API key (blank = none needed):", parent=self
-            ) or None
-            label = f"Custom: {model_string}"
-            PROVIDERS[label] = {"model": model_string, "env_key": env_var}
-            menu = self.provider_dropdown["menu"]
-            menu.add_command(label=label, command=tk._setit(self.provider_var, label, self._on_provider_change))
-            self.provider_var.set(label)
-        elif PROVIDERS.get(selection, {}).get("openrouter"):
-            model_string = simpledialog.askstring(
-                "OpenRouter Model", "OpenRouter model (e.g. deepseek/deepseek-v4-flash):", parent=self
-            )
-            if not model_string or "/" not in model_string:
-                self.provider_var.set(list(PROVIDERS.keys())[0])
-                self._update_status_indicator()
-                return
-            label = register_openrouter_model(model_string)
-            menu = self.provider_dropdown["menu"]
-            menu.add_command(label=label, command=tk._setit(self.provider_var, label, self._on_provider_change))
-            self.provider_var.set(label)
-        self._update_status_indicator()
-
-    def _set_stage(self, label):
-        """label=None stops the spinner and clears the status text; a string
-        starts/updates it (e.g. 'Suggesting fix', 'Developing fix',
-        'Implementing fix')."""
-        self._spinner_text["value"] = label
-        if label is None:
-            self._spinner.stop()
-        else:
-            self._spinner.start()
-
-    def _append(self, who, text):
-        self.transcript.configure(state="normal")
-        tag = "who_user" if who.startswith("You") else "who_ai"
-        self.transcript.insert(tk.END, f"{who}\n", tag)
-        self._insert_formatted(text)
-        self.transcript.insert(tk.END, "\n\n")
-        self.transcript.configure(state="disabled")
-        self.transcript.see(tk.END)
-
-    def _insert_formatted(self, text):
-        """Minimal markdown-ish renderer: ```code blocks```, `inline code`,
-        **bold**, and $math$/$$math$$ spans (rendered in a distinct color/
-        font rather than literally, since Tk can't do real LaTeX)."""
-        t = self.transcript
-        lines = text.split("\n")
-        in_code_block = False
-        for line in lines:
-            if line.strip().startswith("```"):
-                in_code_block = not in_code_block
-                continue
-            if in_code_block:
-                t.insert(tk.END, line + "\n", "code_block")
-                continue
-            if line.startswith("#"):
-                stripped = line.lstrip("#").strip()
-                t.insert(tk.END, stripped + "\n", "heading")
-                continue
-
-            # inline: **bold**, `code`, $math$
-            pos = 0
-            pattern = re.compile(r"(\*\*.+?\*\*|`.+?`|\$\$.+?\$\$|\$.+?\$)")
-            for m in pattern.finditer(line):
-                if m.start() > pos:
-                    t.insert(tk.END, line[pos:m.start()])
-                chunk = m.group(0)
-                if chunk.startswith("**"):
-                    t.insert(tk.END, chunk[2:-2], "bold")
-                elif chunk.startswith("`"):
-                    t.insert(tk.END, chunk[1:-1], "inline_code")
-                elif chunk.startswith("$$"):
-                    t.insert(tk.END, chunk[2:-2], "math")
-                else:
-                    t.insert(tk.END, chunk[1:-1], "math")
-                pos = m.end()
-            t.insert(tk.END, line[pos:] + "\n")
-
-    def send(self):
-        question = self.entry.get().strip()
-        if not question:
-            return
-
-        current_provider = self.provider_var.get()
-        prov_info = PROVIDERS[current_provider]
-        env_var = prov_info.get("env_key")
-
-        if not self._has_active_key(current_provider):
-            api_key = simpledialog.askstring(
-                prov_info.get("prompt_title", "API Key Required"),
-                prov_info.get("prompt_msg", f"Enter the API key for {env_var}:"),
-                parent=self, show='*'
-            )
-            if not api_key or not api_key.strip():
-                return
-            clean_key = api_key.strip()
-            self.session_keys[current_provider] = clean_key
-            os.environ[env_var] = clean_key
+        def _on_provider_change(self, selection):
+            if PROVIDERS.get(selection, {}).get("custom"):
+                model_string = simpledialog.askstring(
+                    "Custom Model", "Model string (e.g. openai/gpt-6-astra):", parent=self
+                )
+                if not model_string or "/" not in model_string:
+                    # Cancelled or invalid -- fall back to whatever provider was
+                    # active before this selection instead of leaving the
+                    # sentinel entry selected with nothing behind it.
+                    self.provider_var.set(list(PROVIDERS.keys())[0])
+                    self._update_status_indicator()
+                    return
+                env_var = simpledialog.askstring(
+                    "Env Var", "Env var name for the API key (blank = none needed):", parent=self
+                ) or None
+                label = f"Custom: {model_string}"
+                PROVIDERS[label] = {"model": model_string, "env_key": env_var}
+                menu = self.provider_dropdown["menu"]
+                menu.add_command(label=label, command=tk._setit(self.provider_var, label, self._on_provider_change))
+                self.provider_var.set(label)
+            elif PROVIDERS.get(selection, {}).get("openrouter"):
+                model_string = simpledialog.askstring(
+                    "OpenRouter Model", "OpenRouter model (e.g. deepseek/deepseek-v4-flash):", parent=self
+                )
+                if not model_string or "/" not in model_string:
+                    self.provider_var.set(list(PROVIDERS.keys())[0])
+                    self._update_status_indicator()
+                    return
+                label = register_openrouter_model(model_string)
+                menu = self.provider_dropdown["menu"]
+                menu.add_command(label=label, command=tk._setit(self.provider_var, label, self._on_provider_change))
+                self.provider_var.set(label)
             self._update_status_indicator()
-            self._append("Pulse", f"API key saved for {current_provider}. Send your message again.")
-            return
 
-        include_code = self.send_code_var.get()
-        self.entry.delete(0, tk.END)
-        self._append("You  (+ code)" if include_code else "You", question)
-
-        threading.Thread(target=self._ask_and_maybe_retry, args=(question, include_code, current_provider), daemon=True).start()
-
-    def _build_file_labels(self, extra_files):
-        """Give every file a short, unique display label (usually just its
-        basename) used both in the code shown to the agent and later to
-        resolve which real file a proposed fix's "file" field refers to.
-        """
-        label_for_path, path_for_label, used = {}, {}, set()
-
-        def add(path):
-            if not path or path in label_for_path:
-                return
-            base = os.path.basename(path)
-            label = base
-            if label in used:
-                parent = os.path.basename(os.path.dirname(path))
-                label = f"{parent}/{base}"
-            used.add(label)
-            label_for_path[path] = label
-            path_for_label[label] = path
-
-        add(self.script_path)
-        for p in extra_files:
-            add(p)
-
-        self._label_for_path = label_for_path
-        self._path_for_label = path_for_label
-
-    def _build_context(self, include_code=False):
-        manifest = self.get_manifest_fn() or {}
-        context = "Current tracked matrix/scalar stats:\n"
-        for name, s in manifest.items():
-            if "error" in s:
-                context += f"- {name}: NoneType/error reading matrix ({s['error']})\n"
-                continue
-            if s.get("kind") == "scalar":
-                latest = s.get("latest_value")
-                value_str = "None" if latest is None else str(latest)
-                context += (
-                    f"- {name}: scalar, backend={s.get('backend')}, latest_value={value_str}, "
-                    f"nan={s.get('nan')} inf={s.get('inf')}\n"
-                )
+        def _set_stage(self, label):
+            """label=None stops the spinner and clears the status text; a string
+            starts/updates it (e.g. 'Suggesting fix', 'Developing fix',
+            'Implementing fix')."""
+            self._spinner_text["value"] = label
+            if label is None:
+                self._spinner.stop()
             else:
-                state = s.get("state", "track")
-                context += (
-                    f"- {name}: shape={s.get('shape')} backend={s.get('backend')} kind={s.get('kind')} "
-                    f"min={s.get('min')} max={s.get('max')} mean={s.get('mean')} std={s.get('std')} "
-                    f"nan={s.get('nan')} inf={s.get('inf')} state={state}\n"
+                self._spinner.start()
+
+        def _append(self, who, text):
+            self.transcript.configure(state="normal")
+            tag = "who_user" if who.startswith("You") else "who_ai"
+            self.transcript.insert(tk.END, f"{who}\n", tag)
+            self._insert_formatted(text)
+            self.transcript.insert(tk.END, "\n\n")
+            self.transcript.configure(state="disabled")
+            self.transcript.see(tk.END)
+
+        def _insert_formatted(self, text):
+            """Minimal markdown-ish renderer: ```code blocks```, `inline code`,
+            **bold**, and $math$/$$math$$ spans (rendered in a distinct color/
+            font rather than literally, since Tk can't do real LaTeX)."""
+            t = self.transcript
+            lines = text.split("\n")
+            in_code_block = False
+            for line in lines:
+                if line.strip().startswith("```"):
+                    in_code_block = not in_code_block
+                    continue
+                if in_code_block:
+                    t.insert(tk.END, line + "\n", "code_block")
+                    continue
+                if line.startswith("#"):
+                    stripped = line.lstrip("#").strip()
+                    t.insert(tk.END, stripped + "\n", "heading")
+                    continue
+
+                # inline: **bold**, `code`, $math$
+                pos = 0
+                pattern = re.compile(r"(\*\*.+?\*\*|`.+?`|\$\$.+?\$\$|\$.+?\$)")
+                for m in pattern.finditer(line):
+                    if m.start() > pos:
+                        t.insert(tk.END, line[pos:m.start()])
+                    chunk = m.group(0)
+                    if chunk.startswith("**"):
+                        t.insert(tk.END, chunk[2:-2], "bold")
+                    elif chunk.startswith("`"):
+                        t.insert(tk.END, chunk[1:-1], "inline_code")
+                    elif chunk.startswith("$$"):
+                        t.insert(tk.END, chunk[2:-2], "math")
+                    else:
+                        t.insert(tk.END, chunk[1:-1], "math")
+                    pos = m.end()
+                t.insert(tk.END, line[pos:] + "\n")
+
+        def send(self):
+            question = self.entry.get().strip()
+            if not question:
+                return
+
+            current_provider = self.provider_var.get()
+            prov_info = PROVIDERS[current_provider]
+            env_var = prov_info.get("env_key")
+
+            if not self._has_active_key(current_provider):
+                api_key = simpledialog.askstring(
+                    prov_info.get("prompt_title", "API Key Required"),
+                    prov_info.get("prompt_msg", f"Enter the API key for {env_var}:"),
+                    parent=self, show='*'
                 )
-        if include_code and self.get_code_fn:
-            code = self.get_code_fn()
+                if not api_key or not api_key.strip():
+                    return
+                clean_key = api_key.strip()
+                self.session_keys[current_provider] = clean_key
+                os.environ[env_var] = clean_key
+                self._update_status_indicator()
+                self._append("Pulse", f"API key saved for {current_provider}. Send your message again.")
+                return
+
+            include_code = self.send_code_var.get()
+            self.entry.delete(0, tk.END)
+            self._append("You  (+ code)" if include_code else "You", question)
+
+            threading.Thread(target=self._ask_and_maybe_retry, args=(question, include_code, current_provider), daemon=True).start()
+
+        def _build_file_labels(self, extra_files):
+            """Give every file a short, unique display label (usually just its
+            basename) used both in the code shown to the agent and later to
+            resolve which real file a proposed fix's "file" field refers to.
+            """
+            label_for_path, path_for_label, used = {}, {}, set()
+
+            def add(path):
+                if not path or path in label_for_path:
+                    return
+                base = os.path.basename(path)
+                label = base
+                if label in used:
+                    parent = os.path.basename(os.path.dirname(path))
+                    label = f"{parent}/{base}"
+                used.add(label)
+                label_for_path[path] = label
+                path_for_label[label] = path
+
+            add(self.script_path)
+            for p in extra_files:
+                add(p)
+
+            self._label_for_path = label_for_path
+            self._path_for_label = path_for_label
+
+        def _build_context(self, include_code=False):
+            manifest = self.get_manifest_fn() or {}
+            context = "Current tracked matrix/scalar stats:\n"
+            for name, s in manifest.items():
+                if "error" in s:
+                    context += f"- {name}: NoneType/error reading matrix ({s['error']})\n"
+                    continue
+                if s.get("kind") == "scalar":
+                    latest = s.get("latest_value")
+                    value_str = "None" if latest is None else str(latest)
+                    context += (
+                        f"- {name}: scalar, backend={s.get('backend')}, latest_value={value_str}, "
+                        f"nan={s.get('nan')} inf={s.get('inf')}\n"
+                    )
+                else:
+                    state = s.get("state", "track")
+                    context += (
+                        f"- {name}: shape={s.get('shape')} backend={s.get('backend')} kind={s.get('kind')} "
+                        f"min={s.get('min')} max={s.get('max')} mean={s.get('mean')} std={s.get('std')} "
+                        f"nan={s.get('nan')} inf={s.get('inf')} state={state}\n"
+                    )
+            if include_code and self.get_code_fn:
+                code = self.get_code_fn()
+                extra_files = (self.get_extra_files_fn() or {}) if self.get_extra_files_fn else {}
+                self._build_file_labels(extra_files)
+                entry_label = self._label_for_path.get(self.script_path, "main_script.py")
+
+                if code:
+                    numbered = "\n".join(f"{i+1:>4} | {line}" for i, line in enumerate(code.splitlines()))
+                    context += f"\n=== {entry_label} (main script, line-numbered) ===\n```\n{numbered}\n```\n"
+                else:
+                    context += "\n(User checked 'Send Code' but no code text is available.)\n"
+
+                if extra_files:
+                    context += (
+                        "\nThis project is modularized -- other local files it imports are included "
+                        "below, each line-numbered under its own header. When proposing a code fix, "
+                        "set each fix's \"file\" to the exact header shown here (e.g. \"model.py\") so "
+                        f"Pulse edits the right file. Omit \"file\" to default to {entry_label}.\n"
+                    )
+                    for path, text in extra_files.items():
+                        label = self._label_for_path.get(path, os.path.basename(path))
+                        numbered = "\n".join(f"{i+1:>4} | {line}" for i, line in enumerate(text.splitlines()))
+                        context += f"\n=== {label} ===\n```\n{numbered}\n```\n"
+            return context
+
+        def _image_payloads(self):
+            manifest = self.get_manifest_fn() or {}
+            payloads = []
+            for name, s in sorted(manifest.items()):
+                img_path = s.get("image")
+                if not img_path or not os.path.exists(img_path):
+                    continue
+                try:
+                    with Image.open(img_path) as img:
+                        img.thumbnail((512, 512), Image.Resampling.LANCZOS)
+                        buffer = io.BytesIO()
+                        img.save(buffer, format="PNG", optimize=True)
+                        encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                    payloads.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{encoded}"},
+                    })
+                except Exception:
+                    pass
+            return payloads
+
+        _RETRYABLE_ERROR_ATTRS = (
+            "RateLimitError", "Timeout", "APIConnectionError",
+            "ServiceUnavailableError", "InternalServerError",
+        )
+
+        def _is_retryable_model_error(self, exc):
+            for attr in self._RETRYABLE_ERROR_ATTRS:
+                cls = getattr(litellm, attr, None)
+                if cls is not None and isinstance(exc, cls):
+                    return True
+            return False
+
+        def _classify_model_error(self, exc):
+            """Turn whatever litellm/the provider's SDK raised into one short,
+            stable, user-facing reason instead of a raw exception repr."""
+            for attr, reason in (
+                ("AuthenticationError", "authentication failed -- check the API key for this provider"),
+                ("PermissionDeniedError", "the API key doesn't have permission for this model"),
+                ("RateLimitError", "rate limited by the provider -- try again shortly"),
+                ("ContextWindowExceededError", "the conversation/code context is too large for this model's context window"),
+                ("BadRequestError", "the provider rejected the request (often an invalid/unavailable model name)"),
+                ("NotFoundError", "model not found -- check the model name is correct and available on this provider/account"),
+                ("Timeout", "the request timed out"),
+                ("APIConnectionError", "couldn't connect to the provider (network issue, or a local server that isn't running)"),
+                ("ServiceUnavailableError", "the provider's service is temporarily unavailable"),
+                ("InternalServerError", "the provider's own service hit an internal error"),
+            ):
+                cls = getattr(litellm, attr, None)
+                if cls is not None and isinstance(exc, cls):
+                    return reason
+            msg = str(exc)
+            return msg[:200] + ("…" if len(msg) > 200 else "")
+
+        def _call_model(self, model_name, instruction, image_payloads=None, max_tokens=_AGENT_MAX_TOKENS):
+            """One lightweight completion call: system prompt + recent history +
+            a one-off stage instruction (+ images on the first call only, so
+            they aren't re-uploaded on every stage). Does not touch
+            self.history -- the caller decides what gets persisted once the
+            whole pipeline finishes.
+
+            Transient failures (rate limits, timeouts, connection blips, a
+            provider's own 500) are retried up to 3 times with a short
+            backoff before giving up; anything else (bad API key, invalid
+            model name, context too long) fails immediately since retrying
+            won't change the outcome. On exhaustion, raises AgentRequestFailed
+            rather than returning an error string dressed up as a real answer
+            -- see _ask's try/except, the one chokepoint for the whole
+            multi-pass pipeline.
+            """
+            content = [{"type": "text", "text": instruction}]
+            if image_payloads:
+                content.extend(image_payloads)
+            messages = (
+                [{"role": "system", "content": SYSTEM_PROMPT}]
+                + self.history[-10:]
+                + [{"role": "user", "content": content}]
+            )
+            max_tokens = _clamp_output_tokens(model_name, max_tokens)
+            max_attempts = 3
+            last_exc = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    response = litellm.completion(
+                        model=model_name,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        timeout=_AGENT_TIMEOUT_SECONDS,
+                    )
+                    text = (response.choices[0].message.content or "").strip()
+                    if not text:
+                        raise AgentRequestFailed("the provider returned an empty response")
+                    self._record_usage(response)
+                    return text
+                except AgentRequestFailed:
+                    raise
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < max_attempts and self._is_retryable_model_error(exc):
+                        backoff = 2 ** (attempt - 1)  # 1s, 2s, 4s
+                        reason = self._classify_model_error(exc)
+                        self.after(0, lambda a=attempt, m=max_attempts, b=backoff, r=reason: self._append(
+                            "Pulse", f"⚠ Agent request hit a transient error (attempt {a}/{m}), retrying in {b}s: {r}"))
+                        time.sleep(backoff)
+                        continue
+                    raise AgentRequestFailed(self._classify_model_error(exc)) from exc
+            raise AgentRequestFailed(self._classify_model_error(last_exc) if last_exc else "unknown error")
+
+        def _record_usage(self, response):
+            """Best-effort token/cost accounting for the COST directive --
+            never let a usage-accounting hiccup affect the actual chat
+            response. Cost is litellm's own estimate where it has pricing
+            data for the model; otherwise only token counts are available."""
+            try:
+                usage = getattr(response, "usage", None)
+                if usage:
+                    self._token_usage["prompt_tokens"] += getattr(usage, "prompt_tokens", 0) or 0
+                    self._token_usage["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
+                    self._token_usage["total_tokens"] += getattr(usage, "total_tokens", 0) or 0
+                self._token_usage["calls"] += 1
+                try:
+                    self._token_usage["cost_usd"] += float(litellm.completion_cost(completion_response=response) or 0.0)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        _GREP_MAX_MATCHES = 40
+        _GREP_CONTEXT_LINES = 1
+        _VIEW_MAX_LINES = 400
+        _VIEW_ARG_RE = re.compile(r"^(?:([^:]+):)?\s*(\d+)\s*-\s*(\d+)\s*$")
+
+        def _iter_searchable_files(self):
+            """(label, path, text) for the entry script plus every other local
+            project file Pulse knows about, regardless of whether 'Send Code'
+            is currently checked -- GREP/VIEW let the agent pull in only the
+            slice it actually needs instead of requiring the whole file(s) to
+            already be in context.
+            """
             extra_files = (self.get_extra_files_fn() or {}) if self.get_extra_files_fn else {}
             self._build_file_labels(extra_files)
-            entry_label = self._label_for_path.get(self.script_path, "main_script.py")
+            code = self.get_code_fn() if self.get_code_fn else None
+            if self.script_path and code is not None:
+                label = self._label_for_path.get(self.script_path, os.path.basename(self.script_path))
+                yield label, self.script_path, code
+            for path, text in extra_files.items():
+                label = self._label_for_path.get(path, os.path.basename(path))
+                yield label, path, text
 
-            if code:
-                numbered = "\n".join(f"{i+1:>4} | {line}" for i, line in enumerate(code.splitlines()))
-                context += f"\n=== {entry_label} (main script, line-numbered) ===\n```\n{numbered}\n```\n"
-            else:
-                context += "\n(User checked 'Send Code' but no code text is available.)\n"
-
-            if extra_files:
-                context += (
-                    "\nThis project is modularized -- other local files it imports are included "
-                    "below, each line-numbered under its own header. When proposing a code fix, "
-                    "set each fix's \"file\" to the exact header shown here (e.g. \"model.py\") so "
-                    f"Pulse edits the right file. Omit \"file\" to default to {entry_label}.\n"
-                )
-                for path, text in extra_files.items():
-                    label = self._label_for_path.get(path, os.path.basename(path))
-                    numbered = "\n".join(f"{i+1:>4} | {line}" for i, line in enumerate(text.splitlines()))
-                    context += f"\n=== {label} ===\n```\n{numbered}\n```\n"
-        return context
-
-    def _image_payloads(self):
-        manifest = self.get_manifest_fn() or {}
-        payloads = []
-        for name, s in sorted(manifest.items()):
-            img_path = s.get("image")
-            if not img_path or not os.path.exists(img_path):
-                continue
+        def _run_grep(self, pattern):
+            """Case-insensitive regex (or literal, if not valid regex) search
+            across every known project file, returning matches as
+            'label, line N' with a line of context on each side, capped at
+            _GREP_MAX_MATCHES total."""
             try:
-                with Image.open(img_path) as img:
-                    img.thumbnail((512, 512), Image.Resampling.LANCZOS)
-                    buffer = io.BytesIO()
-                    img.save(buffer, format="PNG", optimize=True)
-                    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                payloads.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{encoded}"},
-                })
-            except Exception:
-                pass
-        return payloads
+                rx = re.compile(pattern, re.IGNORECASE)
+            except re.error:
+                rx = re.compile(re.escape(pattern), re.IGNORECASE)
 
-    _RETRYABLE_ERROR_ATTRS = (
-        "RateLimitError", "Timeout", "APIConnectionError",
-        "ServiceUnavailableError", "InternalServerError",
-    )
-
-    def _is_retryable_model_error(self, exc):
-        for attr in self._RETRYABLE_ERROR_ATTRS:
-            cls = getattr(litellm, attr, None)
-            if cls is not None and isinstance(exc, cls):
-                return True
-        return False
-
-    def _classify_model_error(self, exc):
-        """Turn whatever litellm/the provider's SDK raised into one short,
-        stable, user-facing reason instead of a raw exception repr."""
-        for attr, reason in (
-            ("AuthenticationError", "authentication failed -- check the API key for this provider"),
-            ("PermissionDeniedError", "the API key doesn't have permission for this model"),
-            ("RateLimitError", "rate limited by the provider -- try again shortly"),
-            ("ContextWindowExceededError", "the conversation/code context is too large for this model's context window"),
-            ("BadRequestError", "the provider rejected the request (often an invalid/unavailable model name)"),
-            ("NotFoundError", "model not found -- check the model name is correct and available on this provider/account"),
-            ("Timeout", "the request timed out"),
-            ("APIConnectionError", "couldn't connect to the provider (network issue, or a local server that isn't running)"),
-            ("ServiceUnavailableError", "the provider's service is temporarily unavailable"),
-            ("InternalServerError", "the provider's own service hit an internal error"),
-        ):
-            cls = getattr(litellm, attr, None)
-            if cls is not None and isinstance(exc, cls):
-                return reason
-        msg = str(exc)
-        return msg[:200] + ("…" if len(msg) > 200 else "")
-
-    def _call_model(self, model_name, instruction, image_payloads=None, max_tokens=_AGENT_MAX_TOKENS):
-        """One lightweight completion call: system prompt + recent history +
-        a one-off stage instruction (+ images on the first call only, so
-        they aren't re-uploaded on every stage). Does not touch
-        self.history -- the caller decides what gets persisted once the
-        whole pipeline finishes.
-
-        Transient failures (rate limits, timeouts, connection blips, a
-        provider's own 500) are retried up to 3 times with a short
-        backoff before giving up; anything else (bad API key, invalid
-        model name, context too long) fails immediately since retrying
-        won't change the outcome. On exhaustion, raises AgentRequestFailed
-        rather than returning an error string dressed up as a real answer
-        -- see _ask's try/except, the one chokepoint for the whole
-        multi-pass pipeline.
-        """
-        content = [{"type": "text", "text": instruction}]
-        if image_payloads:
-            content.extend(image_payloads)
-        messages = (
-            [{"role": "system", "content": SYSTEM_PROMPT}]
-            + self.history[-10:]
-            + [{"role": "user", "content": content}]
-        )
-        max_tokens = _clamp_output_tokens(model_name, max_tokens)
-        max_attempts = 3
-        last_exc = None
-        for attempt in range(1, max_attempts + 1):
-            try:
-                response = litellm.completion(
-                    model=model_name,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    timeout=_AGENT_TIMEOUT_SECONDS,
-                )
-                text = (response.choices[0].message.content or "").strip()
-                if not text:
-                    raise AgentRequestFailed("the provider returned an empty response")
-                self._record_usage(response)
-                return text
-            except AgentRequestFailed:
-                raise
-            except Exception as exc:
-                last_exc = exc
-                if attempt < max_attempts and self._is_retryable_model_error(exc):
-                    backoff = 2 ** (attempt - 1)  # 1s, 2s, 4s
-                    reason = self._classify_model_error(exc)
-                    self.after(0, lambda a=attempt, m=max_attempts, b=backoff, r=reason: self._append(
-                        "Pulse", f"⚠ Agent request hit a transient error (attempt {a}/{m}), retrying in {b}s: {r}"))
-                    time.sleep(backoff)
-                    continue
-                raise AgentRequestFailed(self._classify_model_error(exc)) from exc
-        raise AgentRequestFailed(self._classify_model_error(last_exc) if last_exc else "unknown error")
-
-    def _record_usage(self, response):
-        """Best-effort token/cost accounting for the COST directive --
-        never let a usage-accounting hiccup affect the actual chat
-        response. Cost is litellm's own estimate where it has pricing
-        data for the model; otherwise only token counts are available."""
-        try:
-            usage = getattr(response, "usage", None)
-            if usage:
-                self._token_usage["prompt_tokens"] += getattr(usage, "prompt_tokens", 0) or 0
-                self._token_usage["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
-                self._token_usage["total_tokens"] += getattr(usage, "total_tokens", 0) or 0
-            self._token_usage["calls"] += 1
-            try:
-                self._token_usage["cost_usd"] += float(litellm.completion_cost(completion_response=response) or 0.0)
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-    _GREP_MAX_MATCHES = 40
-    _GREP_CONTEXT_LINES = 1
-    _VIEW_MAX_LINES = 400
-    _VIEW_ARG_RE = re.compile(r"^(?:([^:]+):)?\s*(\d+)\s*-\s*(\d+)\s*$")
-
-    def _iter_searchable_files(self):
-        """(label, path, text) for the entry script plus every other local
-        project file Pulse knows about, regardless of whether 'Send Code'
-        is currently checked -- GREP/VIEW let the agent pull in only the
-        slice it actually needs instead of requiring the whole file(s) to
-        already be in context.
-        """
-        extra_files = (self.get_extra_files_fn() or {}) if self.get_extra_files_fn else {}
-        self._build_file_labels(extra_files)
-        code = self.get_code_fn() if self.get_code_fn else None
-        if self.script_path and code is not None:
-            label = self._label_for_path.get(self.script_path, os.path.basename(self.script_path))
-            yield label, self.script_path, code
-        for path, text in extra_files.items():
-            label = self._label_for_path.get(path, os.path.basename(path))
-            yield label, path, text
-
-    def _run_grep(self, pattern):
-        """Case-insensitive regex (or literal, if not valid regex) search
-        across every known project file, returning matches as
-        'label, line N' with a line of context on each side, capped at
-        _GREP_MAX_MATCHES total."""
-        try:
-            rx = re.compile(pattern, re.IGNORECASE)
-        except re.error:
-            rx = re.compile(re.escape(pattern), re.IGNORECASE)
-
-        blocks = []
-        total = 0
-        for label, _path, text in self._iter_searchable_files():
-            if total >= self._GREP_MAX_MATCHES:
-                break
-            lines = text.splitlines()
-            for i, line in enumerate(lines):
+            blocks = []
+            total = 0
+            for label, _path, text in self._iter_searchable_files():
                 if total >= self._GREP_MAX_MATCHES:
                     break
-                if not rx.search(line):
-                    continue
-                lo = max(0, i - self._GREP_CONTEXT_LINES)
-                hi = min(len(lines), i + self._GREP_CONTEXT_LINES + 1)
-                snippet = "\n".join(f"    {n + 1:>4} | {lines[n]}" for n in range(lo, hi))
-                blocks.append(f"  {label}, line {i + 1}:\n{snippet}")
-                total += 1
+                lines = text.splitlines()
+                for i, line in enumerate(lines):
+                    if total >= self._GREP_MAX_MATCHES:
+                        break
+                    if not rx.search(line):
+                        continue
+                    lo = max(0, i - self._GREP_CONTEXT_LINES)
+                    hi = min(len(lines), i + self._GREP_CONTEXT_LINES + 1)
+                    snippet = "\n".join(f"    {n + 1:>4} | {lines[n]}" for n in range(lo, hi))
+                    blocks.append(f"  {label}, line {i + 1}:\n{snippet}")
+                    total += 1
 
-        if not blocks:
-            return f"GREP '{pattern}': no matches in any tracked file."
-        truncated = " (truncated -- narrow the pattern for more)" if total >= self._GREP_MAX_MATCHES else ""
-        return f"GREP '{pattern}': {total} match(es){truncated}\n" + "\n".join(blocks)
+            if not blocks:
+                return f"GREP '{pattern}': no matches in any tracked file."
+            truncated = " (truncated -- narrow the pattern for more)" if total >= self._GREP_MAX_MATCHES else ""
+            return f"GREP '{pattern}': {total} match(es){truncated}\n" + "\n".join(blocks)
 
-    def _run_view(self, arg):
-        """Exact line range from a known project file -- '<file>:<start>-
-        <end>' (file label optional, defaults to the main script), e.g.
-        'model.py:40-75' or '120-160'. Capped at _VIEW_MAX_LINES."""
-        m = self._VIEW_ARG_RE.match(arg.strip())
-        if not m:
-            return f"VIEW '{arg}': could not parse -- expected '<file>:<start>-<end>' or '<start>-<end>'."
-        file_label, start_str, end_str = m.groups()
-        start, end = int(start_str), int(end_str)
-        if end < start:
-            start, end = end, start
+        def _run_view(self, arg):
+            """Exact line range from a known project file -- '<file>:<start>-
+            <end>' (file label optional, defaults to the main script), e.g.
+            'model.py:40-75' or '120-160'. Capped at _VIEW_MAX_LINES."""
+            m = self._VIEW_ARG_RE.match(arg.strip())
+            if not m:
+                return f"VIEW '{arg}': could not parse -- expected '<file>:<start>-<end>' or '<start>-<end>'."
+            file_label, start_str, end_str = m.groups()
+            start, end = int(start_str), int(end_str)
+            if end < start:
+                start, end = end, start
 
-        extra_files = (self.get_extra_files_fn() or {}) if self.get_extra_files_fn else {}
-        # Build/refresh the label<->path map before resolving -- VIEW can
-        # be sent on its own, without a preceding GREP or 'Send Code' this
-        # turn, so _path_for_label may otherwise still be empty or stale.
-        self._build_file_labels(extra_files)
-        path = self._resolve_fix_path(file_label) if file_label else self.script_path
-        if not path:
-            return f"VIEW '{arg}': could not resolve file '{file_label}'."
+            extra_files = (self.get_extra_files_fn() or {}) if self.get_extra_files_fn else {}
+            # Build/refresh the label<->path map before resolving -- VIEW can
+            # be sent on its own, without a preceding GREP or 'Send Code' this
+            # turn, so _path_for_label may otherwise still be empty or stale.
+            self._build_file_labels(extra_files)
+            path = self._resolve_fix_path(file_label) if file_label else self.script_path
+            if not path:
+                return f"VIEW '{arg}': could not resolve file '{file_label}'."
 
-        code = self.get_code_fn() if self.get_code_fn else None
-        text = code if path == self.script_path else extra_files.get(path)
-        if text is None:
-            return f"VIEW '{arg}': no source text available for '{file_label or os.path.basename(path)}'."
+            code = self.get_code_fn() if self.get_code_fn else None
+            text = code if path == self.script_path else extra_files.get(path)
+            if text is None:
+                return f"VIEW '{arg}': no source text available for '{file_label or os.path.basename(path)}'."
 
-        lines = text.splitlines()
-        end = min(end, len(lines))
-        start = max(1, start)
-        if end - start + 1 > self._VIEW_MAX_LINES:
-            end = start + self._VIEW_MAX_LINES - 1
-        if start > len(lines):
-            return f"VIEW '{arg}': file only has {len(lines)} lines."
-
-        label = self._label_for_path.get(path, os.path.basename(path))
-        numbered = "\n".join(f"    {n:>4} | {lines[n - 1]}" for n in range(start, end + 1))
-        return f"VIEW {label}:{start}-{end}\n{numbered}"
-
-    # ------------------------------------------------------------------
-    # Code intelligence (AST-based, pure/local -- no live-process access
-    # needed): DEFOF/CALLERS/DEPGRAPH.
-    # ------------------------------------------------------------------
-    def _iter_ast_trees(self):
-        """(label, path, text, tree) for every known project file that
-        parses as valid Python -- a file that doesn't parse (mid-edit
-        syntax error, or a non-Python file that slipped into extra_files)
-        is skipped rather than raising."""
-        for label, path, text in self._iter_searchable_files():
-            try:
-                tree = ast.parse(text, filename=path)
-            except (SyntaxError, ValueError):
-                continue
-            yield label, path, text, tree
-
-    def _run_defof(self, symbol):
-        """DEFOF: <symbol> -- AST-based jump-to-definition across every
-        tracked file, not text search."""
-        symbol = symbol.strip()
-        hits = []
-        for label, _path, text, tree in self._iter_ast_trees():
             lines = text.splitlines()
-            for node in ast.walk(tree):
-                kind, name = None, None
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == symbol:
-                    name = node.name
-                    kind = "class" if isinstance(node, ast.ClassDef) else "function"
-                elif isinstance(node, ast.Assign):
-                    for t in node.targets:
-                        if isinstance(t, ast.Name) and t.id == symbol:
-                            name, kind = symbol, "assignment"
-                            break
-                if name is None:
-                    continue
-                start = node.lineno
-                end = min(start + 4, len(lines))
-                snippet = "\n".join(f"    {n:>4} | {lines[n - 1]}" for n in range(start, end + 1) if n <= len(lines))
-                hits.append(f"  {label}:{start} ({kind} {symbol})\n{snippet}")
-        if not hits:
-            return f"DEFOF '{symbol}': no definition found in any tracked file."
-        return f"DEFOF '{symbol}': {len(hits)} definition(s)\n" + "\n\n".join(hits)
+            end = min(end, len(lines))
+            start = max(1, start)
+            if end - start + 1 > self._VIEW_MAX_LINES:
+                end = start + self._VIEW_MAX_LINES - 1
+            if start > len(lines):
+                return f"VIEW '{arg}': file only has {len(lines)} lines."
 
-    def _run_callers(self, symbol):
-        """CALLERS: <symbol> -- every call site of a function/class, so a
-        model doesn't have to guess whether a signature change breaks
-        something elsewhere."""
-        symbol = symbol.strip()
-        hits = []
-        for label, _path, text, tree in self._iter_ast_trees():
-            lines = text.splitlines()
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Call):
-                    continue
-                func = node.func
-                called_name = func.id if isinstance(func, ast.Name) else (func.attr if isinstance(func, ast.Attribute) else None)
-                if called_name != symbol:
-                    continue
-                lineno = node.lineno
-                line = lines[lineno - 1].strip() if lineno <= len(lines) else ""
-                hits.append(f"  {label}, line {lineno}: {line}")
-        if not hits:
-            return f"CALLERS '{symbol}': no call sites found in any tracked file."
-        capped = hits[:60]
-        suffix = f" (truncated, showing first {len(capped)})" if len(hits) > len(capped) else ""
-        return f"CALLERS '{symbol}': {len(hits)} call site(s){suffix}\n" + "\n".join(capped)
-
-    def _run_depgraph(self):
-        """DEPGRAPH: -- the actual import graph between tracked project
-        files, so the model knows which file owns a piece of logic
-        instead of guessing from filenames."""
-        trees = list(self._iter_ast_trees())
-        label_by_modname = {os.path.splitext(os.path.basename(path))[0]: label for label, path, _t, _tr in trees}
-        edges = []
-        for label, _path, _text, tree in trees:
-            deps = set()
-            for node in ast.walk(tree):
-                mods = []
-                if isinstance(node, ast.Import):
-                    mods = [alias.name.split(".")[0] for alias in node.names]
-                elif isinstance(node, ast.ImportFrom) and node.module:
-                    mods = [node.module.split(".")[0]]
-                for m in mods:
-                    other = label_by_modname.get(m)
-                    if other and other != label:
-                        deps.add(other)
-            if deps:
-                edges.append(f"  {label} -> {', '.join(sorted(deps))}")
-        if not edges:
-            return "DEPGRAPH: no import relationships found between tracked local files."
-        return "DEPGRAPH (import graph between tracked local files):\n" + "\n".join(edges)
-
-    # ------------------------------------------------------------------
-    # Statistical tooling beyond CALC: pattern-detection across a
-    # variable's full recorded history, exactly the kind of thing code is
-    # better at than eyeballing a chart. Scalars (loss/accuracy/lr/custom
-    # logged values) get a persisted (step, value) history in the
-    # manifest -- see the "history" field written in _worker_main.
-    # ------------------------------------------------------------------
-    def _scalar_history(self, name):
-        """Resolve `name` against the manifest (exact match, else a
-        unique case-insensitive substring match, same convention as
-        PROMOTE) and return (resolved_name, [(step, value), ...] or None).
-        """
-        manifest = self.get_manifest_fn() or {}
-        stats = manifest.get(name)
-        if stats is None:
-            matches = [k for k in manifest if name.lower() in k.lower()]
-            if len(matches) == 1:
-                name, stats = matches[0], manifest[matches[0]]
-        if stats is None:
-            return name, None
-        hist = stats.get("history")
-        if hist is None:
-            recent = stats.get("recent")
-            hist = list(enumerate(recent)) if recent else None
-        return name, hist
-
-    def _run_corr(self, arg):
-        """CORR: <var1> <var2> -- real correlation coefficient between two
-        tracked scalar histories, instead of eyeballing whether two charts
-        move together."""
-        parts = arg.split()
-        if len(parts) != 2:
-            return f"CORR '{arg}': expected two variable names, e.g. 'CORR: loss grad_norm'."
-        name1, hist1 = self._scalar_history(parts[0])
-        name2, hist2 = self._scalar_history(parts[1])
-        if not hist1 or not hist2:
-            missing = parts[0] if not hist1 else parts[1]
-            return f"CORR '{arg}': no numeric history for '{missing}' -- only scalar-tracked variables (loss, accuracy, lr, ...) have one."
-        v1 = [v for _, v in hist1 if v is not None]
-        v2 = [v for _, v in hist2 if v is not None]
-        n = min(len(v1), len(v2))
-        if n < 3:
-            return f"CORR '{name1}' vs '{name2}': not enough overlapping data points yet ({n})."
-        v1, v2 = v1[-n:], v2[-n:]
-        mean1, mean2 = sum(v1) / n, sum(v2) / n
-        cov = sum((a - mean1) * (b - mean2) for a, b in zip(v1, v2))
-        var1 = sum((a - mean1) ** 2 for a in v1)
-        var2 = sum((b - mean2) ** 2 for b in v2)
-        if var1 == 0 or var2 == 0:
-            return f"CORR '{name1}' vs '{name2}': one series is constant over these {n} points -- correlation undefined."
-        r = cov / math.sqrt(var1 * var2)
-        return f"CORR '{name1}' vs '{name2}' (last {n} points): r = {r:.4f}"
-
-    def _run_outlier(self, var):
-        """OUTLIER: <var> -- deterministic z-score anomaly detection over a
-        variable's history, flags exact points instead of 'eyeball the
-        chart.'"""
-        name, hist = self._scalar_history(var)
-        if not hist:
-            return f"OUTLIER '{var}': no numeric history available -- only scalar-tracked variables have one."
-        pts = [(i, v) for i, v in hist if v is not None]
-        if len(pts) < 4:
-            return f"OUTLIER '{name}': not enough data points yet ({len(pts)})."
-        values = [v for _, v in pts]
-        mean = sum(values) / len(values)
-        variance = sum((v - mean) ** 2 for v in values) / len(values)
-        std = math.sqrt(variance)
-        if std == 0:
-            return f"OUTLIER '{name}': series is constant -- no outliers."
-        flagged = [(i, v, (v - mean) / std) for i, v in pts if abs((v - mean) / std) > 3]
-        if not flagged:
-            return f"OUTLIER '{name}': no points with |z| > 3 over {len(pts)} points (mean={mean:.4g}, std={std:.4g})."
-        lines = "\n".join(f"  history idx {i}: {v:.6g} (z={z:.2f})" for i, v, z in flagged[-20:])
-        return f"OUTLIER '{name}': {len(flagged)} outlier point(s) (mean={mean:.4g}, std={std:.4g})\n{lines}"
-
-    _DIFFSTATS_ARG_RE = re.compile(r"^\s*(\S+)\s+(-?\d+)\s+(-?\d+)\s*$")
-
-    def _run_diffstats(self, arg):
-        """DIFFSTATS: <var> <index_a> <index_b> -- exact delta in a
-        variable's recorded history between two points (indices count
-        into that variable's own deduplicated history, negative counts
-        from the end -- like a Python list index), instead of mentally
-        subtracting two numbers off two different messages."""
-        m = self._DIFFSTATS_ARG_RE.match(arg.strip())
-        if not m:
-            return f"DIFFSTATS '{arg}': expected '<var> <index_a> <index_b>', e.g. 'DIFFSTATS: loss 10 40'."
-        var, a_str, b_str = m.groups()
-        name, hist = self._scalar_history(var)
-        if not hist:
-            return f"DIFFSTATS '{var}': no numeric history available."
-        values = [v for _, v in hist]
-        try:
-            va, vb = values[int(a_str)], values[int(b_str)]
-        except IndexError:
-            return f"DIFFSTATS '{name}': index out of range (history has {len(values)} point(s))."
-        if va is None or vb is None:
-            return f"DIFFSTATS '{name}': one of those points is None/unreadable."
-        delta = vb - va
-        pct = f" ({delta / va * 100:+.2f}%)" if va else ""
-        return f"DIFFSTATS '{name}' [{a_str}] -> [{b_str}]: {va:.6g} -> {vb:.6g}, delta = {delta:+.6g}{pct}"
-
-    def _run_histogram(self, var, buckets=10):
-        """HISTOGRAM: <var> -- actual bucketed distribution counts over a
-        variable's history, not a description of what a heatmap image
-        'looks like it shows.'"""
-        name, hist = self._scalar_history(var)
-        if not hist:
-            return f"HISTOGRAM '{var}': no numeric history available."
-        values = [v for _, v in hist if v is not None]
-        if len(values) < 2:
-            return f"HISTOGRAM '{name}': not enough data points yet ({len(values)})."
-        lo, hi = min(values), max(values)
-        if lo == hi:
-            return f"HISTOGRAM '{name}': all {len(values)} point(s) equal {lo:.6g}."
-        width = (hi - lo) / buckets
-        counts = [0] * buckets
-        for v in values:
-            counts[min(buckets - 1, int((v - lo) / width))] += 1
-        peak = max(counts) or 1
-        lines = []
-        for i, c in enumerate(counts):
-            b_lo, b_hi = lo + i * width, lo + (i + 1) * width
-            bar = "#" * max(1, int(40 * c / peak)) if c else ""
-            lines.append(f"  [{b_lo:>10.4g}, {b_hi:>10.4g}): {c:>5}  {bar}")
-        return f"HISTOGRAM '{name}' ({len(values)} points, range [{lo:.4g}, {hi:.4g}]):\n" + "\n".join(lines)
-
-    # ------------------------------------------------------------------
-    # Grounding tooling: replacing recall with lookup.
-    # ------------------------------------------------------------------
-    def _run_doclookup(self, arg):
-        """DOCLOOKUP: <library>.<symbol> -- fetch the actual current
-        signature/docstring for an already-installed library function,
-        instead of trusting memorized API shape that may be stale for the
-        installed version."""
-        arg = arg.strip()
-        parts = arg.split(".")
-        if len(parts) < 2:
-            return f"DOCLOOKUP '{arg}': expected '<library>.<symbol>', e.g. 'DOCLOOKUP: torch.nn.functional.cross_entropy'."
-        root = parts[0]
-        try:
-            obj = importlib.import_module(root)
-        except Exception as exc:
-            return f"DOCLOOKUP '{arg}': could not import '{root}' ({type(exc).__name__}: {exc}) -- it may not be installed in this environment."
-        resolved = [root]
-        for attr in parts[1:]:
-            try:
-                obj = getattr(obj, attr)
-            except AttributeError:
-                try:
-                    obj = importlib.import_module(".".join(resolved + [attr]))
-                except Exception:
-                    return f"DOCLOOKUP '{arg}': '{'.'.join(resolved)}' has no attribute '{attr}'."
-            resolved.append(attr)
-        try:
-            sig = str(inspect.signature(obj))
-        except (TypeError, ValueError):
-            sig = ""
-        doc = inspect.getdoc(obj) or "(no docstring)"
-        if len(doc) > 1200:
-            doc = doc[:1200] + "\n... (truncated)"
-        return f"DOCLOOKUP '{arg}': {'.'.join(resolved)}{sig}\n{doc}"
-
-    def _run_changelog(self):
-        """CHANGELOG: -- diff of exactly what's changed in tracked files
-        since the last checkpoint, so attention narrows to what's actually
-        different rather than re-reading a whole file. The baseline is
-        the code as of this chat session's start (i.e. the last state
-        training was actually running under) and is advanced to "now"
-        every time CHANGELOG runs, so a second call only shows what's
-        changed since the first."""
-        extra_files = (self.get_extra_files_fn() or {}) if self.get_extra_files_fn else {}
-        self._build_file_labels(extra_files)
-        code = self.get_code_fn() if self.get_code_fn else None
-        current = dict(extra_files)
-        if self.script_path and code is not None:
-            current[self.script_path] = code
-
-        if self._changelog_baseline is None:
-            self._changelog_baseline = current
-            return "CHANGELOG: no prior checkpoint yet -- this turn's code is now the baseline for future CHANGELOG calls."
-
-        diffs = []
-        for path, new_text in current.items():
-            old_text = self._changelog_baseline.get(path, "")
-            if old_text == new_text:
-                continue
             label = self._label_for_path.get(path, os.path.basename(path))
-            diff = "\n".join(difflib.unified_diff(
-                old_text.splitlines(), new_text.splitlines(),
-                fromfile=f"{label} (last checkpoint)", tofile=f"{label} (now)", lineterm="", n=2,
-            ))
-            if diff:
-                diffs.append(diff)
+            numbered = "\n".join(f"    {n:>4} | {lines[n - 1]}" for n in range(start, end + 1))
+            return f"VIEW {label}:{start}-{end}\n{numbered}"
 
-        self._changelog_baseline = current
-        if not diffs:
-            return "CHANGELOG: no changes since the last checkpoint."
-        body = "\n\n".join(diffs)
-        if len(body) > 4000:
-            body = body[:4000] + "\n... (truncated)"
-        return f"CHANGELOG (since last checkpoint):\n{body}"
-
-    def _fixlog_path(self):
-        base = os.path.dirname(self.script_path) if self.script_path else "."
-        return os.path.join(base, ".pulse_fixlog.json")
-
-    def _load_fixlog(self):
-        try:
-            with open(self._fixlog_path(), "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return []
-
-    def _append_fixlog(self, path, old, new, explanation):
-        """Persist every applied code fix (old/new/explanation) to a
-        project-level fix-log so PASTFIX can search it later -- this
-        project's own history of prior fixes, so established local
-        patterns get reused instead of rediscovered from scratch."""
-        log = self._load_fixlog()
-        log.append({"time": time.time(), "path": path, "old": old, "new": new, "explanation": explanation})
-        log = log[-200:]
-        try:
-            with open(self._fixlog_path(), "w", encoding="utf-8") as f:
-                json.dump(log, f)
-        except OSError:
-            pass
-
-    def _run_pastfix(self, query):
-        """PASTFIX: <symbol_or_region> -- search this project's own
-        persistent fix-log for prior fixes touching the same
-        function/region."""
-        query_l = query.strip().lower()
-        hits = []
-        for entry in reversed(self._load_fixlog()):
-            haystack = " ".join([
-                str(entry.get("explanation", "")), str(entry.get("old", "")),
-                str(entry.get("new", "")), str(entry.get("path", "")),
-            ]).lower()
-            if query_l in haystack:
-                hits.append(entry)
-            if len(hits) >= 5:
-                break
-        if not hits:
-            return f"PASTFIX '{query}': no prior fix in this project's fix-log mentions that."
-        lines = []
-        for e in hits:
-            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(e.get("time", 0)))
-            lines.append(f"  [{ts}] {os.path.basename(str(e.get('path', '?')))}: {e.get('explanation', '(no explanation)')}")
-        return f"PASTFIX '{query}': {len(hits)} prior fix(es)\n" + "\n".join(lines)
-
-    # ------------------------------------------------------------------
-    # Automatic safety/verification gate -- NOT model-invoked, runs on
-    # every proposed fix regardless of what directives the model used.
-    # ------------------------------------------------------------------
-    def _lint_check(self, content, path):
-        """Syntax/AST validation, then a real static-analysis pass
-        (pyflakes) if it's importable, on the FULL proposed file content
-        before it's ever written to disk -- catches undefined names, bad
-        syntax, and unused imports deterministically instead of trusting
-        the agent's own read of its diff. Returns (ok, messages)."""
-        if os.path.splitext(path)[1] != ".py":
-            return True, []
-        try:
-            compile(content, path, "exec")
-        except SyntaxError as exc:
-            return False, [f"SyntaxError: {exc.msg} (line {exc.lineno})"]
-
-        try:
-            import pyflakes.api as _pyflakes_api
-            import pyflakes.reporter as _pyflakes_reporter
-        except ImportError:
-            return True, []
-
-        out, err = io.StringIO(), io.StringIO()
-        _pyflakes_api.check(content, path, _pyflakes_reporter.Reporter(out, err))
-        messages = [l for l in (out.getvalue() + err.getvalue()).splitlines() if l.strip()]
-        # Only undefined-name-class errors block the write -- style-only
-        # warnings (unused imports/locals) are reported but don't block,
-        # since those are common in intentionally-scaffolded fixes.
-        blocking = [m for m in messages if "undefined name" in m.lower() or "syntaxerror" in m.lower()]
-        return (len(blocking) == 0), messages
-
-    def _run_gpustatus(self):
-        """GPUSTATUS: -- real per-device GPU memory/utilization instead of
-        the model guessing about 'the GPU'. Under a multi-GPU/multi-rank
-        launch (see _distributed_info), aggregates every rank's status
-        (published periodically to a shared status directory) into one
-        report instead of just this process's own device(s)."""
-        rank, _local_rank, world_size, session_key = self.dist_info
-        if world_size > 1 and session_key:
-            return _format_multi_rank_gpu_status(session_key, rank)
-        return _format_gpu_status(_gpu_status_snapshot())
-
-    def _run_rollback(self, arg):
-        """ROLLBACK: <commit_id, or 'last'> -- deterministically revert
-        via the same .pulse_history mechanism the automatic
-        restart-failure rollback uses, instead of the agent trying to
-        manually reconstruct old code from memory of the conversation."""
-        entries = _load_fix_history(self.script_path)
-        if not entries:
-            return "ROLLBACK: no recorded Pulse code changes to revert."
-        arg = arg.strip()
-        if not arg or arg.lower() == "last":
-            target_idx = len(entries) - 2
-            target_label = f"before commit {entries[-1].get('id', '?')} (most recent)"
-        else:
-            target_idx = None
-            target_label = ""
-            for i, e in enumerate(entries):
-                eid = e.get("id", "")
-                if eid == arg or eid.startswith(arg):
-                    target_idx = i
-                    target_label = f"commit {eid}"
-                    break
-            if target_idx is None:
-                return f"ROLLBACK '{arg}': no commit matches that id -- send CHANGELOG or check .pulse_history/changelog.jsonl."
-        extra_files = (self.get_extra_files_fn() or {}) if self.get_extra_files_fn else {}
-        restored, failed, new_commit = _perform_fix_history_revert(
-            self.script_path, entries, target_idx, target_label,
-            on_code_change=self.on_code_change, extra_files=extra_files,
-        )
-        if new_commit:
-            self._last_commit_id = new_commit
-        if not restored and not failed:
-            return f"ROLLBACK '{arg}': workspace already matches that state -- nothing to revert."
-        parts = []
-        if restored:
-            parts.append(
-                f"ROLLBACK: reverted to state {target_label} -- {len(restored)} file(s) restored: "
-                + ", ".join(os.path.basename(p) for p in restored)
-                + (f" (logged as commit {new_commit})" if new_commit else "")
-                + " -- restart training to pick it up."
-            )
-        if failed:
-            parts.append("ROLLBACK: failed to restore " + ", ".join(f"{os.path.basename(p)} ({err})" for p, err in failed))
-        return "\n".join(parts)
-
-    def _run_mllint(self):
-        """MLLINT: -- a small set of high-confidence, AST-detectable ML
-        anti-patterns (metric/loss mismatches, double-softmax/sigmoid,
-        missing zero_grad, suspiciously high LR, eval functions missing
-        no_grad/.eval()) across every tracked file. These are heuristics
-        about ML *semantics*, worded as things worth double-checking, not
-        certainties the way the syntax LINT gate's findings are."""
-        findings = _mllint_scan(self._iter_ast_trees())
-        if not findings:
-            return "MLLINT: no anti-patterns found in this heuristic check across the tracked files (this doesn't guarantee correctness, just that none of Pulse's known patterns matched)."
-        lines = [f"  {label}:{lineno}: {msg}" for label, lineno, msg in findings]
-        return f"MLLINT: {len(findings)} finding(s) worth double-checking\n" + "\n\n".join(lines)
-
-    def _run_rankdiverge(self, var):
-        """RANKDIVERGE: <var> -- compares this rank's latest value of a
-        tracked scalar against every other rank's latest value (published
-        via the same rank-status files GPUSTATUS reads). In correctly
-        synced distributed training, per-rank loss/metric values should
-        track closely after gradient sync; a rank whose value has drifted
-        noticeably from the rest is a strong signal of something rank-
-        specific gone wrong (unsynced BatchNorm stats, a corrupted data
-        shard, a rank stuck on stale weights, ...). Only meaningful under
-        a multi-rank launch."""
-        rank, _local_rank, world_size, session_key = self.dist_info
-        if world_size <= 1 or not session_key:
-            return "RANKDIVERGE: this process isn't part of a multi-rank launch (world_size == 1)."
-        statuses = _read_all_rank_status(session_key)
-        if not statuses:
-            return "RANKDIVERGE: no rank status files found yet."
-        values = {}
-        for s in statuses:
-            scalars = s.get("scalars") or {}
-            if var in scalars and scalars[var] is not None:
-                values[s.get("rank")] = scalars[var]
-        if len(values) < 2:
-            return f"RANKDIVERGE '{var}': fewer than 2 ranks currently report this variable ({len(values)} found) -- nothing to compare yet."
-        mean = sum(values.values()) / len(values)
-        lines = [f"  rank {r}{' (this process)' if r == rank else ''}: {v:.6g}  (delta from mean: {v - mean:+.4g})" for r, v in sorted(values.items())]
-        spread = max(values.values()) - min(values.values())
-        verdict = "large spread across ranks -- worth investigating" if spread > abs(mean) * 0.1 + 1e-9 else "spread looks tight"
-        return f"RANKDIVERGE '{var}' across {len(values)}/{world_size} rank(s), mean={mean:.6g}, spread={spread:.4g} ({verdict}):\n" + "\n".join(lines)
-
-    def _run_runcompare(self):
-        """RUNCOMPARE: -- compares this run's current scalar values
-        against the most recent PREVIOUS run recorded for this project (a
-        "run" is one process lifetime), so a regression against last
-        time's numbers is visible without anyone having to remember them.
-        Local, per-project file -- see PulseCLI's version for the
-        additional workspace/team-shared comparison when logged in."""
-        manifest = self.get_manifest_fn() or {}
-        current_scalars = {
-            name: stats.get("latest_value") for name, stats in manifest.items()
-            if isinstance(stats, dict) and stats.get("latest_value") is not None
-        }
-        if not current_scalars:
-            return "RUNCOMPARE: no scalar values recorded yet this run."
-
-        history = _load_run_history(self.script_path)
-        previous = next((r for r in reversed(history) if r.get("run_id") != self._run_id), None)
-
-        this_entry = next((r for r in history if r.get("run_id") == self._run_id), None)
-        if this_entry is None:
-            this_entry = {"run_id": self._run_id, "started": time.time()}
-            history.append(this_entry)
-        this_entry["updated"] = time.time()
-        this_entry["scalars"] = current_scalars
-        history = history[-10:]
-        try:
-            with open(_run_history_path(self.script_path), "w", encoding="utf-8") as f:
-                json.dump(history, f)
-        except OSError:
-            pass
-
-        if previous is None:
-            return "RUNCOMPARE: no prior run recorded for this project yet -- this run is now the baseline for future RUNCOMPARE calls."
-
-        prev_scalars = previous.get("scalars", {})
-        lines = []
-        for name, cur_val in current_scalars.items():
-            prev_val = prev_scalars.get(name)
-            if prev_val is None or cur_val is None:
-                continue
-            delta = cur_val - prev_val
-            pct = f" ({delta / prev_val * 100:+.2f}%)" if prev_val else ""
-            lname = name.lower()
-            got_worse = (("loss" in lname or "err" in lname) and delta > 0) or ("acc" in lname and delta < 0)
-            flag = "  <- worse than last run" if got_worse else ""
-            lines.append(f"  {name}: {prev_val:.6g} -> {cur_val:.6g}  (delta {delta:+.6g}{pct}){flag}")
-        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(previous.get("updated", previous.get("started", 0))))
-        if not lines:
-            return f"RUNCOMPARE: found a previous run (last updated {when}) but no overlapping scalar names to compare."
-        return f"RUNCOMPARE vs previous run (last updated {when}):\n" + "\n".join(lines)
-
-    def _run_cost(self):
-        """COST: -- running token/cost usage for this chat session's
-        agent calls, accumulated across every pipeline pass (LOCATE/
-        ANALYZE/DEVELOP/VERIFY/SWEEP), not just the current question."""
-        u = self._token_usage
-        if u["calls"] == 0:
-            return "COST: no agent calls recorded yet this session."
-        lines = [
-            f"  agent calls: {u['calls']}",
-            f"  prompt tokens: {u['prompt_tokens']:,}",
-            f"  completion tokens: {u['completion_tokens']:,}",
-            f"  total tokens: {u['total_tokens']:,}",
-        ]
-        if u["cost_usd"] > 0:
-            lines.append(f"  estimated cost: ${u['cost_usd']:.4f}")
-        else:
-            lines.append("  estimated cost: unavailable (no pricing data for this model/provider)")
-        return "COST (this session so far):\n" + "\n".join(lines)
-
-    def _apply_new_directives(self, requests):
-        """Deterministically service the extended toolset (see
-        _extract_new_directives) the same way _apply_directives handles
-        CALC/PROMOTE/GREP/VIEW -- pure computation/file-reading/subprocess
-        round-trip only, safe to run on the background request thread."""
-        notes = []
-        for symbol in requests.get("defof", []):
-            notes.append(self._run_defof(symbol))
-        for symbol in requests.get("callers", []):
-            notes.append(self._run_callers(symbol))
-        if "depgraph" in requests:
-            notes.append(self._run_depgraph())
-        for arg in requests.get("corr", []):
-            notes.append(self._run_corr(arg))
-        for var in requests.get("outlier", []):
-            notes.append(self._run_outlier(var))
-        for arg in requests.get("diffstats", []):
-            notes.append(self._run_diffstats(arg))
-        for var in requests.get("histogram", []):
-            notes.append(self._run_histogram(var))
-        for arg in requests.get("doclookup", []):
-            notes.append(self._run_doclookup(arg))
-        if "changelog" in requests:
-            notes.append(self._run_changelog())
-        if "gpustatus" in requests:
-            notes.append(self._run_gpustatus())
-        if "mllint" in requests:
-            notes.append(self._run_mllint())
-        for var in requests.get("rankdiverge", []):
-            notes.append(self._run_rankdiverge(var))
-        if "runcompare" in requests:
-            notes.append(self._run_runcompare())
-        if "cost" in requests:
-            notes.append(self._run_cost())
-        for arg in requests.get("rollback", []):
-            notes.append(self._run_rollback(arg))
-        for query in requests.get("pastfix", []):
-            notes.append(self._run_pastfix(query))
-
-        exec_kinds = (("dryrun", "DRYRUN"), ("repl", "REPL"), ("replay", "REPLAY"),
-                      ("gradcheck", "GRADCHECK"), ("shapetrace", "SHAPETRACE"),
-                      ("layerstats", "LAYERSTATS"), ("hardexamples", "HARDEXAMPLES"),
-                      ("ampstatus", "AMPSTATUS"), ("seedcheck", "SEEDCHECK"))
-        for req_key, kind in exec_kinds:
-            if req_key not in requests:
-                continue
-            if not self.exec_fn:
-                notes.append(f"{kind}: execution tooling isn't available in this session (no live training process bridge).")
-                continue
-            for arg in requests[req_key]:
-                notes.append(self.exec_fn(kind, arg))
-
-        return "\n\n".join(n for n in notes if n)
-
-    def _apply_directives(self, calc_exprs, promote_names, grep_patterns=None, view_requests=None):
-        """Deterministically compute any CALC: expressions, figure out
-        which PROMOTE: names match a currently-known variable, and run any
-        GREP:/VIEW: requests. Pure computation/file-reading only -- no Tk
-        calls -- so this is safe to run on the background request thread.
-        Returns (note_text, calc_lines, promoted_names) for the caller to
-        display/apply on the main thread; GREP/VIEW results are folded
-        into note_text (and so into the agent's own history) rather than
-        surfaced as separate return values, since nothing on the main
-        thread needs to act on them the way it does for promotions.
-        """
-        calc_lines = ""
-        if calc_exprs:
-            computed = [(expr, _safe_eval_math(expr)) for expr in calc_exprs]
-            calc_lines = "\n".join(f"  {expr} = {result}" for expr, result in computed)
-
-        promoted = []
-        if promote_names and self.promote_fn:
-            manifest = self.get_manifest_fn() or {}
-            known = list(manifest.keys())
-            for raw_name in promote_names:
-                name = raw_name.strip()
-                if not name:
+        # ------------------------------------------------------------------
+        # Code intelligence (AST-based, pure/local -- no live-process access
+        # needed): DEFOF/CALLERS/DEPGRAPH.
+        # ------------------------------------------------------------------
+        def _iter_ast_trees(self):
+            """(label, path, text, tree) for every known project file that
+            parses as valid Python -- a file that doesn't parse (mid-edit
+            syntax error, or a non-Python file that slipped into extra_files)
+            is skipped rather than raising."""
+            for label, path, text in self._iter_searchable_files():
+                try:
+                    tree = ast.parse(text, filename=path)
+                except (SyntaxError, ValueError):
                     continue
-                if name in known:
-                    target = name
-                else:
-                    matches = [k for k in known if name.lower() in k.lower()]
-                    target = matches[0] if len(matches) == 1 else None
-                if target:
-                    promoted.append(target)
+                yield label, path, text, tree
 
-        notes = []
-        if calc_lines:
-            notes.append(f"Pulse computed these deterministically -- use these exact values:\n{calc_lines}")
-        if promoted:
-            notes.append(f"Promoted to full tracking: {', '.join(promoted)}.")
-        if grep_patterns:
-            for pattern in grep_patterns:
-                notes.append(self._run_grep(pattern))
-        if view_requests:
-            for arg in view_requests:
-                notes.append(self._run_view(arg))
+        def _run_defof(self, symbol):
+            """DEFOF: <symbol> -- AST-based jump-to-definition across every
+            tracked file, not text search."""
+            symbol = symbol.strip()
+            hits = []
+            for label, _path, text, tree in self._iter_ast_trees():
+                lines = text.splitlines()
+                for node in ast.walk(tree):
+                    kind, name = None, None
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == symbol:
+                        name = node.name
+                        kind = "class" if isinstance(node, ast.ClassDef) else "function"
+                    elif isinstance(node, ast.Assign):
+                        for t in node.targets:
+                            if isinstance(t, ast.Name) and t.id == symbol:
+                                name, kind = symbol, "assignment"
+                                break
+                    if name is None:
+                        continue
+                    start = node.lineno
+                    end = min(start + 4, len(lines))
+                    snippet = "\n".join(f"    {n:>4} | {lines[n - 1]}" for n in range(start, end + 1) if n <= len(lines))
+                    hits.append(f"  {label}:{start} ({kind} {symbol})\n{snippet}")
+            if not hits:
+                return f"DEFOF '{symbol}': no definition found in any tracked file."
+            return f"DEFOF '{symbol}': {len(hits)} definition(s)\n" + "\n\n".join(hits)
 
-        return "\n\n".join(notes), calc_lines, promoted
+        def _run_callers(self, symbol):
+            """CALLERS: <symbol> -- every call site of a function/class, so a
+            model doesn't have to guess whether a signature change breaks
+            something elsewhere."""
+            symbol = symbol.strip()
+            hits = []
+            for label, _path, text, tree in self._iter_ast_trees():
+                lines = text.splitlines()
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    func = node.func
+                    called_name = func.id if isinstance(func, ast.Name) else (func.attr if isinstance(func, ast.Attribute) else None)
+                    if called_name != symbol:
+                        continue
+                    lineno = node.lineno
+                    line = lines[lineno - 1].strip() if lineno <= len(lines) else ""
+                    hits.append(f"  {label}, line {lineno}: {line}")
+            if not hits:
+                return f"CALLERS '{symbol}': no call sites found in any tracked file."
+            capped = hits[:60]
+            suffix = f" (truncated, showing first {len(capped)})" if len(hits) > len(capped) else ""
+            return f"CALLERS '{symbol}': {len(hits)} call site(s){suffix}\n" + "\n".join(capped)
 
-    def _ask_yes_no_blocking(self, title, message):
-        """Show a yes/no dialog from the background request thread and
-        block until answered, by scheduling the actual messagebox call on
-        the Tk main thread (via after) and waiting on an Event."""
-        result = {}
-        event = threading.Event()
+        def _run_depgraph(self):
+            """DEPGRAPH: -- the actual import graph between tracked project
+            files, so the model knows which file owns a piece of logic
+            instead of guessing from filenames."""
+            trees = list(self._iter_ast_trees())
+            label_by_modname = {os.path.splitext(os.path.basename(path))[0]: label for label, path, _t, _tr in trees}
+            edges = []
+            for label, _path, _text, tree in trees:
+                deps = set()
+                for node in ast.walk(tree):
+                    mods = []
+                    if isinstance(node, ast.Import):
+                        mods = [alias.name.split(".")[0] for alias in node.names]
+                    elif isinstance(node, ast.ImportFrom) and node.module:
+                        mods = [node.module.split(".")[0]]
+                    for m in mods:
+                        other = label_by_modname.get(m)
+                        if other and other != label:
+                            deps.add(other)
+                if deps:
+                    edges.append(f"  {label} -> {', '.join(sorted(deps))}")
+            if not edges:
+                return "DEPGRAPH: no import relationships found between tracked local files."
+            return "DEPGRAPH (import graph between tracked local files):\n" + "\n".join(edges)
 
-        def _show():
+        # ------------------------------------------------------------------
+        # Statistical tooling beyond CALC: pattern-detection across a
+        # variable's full recorded history, exactly the kind of thing code is
+        # better at than eyeballing a chart. Scalars (loss/accuracy/lr/custom
+        # logged values) get a persisted (step, value) history in the
+        # manifest -- see the "history" field written in _worker_main.
+        # ------------------------------------------------------------------
+        def _scalar_history(self, name):
+            """Resolve `name` against the manifest (exact match, else a
+            unique case-insensitive substring match, same convention as
+            PROMOTE) and return (resolved_name, [(step, value), ...] or None).
+            """
+            manifest = self.get_manifest_fn() or {}
+            stats = manifest.get(name)
+            if stats is None:
+                matches = [k for k in manifest if name.lower() in k.lower()]
+                if len(matches) == 1:
+                    name, stats = matches[0], manifest[matches[0]]
+            if stats is None:
+                return name, None
+            hist = stats.get("history")
+            if hist is None:
+                recent = stats.get("recent")
+                hist = list(enumerate(recent)) if recent else None
+            return name, hist
+
+        def _run_corr(self, arg):
+            """CORR: <var1> <var2> -- real correlation coefficient between two
+            tracked scalar histories, instead of eyeballing whether two charts
+            move together."""
+            parts = arg.split()
+            if len(parts) != 2:
+                return f"CORR '{arg}': expected two variable names, e.g. 'CORR: loss grad_norm'."
+            name1, hist1 = self._scalar_history(parts[0])
+            name2, hist2 = self._scalar_history(parts[1])
+            if not hist1 or not hist2:
+                missing = parts[0] if not hist1 else parts[1]
+                return f"CORR '{arg}': no numeric history for '{missing}' -- only scalar-tracked variables (loss, accuracy, lr, ...) have one."
+            v1 = [v for _, v in hist1 if v is not None]
+            v2 = [v for _, v in hist2 if v is not None]
+            n = min(len(v1), len(v2))
+            if n < 3:
+                return f"CORR '{name1}' vs '{name2}': not enough overlapping data points yet ({n})."
+            v1, v2 = v1[-n:], v2[-n:]
+            mean1, mean2 = sum(v1) / n, sum(v2) / n
+            cov = sum((a - mean1) * (b - mean2) for a, b in zip(v1, v2))
+            var1 = sum((a - mean1) ** 2 for a in v1)
+            var2 = sum((b - mean2) ** 2 for b in v2)
+            if var1 == 0 or var2 == 0:
+                return f"CORR '{name1}' vs '{name2}': one series is constant over these {n} points -- correlation undefined."
+            r = cov / math.sqrt(var1 * var2)
+            return f"CORR '{name1}' vs '{name2}' (last {n} points): r = {r:.4f}"
+
+        def _run_outlier(self, var):
+            """OUTLIER: <var> -- deterministic z-score anomaly detection over a
+            variable's history, flags exact points instead of 'eyeball the
+            chart.'"""
+            name, hist = self._scalar_history(var)
+            if not hist:
+                return f"OUTLIER '{var}': no numeric history available -- only scalar-tracked variables have one."
+            pts = [(i, v) for i, v in hist if v is not None]
+            if len(pts) < 4:
+                return f"OUTLIER '{name}': not enough data points yet ({len(pts)})."
+            values = [v for _, v in pts]
+            mean = sum(values) / len(values)
+            variance = sum((v - mean) ** 2 for v in values) / len(values)
+            std = math.sqrt(variance)
+            if std == 0:
+                return f"OUTLIER '{name}': series is constant -- no outliers."
+            flagged = [(i, v, (v - mean) / std) for i, v in pts if abs((v - mean) / std) > 3]
+            if not flagged:
+                return f"OUTLIER '{name}': no points with |z| > 3 over {len(pts)} points (mean={mean:.4g}, std={std:.4g})."
+            lines = "\n".join(f"  history idx {i}: {v:.6g} (z={z:.2f})" for i, v, z in flagged[-20:])
+            return f"OUTLIER '{name}': {len(flagged)} outlier point(s) (mean={mean:.4g}, std={std:.4g})\n{lines}"
+
+        _DIFFSTATS_ARG_RE = re.compile(r"^\s*(\S+)\s+(-?\d+)\s+(-?\d+)\s*$")
+
+        def _run_diffstats(self, arg):
+            """DIFFSTATS: <var> <index_a> <index_b> -- exact delta in a
+            variable's recorded history between two points (indices count
+            into that variable's own deduplicated history, negative counts
+            from the end -- like a Python list index), instead of mentally
+            subtracting two numbers off two different messages."""
+            m = self._DIFFSTATS_ARG_RE.match(arg.strip())
+            if not m:
+                return f"DIFFSTATS '{arg}': expected '<var> <index_a> <index_b>', e.g. 'DIFFSTATS: loss 10 40'."
+            var, a_str, b_str = m.groups()
+            name, hist = self._scalar_history(var)
+            if not hist:
+                return f"DIFFSTATS '{var}': no numeric history available."
+            values = [v for _, v in hist]
             try:
-                result["value"] = messagebox.askyesno(title, message, parent=self)
-            finally:
-                event.set()
+                va, vb = values[int(a_str)], values[int(b_str)]
+            except IndexError:
+                return f"DIFFSTATS '{name}': index out of range (history has {len(values)} point(s))."
+            if va is None or vb is None:
+                return f"DIFFSTATS '{name}': one of those points is None/unreadable."
+            delta = vb - va
+            pct = f" ({delta / va * 100:+.2f}%)" if va else ""
+            return f"DIFFSTATS '{name}' [{a_str}] -> [{b_str}]: {va:.6g} -> {vb:.6g}, delta = {delta:+.6g}{pct}"
 
-        self.after(0, _show)
-        event.wait()
-        return bool(result.get("value"))
+        def _run_histogram(self, var, buckets=10):
+            """HISTOGRAM: <var> -- actual bucketed distribution counts over a
+            variable's history, not a description of what a heatmap image
+            'looks like it shows.'"""
+            name, hist = self._scalar_history(var)
+            if not hist:
+                return f"HISTOGRAM '{var}': no numeric history available."
+            values = [v for _, v in hist if v is not None]
+            if len(values) < 2:
+                return f"HISTOGRAM '{name}': not enough data points yet ({len(values)})."
+            lo, hi = min(values), max(values)
+            if lo == hi:
+                return f"HISTOGRAM '{name}': all {len(values)} point(s) equal {lo:.6g}."
+            width = (hi - lo) / buckets
+            counts = [0] * buckets
+            for v in values:
+                counts[min(buckets - 1, int((v - lo) / width))] += 1
+            peak = max(counts) or 1
+            lines = []
+            for i, c in enumerate(counts):
+                b_lo, b_hi = lo + i * width, lo + (i + 1) * width
+                bar = "#" * max(1, int(40 * c / peak)) if c else ""
+                lines.append(f"  [{b_lo:>10.4g}, {b_hi:>10.4g}): {c:>5}  {bar}")
+            return f"HISTOGRAM '{name}' ({len(values)} points, range [{lo:.4g}, {hi:.4g}]):\n" + "\n".join(lines)
 
-    @staticmethod
-    def _parse_json_obj(answer):
-        """Generic defensive JSON-object parser for the verify (pass 4) and
-        sweep (pass 5) responses -- same tolerance for stray code fences as
-        _parse_code_fix, but without requiring any particular fields.
+        # ------------------------------------------------------------------
+        # Grounding tooling: replacing recall with lookup.
+        # ------------------------------------------------------------------
+        def _run_doclookup(self, arg):
+            """DOCLOOKUP: <library>.<symbol> -- fetch the actual current
+            signature/docstring for an already-installed library function,
+            instead of trusting memorized API shape that may be stale for the
+            installed version."""
+            arg = arg.strip()
+            parts = arg.split(".")
+            if len(parts) < 2:
+                return f"DOCLOOKUP '{arg}': expected '<library>.<symbol>', e.g. 'DOCLOOKUP: torch.nn.functional.cross_entropy'."
+            root = parts[0]
+            try:
+                obj = importlib.import_module(root)
+            except Exception as exc:
+                return f"DOCLOOKUP '{arg}': could not import '{root}' ({type(exc).__name__}: {exc}) -- it may not be installed in this environment."
+            resolved = [root]
+            for attr in parts[1:]:
+                try:
+                    obj = getattr(obj, attr)
+                except AttributeError:
+                    try:
+                        obj = importlib.import_module(".".join(resolved + [attr]))
+                    except Exception:
+                        return f"DOCLOOKUP '{arg}': '{'.'.join(resolved)}' has no attribute '{attr}'."
+                resolved.append(attr)
+            try:
+                sig = str(inspect.signature(obj))
+            except (TypeError, ValueError):
+                sig = ""
+            doc = inspect.getdoc(obj) or "(no docstring)"
+            if len(doc) > 1200:
+                doc = doc[:1200] + "\n... (truncated)"
+            return f"DOCLOOKUP '{arg}': {'.'.join(resolved)}{sig}\n{doc}"
 
-        Models are told to respond with ONLY the JSON object, but often
-        don't -- a stray "Sure, here you go:" before it, a trailing
-        sentence after it, or a code fence that isn't stripped cleanly is
-        enough to make a naive "whole string must be exactly `{...}`"
-        check fail, which is why verification used to report "unparsable"
-        on almost every call. Instead, find the first balanced {...} span
-        anywhere in the text (respecting strings, so braces inside a
-        quoted "reason" don't throw off the count) and parse just that.
-        """
-        text = (answer or "").strip()
-        if not text:
-            return None
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.lower().startswith("json"):
-                text = text[4:]
-            text = text.strip()
+        def _run_changelog(self):
+            """CHANGELOG: -- diff of exactly what's changed in tracked files
+            since the last checkpoint, so attention narrows to what's actually
+            different rather than re-reading a whole file. The baseline is
+            the code as of this chat session's start (i.e. the last state
+            training was actually running under) and is advanced to "now"
+            every time CHANGELOG runs, so a second call only shows what's
+            changed since the first."""
+            extra_files = (self.get_extra_files_fn() or {}) if self.get_extra_files_fn else {}
+            self._build_file_labels(extra_files)
+            code = self.get_code_fn() if self.get_code_fn else None
+            current = dict(extra_files)
+            if self.script_path and code is not None:
+                current[self.script_path] = code
 
-        start = text.find("{")
-        if start == -1:
-            return None
+            if self._changelog_baseline is None:
+                self._changelog_baseline = current
+                return "CHANGELOG: no prior checkpoint yet -- this turn's code is now the baseline for future CHANGELOG calls."
 
-        depth = 0
-        in_string = False
-        escape = False
-        end = -1
-        for i in range(start, len(text)):
-            ch = text[i]
-            if in_string:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == '"':
-                    in_string = False
-                continue
-            if ch == '"':
-                in_string = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i
+            diffs = []
+            for path, new_text in current.items():
+                old_text = self._changelog_baseline.get(path, "")
+                if old_text == new_text:
+                    continue
+                label = self._label_for_path.get(path, os.path.basename(path))
+                diff = "\n".join(difflib.unified_diff(
+                    old_text.splitlines(), new_text.splitlines(),
+                    fromfile=f"{label} (last checkpoint)", tofile=f"{label} (now)", lineterm="", n=2,
+                ))
+                if diff:
+                    diffs.append(diff)
+
+            self._changelog_baseline = current
+            if not diffs:
+                return "CHANGELOG: no changes since the last checkpoint."
+            body = "\n\n".join(diffs)
+            if len(body) > 4000:
+                body = body[:4000] + "\n... (truncated)"
+            return f"CHANGELOG (since last checkpoint):\n{body}"
+
+        def _fixlog_path(self):
+            base = os.path.dirname(self.script_path) if self.script_path else "."
+            return os.path.join(base, ".pulse_fixlog.json")
+
+        def _load_fixlog(self):
+            try:
+                with open(self._fixlog_path(), "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (OSError, json.JSONDecodeError):
+                return []
+
+        def _append_fixlog(self, path, old, new, explanation):
+            """Persist every applied code fix (old/new/explanation) to a
+            project-level fix-log so PASTFIX can search it later -- this
+            project's own history of prior fixes, so established local
+            patterns get reused instead of rediscovered from scratch."""
+            log = self._load_fixlog()
+            log.append({"time": time.time(), "path": path, "old": old, "new": new, "explanation": explanation})
+            log = log[-200:]
+            try:
+                with open(self._fixlog_path(), "w", encoding="utf-8") as f:
+                    json.dump(log, f)
+            except OSError:
+                pass
+
+        def _run_pastfix(self, query):
+            """PASTFIX: <symbol_or_region> -- search this project's own
+            persistent fix-log for prior fixes touching the same
+            function/region."""
+            query_l = query.strip().lower()
+            hits = []
+            for entry in reversed(self._load_fixlog()):
+                haystack = " ".join([
+                    str(entry.get("explanation", "")), str(entry.get("old", "")),
+                    str(entry.get("new", "")), str(entry.get("path", "")),
+                ]).lower()
+                if query_l in haystack:
+                    hits.append(entry)
+                if len(hits) >= 5:
                     break
-        if end == -1:
-            return None
+            if not hits:
+                return f"PASTFIX '{query}': no prior fix in this project's fix-log mentions that."
+            lines = []
+            for e in hits:
+                ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(e.get("time", 0)))
+                lines.append(f"  [{ts}] {os.path.basename(str(e.get('path', '?')))}: {e.get('explanation', '(no explanation)')}")
+            return f"PASTFIX '{query}': {len(hits)} prior fix(es)\n" + "\n".join(lines)
 
-        try:
-            payload = json.loads(text[start:end + 1])
-        except (ValueError, TypeError):
-            return None
-        return payload if isinstance(payload, dict) else None
-
-    @staticmethod
-    def _describe_fix(fix):
-        parts = []
-        for i, (old, new) in enumerate(zip(fix["old"], fix["new"])):
-            parts.append(f"--- change {i + 1} ---\nOLD:\n{old}\nNEW:\n{new}")
-        if fix.get("explanation"):
-            parts.append(f"Explanation: {fix['explanation']}")
-        return "\n\n".join(parts)
-
-    def _verify_fix_with_retries(self, model_name, fix, diagnosis):
-        """PASS 4: check the fix's math/logic before it's handed to the
-        user. If it fails, ask the agent to revise and re-check, up to
-        _MAX_VERIFY_ATTEMPTS times. Returns (fix, passed, reason). A failed
-        verify/revise request applies the fix as unverified best effort
-        instead of discarding it (see pulse_cli's copy)."""
-        reason = ""
-        for attempt in range(_MAX_VERIFY_ATTEMPTS):
-            fix_desc = self._describe_fix(fix)
-            self.after(0, lambda: self._set_stage("Checking the fix"))
+        # ------------------------------------------------------------------
+        # Automatic safety/verification gate -- NOT model-invoked, runs on
+        # every proposed fix regardless of what directives the model used.
+        # ------------------------------------------------------------------
+        def _lint_check(self, content, path):
+            """Syntax/AST validation, then a real static-analysis pass
+            (pyflakes) if it's importable, on the FULL proposed file content
+            before it's ever written to disk -- catches undefined names, bad
+            syntax, and unused imports deterministically instead of trusting
+            the agent's own read of its diff. Returns (ok, messages)."""
+            if os.path.splitext(path)[1] != ".py":
+                return True, []
             try:
-                verify_answer = self._call_model(
-                    model_name, _PASS4_VERIFY_TMPL.format(diagnosis=diagnosis, fix_desc=fix_desc),
-                    max_tokens=_AGENT_MAX_TOKENS,
-                )
-            except AgentRequestFailed as exc:
-                return fix, False, f"(verification request failed: {exc})"
-            verdict = self._parse_json_obj(verify_answer)
-            if verdict is None:
-                return fix, True, "(verification response was unparsable; proceeding anyway)"
-            passes = bool(verdict.get("passes"))
-            reason = str(verdict.get("reason", "")).strip()
-            if passes:
-                return fix, True, reason
-            if attempt == _MAX_VERIFY_ATTEMPTS - 1:
-                break
-            self.after(0, lambda: self._set_stage("Revising fix"))
+                compile(content, path, "exec")
+            except SyntaxError as exc:
+                return False, [f"SyntaxError: {exc.msg} (line {exc.lineno})"]
+
             try:
-                revised_answer = self._call_model(
-                    model_name, _PASS4_REVISE_TMPL.format(diagnosis=diagnosis, fix_desc=fix_desc, reason=reason),
-                    max_tokens=_AGENT_MAX_TOKENS,
-                )
-            except AgentRequestFailed:
-                break
-            revised = self._parse_code_fix(revised_answer)
-            if revised is None:
-                break
-            fix = revised
-        return fix, False, (reason or "(verification did not clearly pass after retries)")
+                import pyflakes.api as _pyflakes_api
+                import pyflakes.reporter as _pyflakes_reporter
+            except ImportError:
+                return True, []
 
-    _PROBE_CODEBLOCK_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
+            out, err = io.StringIO(), io.StringIO()
+            _pyflakes_api.check(content, path, _pyflakes_reporter.Reporter(out, err))
+            messages = [l for l in (out.getvalue() + err.getvalue()).splitlines() if l.strip()]
+            # Only undefined-name-class errors block the write -- style-only
+            # warnings (unused imports/locals) are reported but don't block,
+            # since those are common in intentionally-scaffolded fixes.
+            blocking = [m for m in messages if "undefined name" in m.lower() or "syntaxerror" in m.lower()]
+            return (len(blocking) == 0), messages
 
-    def _build_fast_probe_source(self, model_name, path, content):
-        """Ask the agent for a fast-but-faithful copy of `content` (same
-        model/data/loss, just iteration-capped) -- see pulse_cli's copy
-        for the full rationale. Returns None if nothing parseable came
-        back, so the empirical check is skipped rather than run on
-        garbage."""
-        try:
-            answer = self._call_model(
-                model_name,
-                _PASS4B_PROBE_TMPL.format(filename=os.path.basename(path), content=content),
-                max_tokens=_AGENT_MAX_TOKENS,
+        def _run_gpustatus(self):
+            """GPUSTATUS: -- real per-device GPU memory/utilization instead of
+            the model guessing about 'the GPU'. Under a multi-GPU/multi-rank
+            launch (see _distributed_info), aggregates every rank's status
+            (published periodically to a shared status directory) into one
+            report instead of just this process's own device(s)."""
+            rank, _local_rank, world_size, session_key = self.dist_info
+            if world_size > 1 and session_key:
+                return _format_multi_rank_gpu_status(session_key, rank)
+            return _format_gpu_status(_gpu_status_snapshot())
+
+        def _run_rollback(self, arg):
+            """ROLLBACK: <commit_id, or 'last'> -- deterministically revert
+            via the same .pulse_history mechanism the automatic
+            restart-failure rollback uses, instead of the agent trying to
+            manually reconstruct old code from memory of the conversation."""
+            entries = _load_fix_history(self.script_path)
+            if not entries:
+                return "ROLLBACK: no recorded Pulse code changes to revert."
+            arg = arg.strip()
+            if not arg or arg.lower() == "last":
+                target_idx = len(entries) - 2
+                target_label = f"before commit {entries[-1].get('id', '?')} (most recent)"
+            else:
+                target_idx = None
+                target_label = ""
+                for i, e in enumerate(entries):
+                    eid = e.get("id", "")
+                    if eid == arg or eid.startswith(arg):
+                        target_idx = i
+                        target_label = f"commit {eid}"
+                        break
+                if target_idx is None:
+                    return f"ROLLBACK '{arg}': no commit matches that id -- send CHANGELOG or check .pulse_history/changelog.jsonl."
+            extra_files = (self.get_extra_files_fn() or {}) if self.get_extra_files_fn else {}
+            restored, failed, new_commit = _perform_fix_history_revert(
+                self.script_path, entries, target_idx, target_label,
+                on_code_change=self.on_code_change, extra_files=extra_files,
             )
-        except AgentRequestFailed:
-            return None
-        m = self._PROBE_CODEBLOCK_RE.search(answer or "")
-        probe_src = (m.group(1) if m else (answer or "")).strip()
-        if not probe_src:
-            return None
-        try:
-            ast.parse(probe_src)
-        except SyntaxError:
-            return None
-        return probe_src
+            if new_commit:
+                self._last_commit_id = new_commit
+            if not restored and not failed:
+                return f"ROLLBACK '{arg}': workspace already matches that state -- nothing to revert."
+            parts = []
+            if restored:
+                parts.append(
+                    f"ROLLBACK: reverted to state {target_label} -- {len(restored)} file(s) restored: "
+                    + ", ".join(os.path.basename(p) for p in restored)
+                    + (f" (logged as commit {new_commit})" if new_commit else "")
+                    + " -- restart training to pick it up."
+                )
+            if failed:
+                parts.append("ROLLBACK: failed to restore " + ", ".join(f"{os.path.basename(p)} ({err})" for p, err in failed))
+            return "\n".join(parts)
 
-    def _run_loss_probe(self, target_path, probe_src):
-        """Write `probe_src` next to the real script, run it as a short,
-        hard-capped subprocess, and return whatever loss readings it
-        reported. Always cleans up every file it created, including
-        anything the run itself wrote to disk. Same mechanics as
-        PulseCLI._run_loss_probe -- kept as a separate copy here since the
-        GUI has no _resolve_restart_interpreter of its own and instead
-        just uses sys.executable."""
-        directory = os.path.dirname(os.path.abspath(target_path)) or "."
-        token = uuid.uuid4().hex[:10]
-        probe_path = os.path.join(directory, f".__pulse_probe_{token}.py")
-        harness_name = f"_pulse_probe_harness_{token}"
-        harness_path = os.path.join(directory, f"{harness_name}.py")
-        metrics_path = os.path.join(directory, f".__pulse_probe_{token}.json")
+        def _run_mllint(self):
+            """MLLINT: -- a small set of high-confidence, AST-detectable ML
+            anti-patterns (metric/loss mismatches, double-softmax/sigmoid,
+            missing zero_grad, suspiciously high LR, eval functions missing
+            no_grad/.eval()) across every tracked file. These are heuristics
+            about ML *semantics*, worded as things worth double-checking, not
+            certainties the way the syntax LINT gate's findings are."""
+            findings = _mllint_scan(self._iter_ast_trees())
+            if not findings:
+                return "MLLINT: no anti-patterns found in this heuristic check across the tracked files (this doesn't guarantee correctness, just that none of Pulse's known patterns matched)."
+            lines = [f"  {label}:{lineno}: {msg}" for label, lineno, msg in findings]
+            return f"MLLINT: {len(findings)} finding(s) worth double-checking\n" + "\n\n".join(lines)
 
-        try:
-            before_entries = set(os.listdir(directory))
-        except OSError:
-            before_entries = set()
+        def _run_rankdiverge(self, var):
+            """RANKDIVERGE: <var> -- compares this rank's latest value of a
+            tracked scalar against every other rank's latest value (published
+            via the same rank-status files GPUSTATUS reads). In correctly
+            synced distributed training, per-rank loss/metric values should
+            track closely after gradient sync; a rank whose value has drifted
+            noticeably from the rest is a strong signal of something rank-
+            specific gone wrong (unsynced BatchNorm stats, a corrupted data
+            shard, a rank stuck on stale weights, ...). Only meaningful under
+            a multi-rank launch."""
+            rank, _local_rank, world_size, session_key = self.dist_info
+            if world_size <= 1 or not session_key:
+                return "RANKDIVERGE: this process isn't part of a multi-rank launch (world_size == 1)."
+            statuses = _read_all_rank_status(session_key)
+            if not statuses:
+                return "RANKDIVERGE: no rank status files found yet."
+            values = {}
+            for s in statuses:
+                scalars = s.get("scalars") or {}
+                if var in scalars and scalars[var] is not None:
+                    values[s.get("rank")] = scalars[var]
+            if len(values) < 2:
+                return f"RANKDIVERGE '{var}': fewer than 2 ranks currently report this variable ({len(values)} found) -- nothing to compare yet."
+            mean = sum(values.values()) / len(values)
+            lines = [f"  rank {r}{' (this process)' if r == rank else ''}: {v:.6g}  (delta from mean: {v - mean:+.4g})" for r, v in sorted(values.items())]
+            spread = max(values.values()) - min(values.values())
+            verdict = "large spread across ranks -- worth investigating" if spread > abs(mean) * 0.1 + 1e-9 else "spread looks tight"
+            return f"RANKDIVERGE '{var}' across {len(values)}/{world_size} rank(s), mean={mean:.6g}, spread={spread:.4g} ({verdict}):\n" + "\n".join(lines)
 
-        result = {"loss": [], "note": "", "stdout_tail": "", "stderr_tail": ""}
-        try:
-            with open(harness_path, "w", encoding="utf-8") as f:
-                f.write(_PROBE_HARNESS_SRC)
-            with open(probe_path, "w", encoding="utf-8") as f:
-                f.write(f"import {harness_name}  # noqa -- Pulse empirical-verify harness, deleted after this probe\n")
-                f.write(probe_src)
+        def _run_runcompare(self):
+            """RUNCOMPARE: -- compares this run's current scalar values
+            against the most recent PREVIOUS run recorded for this project (a
+            "run" is one process lifetime), so a regression against last
+            time's numbers is visible without anyone having to remember them.
+            Local, per-project file -- see PulseCLI's version for the
+            additional workspace/team-shared comparison when logged in."""
+            manifest = self.get_manifest_fn() or {}
+            current_scalars = {
+                name: stats.get("latest_value") for name, stats in manifest.items()
+                if isinstance(stats, dict) and stats.get("latest_value") is not None
+            }
+            if not current_scalars:
+                return "RUNCOMPARE: no scalar values recorded yet this run."
+
+            history = _load_run_history(self.script_path)
+            previous = next((r for r in reversed(history) if r.get("run_id") != self._run_id), None)
+
+            this_entry = next((r for r in history if r.get("run_id") == self._run_id), None)
+            if this_entry is None:
+                this_entry = {"run_id": self._run_id, "started": time.time()}
+                history.append(this_entry)
+            this_entry["updated"] = time.time()
+            this_entry["scalars"] = current_scalars
+            history = history[-10:]
+            try:
+                with open(_run_history_path(self.script_path), "w", encoding="utf-8") as f:
+                    json.dump(history, f)
+            except OSError:
+                pass
+
+            if previous is None:
+                return "RUNCOMPARE: no prior run recorded for this project yet -- this run is now the baseline for future RUNCOMPARE calls."
+
+            prev_scalars = previous.get("scalars", {})
+            lines = []
+            for name, cur_val in current_scalars.items():
+                prev_val = prev_scalars.get(name)
+                if prev_val is None or cur_val is None:
+                    continue
+                delta = cur_val - prev_val
+                pct = f" ({delta / prev_val * 100:+.2f}%)" if prev_val else ""
+                lname = name.lower()
+                got_worse = (("loss" in lname or "err" in lname) and delta > 0) or ("acc" in lname and delta < 0)
+                flag = "  <- worse than last run" if got_worse else ""
+                lines.append(f"  {name}: {prev_val:.6g} -> {cur_val:.6g}  (delta {delta:+.6g}{pct}){flag}")
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(previous.get("updated", previous.get("started", 0))))
+            if not lines:
+                return f"RUNCOMPARE: found a previous run (last updated {when}) but no overlapping scalar names to compare."
+            return f"RUNCOMPARE vs previous run (last updated {when}):\n" + "\n".join(lines)
+
+        def _run_cost(self):
+            """COST: -- running token/cost usage for this chat session's
+            agent calls, accumulated across every pipeline pass (LOCATE/
+            ANALYZE/DEVELOP/VERIFY/SWEEP), not just the current question."""
+            u = self._token_usage
+            if u["calls"] == 0:
+                return "COST: no agent calls recorded yet this session."
+            lines = [
+                f"  agent calls: {u['calls']}",
+                f"  prompt tokens: {u['prompt_tokens']:,}",
+                f"  completion tokens: {u['completion_tokens']:,}",
+                f"  total tokens: {u['total_tokens']:,}",
+            ]
+            if u["cost_usd"] > 0:
+                lines.append(f"  estimated cost: ${u['cost_usd']:.4f}")
+            else:
+                lines.append("  estimated cost: unavailable (no pricing data for this model/provider)")
+            return "COST (this session so far):\n" + "\n".join(lines)
+
+        def _apply_new_directives(self, requests):
+            """Deterministically service the extended toolset (see
+            _extract_new_directives) the same way _apply_directives handles
+            CALC/PROMOTE/GREP/VIEW -- pure computation/file-reading/subprocess
+            round-trip only, safe to run on the background request thread."""
+            notes = []
+            for symbol in requests.get("defof", []):
+                notes.append(self._run_defof(symbol))
+            for symbol in requests.get("callers", []):
+                notes.append(self._run_callers(symbol))
+            if "depgraph" in requests:
+                notes.append(self._run_depgraph())
+            for arg in requests.get("corr", []):
+                notes.append(self._run_corr(arg))
+            for var in requests.get("outlier", []):
+                notes.append(self._run_outlier(var))
+            for arg in requests.get("diffstats", []):
+                notes.append(self._run_diffstats(arg))
+            for var in requests.get("histogram", []):
+                notes.append(self._run_histogram(var))
+            for arg in requests.get("doclookup", []):
+                notes.append(self._run_doclookup(arg))
+            if "changelog" in requests:
+                notes.append(self._run_changelog())
+            if "gpustatus" in requests:
+                notes.append(self._run_gpustatus())
+            if "mllint" in requests:
+                notes.append(self._run_mllint())
+            for var in requests.get("rankdiverge", []):
+                notes.append(self._run_rankdiverge(var))
+            if "runcompare" in requests:
+                notes.append(self._run_runcompare())
+            if "cost" in requests:
+                notes.append(self._run_cost())
+            for arg in requests.get("rollback", []):
+                notes.append(self._run_rollback(arg))
+            for query in requests.get("pastfix", []):
+                notes.append(self._run_pastfix(query))
+
+            exec_kinds = (("dryrun", "DRYRUN"), ("repl", "REPL"), ("replay", "REPLAY"),
+                          ("gradcheck", "GRADCHECK"), ("shapetrace", "SHAPETRACE"),
+                          ("layerstats", "LAYERSTATS"), ("hardexamples", "HARDEXAMPLES"),
+                          ("ampstatus", "AMPSTATUS"), ("seedcheck", "SEEDCHECK"))
+            for req_key, kind in exec_kinds:
+                if req_key not in requests:
+                    continue
+                if not self.exec_fn:
+                    notes.append(f"{kind}: execution tooling isn't available in this session (no live training process bridge).")
+                    continue
+                for arg in requests[req_key]:
+                    notes.append(self.exec_fn(kind, arg))
+
+            return "\n\n".join(n for n in notes if n)
+
+        def _apply_directives(self, calc_exprs, promote_names, grep_patterns=None, view_requests=None):
+            """Deterministically compute any CALC: expressions, figure out
+            which PROMOTE: names match a currently-known variable, and run any
+            GREP:/VIEW: requests. Pure computation/file-reading only -- no Tk
+            calls -- so this is safe to run on the background request thread.
+            Returns (note_text, calc_lines, promoted_names) for the caller to
+            display/apply on the main thread; GREP/VIEW results are folded
+            into note_text (and so into the agent's own history) rather than
+            surfaced as separate return values, since nothing on the main
+            thread needs to act on them the way it does for promotions.
+            """
+            calc_lines = ""
+            if calc_exprs:
+                computed = [(expr, _safe_eval_math(expr)) for expr in calc_exprs]
+                calc_lines = "\n".join(f"  {expr} = {result}" for expr, result in computed)
+
+            promoted = []
+            if promote_names and self.promote_fn:
+                manifest = self.get_manifest_fn() or {}
+                known = list(manifest.keys())
+                for raw_name in promote_names:
+                    name = raw_name.strip()
+                    if not name:
+                        continue
+                    if name in known:
+                        target = name
+                    else:
+                        matches = [k for k in known if name.lower() in k.lower()]
+                        target = matches[0] if len(matches) == 1 else None
+                    if target:
+                        promoted.append(target)
+
+            notes = []
+            if calc_lines:
+                notes.append(f"Pulse computed these deterministically -- use these exact values:\n{calc_lines}")
+            if promoted:
+                notes.append(f"Promoted to full tracking: {', '.join(promoted)}.")
+            if grep_patterns:
+                for pattern in grep_patterns:
+                    notes.append(self._run_grep(pattern))
+            if view_requests:
+                for arg in view_requests:
+                    notes.append(self._run_view(arg))
+
+            return "\n\n".join(notes), calc_lines, promoted
+
+        def _ask_yes_no_blocking(self, title, message):
+            """Show a yes/no dialog from the background request thread and
+            block until answered, by scheduling the actual messagebox call on
+            the Tk main thread (via after) and waiting on an Event."""
+            result = {}
+            event = threading.Event()
+
+            def _show():
+                try:
+                    result["value"] = messagebox.askyesno(title, message, parent=self)
+                finally:
+                    event.set()
+
+            self.after(0, _show)
+            event.wait()
+            return bool(result.get("value"))
+
+        @staticmethod
+        def _parse_json_obj(answer):
+            """Generic defensive JSON-object parser for the verify (pass 4) and
+            sweep (pass 5) responses -- same tolerance for stray code fences as
+            _parse_code_fix, but without requiring any particular fields.
+
+            Models are told to respond with ONLY the JSON object, but often
+            don't -- a stray "Sure, here you go:" before it, a trailing
+            sentence after it, or a code fence that isn't stripped cleanly is
+            enough to make a naive "whole string must be exactly `{...}`"
+            check fail, which is why verification used to report "unparsable"
+            on almost every call. Instead, find the first balanced {...} span
+            anywhere in the text (respecting strings, so braces inside a
+            quoted "reason" don't throw off the count) and parse just that.
+            """
+            text = (answer or "").strip()
+            if not text:
+                return None
+            if text.startswith("```"):
+                text = text.strip("`")
+                if text.lower().startswith("json"):
+                    text = text[4:]
+                text = text.strip()
+
+            start = text.find("{")
+            if start == -1:
+                return None
 
             depth = 0
-            try:
-                depth = int(os.environ.get(_RESTART_DEPTH_ENV, "0"))
-            except ValueError:
-                depth = 0
-            env = dict(
-                os.environ,
-                **{
-                    _RESTART_CHILD_ENV: "1",
-                    _RESTART_DEPTH_ENV: str(depth + 1),
-                    "PULSE_AUTO_RESTART": "1",
-                    "PULSE_PROBE_METRICS_PATH": metrics_path,
-                    "PULSE_PROBE_TIME_BUDGET": str(_PROBE_SOFT_TIME_BUDGET_SECONDS),
-                },
-            )
-            try:
-                proc = subprocess.run(
-                    [sys.executable, probe_path], cwd=directory, env=env,
-                    capture_output=True, text=True, timeout=_PROBE_HARD_TIMEOUT_SECONDS,
-                )
-                result["stdout_tail"] = (proc.stdout or "")[-4000:]
-                result["stderr_tail"] = (proc.stderr or "")[-4000:]
-                if proc.returncode != 0:
-                    result["note"] = f"probe process exited with code {proc.returncode}"
-            except subprocess.TimeoutExpired as exc:
-                result["note"] = f"probe run hit the hard {_PROBE_HARD_TIMEOUT_SECONDS:.0f}s cap and was stopped"
-                result["stdout_tail"] = (exc.stdout or "")[-4000:]
-                result["stderr_tail"] = (exc.stderr or "")[-4000:]
-            except Exception as exc:
-                result["note"] = f"probe run failed to launch: {exc}"
+            in_string = False
+            escape = False
+            end = -1
+            for i in range(start, len(text)):
+                ch = text[i]
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif ch == "\\":
+                        escape = True
+                    elif ch == '"':
+                        in_string = False
+                    continue
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+            if end == -1:
+                return None
 
-            if os.path.exists(metrics_path):
+            try:
+                payload = json.loads(text[start:end + 1])
+            except (ValueError, TypeError):
+                return None
+            return payload if isinstance(payload, dict) else None
+
+        @staticmethod
+        def _describe_fix(fix):
+            parts = []
+            for i, (old, new) in enumerate(zip(fix["old"], fix["new"])):
+                parts.append(f"--- change {i + 1} ---\nOLD:\n{old}\nNEW:\n{new}")
+            if fix.get("explanation"):
+                parts.append(f"Explanation: {fix['explanation']}")
+            return "\n\n".join(parts)
+
+        def _verify_fix_with_retries(self, model_name, fix, diagnosis):
+            """PASS 4: check the fix's math/logic before it's handed to the
+            user. If it fails, ask the agent to revise and re-check, up to
+            _MAX_VERIFY_ATTEMPTS times. Returns (fix, passed, reason). A failed
+            verify/revise request applies the fix as unverified best effort
+            instead of discarding it (see pulse_cli's copy)."""
+            reason = ""
+            for attempt in range(_MAX_VERIFY_ATTEMPTS):
+                fix_desc = self._describe_fix(fix)
+                self.after(0, lambda: self._set_stage("Checking the fix"))
                 try:
-                    with open(metrics_path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    if isinstance(data, dict) and isinstance(data.get("loss"), list):
-                        result["loss"] = [v for v in data["loss"] if isinstance(v, (int, float))]
-                except Exception:
-                    pass
-
-            if not result["loss"]:
-                result["loss"] = _scrape_stdout_losses(result["stdout_tail"])
-        finally:
-            for p in (probe_path, harness_path, metrics_path):
+                    verify_answer = self._call_model(
+                        model_name, _PASS4_VERIFY_TMPL.format(diagnosis=diagnosis, fix_desc=fix_desc),
+                        max_tokens=_AGENT_MAX_TOKENS,
+                    )
+                except AgentRequestFailed as exc:
+                    return fix, False, f"(verification request failed: {exc})"
+                verdict = self._parse_json_obj(verify_answer)
+                if verdict is None:
+                    return fix, True, "(verification response was unparsable; proceeding anyway)"
+                passes = bool(verdict.get("passes"))
+                reason = str(verdict.get("reason", "")).strip()
+                if passes:
+                    return fix, True, reason
+                if attempt == _MAX_VERIFY_ATTEMPTS - 1:
+                    break
+                self.after(0, lambda: self._set_stage("Revising fix"))
                 try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except OSError:
-                    pass
+                    revised_answer = self._call_model(
+                        model_name, _PASS4_REVISE_TMPL.format(diagnosis=diagnosis, fix_desc=fix_desc, reason=reason),
+                        max_tokens=_AGENT_MAX_TOKENS,
+                    )
+                except AgentRequestFailed:
+                    break
+                revised = self._parse_code_fix(revised_answer)
+                if revised is None:
+                    break
+                fix = revised
+            return fix, False, (reason or "(verification did not clearly pass after retries)")
+
+        _PROBE_CODEBLOCK_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
+
+        def _build_fast_probe_source(self, model_name, path, content):
+            """Ask the agent for a fast-but-faithful copy of `content` (same
+            model/data/loss, just iteration-capped) -- see pulse_cli's copy
+            for the full rationale. Returns None if nothing parseable came
+            back, so the empirical check is skipped rather than run on
+            garbage."""
             try:
-                after_entries = set(os.listdir(directory))
-            except OSError:
-                after_entries = set()
-            for name in after_entries - before_entries:
-                full = os.path.join(directory, name)
-                try:
-                    if os.path.isdir(full):
-                        shutil.rmtree(full, ignore_errors=True)
-                    else:
-                        os.remove(full)
-                except OSError:
-                    pass
-        return result
-
-    def _verify_fix_empirically(self, model_name, fix, diagnosis, original_content):
-        """PASS 4.5 -- MEASURE: same idea as PulseCLI._verify_fix_empirically
-        -- actually run a fast, hard-capped slice of the real training loop
-        and check the loss for real, instead of trusting Pass 4's
-        self-report. On failure, reverts this attempt, asks the agent to
-        revise using the measured curve, and retries (bounded). If every
-        attempt fails/is inconclusive, the LAST attempted fix is left
-        applied (same best-effort philosophy as Pass 4) but flagged.
-
-        `original_content` is this fix's pre-edit content for script_path
-        (from _write_code_fix's `originals` return), since the GUI doesn't
-        keep a standing _pending_revert_backups the way the CLI does.
-
-        Returns (fix, ok, detail): ok is True/False/None (None = skipped,
-        nothing to measure or a probe couldn't be built/run at all).
-        """
-        target_path = self.script_path
-        if not target_path or original_content is None:
-            return fix, None, "fix didn't touch the main tracked script -- nothing to run standalone"
-
-        evidence = ""
-        for attempt in range(_MAX_EMPIRICAL_ATTEMPTS):
-            try:
-                with open(target_path, "r", encoding="utf-8") as f:
-                    current_content = f.read()
-            except OSError as exc:
-                return fix, None, f"couldn't re-read {os.path.basename(target_path)}: {exc}"
-
-            probe_src = self._build_fast_probe_source(model_name, target_path, current_content)
-            if probe_src is None:
-                return fix, None, "couldn't build a runnable fast probe of the fix"
-
-            self.after(0, lambda: self._set_stage(f"Running fast probe (hard cap {_PROBE_HARD_TIMEOUT_SECONDS:.0f}s)"))
-            probe_result = self._run_loss_probe(target_path, probe_src)
-
-            verdict, detail = _loss_probe_verdict(probe_result["loss"])
-            note = probe_result.get("note") or ""
-            evidence = detail + (f" [{note}]" if note else "")
-
-            if verdict == "pass":
-                return fix, True, evidence
-            if verdict == "inconclusive":
-                return fix, None, evidence
-
-            if attempt == _MAX_EMPIRICAL_ATTEMPTS - 1:
-                break
-            try:
-                with open(target_path, "w", encoding="utf-8") as f:
-                    f.write(original_content)
-            except OSError:
-                break
-            fix_desc = self._describe_fix(fix)
-            try:
-                revised_answer = self._call_model(
+                answer = self._call_model(
                     model_name,
-                    _PASS4B_REVISE_WITH_EVIDENCE_TMPL.format(
-                        diagnosis=diagnosis, fix_desc=fix_desc, evidence=evidence,
-                    ),
+                    _PASS4B_PROBE_TMPL.format(filename=os.path.basename(path), content=content),
                     max_tokens=_AGENT_MAX_TOKENS,
                 )
             except AgentRequestFailed:
-                break
-            revised = self._parse_code_fix(revised_answer)
-            if revised is None:
-                break
-            _write_lines2, applied_by_path2, _orig2, _skipped2 = self._write_code_fix(revised)
-            if not applied_by_path2:
-                break
-            fix = revised
-        return fix, False, evidence or "loss did not improve after retries"
+                return None
+            m = self._PROBE_CODEBLOCK_RE.search(answer or "")
+            probe_src = (m.group(1) if m else (answer or "")).strip()
+            if not probe_src:
+                return None
+            try:
+                ast.parse(probe_src)
+            except SyntaxError:
+                return None
+            return probe_src
 
-    def _run_sweep_and_maybe_recurse(self, model_name, include_code, provider_name, _depth):
-        """PASS 5: re-read everything for OTHER, unrelated errors. If any
-        turn up, ask the user whether to fix those too (PASS 6 recurses
-        through the same 1-5 format for the new issue)."""
-        self.after(0, lambda: self._set_stage("Reading for other errors"))
-        sweep_answer = self._call_model(model_name, _PASS5_SWEEP, max_tokens=_AGENT_MAX_TOKENS)
-        self.after(0, lambda: self._set_stage(None))
-        sweep = self._parse_json_obj(sweep_answer)
-        found = bool(sweep.get("other_errors_found")) if sweep else False
-        summary = str(sweep.get("summary", "")).strip() if sweep else ""
+        def _run_loss_probe(self, target_path, probe_src):
+            """Write `probe_src` next to the real script, run it as a short,
+            hard-capped subprocess, and return whatever loss readings it
+            reported. Always cleans up every file it created, including
+            anything the run itself wrote to disk. Same mechanics as
+            PulseCLI._run_loss_probe -- kept as a separate copy here since the
+            GUI has no _resolve_restart_interpreter of its own and instead
+            just uses sys.executable."""
+            directory = os.path.dirname(os.path.abspath(target_path)) or "."
+            token = uuid.uuid4().hex[:10]
+            probe_path = os.path.join(directory, f".__pulse_probe_{token}.py")
+            harness_name = f"_pulse_probe_harness_{token}"
+            harness_path = os.path.join(directory, f"{harness_name}.py")
+            metrics_path = os.path.join(directory, f".__pulse_probe_{token}.json")
 
-        if not found or not summary:
-            return
+            try:
+                before_entries = set(os.listdir(directory))
+            except OSError:
+                before_entries = set()
 
-        self.after(0, lambda: self._append("Pulse (5 · Full re-read)", f"Found other possible issue(s):\n\n{summary}"))
-        want_fix = self._ask_yes_no_blocking("Fix other errors?", f"{summary}\n\nFix these too?")
-        if not want_fix:
-            return
+            result = {"loss": [], "note": "", "stdout_tail": "", "stderr_tail": ""}
+            try:
+                with open(harness_path, "w", encoding="utf-8") as f:
+                    f.write(_PROBE_HARNESS_SRC)
+                with open(probe_path, "w", encoding="utf-8") as f:
+                    f.write(f"import {harness_name}  # noqa -- Pulse empirical-verify harness, deleted after this probe\n")
+                    f.write(probe_src)
 
-        self.after(0, lambda: self._append("Pulse", "(6) Following the established format for the additional issue(s)..."))
-        self._ask(f"Please also fix this: {summary}", include_code, provider_name, _depth=_depth + 1)
-
-    def _ask(self, question, include_code, provider_name, _depth=0):
-        """Runs the question through an adaptive multi-pass pipeline
-        instead of a fixed number of calls -- how many passes actually run
-        depends on whether a code fix was asked for, whether it verifies
-        cleanly, and whether a final sweep turns up anything else:
-
-          1. LOCATE  -- read everything, identify the region(s) of the error.
-          2. ANALYZE -- focused second read of those regions; diagnosis + reasoning.
-          3. DEVELOP -- develop and implement the fix (code-fix JSON, if requested).
-          4. VERIFY  -- check the fix's math/logic; revise and re-check on failure.
-          5. SWEEP   -- re-read everything for OTHER errors; ask the user y/n.
-          6.         -- if yes, recurse through 1-5 for the new issue(s).
-
-        Each pass posts to the transcript as soon as it's ready, with the
-        header spinner showing which pass is running. Only the top-level
-        call (_depth == 0) restarts the training process afterward, once,
-        if any fix landed anywhere in the (possibly recursive) chain.
-        """
-        try:
-            if _depth == 0:
-                self._fix_applied_this_turn = False
-                self._last_call_failed_transiently = False
-            model_name = PROVIDERS[provider_name]["model"]
-            context = self._build_context(include_code=include_code)
-            base_text = f"{context}\nQuestion: {question}"
-            images = self._image_payloads()
-
-            self.history.append({"role": "user", "content": [{"type": "text", "text": base_text}] + images})
-
-            wants_implementation = include_code and any(
-                kw in question.lower() for kw in _IMPLEMENT_KEYWORDS
-            )
-
-            # Pass 1: locate the region(s) of the error.
-            self.after(0, lambda: self._set_stage("Reading for region of error"))
-            regions = self._call_model(model_name, f"{base_text}\n\n{_PASS1_LOCATE}", images, max_tokens=_AGENT_MAX_TOKENS)
-            self.after(0, lambda: self._append("Pulse (1 · Region of error)", regions))
-
-            # Pass 2: focused second read + diagnosis/reasoning.
-            self.after(0, lambda: self._set_stage("Analyzing"))
-            raw_analysis = self._call_model(model_name, _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=_AGENT_MAX_TOKENS)
-            analysis, calc_exprs, promote_names, grep_patterns, view_requests = _extract_directives(raw_analysis)
-            analysis, new_requests = _extract_new_directives(analysis)
-            self.after(0, lambda: self._append("Pulse (2 · Diagnosis & reasoning)", analysis))
-
-            directive_note = ""
-            if calc_exprs or promote_names or grep_patterns or view_requests:
-                directive_note, calc_lines, promoted = self._apply_directives(
-                    calc_exprs, promote_names, grep_patterns, view_requests
-                )
-                if calc_lines:
-                    self.after(0, lambda: self._append("Pulse (verified calculations)", calc_lines))
-                for target in promoted:
-                    self.after(0, lambda t=target: self.promote_fn(t))
-                if promoted:
-                    promoted_str = ", ".join(promoted)
-                    self.after(0, lambda s=promoted_str: self._append("Pulse", f"⚙ Promoted to full tracking (agent request): {s}"))
-                if directive_note:
-                    self.history.append({"role": "user", "content": [{"type": "text", "text": directive_note}]})
-
-            if new_requests:
-                new_note = self._apply_new_directives(new_requests)
-                if new_note:
-                    self.after(0, lambda n=new_note: self._append("Pulse (tool results)", n))
-                    self.history.append({"role": "user", "content": [{"type": "text", "text": new_note}]})
-
-            full_answer = f"{regions}\n\n{analysis}"
-
-            if not wants_implementation:
-                self.after(0, lambda: self._set_stage("Developing fix"))
-                fix_text = self._call_model(
-                    model_name, _PASS3_FIX_TEXT_TMPL.format(diagnosis=full_answer), max_tokens=_AGENT_MAX_TOKENS
-                )
-                self.after(0, lambda: self._set_stage(None))
-                full_answer += f"\n\n{fix_text}"
-                self.after(0, lambda: self._append("Pulse (3 · Fix)", fix_text))
-                self.history.append({"role": "assistant", "content": full_answer})
-                return
-
-            # Pass 3: develop and implement the fix, with passes 1-2's
-            # findings handed over (otherwise it re-derives them from scratch).
-            self.after(0, lambda: self._set_stage("Developing & implementing fix"))
-            fix_answer = self._call_model(
-                model_name, _PASS3_IMPLEMENT_TMPL.format(diagnosis=full_answer), max_tokens=_AGENT_MAX_TOKENS
-            )
-            fix = self._parse_code_fix(fix_answer)
-            if fix is None:
-                self.after(0, lambda: self._set_stage(None))
-                full_answer += f"\n\n{fix_answer}"
-                self.after(0, lambda: self._append("Pulse (3 · Fix)", fix_answer))
-                self.history.append({"role": "assistant", "content": full_answer})
-                return
-
-            # Pass 4: verify the fix's math/logic before handing it to the
-            # user; revise and re-check on failure (bounded retries).
-            fix, verify_ok, verify_reason = self._verify_fix_with_retries(model_name, fix, full_answer)
-            status = "passed" if verify_ok else "did not clearly pass -- applying best effort"
-            self.after(0, lambda: self._append("Pulse (4 · Verification)", f"{status}: {verify_reason}"))
-
-            self.after(0, lambda: self._set_stage(None))
-            self.history.append({"role": "assistant", "content": full_answer})
-
-            write_lines, applied_by_path, _originals, skipped = self._write_code_fix(fix)
-
-            # If any snippet failed to match (verbatim or fuzzy), give the
-            # model ONE chance to re-quote the exact text before reporting
-            # a miss -- a weaker model is much more likely to slightly
-            # misquote a snippet than to have picked the wrong fix
-            # entirely, and this is the cheapest place to recover that
-            # without re-running the whole diagnosis.
-            if skipped and self._path_for_label:
-                retry_fix = self._request_corrected_snippets(model_name, fix, skipped)
-                if retry_fix is not None:
-                    retry_write_lines, retry_applied, _retry_orig, retry_skipped = self._write_code_fix(retry_fix)
-                    if retry_applied:
-                        # Merge: keep whatever landed on the first pass,
-                        # add whatever landed on the retry (concatenating
-                        # per-file change lists rather than overwriting,
-                        # in case both passes touched the same file).
-                        write_lines = write_lines + "\n\n(retry after correcting a snippet mismatch)\n" + retry_write_lines
-                        for p, changes in retry_applied.items():
-                            applied_by_path[p] = applied_by_path.get(p, []) + changes
-                        skipped = retry_skipped
-
-            self.after(0, lambda: self._append("Pulse", write_lines))
-            if applied_by_path:
-                self._fix_applied_this_turn = True
-
-            # Pass 4.5: don't just trust Pass 4's self-report -- actually run
-            # a fast, hard-capped slice of the real training loop and check
-            # the loss for real. Only meaningful once a fix landed on disk.
-            if applied_by_path:
-                script_original = _originals.get(self.script_path) if self.script_path else None
+                depth = 0
                 try:
-                    fix, empirical_ok, empirical_detail = self._verify_fix_empirically(
-                        model_name, fix, full_answer, script_original,
+                    depth = int(os.environ.get(_RESTART_DEPTH_ENV, "0"))
+                except ValueError:
+                    depth = 0
+                env = dict(
+                    os.environ,
+                    **{
+                        _RESTART_CHILD_ENV: "1",
+                        _RESTART_DEPTH_ENV: str(depth + 1),
+                        "PULSE_AUTO_RESTART": "1",
+                        "PULSE_PROBE_METRICS_PATH": metrics_path,
+                        "PULSE_PROBE_TIME_BUDGET": str(_PROBE_SOFT_TIME_BUDGET_SECONDS),
+                    },
+                )
+                try:
+                    proc = subprocess.run(
+                        [sys.executable, probe_path], cwd=directory, env=env,
+                        capture_output=True, text=True, timeout=_PROBE_HARD_TIMEOUT_SECONDS,
                     )
+                    result["stdout_tail"] = (proc.stdout or "")[-4000:]
+                    result["stderr_tail"] = (proc.stderr or "")[-4000:]
+                    if proc.returncode != 0:
+                        result["note"] = f"probe process exited with code {proc.returncode}"
+                except subprocess.TimeoutExpired as exc:
+                    result["note"] = f"probe run hit the hard {_PROBE_HARD_TIMEOUT_SECONDS:.0f}s cap and was stopped"
+                    result["stdout_tail"] = (exc.stdout or "")[-4000:]
+                    result["stderr_tail"] = (exc.stderr or "")[-4000:]
                 except Exception as exc:
-                    empirical_ok, empirical_detail = None, f"probe step raised an unexpected error: {exc}"
-                if empirical_ok is True:
-                    empirical_note = f"PASSED -- {empirical_detail}"
-                elif empirical_ok is False:
-                    empirical_note = f"DID NOT PASS -- {empirical_detail} -- fix left applied as best effort."
-                else:
-                    empirical_note = f"skipped -- {empirical_detail}"
-                self.after(0, lambda: self._set_stage(None))
-                self.after(0, lambda: self._append("Pulse (4.5 · Empirical check)", empirical_note))
+                    result["note"] = f"probe run failed to launch: {exc}"
 
-            # Pass 5 (+ 6): only worth a full re-read if a fix actually landed.
-            # The fix is already on disk, so a failed sweep request must not
-            # stop the restart that tests it.
-            if applied_by_path and _depth < 3:
-                try:
-                    self._run_sweep_and_maybe_recurse(model_name, include_code, provider_name, _depth)
-                except AgentRequestFailed as exc:
-                    msg = f"⚠ Full re-read skipped (agent request failed: {exc}) -- continuing with the applied fix."
-                    self.after(0, lambda m=msg: self._append("Pulse", m))
-
-            if _depth == 0 and self._fix_applied_this_turn and self.restart_fn:
-                self.after(0, lambda: self._append("Pulse", "⚙ Restarting the training loop to pick up the fix..."))
-                self.restart_fn(provider_name)
-        except AgentRequestFailed as exc:
-            # Whichever pass hit this, stop the pipeline right here rather
-            # than let a raw failure get treated as a real diagnosis/fix
-            # downstream. Queuing for a background retry (rather than just
-            # printing and dropping it) happens in the thin wrapper that
-            # spawns _ask -- see _ask_and_maybe_retry.
-            msg = f"⚠ AI agent request failed: {exc}"
-            self.after(0, lambda m=msg: self._append("Pulse", m))
-            self.history.append({"role": "assistant", "content": msg})
-            if _depth == 0 and self._fix_applied_this_turn and self.restart_fn:
-                # A fix already landed before this later request failed --
-                # still restart so it actually gets run and tested.
-                self.after(0, lambda: self._append("Pulse", "⚙ Restarting the training loop to pick up the fix..."))
-                self.restart_fn(provider_name)
-            elif _depth == 0:
-                self._last_call_failed_transiently = True
-
-    def _ask_and_maybe_retry(self, question, include_code, provider_name, _depth=0):
-        """Thin wrapper around _ask -- every _ask spawn site calls this
-        instead, so a transient failure gets queued for a background
-        retry (see _queue_agent_retry) rather than just printed and
-        dropped. Recursive sweep-pass calls (_depth > 0) are invoked
-        directly by _ask itself via _run_sweep_and_maybe_recurse, not
-        through here, so only top-level asks are ever queued."""
-        self._ask(question, include_code, provider_name, _depth)
-        if _depth == 0:
-            if self._last_call_failed_transiently:
-                self._queue_agent_retry(question, include_code, provider_name)
-            elif self._pending_agent_retry and self._pending_agent_retry.get("question") == question:
-                self._pending_agent_retry = None
-
-    def _queue_agent_retry(self, question, include_code, provider_name):
-        """Called when a top-level ask failed only because of a transient
-        agent-side error after exhausting _call_model's own in-call
-        retries. Kept and retried again later on a backoff instead of
-        lost for good, while training keeps going untouched in the
-        meantime."""
-        existing = self._pending_agent_retry
-        backoff = 60.0
-        if existing and existing.get("question") == question:
-            backoff = min(existing.get("backoff", 60.0) * 2, 600.0)
-        self._pending_agent_retry = {
-            "question": question, "include_code": include_code, "provider_name": provider_name,
-            "next_attempt": time.time() + backoff, "backoff": backoff,
-        }
-        msg = (f"⚠ Will retry this request again in ~{backoff:.0f}s (agent request hit a rate limit/"
-               "transient error) -- training continues unaffected in the meantime.")
-        self.after(0, lambda m=msg: self._append("Pulse", m))
-        self._ensure_retry_ticker()
-
-    def _ensure_retry_ticker(self):
-        """Starts the one background thread that periodically retries
-        whatever's in self._pending_agent_retry, if anything. Lazily
-        started on first need, idempotent."""
-        if self._retry_ticker_started:
-            return
-        self._retry_ticker_started = True
-
-        def _loop():
-            while True:
-                time.sleep(15.0)
-                pending = self._pending_agent_retry
-                if pending and time.time() >= pending["next_attempt"]:
-                    msg = "⚙ Retrying an earlier request that hit a rate limit/transient error..."
-                    self.after(0, lambda m=msg: self._append("Pulse", m))
+                if os.path.exists(metrics_path):
                     try:
-                        self._ask_and_maybe_retry(pending["question"], pending["include_code"], pending["provider_name"])
+                        with open(metrics_path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        if isinstance(data, dict) and isinstance(data.get("loss"), list):
+                            result["loss"] = [v for v in data["loss"] if isinstance(v, (int, float))]
                     except Exception:
                         pass
 
-        threading.Thread(target=_loop, daemon=True).start()
+                if not result["loss"]:
+                    result["loss"] = _scrape_stdout_losses(result["stdout_tail"])
+            finally:
+                for p in (probe_path, harness_path, metrics_path):
+                    try:
+                        if os.path.exists(p):
+                            os.remove(p)
+                    except OSError:
+                        pass
+                try:
+                    after_entries = set(os.listdir(directory))
+                except OSError:
+                    after_entries = set()
+                for name in after_entries - before_entries:
+                    full = os.path.join(directory, name)
+                    try:
+                        if os.path.isdir(full):
+                            shutil.rmtree(full, ignore_errors=True)
+                        else:
+                            os.remove(full)
+                    except OSError:
+                        pass
+            return result
 
-    @staticmethod
-    def _parse_code_fix(answer):
-        """If `answer` is a well-formed code-fix JSON payload, return it, else None.
+        def _verify_fix_empirically(self, model_name, fix, diagnosis, original_content):
+            """PASS 4.5 -- MEASURE: same idea as PulseCLI._verify_fix_empirically
+            -- actually run a fast, hard-capped slice of the real training loop
+            and check the loss for real, instead of trusting Pass 4's
+            self-report. On failure, reverts this attempt, asks the agent to
+            revise using the measured curve, and retries (bounded). If every
+            attempt fails/is inconclusive, the LAST attempted fix is left
+            applied (same best-effort philosophy as Pass 4) but flagged.
 
-        Two shapes are accepted:
-        - The intended one: "old"/"new" are each a list with one entry per
-          change, where each entry is that change's full snippet (possibly
-          multi-line via embedded "\\n"), zipped index-by-index with an
-          optional "files" list of the same length.
-        - One some models fall into anyway: "old"/"new" are each a flat
-          list of individual source *lines* for a single whole-block
-          change, rather than one entry per change -- since the fix
-          usually adds or removes lines, "old" and "new" end up different
-          lengths and can't be zipped pairwise. There's no "files" list in
-          this shape either. Detected by the length mismatch and handled
-          by joining each list into one snippet and treating it as a
-          single change.
-        """
-        text = (answer or "").strip()
-        if not text:
-            return None
+            `original_content` is this fix's pre-edit content for script_path
+            (from _write_code_fix's `originals` return), since the GUI doesn't
+            keep a standing _pending_revert_backups the way the CLI does.
 
-        # Agents sometimes wrap JSON in ```json ... ``` fences despite being told not to.
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.lower().startswith("json"):
-                text = text[4:]
-            text = text.strip()
+            Returns (fix, ok, detail): ok is True/False/None (None = skipped,
+            nothing to measure or a probe couldn't be built/run at all).
+            """
+            target_path = self.script_path
+            if not target_path or original_content is None:
+                return fix, None, "fix didn't touch the main tracked script -- nothing to run standalone"
 
-        if not (text.startswith("{") and text.endswith("}")):
-            return None
+            evidence = ""
+            for attempt in range(_MAX_EMPIRICAL_ATTEMPTS):
+                try:
+                    with open(target_path, "r", encoding="utf-8") as f:
+                        current_content = f.read()
+                except OSError as exc:
+                    return fix, None, f"couldn't re-read {os.path.basename(target_path)}: {exc}"
 
-        try:
-            payload = json.loads(text)
-        except (ValueError, TypeError):
-            return None
+                probe_src = self._build_fast_probe_source(model_name, target_path, current_content)
+                if probe_src is None:
+                    return fix, None, "couldn't build a runnable fast probe of the fix"
 
-        if not isinstance(payload, dict):
-            return None
+                self.after(0, lambda: self._set_stage(f"Running fast probe (hard cap {_PROBE_HARD_TIMEOUT_SECONDS:.0f}s)"))
+                probe_result = self._run_loss_probe(target_path, probe_src)
 
-        old, new, explanation = payload.get("old"), payload.get("new"), payload.get("explanation")
-        files = payload.get("files")
-        explanation = explanation if isinstance(explanation, str) else ""
+                verdict, detail = _loss_probe_verdict(probe_result["loss"])
+                note = probe_result.get("note") or ""
+                evidence = detail + (f" [{note}]" if note else "")
 
-        def _valid_str_list(lst):
-            return isinstance(lst, list) and bool(lst) and all(isinstance(x, str) for x in lst)
+                if verdict == "pass":
+                    return fix, True, evidence
+                if verdict == "inconclusive":
+                    return fix, None, evidence
 
-        if not _valid_str_list(old) or not _valid_str_list(new):
-            return None
+                if attempt == _MAX_EMPIRICAL_ATTEMPTS - 1:
+                    break
+                try:
+                    with open(target_path, "w", encoding="utf-8") as f:
+                        f.write(original_content)
+                except OSError:
+                    break
+                fix_desc = self._describe_fix(fix)
+                try:
+                    revised_answer = self._call_model(
+                        model_name,
+                        _PASS4B_REVISE_WITH_EVIDENCE_TMPL.format(
+                            diagnosis=diagnosis, fix_desc=fix_desc, evidence=evidence,
+                        ),
+                        max_tokens=_AGENT_MAX_TOKENS,
+                    )
+                except AgentRequestFailed:
+                    break
+                revised = self._parse_code_fix(revised_answer)
+                if revised is None:
+                    break
+                _write_lines2, applied_by_path2, _orig2, _skipped2 = self._write_code_fix(revised)
+                if not applied_by_path2:
+                    break
+                fix = revised
+            return fix, False, evidence or "loss did not improve after retries"
 
-        if len(old) == len(new):
-            # Standard shape: one change per (old[i], new[i]) pair.
-            if files is not None:
-                if not isinstance(files, list) or len(files) != len(old):
-                    return None
-                if not all(f is None or isinstance(f, str) for f in files):
-                    return None
-            else:
-                files = [None] * len(old)
+        def _run_sweep_and_maybe_recurse(self, model_name, include_code, provider_name, _depth):
+            """PASS 5: re-read everything for OTHER, unrelated errors. If any
+            turn up, ask the user whether to fix those too (PASS 6 recurses
+            through the same 1-5 format for the new issue)."""
+            self.after(0, lambda: self._set_stage("Reading for other errors"))
+            sweep_answer = self._call_model(model_name, _PASS5_SWEEP, max_tokens=_AGENT_MAX_TOKENS)
+            self.after(0, lambda: self._set_stage(None))
+            sweep = self._parse_json_obj(sweep_answer)
+            found = bool(sweep.get("other_errors_found")) if sweep else False
+            summary = str(sweep.get("summary", "")).strip() if sweep else ""
 
-            return {"old": old, "new": new, "files": files, "explanation": explanation}
+            if not found or not summary:
+                return
 
-        # Fallback shape: "old"/"new" are flat line arrays for a single
-        # change -- join them back into one snippet each.
-        joined_old = "\n".join(old)
-        joined_new = "\n".join(new)
-        if not joined_old.strip() or joined_old == joined_new:
-            return None
+            self.after(0, lambda: self._append("Pulse (5 · Full re-read)", f"Found other possible issue(s):\n\n{summary}"))
+            want_fix = self._ask_yes_no_blocking("Fix other errors?", f"{summary}\n\nFix these too?")
+            if not want_fix:
+                return
 
-        file_label = None
-        if isinstance(files, str):
-            file_label = files
-        elif isinstance(files, list) and files and isinstance(files[0], str):
-            file_label = files[0]
+            self.after(0, lambda: self._append("Pulse", "(6) Following the established format for the additional issue(s)..."))
+            self._ask(f"Please also fix this: {summary}", include_code, provider_name, _depth=_depth + 1)
 
-        return {
-            "old": [joined_old], "new": [joined_new], "files": [file_label],
-            "explanation": explanation,
-        }
+        def _ask(self, question, include_code, provider_name, _depth=0):
+            """Runs the question through an adaptive multi-pass pipeline
+            instead of a fixed number of calls -- how many passes actually run
+            depends on whether a code fix was asked for, whether it verifies
+            cleanly, and whether a final sweep turns up anything else:
 
-    def _resolve_fix_path(self, file_label):
-        """Map a fix entry's optional "file" label back to a real path on
-        disk, defaulting to the main script when unset. Falls back to
-        substring matching (case-insensitive) since the agent may not
-        reproduce a header exactly."""
-        if not file_label or not file_label.strip():
-            return self.script_path
-        label = file_label.strip()
-        if label in self._path_for_label:
-            return self._path_for_label[label]
-        # Already a real path: _write_code_fix records resolved paths (not
-        # labels) in `skipped`, which _request_corrected_snippets resolves
-        # again -- without this the re-quote retry finds no file to show.
-        if os.path.isfile(label):
-            return os.path.abspath(label)
-        matches = [p for lbl, p in self._path_for_label.items() if label.lower() in lbl.lower()]
-        if len(matches) == 1:
-            return matches[0]
-        return None
+              1. LOCATE  -- read everything, identify the region(s) of the error.
+              2. ANALYZE -- focused second read of those regions; diagnosis + reasoning.
+              3. DEVELOP -- develop and implement the fix (code-fix JSON, if requested).
+              4. VERIFY  -- check the fix's math/logic; revise and re-check on failure.
+              5. SWEEP   -- re-read everything for OTHER errors; ask the user y/n.
+              6.         -- if yes, recurse through 1-5 for the new issue(s).
 
-    def _write_code_fix(self, fix):
-        """Apply an agent-proposed code fix to the file(s) it targets,
-        writing directly to disk. Pure I/O -- no Tk calls -- so this is
-        safe to run on the background request thread (see _ask). Each fix
-        entry may target a different file (see "files" in the code-fix
-        schema, for a modularized project) -- edits are grouped by resolved
-        file path so each file is read/written once regardless of how many
-        snippets in it changed.
-
-        Each old[i] must appear exactly once in its target file's current
-        contents; snippets that don't match cleanly, or whose file can't be
-        resolved, are skipped and reported rather than guessed at.
-
-        Returns (display_text, applied_by_path, originals, skipped):
-        applied_by_path maps touched file path -> [(old, new), ...] (empty
-        if nothing landed); originals maps path -> its content before this
-        edit, kept around in case a manual revert is ever needed; skipped
-        is a list of (old, file_label_or_path, reason) for snippets that
-        couldn't be matched/applied, so the caller can decide whether to
-        ask the agent for a corrected snippet and retry.
-        """
-        by_path = {}
-        unresolved = []
-        for old, new, label in zip(fix["old"], fix["new"], fix["files"]):
-            path = self._resolve_fix_path(label)
-            if not path:
-                unresolved.append((old, label))
-                continue
-            by_path.setdefault(path, []).append((old, new))
-
-        if not by_path and not unresolved:
-            return "(Proposed a code fix with nothing to apply.)", {}, {}, []
-
-        lines = []
-        if fix["explanation"]:
-            lines.append(f"**Explanation:** {fix['explanation']}")
-
-        originals = {}
-        after_by_path = {}
-        applied_by_path = {}
-        skipped = []
-
-        for path, pairs in by_path.items():
+            Each pass posts to the transcript as soon as it's ready, with the
+            header spinner showing which pass is running. Only the top-level
+            call (_depth == 0) restarts the training process afterward, once,
+            if any fix landed anywhere in the (possibly recursive) chain.
+            """
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    original_content = f.read()
-            except OSError as exc:
-                for old, _new in pairs:
-                    skipped.append((old, path, f"couldn't read file: {exc}"))
-                continue
+                if _depth == 0:
+                    self._fix_applied_this_turn = False
+                    self._last_call_failed_transiently = False
+                model_name = PROVIDERS[provider_name]["model"]
+                context = self._build_context(include_code=include_code)
+                base_text = f"{context}\nQuestion: {question}"
+                images = self._image_payloads()
 
-            content = original_content
-            applied = []
-            for old, new in pairs:
-                count = content.count(old)
-                if count == 1:
-                    content = content.replace(old, _banner_wrap_fix(old, new, path), 1)
-                    applied.append((old, new))
-                    continue
-                if count == 0:
-                    # Fallback: the agent may have reproduced the right
-                    # lines with slightly different indentation or an
-                    # extra/missing blank line -- a weaker model does this
-                    # far more often than it gets the actual tokens wrong.
-                    # Only take this path when a whitespace-normalized
-                    # match is unambiguous (exactly one span in the file);
-                    # otherwise fall through to reporting it as unmatched
-                    # rather than guessing.
-                    span = _find_fuzzy_snippet_span(content, old)
-                    if span is not None:
-                        start, end = span
-                        actual_old = content[start:end]
-                        content = content[:start] + _banner_wrap_fix(actual_old, new, path) + content[end:]
-                        applied.append((actual_old, new))
-                    else:
-                        skipped.append((old, path, "no exact match found in the file"))
-                else:
-                    skipped.append((old, path, f"matched {count} times (ambiguous), skipped for safety"))
+                self.history.append({"role": "user", "content": [{"type": "text", "text": base_text}] + images})
 
-            if not applied:
-                continue
-
-            # Automatic gate -- NOT model-invoked, runs regardless of what
-            # directives the model used. Syntax/AST validation (always)
-            # plus a real lint pass (pyflakes, if importable) on the FULL
-            # proposed file content, before anything touches disk.
-            lint_ok, lint_messages = self._lint_check(content, path)
-            if not lint_ok:
-                lines.append(
-                    f"⚠ Fix for '{path}' failed the automatic syntax/lint gate and was NOT written:\n"
-                    + "\n".join(lint_messages)
+                wants_implementation = include_code and any(
+                    kw in question.lower() for kw in _IMPLEMENT_KEYWORDS
                 )
-                continue
+
+                # Pass 1: locate the region(s) of the error.
+                self.after(0, lambda: self._set_stage("Reading for region of error"))
+                regions = self._call_model(model_name, f"{base_text}\n\n{_PASS1_LOCATE}", images, max_tokens=_AGENT_MAX_TOKENS)
+                self.after(0, lambda: self._append("Pulse (1 · Region of error)", regions))
+
+                # Pass 2: focused second read + diagnosis/reasoning.
+                self.after(0, lambda: self._set_stage("Analyzing"))
+                raw_analysis = self._call_model(model_name, _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=_AGENT_MAX_TOKENS)
+                analysis, calc_exprs, promote_names, grep_patterns, view_requests = _extract_directives(raw_analysis)
+                analysis, new_requests = _extract_new_directives(analysis)
+                self.after(0, lambda: self._append("Pulse (2 · Diagnosis & reasoning)", analysis))
+
+                directive_note = ""
+                if calc_exprs or promote_names or grep_patterns or view_requests:
+                    directive_note, calc_lines, promoted = self._apply_directives(
+                        calc_exprs, promote_names, grep_patterns, view_requests
+                    )
+                    if calc_lines:
+                        self.after(0, lambda: self._append("Pulse (verified calculations)", calc_lines))
+                    for target in promoted:
+                        self.after(0, lambda t=target: self.promote_fn(t))
+                    if promoted:
+                        promoted_str = ", ".join(promoted)
+                        self.after(0, lambda s=promoted_str: self._append("Pulse", f"⚙ Promoted to full tracking (agent request): {s}"))
+                    if directive_note:
+                        self.history.append({"role": "user", "content": [{"type": "text", "text": directive_note}]})
+
+                if new_requests:
+                    new_note = self._apply_new_directives(new_requests)
+                    if new_note:
+                        self.after(0, lambda n=new_note: self._append("Pulse (tool results)", n))
+                        self.history.append({"role": "user", "content": [{"type": "text", "text": new_note}]})
+
+                full_answer = f"{regions}\n\n{analysis}"
+
+                if not wants_implementation:
+                    self.after(0, lambda: self._set_stage("Developing fix"))
+                    fix_text = self._call_model(
+                        model_name, _PASS3_FIX_TEXT_TMPL.format(diagnosis=full_answer), max_tokens=_AGENT_MAX_TOKENS
+                    )
+                    self.after(0, lambda: self._set_stage(None))
+                    full_answer += f"\n\n{fix_text}"
+                    self.after(0, lambda: self._append("Pulse (3 · Fix)", fix_text))
+                    self.history.append({"role": "assistant", "content": full_answer})
+                    return
+
+                # Pass 3: develop and implement the fix, with passes 1-2's
+                # findings handed over (otherwise it re-derives them from scratch).
+                self.after(0, lambda: self._set_stage("Developing & implementing fix"))
+                fix_answer = self._call_model(
+                    model_name, _PASS3_IMPLEMENT_TMPL.format(diagnosis=full_answer), max_tokens=_AGENT_MAX_TOKENS
+                )
+                fix = self._parse_code_fix(fix_answer)
+                if fix is None:
+                    self.after(0, lambda: self._set_stage(None))
+                    full_answer += f"\n\n{fix_answer}"
+                    self.after(0, lambda: self._append("Pulse (3 · Fix)", fix_answer))
+                    self.history.append({"role": "assistant", "content": full_answer})
+                    return
+
+                # Pass 4: verify the fix's math/logic before handing it to the
+                # user; revise and re-check on failure (bounded retries).
+                fix, verify_ok, verify_reason = self._verify_fix_with_retries(model_name, fix, full_answer)
+                status = "passed" if verify_ok else "did not clearly pass -- applying best effort"
+                self.after(0, lambda: self._append("Pulse (4 · Verification)", f"{status}: {verify_reason}"))
+
+                self.after(0, lambda: self._set_stage(None))
+                self.history.append({"role": "assistant", "content": full_answer})
+
+                write_lines, applied_by_path, _originals, skipped = self._write_code_fix(fix)
+
+                # If any snippet failed to match (verbatim or fuzzy), give the
+                # model ONE chance to re-quote the exact text before reporting
+                # a miss -- a weaker model is much more likely to slightly
+                # misquote a snippet than to have picked the wrong fix
+                # entirely, and this is the cheapest place to recover that
+                # without re-running the whole diagnosis.
+                if skipped and self._path_for_label:
+                    retry_fix = self._request_corrected_snippets(model_name, fix, skipped)
+                    if retry_fix is not None:
+                        retry_write_lines, retry_applied, _retry_orig, retry_skipped = self._write_code_fix(retry_fix)
+                        if retry_applied:
+                            # Merge: keep whatever landed on the first pass,
+                            # add whatever landed on the retry (concatenating
+                            # per-file change lists rather than overwriting,
+                            # in case both passes touched the same file).
+                            write_lines = write_lines + "\n\n(retry after correcting a snippet mismatch)\n" + retry_write_lines
+                            for p, changes in retry_applied.items():
+                                applied_by_path[p] = applied_by_path.get(p, []) + changes
+                            skipped = retry_skipped
+
+                self.after(0, lambda: self._append("Pulse", write_lines))
+                if applied_by_path:
+                    self._fix_applied_this_turn = True
+
+                # Pass 4.5: don't just trust Pass 4's self-report -- actually run
+                # a fast, hard-capped slice of the real training loop and check
+                # the loss for real. Only meaningful once a fix landed on disk.
+                if applied_by_path:
+                    script_original = _originals.get(self.script_path) if self.script_path else None
+                    try:
+                        fix, empirical_ok, empirical_detail = self._verify_fix_empirically(
+                            model_name, fix, full_answer, script_original,
+                        )
+                    except Exception as exc:
+                        empirical_ok, empirical_detail = None, f"probe step raised an unexpected error: {exc}"
+                    if empirical_ok is True:
+                        empirical_note = f"PASSED -- {empirical_detail}"
+                    elif empirical_ok is False:
+                        empirical_note = f"DID NOT PASS -- {empirical_detail} -- fix left applied as best effort."
+                    else:
+                        empirical_note = f"skipped -- {empirical_detail}"
+                    self.after(0, lambda: self._set_stage(None))
+                    self.after(0, lambda: self._append("Pulse (4.5 · Empirical check)", empirical_note))
+
+                # Pass 5 (+ 6): only worth a full re-read if a fix actually landed.
+                # The fix is already on disk, so a failed sweep request must not
+                # stop the restart that tests it.
+                if applied_by_path and _depth < 3:
+                    try:
+                        self._run_sweep_and_maybe_recurse(model_name, include_code, provider_name, _depth)
+                    except AgentRequestFailed as exc:
+                        msg = f"⚠ Full re-read skipped (agent request failed: {exc}) -- continuing with the applied fix."
+                        self.after(0, lambda m=msg: self._append("Pulse", m))
+
+                if _depth == 0 and self._fix_applied_this_turn and self.restart_fn:
+                    self.after(0, lambda: self._append("Pulse", "⚙ Restarting the training loop to pick up the fix..."))
+                    self.restart_fn(provider_name)
+            except AgentRequestFailed as exc:
+                # Whichever pass hit this, stop the pipeline right here rather
+                # than let a raw failure get treated as a real diagnosis/fix
+                # downstream. Queuing for a background retry (rather than just
+                # printing and dropping it) happens in the thin wrapper that
+                # spawns _ask -- see _ask_and_maybe_retry.
+                msg = f"⚠ AI agent request failed: {exc}"
+                self.after(0, lambda m=msg: self._append("Pulse", m))
+                self.history.append({"role": "assistant", "content": msg})
+                if _depth == 0 and self._fix_applied_this_turn and self.restart_fn:
+                    # A fix already landed before this later request failed --
+                    # still restart so it actually gets run and tested.
+                    self.after(0, lambda: self._append("Pulse", "⚙ Restarting the training loop to pick up the fix..."))
+                    self.restart_fn(provider_name)
+                elif _depth == 0:
+                    self._last_call_failed_transiently = True
+
+        def _ask_and_maybe_retry(self, question, include_code, provider_name, _depth=0):
+            """Thin wrapper around _ask -- every _ask spawn site calls this
+            instead, so a transient failure gets queued for a background
+            retry (see _queue_agent_retry) rather than just printed and
+            dropped. Recursive sweep-pass calls (_depth > 0) are invoked
+            directly by _ask itself via _run_sweep_and_maybe_recurse, not
+            through here, so only top-level asks are ever queued."""
+            self._ask(question, include_code, provider_name, _depth)
+            if _depth == 0:
+                if self._last_call_failed_transiently:
+                    self._queue_agent_retry(question, include_code, provider_name)
+                elif self._pending_agent_retry and self._pending_agent_retry.get("question") == question:
+                    self._pending_agent_retry = None
+
+        def _queue_agent_retry(self, question, include_code, provider_name):
+            """Called when a top-level ask failed only because of a transient
+            agent-side error after exhausting _call_model's own in-call
+            retries. Kept and retried again later on a backoff instead of
+            lost for good, while training keeps going untouched in the
+            meantime."""
+            existing = self._pending_agent_retry
+            backoff = 60.0
+            if existing and existing.get("question") == question:
+                backoff = min(existing.get("backoff", 60.0) * 2, 600.0)
+            self._pending_agent_retry = {
+                "question": question, "include_code": include_code, "provider_name": provider_name,
+                "next_attempt": time.time() + backoff, "backoff": backoff,
+            }
+            msg = (f"⚠ Will retry this request again in ~{backoff:.0f}s (agent request hit a rate limit/"
+                   "transient error) -- training continues unaffected in the meantime.")
+            self.after(0, lambda m=msg: self._append("Pulse", m))
+            self._ensure_retry_ticker()
+
+        def _ensure_retry_ticker(self):
+            """Starts the one background thread that periodically retries
+            whatever's in self._pending_agent_retry, if anything. Lazily
+            started on first need, idempotent."""
+            if self._retry_ticker_started:
+                return
+            self._retry_ticker_started = True
+
+            def _loop():
+                while True:
+                    time.sleep(15.0)
+                    pending = self._pending_agent_retry
+                    if pending and time.time() >= pending["next_attempt"]:
+                        msg = "⚙ Retrying an earlier request that hit a rate limit/transient error..."
+                        self.after(0, lambda m=msg: self._append("Pulse", m))
+                        try:
+                            self._ask_and_maybe_retry(pending["question"], pending["include_code"], pending["provider_name"])
+                        except Exception:
+                            pass
+
+            threading.Thread(target=_loop, daemon=True).start()
+
+        @staticmethod
+        def _parse_code_fix(answer):
+            """If `answer` is a well-formed code-fix JSON payload, return it, else None.
+
+            Two shapes are accepted:
+            - The intended one: "old"/"new" are each a list with one entry per
+              change, where each entry is that change's full snippet (possibly
+              multi-line via embedded "\\n"), zipped index-by-index with an
+              optional "files" list of the same length.
+            - One some models fall into anyway: "old"/"new" are each a flat
+              list of individual source *lines* for a single whole-block
+              change, rather than one entry per change -- since the fix
+              usually adds or removes lines, "old" and "new" end up different
+              lengths and can't be zipped pairwise. There's no "files" list in
+              this shape either. Detected by the length mismatch and handled
+              by joining each list into one snippet and treating it as a
+              single change.
+            """
+            text = (answer or "").strip()
+            if not text:
+                return None
+
+            # Agents sometimes wrap JSON in ```json ... ``` fences despite being told not to.
+            if text.startswith("```"):
+                text = text.strip("`")
+                if text.lower().startswith("json"):
+                    text = text[4:]
+                text = text.strip()
+
+            if not (text.startswith("{") and text.endswith("}")):
+                return None
 
             try:
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(content)
-            except OSError as exc:
-                lines.append(f"⚠ Failed to write changes to '{path}': {exc}")
-                continue
+                payload = json.loads(text)
+            except (ValueError, TypeError):
+                return None
 
-            originals[path] = original_content
-            applied_by_path[path] = applied
-            after_by_path[path] = content
-            for old, new in applied:
-                self._append_fixlog(path, old, new, fix.get("explanation", ""))
-            if path == self.script_path and self.on_code_change:
-                self.on_code_change(content)
+            if not isinstance(payload, dict):
+                return None
 
-        for old, label in unresolved:
-            skipped.append((old, label or "(unspecified file)", "couldn't determine which file this targets"))
+            old, new, explanation = payload.get("old"), payload.get("new"), payload.get("explanation")
+            files = payload.get("files")
+            explanation = explanation if isinstance(explanation, str) else ""
 
-        if not applied_by_path:
-            lines.append("\n⚠ No changes were applied -- none of the proposed snippets matched cleanly:")
-            for old, where, reason in skipped:
-                lines.append(f"  - [{os.path.basename(str(where))}] {reason}: `{old.splitlines()[0][:80]}...`")
-            return "\n".join(lines), {}, {}, skipped
+            def _valid_str_list(lst):
+                return isinstance(lst, list) and bool(lst) and all(isinstance(x, str) for x in lst)
 
-        for path, applied in applied_by_path.items():
-            lines.append(f"\n✓ Applied {len(applied)} change(s) to `{os.path.basename(path)}`:")
-            for old, new in applied:
-                safe_old = old.splitlines()[0][:80] if old.splitlines() else "(empty)"
-                safe_new = new.splitlines()[0][:80] if new.splitlines() else "(empty)"
-                lines.append(f"  - replaced `{safe_old}...` with `{safe_new}...`")
-        if skipped:
-            lines.append(f"\n⚠ Skipped {len(skipped)} proposed change(s) that didn't match cleanly:")
-            for old, where, reason in skipped:
-                lines.append(f"  - [{os.path.basename(str(where))}] {reason}: `{old.splitlines()[0][:80]}...`")
+            if not _valid_str_list(old) or not _valid_str_list(new):
+                return None
 
-        commit_files = {p: (originals[p], after_by_path[p]) for p in applied_by_path}
-        commit_id = _record_fix_history_commit(self.script_path, commit_files, fix.get("explanation") or "(no explanation given)")
-        if commit_id:
-            self._last_commit_id = commit_id
-            lines.append(f"\n📝 Logged as commit {commit_id} in .pulse_history/ -- send `ROLLBACK: {commit_id}` (or ROLLBACK: last) to undo.")
+            if len(old) == len(new):
+                # Standard shape: one change per (old[i], new[i]) pair.
+                if files is not None:
+                    if not isinstance(files, list) or len(files) != len(old):
+                        return None
+                    if not all(f is None or isinstance(f, str) for f in files):
+                        return None
+                else:
+                    files = [None] * len(old)
 
-        return "\n".join(lines), applied_by_path, originals, skipped
+                return {"old": old, "new": new, "files": files, "explanation": explanation}
 
-    def _request_corrected_snippets(self, model_name, fix, skipped):
-        """One bounded retry for snippets that failed to match (verbatim
-        or fuzzy) in _write_code_fix. Shows the model the actual current
-        content of each affected file plus exactly which of its own "old"
-        snippets didn't match and why, and asks ONLY for corrected old/new
-        pairs for those -- not a full re-diagnosis. Returns a fix dict
-        covering just the corrected entries, or None if nothing could be
-        recovered (unparsable response, or no snippets left worth
-        retrying)."""
-        if not skipped:
+            # Fallback shape: "old"/"new" are flat line arrays for a single
+            # change -- join them back into one snippet each.
+            joined_old = "\n".join(old)
+            joined_new = "\n".join(new)
+            if not joined_old.strip() or joined_old == joined_new:
+                return None
+
+            file_label = None
+            if isinstance(files, str):
+                file_label = files
+            elif isinstance(files, list) and files and isinstance(files[0], str):
+                file_label = files[0]
+
+            return {
+                "old": [joined_old], "new": [joined_new], "files": [file_label],
+                "explanation": explanation,
+            }
+
+        def _resolve_fix_path(self, file_label):
+            """Map a fix entry's optional "file" label back to a real path on
+            disk, defaulting to the main script when unset. Falls back to
+            substring matching (case-insensitive) since the agent may not
+            reproduce a header exactly."""
+            if not file_label or not file_label.strip():
+                return self.script_path
+            label = file_label.strip()
+            if label in self._path_for_label:
+                return self._path_for_label[label]
+            # Already a real path: _write_code_fix records resolved paths (not
+            # labels) in `skipped`, which _request_corrected_snippets resolves
+            # again -- without this the re-quote retry finds no file to show.
+            if os.path.isfile(label):
+                return os.path.abspath(label)
+            matches = [p for lbl, p in self._path_for_label.items() if label.lower() in lbl.lower()]
+            if len(matches) == 1:
+                return matches[0]
             return None
 
-        # Ambiguous-match skips ("matched N times") aren't a quoting
-        # mistake -- retrying with the same or a re-guessed snippet is
-        # just as likely to be ambiguous again, so only retry the
-        # genuinely-not-found cases.
-        retryable = [(old, label) for old, label, reason in skipped if "no exact match" in reason]
-        if not retryable:
-            return None
+        def _write_code_fix(self, fix):
+            """Apply an agent-proposed code fix to the file(s) it targets,
+            writing directly to disk. Pure I/O -- no Tk calls -- so this is
+            safe to run on the background request thread (see _ask). Each fix
+            entry may target a different file (see "files" in the code-fix
+            schema, for a modularized project) -- edits are grouped by resolved
+            file path so each file is read/written once regardless of how many
+            snippets in it changed.
 
-        file_blocks = []
-        seen_paths = set()
-        for old, label in retryable:
-            path = self._resolve_fix_path(label)
-            if not path or path in seen_paths:
-                continue
-            seen_paths.add(path)
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    file_blocks.append(f"--- current content of {os.path.basename(path)} ---\n{f.read()}")
-            except OSError:
-                continue
+            Each old[i] must appear exactly once in its target file's current
+            contents; snippets that don't match cleanly, or whose file can't be
+            resolved, are skipped and reported rather than guessed at.
 
-        if not file_blocks:
-            return None
+            Returns (display_text, applied_by_path, originals, skipped):
+            applied_by_path maps touched file path -> [(old, new), ...] (empty
+            if nothing landed); originals maps path -> its content before this
+            edit, kept around in case a manual revert is ever needed; skipped
+            is a list of (old, file_label_or_path, reason) for snippets that
+            couldn't be matched/applied, so the caller can decide whether to
+            ask the agent for a corrected snippet and retry.
+            """
+            by_path = {}
+            unresolved = []
+            for old, new, label in zip(fix["old"], fix["new"], fix["files"]):
+                path = self._resolve_fix_path(label)
+                if not path:
+                    unresolved.append((old, label))
+                    continue
+                by_path.setdefault(path, []).append((old, new))
 
-        mismatch_lines = "\n".join(
-            f"- targeting '{label or self.script_path}': your snippet did not match anywhere in that "
-            f"file's current content:\n{old}"
-            for old, label in retryable
-        )
-        prompt = (
-            "CORRECTION: some of the exact snippets you proposed did not match the file's actual "
-            "current content (below), so nothing was changed for them. This is almost always a "
-            "quoting mistake (wrong indentation, a missing/extra blank line, or slightly different "
-            "text) rather than a wrong diagnosis -- do NOT change what the fix does, just re-quote "
-            "the 'old' text EXACTLY as it appears in the file content shown below.\n\n"
-            + "\n\n".join(file_blocks)
-            + f"\n\nSnippets that didn't match:\n{mismatch_lines}\n\n"
-            "Respond with ONLY a corrected code-fix JSON object (old/new/files/explanation) covering "
-            "just these snippets -- no prose, no markdown fences."
-        )
-        answer = self._call_model(model_name, prompt, max_tokens=_AGENT_MAX_TOKENS)
-        return self._parse_code_fix(answer)
+            if not by_path and not unresolved:
+                return "(Proposed a code fix with nothing to apply.)", {}, {}, []
 
-    def report_training_trouble(self, problem):
-        """Called by the Dashboard when auto-intervention detects training
-        going bad (a value went NaN/inf, or a loss-like scalar spiked) and
-        has already paused the user's training loop via the control queue.
-        Surfaces what was detected and, if an AI provider is already
-        configured, automatically asks the agent to diagnose -- and if it
-        can, fix -- it. Unlike report_script_error, the process is still
-        alive and paused (not crashed), so if a fix gets applied the user
-        can just hit "Resume Training" once they're ready.
-        """
-        self._append(
-            "Pulse",
-            f"⚠ Auto-paused training -- this looks like it's going bad:\n\n{problem}",
-        )
+            lines = []
+            if fix["explanation"]:
+                lines.append(f"**Explanation:** {fix['explanation']}")
 
-        current_provider = self.provider_var.get()
-        if not self._has_active_key(current_provider):
+            originals = {}
+            after_by_path = {}
+            applied_by_path = {}
+            skipped = []
+
+            for path, pairs in by_path.items():
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        original_content = f.read()
+                except OSError as exc:
+                    for old, _new in pairs:
+                        skipped.append((old, path, f"couldn't read file: {exc}"))
+                    continue
+
+                content = original_content
+                applied = []
+                for old, new in pairs:
+                    count = content.count(old)
+                    if count == 1:
+                        content = content.replace(old, _banner_wrap_fix(old, new, path), 1)
+                        applied.append((old, new))
+                        continue
+                    if count == 0:
+                        # Fallback: the agent may have reproduced the right
+                        # lines with slightly different indentation or an
+                        # extra/missing blank line -- a weaker model does this
+                        # far more often than it gets the actual tokens wrong.
+                        # Only take this path when a whitespace-normalized
+                        # match is unambiguous (exactly one span in the file);
+                        # otherwise fall through to reporting it as unmatched
+                        # rather than guessing.
+                        span = _find_fuzzy_snippet_span(content, old)
+                        if span is not None:
+                            start, end = span
+                            actual_old = content[start:end]
+                            content = content[:start] + _banner_wrap_fix(actual_old, new, path) + content[end:]
+                            applied.append((actual_old, new))
+                        else:
+                            skipped.append((old, path, "no exact match found in the file"))
+                    else:
+                        skipped.append((old, path, f"matched {count} times (ambiguous), skipped for safety"))
+
+                if not applied:
+                    continue
+
+                # Automatic gate -- NOT model-invoked, runs regardless of what
+                # directives the model used. Syntax/AST validation (always)
+                # plus a real lint pass (pyflakes, if importable) on the FULL
+                # proposed file content, before anything touches disk.
+                lint_ok, lint_messages = self._lint_check(content, path)
+                if not lint_ok:
+                    lines.append(
+                        f"⚠ Fix for '{path}' failed the automatic syntax/lint gate and was NOT written:\n"
+                        + "\n".join(lint_messages)
+                    )
+                    continue
+
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(content)
+                except OSError as exc:
+                    lines.append(f"⚠ Failed to write changes to '{path}': {exc}")
+                    continue
+
+                originals[path] = original_content
+                applied_by_path[path] = applied
+                after_by_path[path] = content
+                for old, new in applied:
+                    self._append_fixlog(path, old, new, fix.get("explanation", ""))
+                if path == self.script_path and self.on_code_change:
+                    self.on_code_change(content)
+
+            for old, label in unresolved:
+                skipped.append((old, label or "(unspecified file)", "couldn't determine which file this targets"))
+
+            if not applied_by_path:
+                lines.append("\n⚠ No changes were applied -- none of the proposed snippets matched cleanly:")
+                for old, where, reason in skipped:
+                    lines.append(f"  - [{os.path.basename(str(where))}] {reason}: `{old.splitlines()[0][:80]}...`")
+                return "\n".join(lines), {}, {}, skipped
+
+            for path, applied in applied_by_path.items():
+                lines.append(f"\n✓ Applied {len(applied)} change(s) to `{os.path.basename(path)}`:")
+                for old, new in applied:
+                    safe_old = old.splitlines()[0][:80] if old.splitlines() else "(empty)"
+                    safe_new = new.splitlines()[0][:80] if new.splitlines() else "(empty)"
+                    lines.append(f"  - replaced `{safe_old}...` with `{safe_new}...`")
+            if skipped:
+                lines.append(f"\n⚠ Skipped {len(skipped)} proposed change(s) that didn't match cleanly:")
+                for old, where, reason in skipped:
+                    lines.append(f"  - [{os.path.basename(str(where))}] {reason}: `{old.splitlines()[0][:80]}...`")
+
+            commit_files = {p: (originals[p], after_by_path[p]) for p in applied_by_path}
+            commit_id = _record_fix_history_commit(self.script_path, commit_files, fix.get("explanation") or "(no explanation given)")
+            if commit_id:
+                self._last_commit_id = commit_id
+                lines.append(f"\n📝 Logged as commit {commit_id} in .pulse_history/ -- send `ROLLBACK: {commit_id}` (or ROLLBACK: last) to undo.")
+
+            return "\n".join(lines), applied_by_path, originals, skipped
+
+        def _request_corrected_snippets(self, model_name, fix, skipped):
+            """One bounded retry for snippets that failed to match (verbatim
+            or fuzzy) in _write_code_fix. Shows the model the actual current
+            content of each affected file plus exactly which of its own "old"
+            snippets didn't match and why, and asks ONLY for corrected old/new
+            pairs for those -- not a full re-diagnosis. Returns a fix dict
+            covering just the corrected entries, or None if nothing could be
+            recovered (unparsable response, or no snippets left worth
+            retrying)."""
+            if not skipped:
+                return None
+
+            # Ambiguous-match skips ("matched N times") aren't a quoting
+            # mistake -- retrying with the same or a re-guessed snippet is
+            # just as likely to be ambiguous again, so only retry the
+            # genuinely-not-found cases.
+            retryable = [(old, label) for old, label, reason in skipped if "no exact match" in reason]
+            if not retryable:
+                return None
+
+            file_blocks = []
+            seen_paths = set()
+            for old, label in retryable:
+                path = self._resolve_fix_path(label)
+                if not path or path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        file_blocks.append(f"--- current content of {os.path.basename(path)} ---\n{f.read()}")
+                except OSError:
+                    continue
+
+            if not file_blocks:
+                return None
+
+            mismatch_lines = "\n".join(
+                f"- targeting '{label or self.script_path}': your snippet did not match anywhere in that "
+                f"file's current content:\n{old}"
+                for old, label in retryable
+            )
+            prompt = (
+                "CORRECTION: some of the exact snippets you proposed did not match the file's actual "
+                "current content (below), so nothing was changed for them. This is almost always a "
+                "quoting mistake (wrong indentation, a missing/extra blank line, or slightly different "
+                "text) rather than a wrong diagnosis -- do NOT change what the fix does, just re-quote "
+                "the 'old' text EXACTLY as it appears in the file content shown below.\n\n"
+                + "\n\n".join(file_blocks)
+                + f"\n\nSnippets that didn't match:\n{mismatch_lines}\n\n"
+                "Respond with ONLY a corrected code-fix JSON object (old/new/files/explanation) covering "
+                "just these snippets -- no prose, no markdown fences."
+            )
+            answer = self._call_model(model_name, prompt, max_tokens=_AGENT_MAX_TOKENS)
+            return self._parse_code_fix(answer)
+
+        def report_training_trouble(self, problem):
+            """Called by the Dashboard when auto-intervention detects training
+            going bad (a value went NaN/inf, or a loss-like scalar spiked) and
+            has already paused the user's training loop via the control queue.
+            Surfaces what was detected and, if an AI provider is already
+            configured, automatically asks the agent to diagnose -- and if it
+            can, fix -- it. Unlike report_script_error, the process is still
+            alive and paused (not crashed), so if a fix gets applied the user
+            can just hit "Resume Training" once they're ready.
+            """
             self._append(
                 "Pulse",
-                "Pick a provider and enter an API key above, then ask me about this and "
-                "I'll take a look.",
+                f"⚠ Auto-paused training -- this looks like it's going bad:\n\n{problem}",
             )
-            return
 
-        question = (
-            f"Pulse just auto-paused training because it detected a problem: {problem}\n"
-            "Please diagnose the root cause and, if you can, fix it."
-        )
-        self._append("You (training auto-paused)", "(auto-reported by Pulse)")
-        threading.Thread(target=self._ask_and_maybe_retry, args=(question, True, current_provider), daemon=True).start()
+            current_provider = self.provider_var.get()
+            if not self._has_active_key(current_provider):
+                self._append(
+                    "Pulse",
+                    "Pick a provider and enter an API key above, then ask me about this and "
+                    "I'll take a look.",
+                )
+                return
 
-    _TB_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+)')
+            question = (
+                f"Pulse just auto-paused training because it detected a problem: {problem}\n"
+                "Please diagnose the root cause and, if you can, fix it."
+            )
+            self._append("You (training auto-paused)", "(auto-reported by Pulse)")
+            threading.Thread(target=self._ask_and_maybe_retry, args=(question, True, current_provider), daemon=True).start()
 
-    def _last_user_frame(self, tb_text):
-        """Return (file, line) of the deepest traceback frame that belongs
-        to the tracked script, so a crash report can lead with 'line N'
-        instead of making the user hunt through the whole traceback for
-        it. Falls back to the deepest frame overall if none match."""
-        matches = self._TB_FRAME_RE.findall(tb_text)
-        if not matches:
-            return None
-        if self.script_path:
-            own = [m for m in matches if os.path.abspath(m[0]) == os.path.abspath(self.script_path)]
-            if own:
-                return own[-1]
-        return matches[-1]
+        _TB_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+)')
 
-    def report_script_error(self, tb_text):
-        """Called by the Dashboard when it finds a crash file: the user's
-        script raised an uncaught exception somewhere (an init error, or
-        anything that happened after auto_track() was called) and the
-        process has already exited. Surfaces the traceback and, if an AI
-        provider is already configured, automatically asks the agent to
-        diagnose -- and if it can, fix -- it, the same way a normal
-        question would. The fix still can't un-crash the process that
-        already exited, but it means the *next* run has a shot at working.
-        """
-        frame_info = self._last_user_frame(tb_text)
-        header = f"⚠ Error at {os.path.basename(frame_info[0])}, line {frame_info[1]}\n\n" if frame_info else ""
-        self._append(
-            "Pulse",
-            f"{header}⚠ Your script crashed with an uncaught exception (the process has already exited). "
-            f"Here's the traceback:\n\n```\n{tb_text}\n```",
-        )
+        def _last_user_frame(self, tb_text):
+            """Return (file, line) of the deepest traceback frame that belongs
+            to the tracked script, so a crash report can lead with 'line N'
+            instead of making the user hunt through the whole traceback for
+            it. Falls back to the deepest frame overall if none match."""
+            matches = self._TB_FRAME_RE.findall(tb_text)
+            if not matches:
+                return None
+            if self.script_path:
+                own = [m for m in matches if os.path.abspath(m[0]) == os.path.abspath(self.script_path)]
+                if own:
+                    return own[-1]
+            return matches[-1]
 
-        current_provider = self.provider_var.get()
-        if not self._has_active_key(current_provider):
+        def report_script_error(self, tb_text):
+            """Called by the Dashboard when it finds a crash file: the user's
+            script raised an uncaught exception somewhere (an init error, or
+            anything that happened after auto_track() was called) and the
+            process has already exited. Surfaces the traceback and, if an AI
+            provider is already configured, automatically asks the agent to
+            diagnose -- and if it can, fix -- it, the same way a normal
+            question would. The fix still can't un-crash the process that
+            already exited, but it means the *next* run has a shot at working.
+            """
+            frame_info = self._last_user_frame(tb_text)
+            header = f"⚠ Error at {os.path.basename(frame_info[0])}, line {frame_info[1]}\n\n" if frame_info else ""
             self._append(
                 "Pulse",
-                "Pick a provider and enter an API key above, then ask me about this error and "
-                "I'll take a look.",
+                f"{header}⚠ Your script crashed with an uncaught exception (the process has already exited). "
+                f"Here's the traceback:\n\n```\n{tb_text}\n```",
             )
-            return
 
-        question = (
-            f"My script just crashed with this uncaught exception:\n{tb_text}\n"
-            "Please diagnose the root cause and, if you can, fix it."
-        )
-        self._append("You (script crashed)", "(auto-reported by Pulse)")
-        threading.Thread(target=self._ask_and_maybe_retry, args=(question, True, current_provider), daemon=True).start()
+            current_provider = self.provider_var.get()
+            if not self._has_active_key(current_provider):
+                self._append(
+                    "Pulse",
+                    "Pick a provider and enter an API key above, then ask me about this error and "
+                    "I'll take a look.",
+                )
+                return
 
-    def report_restart_failure(self, failure):
-        """Called by the Dashboard when a fix-triggered restart's
-        replacement process crashed immediately (nonzero exit) instead of
-        picking up training. Unlike the old behavior of blindly retrying
-        the exact same broken code (or giving up and leaving the run on
-        stale in-memory code), this hands the failure's stdout/stderr
-        straight back to the agent so it can fix the CURRENT code rather
-        than starting the diagnosis over from scratch. If a new fix lands,
-        `_ask` will trigger another restart via `restart_fn` the same way
-        as any other fix -- persistent_tracer's RESTART handler (which is
-        still alive, since a failed attempt no longer tears the process
-        down) picks that up and tries again.
-        """
-        returncode = failure.get("returncode")
-        stdout = failure.get("stdout", "")
-        stderr = failure.get("stderr", "")
-        self._append(
-            "Pulse",
-            f"⚠ The restarted training process crashed immediately (exit code {returncode}) instead of "
-            f"picking up the fix. Feeding this back to the agent to fix the current code:\n\n"
-            f"```\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}\n```",
-        )
+            question = (
+                f"My script just crashed with this uncaught exception:\n{tb_text}\n"
+                "Please diagnose the root cause and, if you can, fix it."
+            )
+            self._append("You (script crashed)", "(auto-reported by Pulse)")
+            threading.Thread(target=self._ask_and_maybe_retry, args=(question, True, current_provider), daemon=True).start()
 
-        current_provider = self.provider_var.get()
-        if not self._has_active_key(current_provider):
+        def report_restart_failure(self, failure):
+            """Called by the Dashboard when a fix-triggered restart's
+            replacement process crashed immediately (nonzero exit) instead of
+            picking up training. Unlike the old behavior of blindly retrying
+            the exact same broken code (or giving up and leaving the run on
+            stale in-memory code), this hands the failure's stdout/stderr
+            straight back to the agent so it can fix the CURRENT code rather
+            than starting the diagnosis over from scratch. If a new fix lands,
+            `_ask` will trigger another restart via `restart_fn` the same way
+            as any other fix -- persistent_tracer's RESTART handler (which is
+            still alive, since a failed attempt no longer tears the process
+            down) picks that up and tries again.
+            """
+            returncode = failure.get("returncode")
+            stdout = failure.get("stdout", "")
+            stderr = failure.get("stderr", "")
             self._append(
                 "Pulse",
-                "Pick a provider and enter an API key above, then ask me to fix this and I'll take a look.",
+                f"⚠ The restarted training process crashed immediately (exit code {returncode}) instead of "
+                f"picking up the fix. Feeding this back to the agent to fix the current code:\n\n"
+                f"```\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}\n```",
             )
-            return
 
-        question = (
-            f"The fix you just applied caused the restarted training process to crash immediately with "
-            f"exit code {returncode}. Its output:\n\nSTDOUT:\n{stdout or '(empty)'}\n\n"
-            f"STDERR:\n{stderr or '(empty)'}\n\n"
-            "This is the same bug context as before -- fix the CURRENT code (shown below) directly. Do "
-            "not restart the diagnosis from scratch, and do not reintroduce whatever change just failed."
-        )
-        self._append("You (restart failed)", "(auto-reported by Pulse)")
-        threading.Thread(target=self._ask_and_maybe_retry, args=(question, True, current_provider), daemon=True).start()
+            current_provider = self.provider_var.get()
+            if not self._has_active_key(current_provider):
+                self._append(
+                    "Pulse",
+                    "Pick a provider and enter an API key above, then ask me to fix this and I'll take a look.",
+                )
+                return
+
+            question = (
+                f"The fix you just applied caused the restarted training process to crash immediately with "
+                f"exit code {returncode}. Its output:\n\nSTDOUT:\n{stdout or '(empty)'}\n\n"
+                f"STDERR:\n{stderr or '(empty)'}\n\n"
+                "This is the same bug context as before -- fix the CURRENT code (shown below) directly. Do "
+                "not restart the diagnosis from scratch, and do not reintroduce whatever change just failed."
+            )
+            self._append("You (restart failed)", "(auto-reported by Pulse)")
+            threading.Thread(target=self._ask_and_maybe_retry, args=(question, True, current_provider), daemon=True).start()
 
 
-# ============================================================================
-# dashboard: live heatmap/linechart grid (left) + chat (right)
-# ============================================================================
+    # ============================================================================
+    # dashboard: live heatmap/linechart grid (left) + chat (right)
+    # ============================================================================
+
+    _CHAT_PANEL_CLS = ChatPanel
+    return ChatPanel
+
 
 class Dashboard:
     # Slower than "instant" on purpose -- loss/tensor stats don't need to
@@ -5974,7 +6009,7 @@ class Dashboard:
         self.canvas.bind("<Configure>", self._on_canvas_resize)
         self._tile_outer_w = self.THUMB_SIZE[0] + 44
 
-        self.chat_panel = ChatPanel(
+        self.chat_panel = _chat_panel_class()(
             right,
             get_manifest_fn=lambda: self._manifest,
             get_code_fn=lambda: self.code_text,
