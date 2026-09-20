@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import math
 import os
-import shlex
 import shutil
 import sys
 import threading
@@ -190,11 +189,6 @@ def discover(extra_roots: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     anywhere, and a scan of the working directory finds runs whose registry entry never
     got written (a read-only home, a different user, an older Pulse).
     """
-    def is_empty_and_over(info: Dict[str, Any]) -> bool:
-        """A run that ended without ever reporting a number is not worth listing."""
-        return (info.get("status") in ("ended", "finished", "crashed")
-                and not info.get("step") and not info.get("scalars"))
-
     seen: Dict[str, Dict[str, Any]] = {}
 
     for entry in stream.registered_sessions():
@@ -213,7 +207,7 @@ def discover(extra_roots: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     # take turns being the most recent writer, so a list sorted by activity reorders
     # between the moment you read a number and the moment you type it, and `pulse watch 2`
     # attaches to whichever one happened to flush last. Start time does not move.
-    return sorted((s for s in seen.values() if not is_empty_and_over(s)),
+    return sorted(seen.values(),
                   key=lambda s: (s.get("started") or 0, s.get("session_id") or ""),
                   reverse=True)
 
@@ -573,426 +567,6 @@ class Console:
         print(dim(f"\n  asked the run to {action}\n"))
 
 
-def report_unmonitored(processes: List[Dict[str, Any]], limit: int = 5) -> None:
-    """List runs Pulse can see but is not watching, and say what it would take.
-
-    These used to be mentioned only when there were no Pulse runs at all, so somebody
-    with one finished run and one just started outside Pulse was told about the finished
-    one and never about the one they cared about.
-    """
-    if not processes:
-        return
-    from . import pulse_attach as attach
-
-    print(dim(f"\n  {len(processes)} Python run(s) not watched by Pulse:"))
-    for process in processes[:limit]:
-        print(dim(f"    pid {process['pid']:<8} {os.path.basename(process['script'])}"
-                  f"   started {ago(process['started'])}"))
-    if len(processes) > limit:
-        print(dim(f"    ... and {len(processes) - limit} more"))
-
-    first = processes[0]["pid"]
-    if not attach.pyspy_path():
-        print("\n  Pulse can watch one of these from outside, by reading its memory, but")
-        print("  that needs py-spy:   pip install py-spy")
-        print(f"  then:                sudo pulse attach --pid {first}\n")
-        return
-    scope = attach.ptrace_scope()
-    if attach.needs_root():
-        print("\n  To watch one of these Pulse has to read another process's memory, and")
-        print(f"  Linux only allows that for a parent process or root"
-              f"{f' (ptrace_scope is {scope})' if scope is not None else ''}.")
-        print(f"  So it needs sudo:    sudo pulse attach --pid {first}\n")
-    else:
-        print(f"\n  Watch one:           pulse attach --pid {first}\n")
-
-
-# Where sudo looks. It replaces PATH with its own secure_path, so a `pulse` in
-# ~/.local/bin -- where pip puts it -- is invisible to it.
-SECURE_PATH = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin")
-
-
-def secure_path_pulse() -> Optional[str]:
-    """The `pulse` sudo would find, if there is one."""
-    for directory in SECURE_PATH:
-        candidate = os.path.join(directory, "pulse")
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    return None
-
-
-def pulse_on_secure_path() -> bool:
-    """Is there a `pulse` in one of the directories sudo will actually search?"""
-    return secure_path_pulse() is not None
-
-
-def world_writable_by_others(path: str) -> Optional[str]:
-    """Is `path` one that somebody other than its owner and root could replace?
-
-    The launcher makes root exec this file. That is fine when only its owner can write
-    it -- they are the person running sudo. It is not fine if the file, or a directory
-    on the way to it, is writable by others: then anyone who can write there chooses
-    what root runs. Returns the offending path, or None.
-    """
-    current = os.path.abspath(path)
-    seen = set()
-    while current and current not in seen:
-        seen.add(current)
-        try:
-            info = os.lstat(current)
-        except OSError:
-            return None
-        if info.st_mode & 0o002 and not (info.st_mode & 0o1000):
-            return current          # world-writable and not sticky
-        parent = os.path.dirname(current)
-        if parent == current:
-            break
-        current = parent
-    return None
-
-
-LAUNCHER_PATH = "/usr/local/bin/pulse"
-
-# A `pulse` sudo can find, that still runs the install this command was run from. Shell,
-# not Python: it has to work before anything of Pulse's is importable by root.
-#
-# The path to the real pulse is baked in as an absolute path rather than looked up. A
-# PATH lookup would find this launcher itself -- /usr/local/bin is on every PATH -- and
-# exec itself until the process table gives out.
-LAUNCHER_TEMPLATE = """#!/bin/sh
-# Pulse, runnable under sudo. Written by `pulse install-sudo`.
-#
-# `sudo pulse` fails on its own twice over: sudo replaces PATH with secure_path, which
-# does not contain the ~/.local/bin that pip installs the command into, and even by full
-# path root's Python does not look in the invoking user's site-packages, so it fails on
-# numpy. Carrying the real user's HOME across leaves both findable.
-PULSE={pulse}
-
-# Started empty deliberately: without this the test below reads whatever REAL_HOME the
-# caller happened to export, and this file is on every user's PATH, not just sudo's.
-REAL_HOME=
-if [ -n "$SUDO_USER" ]; then
-    # getent on Linux; dscl on macOS, which has no getent. head: a host with both files
-    # and LDAP can answer twice.
-    if command -v getent >/dev/null 2>&1; then
-        REAL_HOME=$(getent passwd "$SUDO_USER" 2>/dev/null | head -n 1 | cut -d: -f6)
-    elif command -v dscl >/dev/null 2>&1; then
-        REAL_HOME=$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null \\
-                    | sed 's/^NFSHomeDirectory: //')
-    fi
-    if [ -z "$REAL_HOME" ]; then
-        echo "pulse: cannot find the home directory of '$SUDO_USER'." >&2
-        echo "pulse: without it Pulse runs with root's, and will not find your install." >&2
-        exit 1
-    fi
-else
-    REAL_HOME="$HOME"
-fi
-
-if [ ! -x "$PULSE" ]; then
-    echo "pulse: $PULSE is gone (reinstalled elsewhere?)." >&2
-    echo "pulse: re-run 'pulse install-sudo' as yourself to point this at it." >&2
-    exit 127
-fi
-exec env HOME="$REAL_HOME" "$PULSE" "$@"
-"""
-
-
-def launcher_text(pulse_path: str) -> str:
-    """The launcher script, pointing at a particular pulse."""
-    return LAUNCHER_TEMPLATE.format(pulse=shlex.quote(pulse_path))
-
-
-def _this_pulse() -> Optional[str]:
-    """The absolute path of the `pulse` command that is running now.
-
-    Not an assumed ~/.local/bin: Pulse may have been installed with pipx, into a venv, or
-    system-wide, and the launcher has to point at the one the person actually uses.
-    """
-    entry = sys.argv[0] if sys.argv else ""
-    if entry and os.path.basename(entry) == "pulse":
-        resolved = os.path.abspath(entry)
-        if os.path.isfile(resolved) and os.access(resolved, os.X_OK):
-            return resolved
-    found = shutil.which("pulse")
-    if found:
-        return os.path.abspath(found)
-    candidate = os.path.join(os.path.expanduser("~"), ".local", "bin", "pulse")
-    return candidate if os.path.isfile(candidate) else None
-
-
-def install_sudo_launcher(target: str = LAUNCHER_PATH) -> int:
-    """Put a `pulse` where sudo looks, so `sudo pulse ...` works.
-
-    Run as yourself, not under sudo: it asks sudo only to place one small file. That is
-    the way round it has to be -- if `sudo pulse` worked there would be nothing to fix --
-    and it means the launcher can record who the real user is.
-    """
-    import subprocess
-    import tempfile
-
-    if os.name != "posix":
-        print("\n  This is for Linux and macOS; on Windows there is no sudo to fix.\n")
-        return 1
-
-    user_pulse = _this_pulse()
-    if not user_pulse:
-        print("\n  Cannot find the `pulse` command to point at.")
-        print("  Install Pulse first:   pip install --user pulseml\n")
-        return 1
-    if os.path.abspath(user_pulse) == os.path.abspath(target):
-        # Pointing the launcher at itself would exec itself forever.
-        print(f"\n  The only pulse found is {target} itself, which is the launcher.")
-        print("  Install Pulse properly first:   pip install --user pulseml\n")
-        return 1
-
-    # The long form works and needs no launcher, so say it here: after the launcher is
-    # in place sudo_hint() shortens to `sudo pulse`, which would be circular advice in
-    # the refusal below.
-    long_form = " ".join(shlex.quote(part) for part in _sudo_env_command([]))
-
-    exposed = world_writable_by_others(user_pulse)
-    if exposed:
-        # The launcher would make root exec this. If anyone can write it, anyone
-        # chooses what root runs.
-        print(f"\n  Refusing to install: {exposed} is writable by anybody.")
-        print(f"  A launcher would make root run {user_pulse}, so whoever can write")
-        print("  there would decide what root runs. Fix the permissions first.\n")
-        return 1
-
-    existing_elsewhere = secure_path_pulse()
-    if existing_elsewhere and os.path.abspath(existing_elsewhere) != os.path.abspath(target):
-        # /usr/local/bin comes before /usr/bin on every PATH, so installing here would
-        # shadow a system-wide pulse for every user on the machine.
-        print(f"\n  There is already a pulse sudo can find: {existing_elsewhere}")
-        print("  `sudo pulse` should work as it is. Installing a launcher would shadow")
-        print("  that one for everybody on this machine, so this is leaving it alone.\n")
-        return 0
-
-    launcher = launcher_text(user_pulse)
-    if os.path.lexists(target):
-        try:
-            with open(target, encoding="utf-8", errors="replace") as handle:
-                existing = handle.read()
-        except OSError as exc:
-            # A directory, or root-owned and unreadable: either way not ours to replace.
-            print(f"\n  {target} is in the way and cannot be read ({exc.strerror}).")
-            print(f"  Use:   {long_form}\n")
-            return 1
-        if existing == launcher:
-            print(f"\n  Already installed at {target} -- `sudo pulse` works.\n")
-            return 0
-        if existing.startswith("#!/bin/sh\n# Pulse, runnable under sudo."):
-            print(f"\n  Updating the launcher at {target} to point at {user_pulse}.\n")
-        else:
-            print(f"\n  {target} exists and is not this launcher; leaving it alone.")
-            print(f"  Use:   {long_form}\n")
-            return 1
-    else:
-        print(f"\n  Writing a launcher to {target} so `sudo pulse` works.")
-        print(f"  It runs {user_pulse}, with your HOME, as root.\n")
-
-    with tempfile.NamedTemporaryFile("w", suffix="-pulse", delete=False,
-                                     encoding="utf-8") as handle:
-        handle.write(launcher)
-        staged = handle.name
-    os.chmod(staged, 0o755)
-    try:
-        command = ["sudo", "install", "-m", "0755", staged, target]
-        print(dim("      " + " ".join(shlex.quote(part) for part in command) + "\n"))
-        result = subprocess.run(command)
-    except OSError as exc:
-        print(f"  Could not run sudo: {exc}\n")
-        return 1
-    finally:
-        try:
-            os.unlink(staged)
-        except OSError:
-            pass
-
-    if result.returncode != 0:
-        print("\n  sudo did not install it. Without it, the command that works is:")
-        print(f"      {sudo_hint([])}\n")
-        return 1
-    print("  Done. `sudo pulse train.py` now works.\n")
-    return 0
-
-
-def sudo_relaunch_command(args: Optional[List[str]] = None) -> List[str]:
-    """A sudo command that runs `pulse <args>` and actually works.
-
-    `sudo pulse ...` does not, on a pip install: sudo's secure_path does not include the
-    ~/.local/bin the command lives in, so the shell reports "pulse: command not found".
-    Giving the full path does not work either -- root's Python does not look in the
-    user's site-packages, so it fails on numpy instead. Carrying PATH and HOME across is
-    what leaves both findable.
-
-    `args` is what should follow `pulse`. It defaults to this process's own arguments,
-    which is right when the answer is "run again with sudo", and wrong whenever the
-    caller means something more specific -- so callers that know say so.
-    """
-    args = list(sys.argv[1:] if args is None else args)
-    # A `pulse` sudo can find -- a system-wide install, or a launcher in /usr/local/bin
-    # -- makes the short form correct, and anything longer is noise.
-    if pulse_on_secure_path():
-        return ["sudo", "pulse"] + args
-    return _sudo_env_command(args)
-
-
-def _sudo_env_command(args: List[str]) -> List[str]:
-    """The long form: works with no launcher, by carrying PATH and HOME across."""
-    home = os.path.expanduser("~")
-    entry = (sys.argv[0] if sys.argv else "") or "pulse"
-    return (["sudo", "env", f"PATH={os.environ.get('PATH', '')}", f"HOME={home}"]
-            + ([sys.executable, "-m", "pulse"] if entry.endswith(".py") else [entry])
-            + list(args))
-
-
-def sudo_hint(args: Optional[List[str]] = None) -> str:
-    return " ".join(shlex.quote(part) for part in sudo_relaunch_command(args))
-
-
-def _can_ask() -> bool:
-    """Is there a person at both ends to ask a question of?
-
-    stdin alone is not enough. Under `redirect_stdout` -- which is how the tests drive
-    these paths -- the prompt is written into a buffer nobody sees while input() blocks
-    on a terminal that was never told anything was wanted. That hangs a test run with
-    no output at all, and answering it would exec sudo over the test runner.
-    """
-    try:
-        return sys.stdin.isatty() and sys.stdout.isatty()
-    except (AttributeError, ValueError):
-        return False
-
-
-def offer_sudo(args: Optional[List[str]] = None) -> bool:
-    """Show the command, and run it here if there is somebody to ask."""
-    command = sudo_relaunch_command(args)
-    print(f"      {sudo_hint(args)}\n")
-    if not pulse_on_secure_path():
-        # The long form is what works today; the short one is one command away.
-        print(dim("  (`pulse install-sudo` makes plain `sudo pulse ...` work instead)\n"))
-    if not _can_ask():
-        return False
-    if not confirm("Run that now?"):
-        return False
-    try:
-        os.execvp(command[0], command)          # replaces this process
-    except OSError as exc:
-        print(f"\n  Could not start sudo: {exc}\n")
-    return False
-
-
-def watch_by_name(wanted: str, model: str = "") -> int:
-    """No Pulse run of this name -- so find the process itself and watch that.
-
-    Looking the pid up by hand is work the tool can do: there is exactly one process
-    running that file nearly every time. `sudo pulse train.py` is the whole command.
-    """
-    from . import pulse_attach as attach
-
-    name = os.path.basename(wanted)
-    running = [p for p in unmonitored_python_processes()
-               if os.path.basename(p["script"]) == name]
-
-    if not running:
-        print(f"\n  No Pulse run for {name!r}, and no process running it either.\n")
-        print(f"  Start it with:   pulse run --stream {name}\n")
-        return 1
-
-    if len(running) > 1:
-        pids = ", ".join(str(p["pid"]) for p in running)
-        print(f"\n  {len(running)} processes are running {name!r} (pid {pids}).")
-        print("  Which one?\n")
-        for process in running:
-            print(f"    sudo pulse attach --pid {process['pid']}"
-                  f"   {dim('started ' + ago(process['started']))}")
-        print()
-        return 1
-
-    pid = running[0]["pid"]
-    report = attach.describe_readiness(pid)
-
-    if not report["pyspy"]:
-        print(f"\n  {name} is running (pid {pid}), started outside Pulse.\n")
-        print("  Pulse can watch it from outside by reading its memory, which needs py-spy:\n")
-        print("      pip install py-spy\n")
-        print(f"  Or restart it under Pulse:   pulse run --stream {name}\n")
-        return 1
-
-    if report["needs_root"]:
-        scope = report.get("ptrace_scope")
-        print(f"\n  {name} is running (pid {pid}), started outside Pulse.\n")
-        print("  Watching it means reading another process's memory. That is ptrace, and")
-        print(f"  Linux allows it only for a parent process or root"
-              f"{f' (ptrace_scope is {scope})' if scope is not None else ''}. So:\n")
-        if report.get("passwordless_sudo") is False:
-            print(dim("  (sudo will ask for your password)"))
-        offer_sudo([wanted])
-        print(f"  Or restart it under Pulse:   pulse run --stream {name}\n")
-        return 1
-
-    if not report["ok"]:
-        print(f"\n  {name} is running (pid {pid}), but Pulse cannot read it:")
-        print(f"  {report['reason']}\n")
-        print(f"  Restart it under Pulse instead:   pulse run --stream {name}\n")
-        return 1
-
-    return attach_to_pid(pid, model=model)
-
-
-def attach_to_pid(pid: int, model: str = "") -> int:
-    """Watch a process Pulse did not start, by sampling it from outside."""
-    from . import pulse_attach as attach
-
-    report = attach.describe_readiness(pid)
-    if not report["ok"]:
-        print(f"\n  Cannot read pid {pid}: {report['reason']}\n")
-        if not report["pyspy"]:
-            print("  Install it:   pip install py-spy\n")
-        elif report["needs_root"] and os.geteuid() != 0:
-            scope = report.get("ptrace_scope")
-            print("  Reading another process's memory is ptrace, which Linux allows only")
-            print(f"  for a parent process or root"
-                  f"{f' (ptrace_scope is {scope})' if scope is not None else ''}. Try:\n")
-            offer_sudo(["attach", "--pid", str(pid)])
-        return 1
-
-    monitor = attach.AttachedMonitor(pid)
-    first = monitor.sample_once()
-    monitor.snapshot()          # so the console has a step and a value to show at once
-    if not first:
-        print(f"\n  pid {pid} can be read, but no numbers came back.")
-        print("  Its loop is probably at the top level of the script, where the values are")
-        print("  module globals; those cannot be read from outside. A loop inside a")
-        print("  function can be, and a run started under Pulse always can.\n")
-        monitor.discard()
-        return 1
-    # The sample above is still in the writer's queue; without this the console's first
-    # poll finds an empty spool and the header says "no steps yet" about a run it has
-    # just read a step from.
-    monitor.writer.flush()
-    monitor.start()
-    print(f"\n  Watching pid {pid} from outside"
-          f"{' (' + os.path.basename(monitor.script) + ')' if monitor.script else ''}: "
-          f"{', '.join(sorted(first))}")
-    print(dim(f"  Sampled {1 / monitor.interval:g} time(s) a second through py-spy; a spike "
-              f"between samples is not seen.\n"))
-
-    session = _describe_session(monitor.directory) or {
-        "session_id": monitor.session_id, "directory": monitor.directory,
-        "script": monitor.script, "status": "live", "step": 0}
-    agent = None
-    if model:
-        from .pulse_brain import build_litellm_agent
-        agent = build_litellm_agent(model)
-    try:
-        return run_console(session, [session], agent=agent)
-    finally:
-        monitor.stop()
-
-
 def confirm(question: str) -> bool:
     """Ask before doing something to someone's training run."""
     try:
@@ -1016,29 +590,19 @@ def render_session_list(sessions: List[Dict[str, Any]], attached: Optional[str] 
               f"{step:<14} {loss:<18} {paint(when)}")
 
 
-def matching_sessions(sessions: List[Dict[str, Any]], wanted: str) -> List[Dict[str, Any]]:
-    """Every run that answers to `wanted`: an index, an id, or a script name."""
-    if wanted.isdigit() and 1 <= int(wanted) <= len(sessions):
-        return [sessions[int(wanted) - 1]]
-    exact = [s for s in sessions if s.get("session_id") == wanted]
-    if exact:
-        return exact
-    name = os.path.basename(wanted)
-    return [s for s in sessions
-            if wanted in (s.get("session_id") or "")
-            or name == os.path.basename(s.get("script") or "")
-            or wanted in os.path.basename(s.get("script") or "")]
-
-
 def pick_session(sessions: List[Dict[str, Any]], wanted: Optional[str]) -> Optional[Dict[str, Any]]:
     """Resolve what the user asked for: an index, a session id, a script name, or nothing."""
     if wanted:
-        matches = matching_sessions(sessions, wanted)
+        if wanted.isdigit() and 1 <= int(wanted) <= len(sessions):
+            return sessions[int(wanted) - 1]
+        for session in sessions:
+            if session["session_id"] == wanted:
+                return session
+        matches = [s for s in sessions
+                   if wanted in (s.get("session_id") or "")
+                   or wanted in os.path.basename(s.get("script") or "")]
         if len(matches) == 1:
             return matches[0]
-        live = [s for s in matches if s["status"] in ("live", "stalled")]
-        if len(live) == 1:
-            return live[0]          # several runs of one script, only one still going
         return None
     live = [s for s in sessions if s["status"] in ("live", "stalled")]
     if len(live) == 1:
@@ -1156,8 +720,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     """`pulse`, `pulse watch [what]`, `pulse sessions`."""
     argv = list(sys.argv[1:] if argv is None else argv)
     command = argv[0] if argv and not argv[0].startswith("-") else ""
-    if command == "install-sudo":
-        return install_sudo_launcher()
     if command in ("watch", "attach", "console", "sessions"):
         argv = argv[1:]
     # Walk the arguments once, so the value of --model is never mistaken for the run
@@ -1176,15 +738,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             wanted = argument
     model = model or os.environ.get("PULSE_MODEL", "")
 
-    if "--pid" in argv:
-        index = argv.index("--pid")
-        try:
-            pid = int(argv[index + 1])
-        except (IndexError, ValueError):
-            print("\n  --pid needs a process id, e.g. pulse attach --pid 12345\n")
-            return 1
-        return attach_to_pid(pid, model=model)
-
     sessions = discover()
     if command == "sessions":
         if not sessions:
@@ -1201,45 +754,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     if sessions:
         render_session_list(sessions)
 
-    idle = unmonitored_python_processes()
     if not sessions:
-        print("  Nothing Pulse is watching yet. Start a run with either:\n")
+        print("  Nothing to watch yet. Start a run with either:\n")
         print("    pulse run --stream train.py   (no changes to your script)")
-        print("    auto_track(mode=\"stream\")     (from inside it)")
-        report_unmonitored(idle)
+        print("    auto_track(mode=\"stream\")     (from inside it)\n")
+        idle = unmonitored_python_processes()
+        if idle:
+            print("  These Python processes are running but not monitored, and Pulse")
+            print("  cannot attach to a process that did not start with it:\n")
+            for process in idle[:5]:
+                print(f"    pid {process['pid']:<8} {os.path.basename(process['script'])}"
+                      f"   {dim('started ' + ago(process['started']))}")
+            print(dim("\n  Restart one under `pulse run --stream` to watch it.\n"))
         return 1
-    # Even with runs of our own: a run started outside Pulse is the one people are
-    # looking for when they say it "doesn't see" their run. Skipped when they named a
-    # script, because the answer about THAT script is more useful than a list of others.
-    if not wanted:
-        report_unmonitored(idle)
 
     session = pick_session(sessions, wanted)
-    if (session is not None and wanted
-            and session.get("status") not in ("live", "stalled")):
-        # A finished run of this script should not stand in for one that is going now.
-        # Asking for train.py while train.py is running means the running one, even if
-        # Pulse still has yesterday's session for it.
-        name = os.path.basename(wanted)
-        if any(os.path.basename(p["script"]) == name for p in idle):
-            return watch_by_name(wanted, model=model)
-
     if session is None:
-        matches = matching_sessions(sessions, wanted) if wanted else [
-            s for s in sessions if s["status"] in ("live", "stalled")]
-        if len(matches) > 1:
-            # Live ones first: if any are still going, an ended run is not what "watch
-            # my run" means.
-            live = [s for s in matches if s["status"] in ("live", "stalled")]
-            shown = live or matches
-            print(f"\n  {len(shown)} runs match{' ' + repr(wanted) if wanted else ''}. Which one?\n")
-            render_session_list(shown)
-            # By id, not by number: the numbers above are positions in THIS list, while
-            # `pulse watch 2` counts through every run on the machine, so on a box with
-            # other runs going the number would pick a different one.
-            print("\n  pulse watch " + (shown[0].get("session_id") or "<id>") + "\n")
-        elif wanted:
-            return watch_by_name(wanted, model=model)
+        if wanted:
+            print(f"\n  Nothing matches {wanted!r}.\n")
         else:
             print("\n  Which one? `pulse watch <number>`\n")
         return 1

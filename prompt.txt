@@ -1,0 +1,618 @@
+You are working on Pulse, a CLI for ML debugging.
+
+Pulse is NOT a web dashboard and I do NOT want a GUI. I want you to redesign the **terminal/CLI UX** so that Pulse feels like a polished developer tool rather than a collection of raw `input()` prompts and print statements.
+
+## IMPORTANT: PRESERVE THE EXISTING IMPLEMENTATION
+
+Do NOT rewrite the CLI from scratch.
+
+Do NOT remove existing functionality.
+
+Do NOT simplify, shorten, or replace large sections of the code just to implement this.
+
+Make surgical changes to the existing implementation.
+
+Preserve:
+
+* existing commands
+* existing authentication behavior
+* workspace behavior
+* Supabase integration
+* model configuration
+* API-key handling
+* GitHub commit handling
+* `pulse run`
+* runtime instrumentation
+* auto-intervention behavior
+* tracking behavior
+* agent behavior
+* error handling
+* existing backend logic
+
+The goal is primarily to improve **how the existing functionality is presented to the user in the terminal**.
+
+Before modifying anything, inspect the existing CLI and understand how the current setup flow works.
+
+---
+
+# CURRENT SETUP FLOW
+
+When a user starts Pulse, the current flow is approximately:
+
+1. Sign up or log in
+2. Select an existing workspace OR create a new workspace
+3. Enter/provide the GitHub commit SHA
+4. Select an agent model from a list of ~20 models
+5. Enter the API key for that model
+6. Start training / run the user's code
+7. During training, Pulse may automatically intervene when it detects a problem
+
+I want every one of these states to have a clean, cohesive terminal UI.
+
+---
+
+# DESIGN DIRECTION
+
+Think:
+
+**modern developer CLI**
++
+**interactive terminal wizard**
++
+**minimal / technical / premium**
+
+NOT:
+
+* web dashboard
+* GUI
+* giant ASCII art
+* walls of text
+* generic `input("Enter X: ")`
+* excessive emojis
+* giant decorative boxes everywhere
+* 20 model cards
+* unnecessary animations
+* fake complexity
+
+Pulse should feel like a serious ML debugging tool.
+
+Use a consistent visual language throughout the entire setup flow.
+
+For example:
+
+```text
+PULSE / WORKSPACE
+PULSE / CODE VERSION
+PULSE / AGENT MODEL
+PULSE / API KEY
+PULSE / RUN
+PULSE / INVESTIGATION
+PULSE / AUTO-INTERVENTION
+```
+
+Use concise status indicators:
+
+```text
+✓ completed
+● currently happening
+○ upcoming
+⚠ anomaly
+✕ failure
+→ transition
+```
+
+Use color sparingly and consistently if the current CLI framework supports it.
+
+One primary Pulse accent color is preferable to a rainbow of colors.
+
+---
+
+# 1. LOGIN / SIGNUP
+
+Instead of a raw prompt like:
+
+```text
+1. Login
+2. Sign up
+```
+
+create a clean interactive screen.
+
+Conceptually:
+
+```text
+╭──────────────────────────────────────────────────────────────╮
+│                                                              │
+│   PULSE                                                       │
+│   ML DEBUGGING                                               │
+│                                                              │
+│   ─────────────────────────────────────────────────────────   │
+│                                                              │
+│   Welcome back.                                               │
+│                                                              │
+│   › Log in                                                    │
+│     Sign up                                                   │
+│                                                              │
+│   Email                                                       │
+│   ❯                                                           │
+│                                                              │
+│   Password                                                    │
+│   ❯                                                           │
+│                                                              │
+│   [ Log in ]                                                  │
+│                                                              │
+│   Don't have an account? Sign up                              │
+│                                                              │
+╰──────────────────────────────────────────────────────────────╯
+```
+
+For signup, similarly provide:
+
+* email
+* password
+* confirm password
+
+The interaction should feel intentional and polished.
+
+Do NOT add unnecessary UI elements just because they look cool.
+
+---
+
+# 2. WORKSPACE SELECTION
+
+The user should be able to:
+
+* navigate existing workspaces
+* clearly see which one is selected
+* create a new workspace
+
+Conceptually:
+
+```text
+PULSE / WORKSPACE
+
+Select a workspace
+Your runs, history, and debugging context live here.
+
+┌────────────────────────────────────────────────────────────┐
+│ ❯ my-project                                  ACTIVE       │
+│   Last used 2 minutes ago                                  │
+├────────────────────────────────────────────────────────────┤
+│   transformer-research                                     │
+│   Last used yesterday                                       │
+├────────────────────────────────────────────────────────────┤
+│   experiments                                               │
+│   Last used 4 days ago                                      │
+└────────────────────────────────────────────────────────────┘
+
++ Create new workspace
+
+↑↓ Select    Enter Continue    N New workspace
+```
+
+Creating a workspace should become a small focused interaction:
+
+```text
+PULSE / NEW WORKSPACE
+
+Name your workspace
+
+❯ transformer-debugging_
+```
+
+Keep it simple.
+
+---
+
+# 3. GITHUB COMMIT SHA
+
+Make this feel like a code-versioning step rather than:
+
+```text
+Enter commit SHA:
+```
+
+Conceptually:
+
+```text
+PULSE / CODE VERSION
+
+Which version of your code are you running?
+
+GitHub commit SHA
+
+❯ a3f9e2c4d81b..._
+
+This lets Pulse associate this run with the exact
+version of your code.
+
+✓ Valid commit format
+
+Enter Continue    Esc Back
+```
+
+IMPORTANT:
+
+If the existing implementation already knows how to detect the current Git repository / HEAD commit, consider making that the default experience.
+
+For example:
+
+```text
+PULSE / CODE VERSION
+
+Git repository detected
+
+Repository
+github.com/user/project
+
+Current commit
+a3f9e2c4  "fix attention scaling"
+
+› Use current commit
+  Enter another SHA
+```
+
+Do NOT implement Git detection if it does not already fit cleanly into the existing architecture. The primary task is UI.
+
+---
+
+# 4. AGENT MODEL SELECTION
+
+There are approximately 20 available models.
+
+DO NOT display them as 20 huge blocks.
+
+Make the model selector searchable/navigable.
+
+Conceptually:
+
+```text
+PULSE / AGENT MODEL
+
+Select the model that powers Pulse's analysis.
+
+Search
+❯ claude_
+
+────────────────────────────────────────────────────────────
+
+› Claude Sonnet
+  Balanced reasoning · Fast
+
+  Claude Opus
+  Highest reasoning capability
+
+  Gemini Flash-Lite
+  Fast · Lower cost
+
+  DeepSeek
+  Strong code reasoning
+
+────────────────────────────────────────────────────────────
+
+↑↓ Navigate    Enter Select    / Search
+```
+
+The actual models/descriptions must come from the existing implementation.
+
+Do NOT invent models.
+
+Do NOT change which models are available.
+
+Do NOT change model configuration logic.
+
+The UI should make ~20 models manageable.
+
+---
+
+# 5. API KEY
+
+The API key screen should feel trustworthy and secure.
+
+Conceptually:
+
+```text
+PULSE / API KEY
+
+Connect your agent model
+
+Model
+Claude Sonnet
+
+API key
+❯ •••••••••••••••••••••••••••
+
+Your key is stored securely and is only used to
+communicate with your selected model.
+
+✓ Key format detected
+
+[ Test connection ]
+
+Enter Continue    Esc Back
+```
+
+If the existing implementation already has API-key validation/testing, surface that cleanly.
+
+For example:
+
+```text
+Testing connection...
+
+✓ API key accepted
+✓ Model reachable
+✓ Pulse agent ready
+```
+
+Do NOT expose the actual API key.
+
+Do NOT change the existing credential storage/security implementation.
+
+---
+
+# 6. SETUP COMPLETION
+
+After setup succeeds, give the user a concise confirmation instead of immediately dumping them into the next screen.
+
+Something like:
+
+```text
+PULSE / READY
+
+✓ Account
+✓ Workspace
+✓ Code version
+✓ Agent model
+✓ API connection
+
+Pulse is ready.
+
+Starting your run...
+```
+
+Keep this brief.
+
+---
+
+# 7. TRAINING / RUN UI
+
+Once `pulse run <file>` starts, the terminal should transition into a clean runtime state.
+
+Do not turn it into a dashboard.
+
+It should remain a CLI.
+
+Conceptually:
+
+```text
+PULSE / RUN
+
+train.py
+PID 18432
+PyTorch 2.x
+CUDA
+GPU: RTX 4080 SUPER
+
+────────────────────────────────────────────────────────────
+
+Training
+Epoch       18 / 50
+Step        7,204
+Loss        2.481 ↓
+Runtime     04:31
+
+Pulse
+97 variables tracked
+31 gradients
+18 activations
+12 tensors
+
+────────────────────────────────────────────────────────────
+```
+
+The exact metrics should come from the existing runtime data.
+
+Do NOT invent fake metrics.
+
+---
+
+# 8. AUTO-INTERVENTION UI
+
+This is especially important.
+
+Currently Pulse may print something like:
+
+```text
+Auto intervening...
+```
+
+I want this to become a polished terminal state that communicates what Pulse is doing.
+
+Conceptually:
+
+```text
+PULSE / AUTO-INTERVENTION
+
+⚠ Anomaly detected
+
+loss
+4.821 ───────────────────────────────╮
+                                     ╰─ 9.734
+
+Pulse is investigating the failure.
+
+✓ Inspecting runtime state
+✓ Checking gradients
+✓ Comparing recent steps
+● Identifying root cause
+○ Generating intervention
+○ Applying intervention
+```
+
+Then:
+
+```text
+PULSE / AUTO-INTERVENTION
+
+✓ Root cause identified
+
+Gradient instability detected in
+optimizer.step()
+
+Proposed intervention
+────────────────────────────────────────
+
+learning_rate
+0.001 → 0.0002
+
+Applying intervention...
+
+████████████████████████████████ 100%
+```
+
+And after successful intervention:
+
+```text
+✓ Pulse intervened
+  learning_rate: 0.001 → 0.0002
+  Training resumed
+```
+
+Then return to the normal training display.
+
+IMPORTANT:
+
+The UI must reflect the ACTUAL state of Pulse.
+
+Do not create fake progress bars or fake investigation steps.
+
+If Pulse is currently doing something, display that.
+
+If the existing implementation does not expose enough state for a particular UI element, omit it rather than fabricating it.
+
+---
+
+# 9. GENERAL UX PRINCIPLES
+
+The entire CLI should feel like one product.
+
+Avoid inconsistent screens such as:
+
+```text
+Enter workspace:
+> 
+
+Choose model:
+1.
+2.
+3.
+
+API Key:
+```
+
+Instead, everything should feel like:
+
+```text
+PULSE / <CURRENT STATE>
+
+short explanation
+
+interactive content
+
+navigation/help
+```
+
+The user should always know:
+
+1. Where they are
+2. What Pulse wants from them
+3. What is currently selected
+4. What key/action continues
+5. What Pulse is doing during autonomous behavior
+
+---
+
+# 10. TECHNICAL REQUIREMENTS
+
+Before implementing:
+
+1. Inspect the entire relevant CLI implementation.
+2. Identify the existing setup flow.
+3. Identify the existing model list.
+4. Identify the existing workspace logic.
+5. Identify the existing auth logic.
+6. Identify the existing API-key logic.
+7. Identify the existing commit SHA logic.
+8. Identify how `pulse run` currently renders runtime output.
+9. Identify how auto-intervention is currently reported.
+
+Then implement the UI around those existing systems.
+
+Prefer the terminal UI library already used by the project.
+
+If an appropriate existing terminal UI dependency is already present, use it.
+
+If there is no suitable dependency, choose a lightweight, well-established terminal UI approach rather than building an enormous custom framework.
+
+Do not introduce unnecessary dependencies.
+
+---
+
+# 11. VERY IMPORTANT CODE-SAFETY RULE
+
+This is an existing production-ish codebase.
+
+I care much more about preserving functionality than making the implementation elegant.
+
+DO NOT:
+
+* rewrite the whole CLI
+* replace large files
+* remove existing commands
+* remove error handling
+* change backend behavior
+* change Supabase behavior
+* change model behavior
+* change authentication semantics
+* change instrumentation
+* change auto-intervention logic
+* silently remove existing functionality
+* shorten a large file by deleting code you think is unnecessary
+
+Make targeted modifications.
+
+Before finishing, verify that the original functionality remains intact.
+
+---
+
+# 12. FINAL RESULT
+
+I want Pulse to feel like this:
+
+```text
+PULSE / WORKSPACE
+        ↓
+PULSE / CODE VERSION
+        ↓
+PULSE / AGENT MODEL
+        ↓
+PULSE / API KEY
+        ↓
+PULSE / READY
+        ↓
+PULSE / RUN
+        ↓
+PULSE / INVESTIGATION
+        ↓
+PULSE / AUTO-INTERVENTION
+        ↓
+✓ Training resumed
+```
+
+The important distinction is:
+
+**This is a terminal product, not a web app.**
+
+Make the terminal itself feel polished, intentional, and modern.
+
+Before changing code, inspect the existing implementation and explain briefly which files/functions you intend to modify and why. Then make the changes surgically.

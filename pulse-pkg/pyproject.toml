@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pulseml"
-version = "0.2.3"
+version = "0.2.15"
 description = "A live ML training debugger for tracking, diagnosing, verifying, and patching training runs."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -54,6 +54,7 @@ dependencies = [
     "pillow",
     "litellm",
     "fpdf2",
+    "py-spy",
 ]
 
 [project.scripts]

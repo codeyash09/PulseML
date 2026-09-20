@@ -60,12 +60,62 @@ def _is_boring(name: str) -> bool:
     return name in _BORING_NAMES or name.startswith(_BORING_PREFIXES)
 
 
-def _scalar_of(value: Any) -> Optional[float]:
+# Reading a value that lives on an accelerator is a device-to-host copy and a stream
+# synchronization, however small the value. Sampling the training loop's locals does not
+# do that unless the run asked for it (PULSE_GPU_READS=1): a 4 Hz sampler calling .item() on
+# every scalar tensor in scope is a sync point the training run never agreed to.
+_GPU_READS = os.environ.get("PULSE_GPU_READS", "").strip().lower() in ("1", "true", "yes", "on")
+_ACCEL_TOKENS = ("cuda", "mps", "xpu", "rocm", "hip", "gpu", "tpu")
+_MIRROR_SUFFIXES = ("_cpu", "_host", "_np", "_numpy", "_cpu_copy", "_host_copy")
+
+
+def _on_accelerator(value: Any) -> bool:
+    """True when `value` lives on a non-CPU device. Reads attributes only -- never data.
+    (Same test as pulse_cli._pulse_is_accelerator_value, kept local so this module stays
+    free of the CLI's dependencies.)"""
+    try:
+        device = getattr(value, "device", None)
+        if device is None:
+            return False
+        kind = getattr(device, "type", None)
+        if isinstance(kind, str) and kind.lower() not in ("cpu", ""):
+            return True
+        text = str(device).lower()
+        if text.startswith("cpu"):
+            return False
+        if any(token in text for token in _ACCEL_TOKENS):
+            return True
+        if "/device:" in text and "/device:cpu:" not in text:       # TensorFlow placement
+            return True
+        device_id = getattr(device, "id", None)                      # CuPy
+        return device_id is not None and int(device_id) >= 0
+    except Exception:
+        return False
+
+
+def _cpu_mirror(name: Optional[str], local_vars: Optional[Dict[str, Any]]) -> Any:
+    """An explicitly maintained host copy of `name` (loss_cpu, loss_np, ...), if the training
+    code keeps one. Pulse reads that instead of the device value."""
+    if not name or not local_vars:
+        return None
+    base = name.rsplit(".", 1)[-1]
+    for candidate in dict.fromkeys(b + suffix for b in (name, base) for suffix in _MIRROR_SUFFIXES):
+        mirror = local_vars.get(candidate)
+        if mirror is not None and not _on_accelerator(mirror):
+            return mirror
+    return None
+
+
+def _scalar_of(value: Any, local_vars: Optional[Dict[str, Any]] = None, name: Optional[str] = None) -> Optional[float]:
     """The float in `value`, if reading it is cheap. None otherwise.
 
-    Cheap means: a Python number, or an array-like holding a handful of elements.
-    A big tensor returns None even though a float could be computed from it -- that
-    computation belongs in the brain, off the training thread.
+    Cheap means: a Python number, or an array-like holding a handful of elements, on the
+    host. A big tensor returns None even though a float could be computed from it -- that
+    computation belongs in the brain, off the training thread. So does anything on an
+    accelerator, unless the run opted in: pass `local_vars` (the implicit sampling path) and
+    such a value is read only through a CPU mirror the training code maintains, or with
+    PULSE_GPU_READS=1. A direct call without `local_vars` (Monitor.observe) is the user
+    asking for that value explicitly and is left alone.
     """
     if value is None or isinstance(value, bool):
         return None
@@ -86,6 +136,9 @@ def _scalar_of(value: Any) -> Optional[float]:
     item = getattr(value, "item", None)
     if item is None or size != 1:
         return None
+    if local_vars is not None and not _GPU_READS and _on_accelerator(value):
+        mirror = _cpu_mirror(name, local_vars)
+        return _scalar_of(mirror) if mirror is not None else None
     try:
         return float(item())
     except (TypeError, ValueError, RuntimeError):
@@ -224,7 +277,7 @@ class Monitor:
         for name, value in list(local_vars.items()):
             if _is_boring(name):
                 continue
-            number = _scalar_of(value)
+            number = _scalar_of(value, local_vars, name)
             if number is not None:
                 # Every sample is sent, including one identical to the last. Suppressing
                 # repeats looks like free bandwidth and is actually how a frozen run

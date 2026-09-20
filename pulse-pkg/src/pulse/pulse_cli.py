@@ -46,6 +46,7 @@ from pulse.pulse_backend import (
 from pulse.pulse_pdf import generate_heatmap_pdf
 from pulse import pulse_detect as _pulse_detect
 from pulse import pulse_supabase as cloud
+from pulse import pulse_ui as _ui
 try:
     import litellm
     # Quiets litellm's own verbose provider-runtime logging unless explicitly enabled.
@@ -353,32 +354,27 @@ _original_input = builtins.input
 
 
 
+def _stdout_is_tty() -> bool:
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:
+        return False
+
+
 def safe_print(*args, **kwargs):
     with _io_lock:
-        # Move cursor to column 0 and clear the line, so a line Pulse is drawing in the
-        # background is not left half-overwritten. Only on a terminal: importing Pulse
-        # replaces print for the WHOLE program, so when the output is a pipe or a file
-        # this used to put "\r\033[K" in front of every line the user's own script
-        # printed -- escape codes in their logs, their CSVs and their piped output.
-        stream = kwargs["file"] if kwargs.get("file") is not None else sys.stdout
-        try:
-            decorate = stream is sys.stdout and stream.isatty()
-        except (AttributeError, ValueError, OSError):
-            decorate = False
-        if decorate:
-            stream.write("\r\033[K")
+        # Move cursor to column 0 and clear line before printing background text -- but only
+        # when this print is going to a terminal. Into a pipe, a log file or a notebook cell
+        # the escape is not a control sequence, just junk at the start of every line.
+        if kwargs.get("file") in (None, sys.stdout) and _stdout_is_tty():
+            sys.stdout.write("\r\033[K")
         _original_print(*args, **kwargs)
 
 def safe_input(prompt=""):
-    # Clear formatting and force prompt to a clean new line -- on a terminal only; with
-    # stdin piped there is no cursor to move and the codes would land in the output.
-    try:
-        interactive = sys.stdout.isatty()
-    except (AttributeError, ValueError):
-        interactive = False
-    if interactive:
-        sys.stdout.write("\033[0m\n\r\033[K")
-        sys.stdout.flush()
+    # Clear formatting and force prompt to a clean new line. Off a terminal keep the new line
+    # (it is what keeps each prompt on its own line in a log) and drop only the escape codes.
+    sys.stdout.write("\033[0m\n\r\033[K" if _stdout_is_tty() else "\n")
+    sys.stdout.flush()
     
     # Hold the lock while waiting for user input
     with _io_lock:
@@ -451,6 +447,21 @@ def _pulse_cpu_mirror_candidates(name: str):
             if candidate not in seen:
                 seen.add(candidate)
                 yield candidate
+
+
+def _trackable_without_reading(value: Any) -> bool:
+    """is_trackable(), except that a value living on an accelerator is judged from its
+    metadata alone (it has a shape and a dtype) and never handed to the backend.
+
+    The tracer asks this about every local in scope, on the training thread, each time a
+    window opens. is_trackable() lives in the backend; if it ever converts or copies to
+    decide ("is this interesting?") that is a device-to-host transfer and a synchronization
+    per tensor per window -- stalls the training loop never asked for. Anything not on an
+    accelerator goes to the backend exactly as before.
+    """
+    if _pulse_is_accelerator_value(value):
+        return getattr(value, "shape", None) is not None and getattr(value, "dtype", None) is not None
+    return is_trackable(value)
 
 
 LOSS_NAME_HINTS = ("loss", "cost", "nll", "cross_entropy", "crossentropy", "objective", "err")
@@ -645,6 +656,179 @@ def _flush_stdin() -> None:
             termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
     except Exception:
         pass  # not a real terminal (piped input, some IDEs, etc.) -- nothing to flush
+
+
+# ---- terminal UI adapters (see pulse_ui.py) -----------------------------------------
+# Presentation only. Each adapter hands back exactly what the plain prompt it stands in for
+# would have returned, so the logic around every call site is untouched -- and each acts
+# only on a real interactive terminal. Anywhere else (pipes, CI, notebooks, PULSE_PLAIN=1,
+# or a terminal that turns out not to support it) the call site's original print()/input()
+# code runs unchanged.
+
+def _prompt_text(plain_prompt: str, *, label: Optional[str] = None, secret: bool = False,
+                 placeholder: Optional[str] = None, validate=None) -> str:
+    """input(plain_prompt) / getpass.getpass(plain_prompt), as a styled field on a terminal."""
+    if _ui.enabled():
+        try:
+            _flush_stdin()
+            return _ui.ask(label or plain_prompt.strip().rstrip(">").strip(),
+                           secret=secret, placeholder=placeholder, validate=validate)
+        except _ui.Unavailable:
+            pass
+    return getpass.getpass(plain_prompt) if secret else input(plain_prompt)
+
+
+def _ui_screen(state: str, subtitle: Optional[str] = None, explain: Optional[str] = None) -> None:
+    if _ui.enabled():
+        _ui.header(state, subtitle, explain)
+
+
+def _ui_step(text: str) -> None:
+    """A sub-step inside the screen already on display (e.g. "Log in" under PULSE / ACCOUNT)."""
+    if _ui.enabled():
+        _ui.subhead(text)
+
+
+def _ui_done(label: str, value: Optional[str] = None) -> None:
+    """Collapse a finished field to a check line."""
+    if _ui.enabled():
+        _ui.ok(label, value)
+
+
+def _say(plain: str, label: Optional[str] = None, value: Optional[str] = None,
+         color: Optional[str] = None) -> None:
+    """Report a finished step: a collapsed check line on a terminal UI, else the original line."""
+    if label is not None and _ui.enabled():
+        _ui.ok(label, value)
+    else:
+        cprint(plain, color=color)
+
+
+def _password_progress(text: str) -> str:
+    return f"{len(text)}/8 characters" if len(text) < 8 else ""
+
+
+def _ui_account_menu() -> Optional[str]:
+    """Sign up / log in / recover as an arrow-key menu -> "s", "l" or "r" (the letters the
+    plain prompt takes; Enter still means sign up). None: use the plain prompt."""
+    if not _ui.enabled():
+        return None
+    try:
+        _flush_stdin()
+        _ui.header("Account", "Welcome to Pulse.",
+                   "Your runs, history and debugging context sync to your Pulse account.")
+        idx = _ui.choose(
+            [
+                _ui.Option("Sign up", "Create a Pulse account", tag="default", key="s"),
+                _ui.Option("Log in", "Use an existing account", key="l"),
+                _ui.Option("Recover account", "Reset your password with your recovery code", key="r"),
+            ],
+            initial=0, allow_cancel=False,
+            footer=f"{_ui._g('up')}{_ui._g('down')} Navigate    Enter Select    S / L / R Jump",
+        )
+    except _ui.Unavailable:
+        return None
+    return "slr"[idx]
+
+
+def _ui_workspace_menu(existing: List[Dict[str, Any]], cached_team_id: Optional[str], describe) -> Optional[str]:
+    """The workspace picker -> the same token the plain prompt takes: "1".."n" for a listed
+    workspace, or "c" / "j" / "r" / "l" / "d". None: use the plain prompt."""
+    if not _ui.enabled():
+        return None
+    try:
+        _flush_stdin()
+        _ui.header("Workspace", "Select a workspace",
+                   "Your runs, history and debugging context live here.")
+        options: List[Any] = []
+        initial = 0
+        for i, team in enumerate(existing):
+            name, _sep, rest = describe(team).partition("  --  ")
+            last_used = team.get("team_id") == cached_team_id
+            if last_used:
+                initial = i
+            options.append(_ui.Option(name, rest or None, tag="last used" if last_used else None))
+        options.append(_ui.Option("+ Create new workspace", "Start a new one", key="c"))
+        options.append(_ui.Option("Join with a code", "Join a teammate's workspace", key="j"))
+        manage = "    R Rename    L Leave    D Delete" if existing else ""
+        picked = _ui.choose(
+            options, initial=initial, allow_cancel=False,
+            hotkeys={"r": "r", "l": "l", "d": "d"} if existing else None,
+            footer=f"{_ui._g('up')}{_ui._g('down')} Select    Enter Continue    C New    J Join{manage}",
+        )
+    except _ui.Unavailable:
+        return None
+    if isinstance(picked, str):
+        return picked
+    return str(picked + 1) if picked < len(existing) else ("c" if picked == len(existing) else "j")
+
+
+def _say_plain(label: str, value: str, plain: str) -> None:
+    """Like _say, for the places that used a bare print() rather than cprint()."""
+    if _ui.enabled():
+        _ui.ok(label, value)
+    else:
+        print(plain)
+
+
+def _ui_pick_agent(names: List[str], cached_provider: Optional[str], current: Optional[str]) -> Optional[str]:
+    """A searchable list of the registered providers. Returns the chosen provider's exact
+    name, "" if the person skipped (Esc -- what pressing Enter on a blank line meant), or
+    None to use the plain numbered list. Everything shown comes from PROVIDERS: the name,
+    its model id, and the local/custom/OpenRouter flags. Nothing is described that the
+    registry does not already say."""
+    if not _ui.enabled():
+        return None
+    try:
+        _flush_stdin()
+        _ui.header("Agent model", "Select the model that powers Pulse's analysis.")
+        options: List[Any] = []
+        initial = 0
+        for i, name in enumerate(names):
+            info = PROVIDERS[name]
+            if info.get("custom"):
+                detail = "type any provider/model string"
+            elif info.get("openrouter"):
+                detail = "type any OpenRouter model"
+            elif info.get("local"):
+                detail = "local -- no data leaves this machine"
+            else:
+                detail = info.get("model") or None
+            tag = "current" if name == current else ("last used" if name == cached_provider else None)
+            if tag and (name == current or initial == 0):
+                initial = i
+            options.append(_ui.Option(name, detail, tag=tag))
+        picked = _ui.choose(options, initial=initial, searchable=True, max_rows=7)
+    except _ui.Unavailable:
+        return None
+    return "" if picked is None else names[picked]
+
+
+def _ui_key_screen(chosen: str) -> None:
+    if not _ui.enabled():
+        return
+    _ui.header("API key", "Connect your agent model")
+    _ui.kv("Model", chosen, indent=0)
+    _ui.note("Used only to call the model you selected. Pulse never writes it to disk.")
+    _ui._emit()
+
+
+def _ui_code_version(sha: Optional[str], cwd: Optional[str]) -> None:
+    """Show the commit this run is attached to. Detection already happened; this only says so."""
+    if not _ui.enabled():
+        return
+    if not sha or sha == "unknown":
+        _ui.note("○ Code version   unknown -- no git commit found (/commit sets one)")
+        return
+    subject = None
+    try:
+        out = subprocess.run(["git", "log", "-1", "--format=%s", sha], cwd=cwd or None,
+                             capture_output=True, text=True, timeout=2)
+        if out.returncode == 0:
+            subject = out.stdout.strip()[:60] or None
+    except Exception:
+        subject = None
+    _ui.ok("Code version", sha[:10] + (f'  "{subject}"' if subject else ""))
 
 
 def _values_equal(a, b) -> bool:
@@ -1015,15 +1199,55 @@ class _Spinner:
         sys.stdout.flush()
 
     def __enter__(self) -> "_Spinner":
+        self._stage = None
+        if _ui.enabled():
+            self._stage = _ui.Stage(self.label)
+            self._stage.__enter__()
+            return self
         self._stop_evt.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         return self
 
     def __exit__(self, *exc) -> None:
+        if getattr(self, "_stage", None) is not None:
+            self._stage.__exit__(*exc)
+            self._stage = None
+            return
         self._stop_evt.set()
         if self._thread:
             self._thread.join()
+
+
+def _async_model_calls_enabled() -> bool:
+    """Background model calls (check-ins, start-of-run priming) are on unless PULSE_ASYNC_MODEL_CALLS=0."""
+    return os.environ.get("PULSE_ASYNC_MODEL_CALLS", "1").strip().lower() not in ("0", "off", "false", "no")
+
+
+class _BackgroundModelCall:
+    """One model call running on a worker thread, so the training thread never waits for it.
+
+    Only the call itself runs here. Whatever the answer changes -- tracked variables,
+    sensitivity, the console -- is applied later by the training thread, in update(), by the
+    same code that used to apply it inline. The worker touches no Pulse state.
+    """
+
+    def __init__(self, fn, **tags):
+        self.done = False
+        self.result = None
+        self.error = None
+        for key, value in tags.items():
+            setattr(self, key, value)
+        self._thread = threading.Thread(target=self._run, args=(fn,), daemon=True, name="pulse-model-call")
+        self._thread.start()
+
+    def _run(self, fn) -> None:
+        try:
+            self.result = fn()
+        except BaseException as exc:          # re-raised on the training thread when applied
+            self.error = exc
+        finally:
+            self.done = True
 
 
 # Adaptive multi-pass agent pipeline (see PulseCLI.ask_agent). Instead of a
@@ -2724,6 +2948,11 @@ class PulseCLI:
         self._last_gpu_probe: float = 0.0
         self.gpu_probe_interval: float = 600.0  # 10 minutes
         self._last_checkin: float = time.monotonic()
+        # Model calls made off the training thread (see _BackgroundModelCall).
+        self._checkin_call: Optional[_BackgroundModelCall] = None
+        self._start_prime_call: Optional[_BackgroundModelCall] = None
+        self._start_prime_answered: bool = False
+        self._start_prime_retried: bool = False
         self.checkin_interval: float = 900.0  # 15 minutes, first one 15 min after start unless negotiated sooner
 
         # Auto-intervention: watch tracked values for signs training is
@@ -3045,7 +3274,7 @@ class PulseCLI:
         for name, val in self.watch_locals.items():
             if name.startswith("__"):
                 continue
-            if is_trackable(val):
+            if _trackable_without_reading(val):
                 trackable[name] = val
 
         for name in self.discovered:
@@ -3171,7 +3400,15 @@ class PulseCLI:
             return "track"
         if val is not None:
             try:
-                if describe_tensor(val).kind == "scalar":
+                if _pulse_is_accelerator_value(val):
+                    # Decided from the shape alone: an accelerator value is never handed to
+                    # the backend to describe.
+                    elements = 1
+                    for dim in getattr(val, "shape", ()) or ():
+                        elements *= int(dim)
+                    if getattr(val, "shape", None) is not None and elements == 1:
+                        return "track"
+                elif describe_tensor(val).kind == "scalar":
                     return "track"
             except Exception:
                 pass
@@ -3440,7 +3677,7 @@ class PulseCLI:
         /lotrack, /autofix once training is running (Ctrl+C to pause).
         """
         variables = self.discover_variables()
-        if not variables:
+        if not variables and not getattr(self, "_code_mode", False):
             # Still set up the agent: crash diagnosis/fixing doesn't need
             # any tracked variables (see auto_track's no-variables branch).
             cprint("[Pulse CLI] No trackable variables found in scope -- crash diagnosis stays on.")
@@ -3455,6 +3692,7 @@ class PulseCLI:
         self._cloud_setup()
         self._agent_setup()
         self._print_ready_summary()
+        self._print_run_header()
 
         # Run silently by default -- no per-step prompt, no dashboard
         # printing -- unless the user explicitly interrupts (Ctrl+C) or
@@ -3469,18 +3707,88 @@ class PulseCLI:
         the last thing printed before training goes quiet, so it's also
         the thing still visible on screen while everything's running.
         """
+        if _ui.enabled():
+            self._print_ready_summary_ui()
+            return
+        code_mode = getattr(self, "_code_mode", False)
         cprint("\n" + "─" * 60)
-        cprint("  Pulse is ready")
+        cprint("  Pulse Code is ready" if code_mode else "  Pulse is ready")
         if self.user_id:
             cprint(f"  Signed in as {self.email}" + (f"  ·  workspace {self.team_join_code}" if self.team_join_code else "  ·  no workspace"))
         else:
             cprint("  Running locally -- not signed in to Pulse Cloud (/cloud for details)")
         cprint(f"  Agent: {self.agent_provider or 'not configured (/agent to set one up)'}")
+        if code_mode:
+            cprint("  Describe what you want built. Type /help any time for commands.")
+            cprint("─" * 60 + "\n")
+            return
         cprint(f"  Auto-fix: {'ON' if self.auto_intervene else 'OFF'}  ·  Sensitivity: {self.sensitivity:.2f}  ·  Tracking {len(self.tracked_vars)} variable{'s' if len(self.tracked_vars) != 1 else ''}")
         if self.tracked_vars:
             cprint(f"  Tracked: {', '.join(self.tracked_vars[:6])}" + (f"  (+{len(self.tracked_vars) - 6} more, see /vars)" if len(self.tracked_vars) > 6 else ""))
         cprint("  Type /help any time for commands, or just ask a question about your run.")
         cprint("─" * 60 + "\n")
+
+    def _print_ready_summary_ui(self) -> None:
+        """PULSE / READY: the same facts as the plain summary, from the same attributes."""
+        sha = getattr(self, "_last_synced_commit_sha", None)
+        known_sha = bool(sha and sha != "unknown")
+        rows = [
+            ("Account", (self.email or "signed in") if self.user_id else "local -- not signed in (/cloud)", bool(self.user_id)),
+            ("Workspace", (f"join code {self.team_join_code}" if self.team_join_code else "selected") if self.team_id else "none", bool(self.team_id)),
+            ("Code version", sha[:10] if known_sha else "unknown", known_sha),
+        ]
+        if self.agent_provider:
+            rows.append(("Agent model", self.agent_provider, True))
+            local = bool(PROVIDERS.get(self.agent_provider, {}).get("local"))
+            rows.append(("API key", "not needed -- local model" if local else "set for this session", True))
+        else:
+            rows.append(("Agent model", "not configured (/agent to set one up)", False))
+        if getattr(self, "_code_mode", False):
+            _ui.ready_block(rows, closing="Pulse Code is ready.")
+            _ui.note("Describe what you want built. Type /help any time for commands.")
+            return
+        _ui.ready_block(rows, closing="Pulse is ready.")
+        _ui.note(
+            f"Auto-fix {'ON' if self.auto_intervene else 'OFF'}  ·  Sensitivity {self.sensitivity:.2f}  ·  "
+            f"Tracking {len(self.tracked_vars)} variable{'s' if len(self.tracked_vars) != 1 else ''}"
+        )
+        _ui.note("Type /help any time for commands, or just ask a question about your run.")
+
+    def _print_run_header(self) -> None:
+        """PULSE / RUN: what is running, from data Pulse already has (the environment record it
+        collected at sign-in, and what the script has imported). Static -- no live figures, so
+        it never competes with the script's own output. Nothing is shown that is not known."""
+        if not _ui.enabled() or self._resumed_from_restart() or getattr(self, "_code_mode", False):
+            return
+        import platform
+        env = next((e for e in getattr(self, "_telemetry", []) if isinstance(e, dict) and e.get("python_version")), {})
+        _ui.header("Run")
+        if self.script_path:
+            _ui.kv("Script", os.path.basename(self.script_path), indent=0)
+        _ui.kv("PID", os.getpid(), indent=0)
+        _ui.kv("Python", env.get("python_version") or platform.python_version(), indent=0)
+        frameworks = env.get("framework_versions")
+        if not frameworks:
+            found = []
+            for module_name, pretty in (("torch", "PyTorch"), ("tensorflow", "TensorFlow"), ("jax", "JAX")):
+                module = sys.modules.get(module_name)
+                version = getattr(module, "__version__", None) if module is not None else None
+                if version:
+                    found.append(f"{pretty} {version}")
+            frameworks = ", ".join(found)
+        if frameworks:
+            _ui.kv("Framework", frameworks, indent=0)
+        if env.get("gpu_name"):
+            count = env.get("gpu_count")
+            _ui.kv("GPU", (f"{count}x " if count and count != 1 else "") + str(env["gpu_name"]), indent=0)
+        if env.get("cuda_version"):
+            _ui.kv("CUDA", env["cuda_version"], indent=0)
+        if self.tracked_vars:
+            _ui.kv("Tracking", f"{len(self.tracked_vars)} variable{'s' if len(self.tracked_vars) != 1 else ''}", indent=0)
+        _ui._emit()
+        _ui.note("Pulse stays quiet while training runs. Ctrl+C pauses after the current step.")
+        _ui._emit(_ui.rule())
+        _ui._emit()
 
     # ------------------------------------------------------------------
     # Cloud: account (Users), team (Teams/join_code), live session sync
@@ -3519,7 +3827,15 @@ class PulseCLI:
         try:
             _flush_stdin()
             suffix = f" [{default}]" if default else ""
-            val = input(f"[Pulse] {context}. Enter {label} manually (Enter to skip){suffix} > ").strip()
+            if _ui.enabled() and "commit" in label:
+                _ui_screen("Code version", "Which version of your code are you running?", f"{context}.")
+            val = _prompt_text(
+                f"[Pulse] {context}. Enter {label} manually (Enter to skip){suffix} > ",
+                label=f"Enter {label} manually",
+                placeholder=(f"Enter to use {default}" if default else "Enter to skip"),
+                validate=((lambda t: f"{_ui._g('ok')} Valid commit format" if _ui.commit_looks_valid(t) else "expects 7-40 hex characters")
+                          if "commit" in label else None),
+            ).strip()
             return val or default
         except (EOFError, KeyboardInterrupt):
             return default
@@ -3602,6 +3918,7 @@ class PulseCLI:
                 # through before ever reaching create_debug_session/a PATCH
                 # body, so this is the right (and only necessary) fallback.
                 sha = sha or "unknown"
+                _ui_code_version(sha, self._repo_cwd)
 
             # Without carrying debug_session_id/uptime/downtime the same
             # way, every restart would open a BRAND NEW Debug_Sessions row
@@ -3728,11 +4045,12 @@ class PulseCLI:
                     f"{env_info['gpu_count']}x {env_info['gpu_name']}"
                     if env_info.get("gpu_name") else "no GPU detected"
                 )
-                cprint(
-                    f"[Pulse] Environment: Python {env_info['python_version']} | {gpu_desc} | "
-                    f"CUDA {env_info.get('cuda_version') or 'n/a'} | "
-                    f"{env_info['framework_versions'] or '(no known ML framework detected)'}"
-                )
+                if not _ui.enabled():      # on a terminal this is shown in PULSE / RUN instead
+                    cprint(
+                        f"[Pulse] Environment: Python {env_info['python_version']} | {gpu_desc} | "
+                        f"CUDA {env_info.get('cuda_version') or 'n/a'} | "
+                        f"{env_info['framework_versions'] or '(no known ML framework detected)'}"
+                    )
 
         self._load_history_context()
 
@@ -3818,33 +4136,37 @@ class PulseCLI:
 
         while attempts < max_attempts:
             _flush_stdin()
-            cprint("\n--- Pulse Cloud Authentication ---")
-            resp = input(
-                "[Pulse] (s)ign up [default] / (l)og in / (r)ecover account > "
-            ).strip().lower() or "s"
+            resp = _ui_account_menu()
+            if resp is None:
+                cprint("\n--- Pulse Cloud Authentication ---")
+                resp = input(
+                    "[Pulse] (s)ign up [default] / (l)og in / (r)ecover account > "
+                ).strip().lower() or "s"
 
             if resp in ("s", "signup", "sign up"):
                 _flush_stdin()
+                _ui_step("Sign up")
                 # Retry only the field that actually failed (email or
                 # password) instead of bouncing back to the top-level
                 # "sign up / log in / recover" menu on every typo -- that
                 # used to mean a single password mismatch cost you a full
                 # re-type of the email address too.
                 while True:
-                    email = input("email (e.g. name@example.com, min. 8 characters) > ").strip()
+                    email = _prompt_text("email (e.g. name@example.com, min. 8 characters) > ", label="Email", placeholder="name@example.com").strip()
                     if not email:
                         cprint("[Pulse] email cannot be blank.", color=_RED)
                         continue
                     if not cloud.is_valid_email(email):
                         cprint("[Pulse] enter a valid email address (min. 8 characters), e.g. name@example.com.", color=_RED)
                         continue
+                    _ui_done("Email", email)
                     break
                 while True:
-                    password = getpass.getpass("Password (min. 8 characters) > ")
+                    password = _prompt_text("Password (min. 8 characters) > ", label="Password", secret=True, placeholder="min. 8 characters", validate=_password_progress)
                     if len(password) < 8:
                         cprint("[Pulse] Password must be at least 8 characters.", color=_RED)
                         continue
-                    confirm_password = getpass.getpass("Confirm password > ")
+                    confirm_password = _prompt_text("Confirm password > ", label="Confirm password", secret=True)
                     if password != confirm_password:
                         # A typo here with no confirmation step means signing up
                         # with a password the user doesn't actually know -- and
@@ -3883,8 +4205,9 @@ class PulseCLI:
                     cprint("[Pulse] Almost there -- check your email for a confirmation link and click it.")
                     while True:
                         _flush_stdin()
-                        resp2 = input(
-                            "Press Enter once confirmed to continue (or type 'skip' to do this later) > "
+                        resp2 = _prompt_text(
+                            "Press Enter once confirmed to continue (or type 'skip' to do this later) > ",
+                            label="Press Enter once you've confirmed  (or type 'skip' to do this later)",
                         ).strip().lower()
                         if resp2 == "skip":
                             cprint("[Pulse] No problem -- run Pulse again and choose (l)og in once you've confirmed.")
@@ -3905,11 +4228,13 @@ class PulseCLI:
 
             elif resp in ("l", "login", "log in"):
                 _flush_stdin()
-                email = input("email > ").strip()
+                _ui_step("Log in")
+                email = _prompt_text("email > ", label="Email", placeholder="name@example.com").strip()
                 if not email:
                     cprint("[Pulse] email cannot be blank.", color=_RED)
                     continue
-                password = getpass.getpass("Password > ")
+                _ui_done("Email", email)
+                password = _prompt_text("Password > ", label="Password", secret=True)
                 if not password:
                     cprint("[Pulse] Password cannot be blank.", color=_RED)
                     continue
@@ -3932,16 +4257,17 @@ class PulseCLI:
                     "[Pulse] Account recovery uses the one-time recovery code shown when you signed up "
                     "(or the last time you recovered/changed your password)."
                 )
-                email = input("email > ").strip()
-                recovery_code = input("Recovery code (e.g. 7F3K-9QRT-2LXP) > ").strip()
+                _ui_step("Recover your account")
+                email = _prompt_text("email > ", label="Email", placeholder="name@example.com").strip()
+                recovery_code = _prompt_text("Recovery code (e.g. 7F3K-9QRT-2LXP) > ", label="Recovery code", placeholder="e.g. 7F3K-9QRT-2LXP").strip()
                 if not email or not recovery_code:
                     cprint("[Pulse] Both email and recovery code are required.", color=_RED)
                     continue
-                new_password = getpass.getpass("New password (min. 8 characters) > ")
+                new_password = _prompt_text("New password (min. 8 characters) > ", label="New password", secret=True, placeholder="min. 8 characters", validate=_password_progress)
                 if len(new_password) < 8:
                     cprint("[Pulse] Password must be at least 8 characters.", color=_RED)
                     continue
-                confirm_new_password = getpass.getpass("Confirm new password > ")
+                confirm_new_password = _prompt_text("Confirm new password > ", label="Confirm new password", secret=True)
                 if new_password != confirm_new_password:
                     cprint("[Pulse] Passwords didn't match. Let's try again.", color=_RED)
                     continue
@@ -3993,6 +4319,7 @@ class PulseCLI:
         """
         privacy_url = os.environ.get("PULSE_PRIVACY_URL", "(set PULSE_PRIVACY_URL to link your Privacy Policy here)")
         tos_url = os.environ.get("PULSE_TOS_URL")
+        _ui_screen("Terms")
         print(
             "\nQuick terms before you create an account:\n"
             "  • Pulse is proprietary software, licensed (not sold) for your own use.\n"
@@ -4003,11 +4330,11 @@ class PulseCLI:
             print(f"Full license: {tos_url}")
         print(f"Privacy Policy: {privacy_url}\n")
         _flush_stdin()
-        resp = input("Type 'yes' to accept (or 'full' to read the complete license first) > ").strip().lower()
+        resp = _prompt_text("Type 'yes' to accept (or 'full' to read the complete license first) > ", label="Type 'yes' to accept, or 'full' to read the complete license first").strip().lower()
         if resp == "full":
             print(f"\n{PULSE_LICENSE_TEXT}")
             _flush_stdin()
-            resp = input("Type 'yes' to accept and create your account > ").strip().lower()
+            resp = _prompt_text("Type 'yes' to accept and create your account > ", label="Type 'yes' to accept and create your account").strip().lower()
         return resp == "yes"
 
     def _show_recovery_code(self, code: Optional[str]) -> None:
@@ -4055,7 +4382,7 @@ class PulseCLI:
             if detected else
             "GitHub repo URL (optional, Enter to skip) > "
         )
-        repo_input = input(prompt).strip()
+        repo_input = _prompt_text(prompt, label="GitHub repository", placeholder=(f"Enter to use detected: {detected}" if detected else "optional -- Enter to skip")).strip()
         repo_url = repo_input or detected
         
         if repo_url:
@@ -4168,32 +4495,35 @@ class PulseCLI:
         while True:
             _flush_stdin()
             existing = cloud.find_teams_for_user(self.user_id)  # re-fetch so rename/delete/leave are reflected immediately
-            cprint("\n--- Pulse Workspace ---")
-            default_choice = None
-            for i, team in enumerate(existing, start=1):
-                is_default = team["team_id"] == cached_team_id
-                if is_default:
-                    default_choice = str(i)
-                marker = "  [last used]" if is_default else ""
-                print(f"  {i}) {self._describe_workspace(team, self.user_id)}{marker}")
-            print("  j) Join a new Workspace")
-            print("  c) Create a new Workspace")
-            if existing:
-                print("  r) Rename a Workspace")
-                print("  l) Leave a Workspace")
-                print("  d) Delete a Workspace (admins only)")
+            resp = _ui_workspace_menu(existing, cached_team_id, lambda t: self._describe_workspace(t, self.user_id))
+            if resp is None:
+                cprint("\n--- Pulse Workspace ---")
+                default_choice = None
+                for i, team in enumerate(existing, start=1):
+                    is_default = team["team_id"] == cached_team_id
+                    if is_default:
+                        default_choice = str(i)
+                    marker = "  [last used]" if is_default else ""
+                    print(f"  {i}) {self._describe_workspace(team, self.user_id)}{marker}")
+                print("  j) Join a new Workspace")
+                print("  c) Create a new Workspace")
+                if existing:
+                    print("  r) Rename a Workspace")
+                    print("  l) Leave a Workspace")
+                    print("  d) Delete a Workspace (admins only)")
 
-            suffix = f" (Enter = {default_choice})" if default_choice else ""
-            resp = input(f"[Pulse] Select a workspace{suffix} > ").strip().lower()
-            if not resp and default_choice:
-                resp = default_choice
+                suffix = f" (Enter = {default_choice})" if default_choice else ""
+                resp = input(f"[Pulse] Select a workspace{suffix} > ").strip().lower()
+                if not resp and default_choice:
+                    resp = default_choice
 
             if resp.isdigit() and existing and 1 <= int(resp) <= len(existing):
                 team = existing[int(resp) - 1]
                 self.team_id = team["team_id"]
                 self.team_join_code = team.get("join_code")
                 self.team_admin_ids = list(team.get("admin_ids") or [])
-                cprint(f"[Pulse] Using workspace (join code: {self.team_join_code}).")
+                _say(f"[Pulse] Using workspace (join code: {self.team_join_code}).",
+                     "Workspace", self._describe_workspace(team, self.user_id).replace("  --  ", "  ·  "))
                 if not team.get("repo") or team.get("repo") == "unknown":
                     self._prompt_and_set_repo()
                 cloud.save_cached_credentials(self.user_id, self.email, self.team_id)
@@ -4201,7 +4531,8 @@ class PulseCLI:
 
             if resp in ("c", "create"):
                 _flush_stdin()
-                name_input = input("Workspace name (optional, Enter to skip) > ").strip()
+                _ui_screen("New workspace", "Name your workspace")
+                name_input = _prompt_text("Workspace name (optional, Enter to skip) > ", label="Workspace name", placeholder="optional -- Enter to skip").strip()
                 detected = cloud.git_remote_url(self._repo_cwd)
                 _flush_stdin()
                 prompt = (
@@ -4209,7 +4540,7 @@ class PulseCLI:
                     if detected else
                     "GitHub repo URL (optional, Enter to skip) > "
                 )
-                repo_input = input(prompt).strip()
+                repo_input = _prompt_text(prompt, label="GitHub repository", placeholder=(f"Enter to use detected: {detected}" if detected else "optional -- Enter to skip")).strip()
                 try:
                     team = cloud.create_team(self.user_id, repo=repo_input or detected, name=name_input or None)
                     self.team_id = team["team_id"]
@@ -4227,7 +4558,8 @@ class PulseCLI:
 
             elif resp in ("j", "join"):
                 _flush_stdin()
-                code = input("Join code > ").strip().upper()
+                _ui_screen("Join workspace", "Enter the join code")
+                code = _prompt_text("Join code > ", label="Join code").strip().upper()
                 if not code:
                     cprint("[Pulse] Join code cannot be blank.", color=_RED)
                     continue
@@ -5242,16 +5574,18 @@ class PulseCLI:
             self.agent_provider = None
             return False
 
-        print("\nSelect an agent/provider:")
         cached_provider = cloud.load_cached_profile().get("agent_provider") if not self.agent_provider else None
-        for i, name in enumerate(names, 1):
-            local_tag = "  [local -- no data leaves this machine]" if PROVIDERS[name].get("local") else ""
-            if PROVIDERS[name].get("custom"):
-                local_tag = "  [type any provider/model string]"
-            if PROVIDERS[name].get("openrouter"):
-                local_tag = "  [type any OpenRouter model]"
-            marker = "  (current)" if name == self.agent_provider else ("  (last used)" if name == cached_provider else "")
-            print(f"  {i}) {name}{local_tag}{marker}")
+        ui_pick = _ui_pick_agent(names, cached_provider, self.agent_provider)
+        if ui_pick is None:
+            print("\nSelect an agent/provider:")
+            for i, name in enumerate(names, 1):
+                local_tag = "  [local -- no data leaves this machine]" if PROVIDERS[name].get("local") else ""
+                if PROVIDERS[name].get("custom"):
+                    local_tag = "  [type any provider/model string]"
+                if PROVIDERS[name].get("openrouter"):
+                    local_tag = "  [type any OpenRouter model]"
+                marker = "  (current)" if name == self.agent_provider else ("  (last used)" if name == cached_provider else "")
+                print(f"  {i}) {name}{local_tag}{marker}")
 
         prompt = (
             "\nAgent number (or Enter to skip) > "
@@ -5260,8 +5594,11 @@ class PulseCLI:
         )
 
         while True:
-            _flush_stdin()
-            raw = input(prompt).strip()
+            if ui_pick is not None:
+                raw = ui_pick          # already resolved by the selector: an exact name, or "" = skip
+            else:
+                _flush_stdin()
+                raw = input(prompt).strip()
             if not raw:
                 if initial:
                     cprint("[Pulse CLI] AI agent disabled for this run.")
@@ -5270,6 +5607,9 @@ class PulseCLI:
                 return False
             if raw.isdigit() and 1 <= int(raw) <= len(names):
                 chosen = names[int(raw) - 1]
+                break
+            if raw in names:           # an exact provider name (what the selector returns)
+                chosen = raw
                 break
             matches = [n for n in names if raw.lower() in n.lower()]
             if len(matches) == 1:
@@ -5281,20 +5621,21 @@ class PulseCLI:
 
         if info.get("custom"):
             _flush_stdin()
-            model_string = input("Model string (e.g. openai/gpt-6-astra, ollama_chat/llama3.1) > ").strip()
+            _ui_screen("Agent model", "Custom model")
+            model_string = _prompt_text("Model string (e.g. openai/gpt-6-astra, ollama_chat/llama3.1) > ", label="Model string", placeholder="e.g. openai/gpt-6-astra, ollama_chat/llama3.1").strip()
             if not model_string:
                 cprint("[Pulse CLI] No model string entered. Agent unchanged.")
                 if initial:
                     self.agent_provider = None
                 return False
-            env_var = input("Env var name for the API key (optional, Enter to skip) > ").strip() or None
+            env_var = _prompt_text("Env var name for the API key (optional, Enter to skip) > ", label="Env var for the API key", placeholder="optional -- Enter to skip").strip() or None
             key = "local"
             if env_var:
                 existing = os.environ.get(env_var, "").strip()
-                if existing and input(f"An {env_var} is already set. Use it? (Y/n) > ").strip().lower() in ("", "y", "yes"):
+                if existing and _prompt_text(f"An {env_var} is already set. Use it? (Y/n) > ", label=f"{env_var} is already set. Use it?  (Y/n)").strip().lower() in ("", "y", "yes"):
                     key = existing
                 else:
-                    key = getpass.getpass("API key > ").strip()
+                    key = _prompt_text("API key > ", label="API key", secret=True).strip()
                 if not key:
                     cprint("[Pulse CLI] No API key entered. Agent unchanged.")
                     if initial:
@@ -5309,19 +5650,20 @@ class PulseCLI:
             self.agent_api_base = None
             self.agent_history = []
             cloud.save_cached_profile(agent_provider=label, agent_env_key=env_var)
-            print(f"✓ Custom agent set: {model_string}")
+            _say_plain("Agent model", f"Custom: {model_string}", f"✓ Custom agent set: {model_string}")
             return True
 
         if info.get("local"):
-            print(f"\n✓ Agent selected: {chosen} -- runs on your own infrastructure, no API key needed.")
+            _say_plain("Agent model", f"{chosen}  ·  runs on your own infrastructure, no API key needed",
+                       f"\n✓ Agent selected: {chosen} -- runs on your own infrastructure, no API key needed.")
             _flush_stdin()
             cached_profile = cloud.load_cached_profile()
             default_base = cached_profile.get("agent_api_base") or info["default_api_base"]
-            api_base = input(f"Server URL [{default_base}] > ").strip() or default_base
+            api_base = _prompt_text(f"Server URL [{default_base}] > ", label="Server URL", placeholder=default_base).strip() or default_base
             default_model = cached_profile.get("agent_model_name") or ""
             model_prompt = f"Model name ({info['model_hint']})"
             model_prompt += f" [{default_model}] > " if default_model else " > "
-            model_name = input(model_prompt).strip() or default_model
+            model_name = _prompt_text(model_prompt, label=f"Model name ({info['model_hint']})", placeholder=default_model or None).strip() or default_model
             if not model_name:
                 cprint("[Pulse CLI] No model name entered. Agent unchanged.")
                 if initial:
@@ -5337,7 +5679,8 @@ class PulseCLI:
 
         if info.get("openrouter"):
             _flush_stdin()
-            slug = input(f"Model ({info['model_hint']}) > ").strip()
+            _ui_screen("Agent model", "OpenRouter model")
+            slug = _prompt_text(f"Model ({info['model_hint']}) > ", label=f"Model ({info['model_hint']})").strip()
             if not slug:
                 cprint("[Pulse CLI] No model entered. Agent unchanged.")
                 if initial:
@@ -5351,18 +5694,20 @@ class PulseCLI:
         env_var = info["env_key"]
         existing = os.environ.get(env_var, "").strip()
 
-        print(f"\n✓ Agent selected: {chosen}")
+        _say_plain("Agent model", chosen, f"\n✓ Agent selected: {chosen}")
+        _ui_key_screen(chosen)
         if existing:
             _flush_stdin()
-            use_existing = input(
-                f"An {env_var} is already set. Use it? (Y/n) > "
+            use_existing = _prompt_text(
+                f"An {env_var} is already set. Use it? (Y/n) > ",
+                label=f"{env_var} is already set. Use it?  (Y/n)",
             ).strip().lower()
             if use_existing in ("", "y", "yes"):
                 key = existing
             else:
-                key = getpass.getpass("API key > ").strip()
+                key = _prompt_text("API key > ", label="API key", secret=True, validate=lambda t: _ui.key_hint_for(t, env_var)).strip()
         else:
-            key = getpass.getpass("API key > ").strip()
+            key = _prompt_text("API key > ", label="API key", secret=True, validate=lambda t: _ui.key_hint_for(t, env_var)).strip()
 
         if not key:
             cprint("[Pulse CLI] No API key entered. Agent unchanged.")
@@ -5383,7 +5728,9 @@ class PulseCLI:
         cloud.save_cached_profile(agent_provider=chosen, agent_env_key=env_var)
 
         if initial:
-            print(f"✓ API key accepted for {self.agent_provider}.")
+            # "accepted" here has always meant Pulse took the key, not that the provider
+            # verified it -- on the terminal UI say what actually happened.
+            _say_plain("API key", "set for this session", f"✓ API key accepted for {self.agent_provider}.")
         else:
             print(f"✓ Switched to {self.agent_provider}. Conversation history reset for the new agent.")
 
@@ -5656,10 +6003,14 @@ class PulseCLI:
                 subprocess.run(["cls"], shell=True)
             except Exception:
                 pass  # best-effort screen clear -- never worth failing a restart over
-        else:
+        elif _stdout_is_tty():
+            # Only on a real terminal. Into a pipe or a log the reset is a raw ESC-c in the
+            # output, and `stty` on a non-terminal stdin just prints an ioctl error.
             sys.stdout.write("\033c\033[0m")
             sys.stdout.flush()
             for clear_cmd in (["stty", "sane"], ["clear"]):
+                if clear_cmd[0] == "stty" and not sys.stdin.isatty():
+                    continue
                 try:
                     subprocess.run(clear_cmd, timeout=5)
                 except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
@@ -6178,7 +6529,7 @@ class PulseCLI:
         the one call site outside that pipeline.
         """
         messages = (
-            [{"role": "system", "content": SYSTEM_PROMPT}]
+            [{"role": "system", "content": getattr(self, "_system_prompt_override", None) or SYSTEM_PROMPT}]
             + self.agent_history[-10:]
             + [{"role": "user", "content": instruction}]
         )
@@ -7730,25 +8081,44 @@ class PulseCLI:
         self._last_intervention_signature = problem
         self.continuous = True
 
-        print("\n" + "=" * 60)
-        cprint(
-            "[Pulse] ⚠ Auto-intervention: training looks like it's going bad. "
-            "Diagnosing while preserving the loop.",
-            color=_RED,
-        )
-        cprint(f"[Pulse] Detected: {problem}", color=_RED)
-        print("=" * 60)
+        ui = _ui.enabled()
+        if ui:
+            _ui.header("Auto-intervention")
+            _ui.warn("Anomaly detected")
+            for detected_line in str(problem).splitlines() or [""]:
+                _ui._emit("  " + detected_line)
+            _ui._emit()
+            _ui.note("Pulse is investigating the failure." if (self.agent_provider and self.agent_key)
+                     else "No agent is configured, so this can't be investigated yet.")
+        else:
+            print("\n" + "=" * 60)
+            cprint(
+                "[Pulse] ⚠ Auto-intervention: training looks like it's going bad. "
+                "Diagnosing while preserving the loop.",
+                color=_RED,
+            )
+            cprint(f"[Pulse] Detected: {problem}", color=_RED)
+            print("=" * 60)
 
         if self.agent_provider and self.agent_key:
             question = (
                 "Pulse just auto-paused training because it detected a problem: "
                 f"{problem}\nPlease diagnose the root cause and, if you can, fix it."
             )
-            cprint("Pulse:")
+            if ui:
+                _ui.header("Investigation")   # the stages below are the agent pipeline's real ones
+            else:
+                cprint("Pulse:")
             self._pending_agent_start_ts = time.monotonic()
             self._pending_agent_problem = problem
             self.ask_agent(question, include_code=bool(self.code_text))
             self._finalize_agent_downtime()
+            if ui:
+                _ui.header("Auto-intervention")
+                if getattr(self, "_fix_applied_this_turn", False):
+                    _ui.ok("Pulse intervened", "a code fix was applied")
+                else:
+                    _ui.note("No code change was applied.")
         else:
             cprint(
                 "[Pulse] No AI agent is configured yet -- problem queued. Run /agent to set one "
@@ -7761,7 +8131,11 @@ class PulseCLI:
             if problem not in self._queued_interventions:
                 self._queued_interventions.append(problem)
 
-        cprint("[Pulse] Continuing training automatically.")
+        if ui:
+            _ui.ok("Training resumed")
+            _ui._emit()
+        else:
+            cprint("[Pulse] Continuing training automatically.")
 
     def _maybe_periodic_checkin(self) -> None:
         """Every checkin_interval seconds (15 min by default, but
@@ -7781,6 +8155,14 @@ class PulseCLI:
         borderline one can ask to be checked again sooner, instead of a
         fixed cadence.
         """
+        # A check-in whose model call was started earlier is applied here once it has landed.
+        pending = self._checkin_call
+        if pending is not None:
+            if not pending.done:
+                return                      # still thinking; the loop carries on meanwhile
+            self._checkin_call = None
+            self._finish_periodic_checkin(pending.result, pending.error, pending.prompt)
+            return
         if not self.agent_provider or not self.agent_key:
             return
         now = time.monotonic()
@@ -7802,13 +8184,26 @@ class PulseCLI:
             "training health and GPU tracking...",
             color=_YELLOW,
         )
+        if _async_model_calls_enabled():
+            # The wait for the model happens on a worker thread; see _finish_periodic_checkin.
+            self._checkin_call = _BackgroundModelCall(
+                lambda: self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS), prompt=prompt)
+            return
         try:
-            answer = self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS)
+            answer, error = self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS), None
         except AgentRequestFailed as exc:
+            answer, error = None, exc
+        self._finish_periodic_checkin(answer, error, prompt)
+
+    def _finish_periodic_checkin(self, answer, error, prompt) -> None:
+        """Everything a check-in does with the model's answer. Runs on the training thread."""
+        if error is not None:
+            if not isinstance(error, AgentRequestFailed):
+                raise error
             # This is a periodic, low-stakes background check -- never
             # worth interrupting training over. Quietly skip this round
             # and try again at the next interval.
-            cprint(f"[Pulse] ⚠ Check-in skipped (agent request failed: {exc})", color=_RED)
+            cprint(f"[Pulse] ⚠ Check-in skipped (agent request failed: {error})", color=_RED)
             return
         _, _calc, _promote, gputrack_names, gpuuntrack_names, _sens, _norm, _grep, _view = self._extract_directives(answer)
         summary = self._apply_directives([], [], gputrack_names, gpuuntrack_names)
@@ -8646,7 +9041,8 @@ class PulseCLI:
         return entries
 
     def _record_fix_commit(
-        self, files: Dict[str, tuple], explanation: str, kind: str = "fix"
+        self, files: Dict[str, tuple], explanation: str, kind: str = "fix",
+        created: Optional[set] = None,
     ) -> Optional[str]:
         """Append one 'commit' to the persistent, git-diff-style change
         log. `files` maps path -> (before, after) full file contents.
@@ -8676,7 +9072,10 @@ class PulseCLI:
                 fromfile=f"a/{label}", tofile=f"b/{label}",
             ))
             diff_parts.append(diff or f"(no textual change to {label})\n")
-            file_entries.append({"path": fpath, "before": before, "after": after, "diff": diff})
+            file_entry = {"path": fpath, "before": before, "after": after, "diff": diff}
+            if created and fpath in created:
+                file_entry["created"] = True      # `before` is "" because the file did not exist
+            file_entries.append(file_entry)
 
         entry = {
             "id": commit_id,
@@ -8973,6 +9372,7 @@ class PulseCLI:
 
         by_path: Dict[str, List[tuple]] = {}
         unresolved = []
+        self._last_apply_lint_failed = []
         for old, new, label in zip(fix["old"], fix["new"], fix["files"]):
             path = self._resolve_fix_path(label)
             if not path:
@@ -8980,7 +9380,7 @@ class PulseCLI:
                 continue
             by_path.setdefault(path, []).append((old, new))
 
-        if not by_path and not unresolved:
+        if not by_path and not unresolved and not fix.get("create"):
             return "[Pulse CLI] Proposed a code fix with nothing to apply."
 
         lines = ["[Pulse CLI] Code fix"]
@@ -9047,6 +9447,7 @@ class PulseCLI:
             cprint(f"  -> /lint {os.path.basename(path)}", color=_YELLOW)
             lint_ok, lint_messages = self._lint_check(content, path)
             if not lint_ok:
+                self._last_apply_lint_failed.append(path)
                 cprint(f"     lint FAILED -- fix will not be written:\n     " + "\n     ".join(lint_messages), color=_RED)
                 lines.append(
                     f"⚠ Fix for '{path}' failed the automatic syntax/lint gate and was NOT written:\n"
@@ -9071,6 +9472,17 @@ class PulseCLI:
                 self.code_text = content
             elif path in self.extra_files:
                 self.extra_files[path] = content
+
+        # New files (Pulse Code). A fix from the debugger never has a "create" key.
+        created_paths: set = set()
+        for spec in fix.get("create") or []:
+            created = self._create_file_for_fix(spec, skipped)
+            if created:
+                cpath, ctext = created
+                originals[cpath] = ""
+                after_by_path[cpath] = ctext
+                applied_by_path[cpath] = [("", ctext)]
+                created_paths.add(cpath)
 
         for old, label in unresolved:
             skipped.append((old, label or "(unspecified file)", "couldn't determine which file this targets"))
@@ -9097,6 +9509,9 @@ class PulseCLI:
             return "\n".join(lines)
 
         for path, applied in applied_by_path.items():
+            if path in created_paths:
+                lines.append(f"\n✓ Created '{os.path.basename(path)}' ({len(after_by_path[path].splitlines())} lines)")
+                continue
             lines.append(f"\n✓ Applied {len(applied)} change(s) to '{os.path.basename(path)}':")
             for old, new in applied:
                 safe_old = old.splitlines()[0][:80] if old.splitlines() else "(empty)"
@@ -9108,7 +9523,8 @@ class PulseCLI:
                 lines.append(f"  - [{os.path.basename(str(where))}] {reason}: {old.splitlines()[0][:80]}...")
 
         commit_files = {p: (originals[p], after_by_path[p]) for p in applied_by_path}
-        commit_id = self._record_fix_commit(commit_files, fix.get("explanation") or "(no explanation given)")
+        commit_id = self._record_fix_commit(commit_files, fix.get("explanation") or "(no explanation given)",
+                                            created=created_paths)
         if commit_id:
             self._last_commit_id = commit_id
             lines.append(f"\n📝 Logged as commit {commit_id} in .pulse_history/ -- /revert {commit_id} to undo, or /log to see history.")
@@ -9130,6 +9546,45 @@ class PulseCLI:
         self._last_apply_skipped = skipped
 
         return "\n".join(lines)
+
+    def _create_file_for_fix(self, spec: Any, skipped: List[tuple]) -> Optional[tuple]:
+        """Write one new file named by a fix's "create" list. Returns (path, content) or None
+        (with the reason appended to `skipped`). Only Pulse Code uses this. A new file must
+        be inside the project root, must not already exist (existing files are edited with
+        old/new snippets, never replaced), and goes through the same lint gate as any edit."""
+        if not isinstance(spec, dict) or not isinstance(spec.get("path"), str) or not isinstance(spec.get("content"), str):
+            skipped.append(("(new file)", "(unspecified file)", "a new file needs a string path and content"))
+            return None
+        root = os.path.abspath(getattr(self, "_project_root", None) or self._repo_cwd or os.getcwd())
+        target = os.path.abspath(os.path.join(root, spec["path"]))
+        shown = spec["path"]
+        if os.path.commonpath([root, target]) != root:
+            skipped.append((f"create {shown}", shown, "outside the project root -- refused"))
+            return None
+        parts = os.path.relpath(target, root).split(os.sep)
+        if any(part in (".git", ".pulse_history") for part in parts):
+            skipped.append((f"create {shown}", shown, "inside a protected directory -- refused"))
+            return None
+        if os.path.exists(target):
+            skipped.append((f"create {shown}", shown, "already exists -- edit it with old/new snippets instead"))
+            return None
+        content = spec["content"] if spec["content"].endswith("\n") or not spec["content"] else spec["content"] + "\n"
+        cprint(f"  -> /lint {os.path.basename(target)}", color=_YELLOW)
+        lint_ok, lint_messages = self._lint_check(content, target)
+        if not lint_ok:
+            self._last_apply_lint_failed.append(target)
+            cprint(f"     lint FAILED -- file will not be written:\n     " + "\n     ".join(lint_messages), color=_RED)
+            return None
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError as exc:
+            skipped.append((f"create {shown}", shown, f"couldn't write file: {exc}"))
+            return None
+        cprint("     lint passed", color=_YELLOW)
+        self.extra_files[target] = content
+        return target, content
 
     def _request_corrected_snippets(self, fix: Dict[str, Any], skipped: List[tuple]) -> Optional[Dict[str, Any]]:
         """One bounded retry for snippets that failed to match (verbatim
@@ -10318,6 +10773,15 @@ class PulseCLI:
         return bool(getattr(self, "_resumed_after_restart", False)
                     or os.environ.get(_RESTART_CHILD_ENV) == "1")
 
+    def _report_mllint_clean(self) -> None:
+        """The clean verdict, once. _prime_at_start and _prime_with_agent_if_needed both scan
+        the same code (the second exists to start the agent fix pipeline once an agent is
+        configured) and each used to announce "no issues" -- twice on every clean script."""
+        if getattr(self, "_mllint_clean_reported", False):
+            return
+        self._mllint_clean_reported = True
+        cprint("[Pulse] ✓ Start-of-run ML anti-pattern check: no issues found in the code.", color=_YELLOW)
+
     def _prime_at_start(self) -> None:
         """Runs once, automatically, before the very first training step.
 
@@ -10334,6 +10798,7 @@ class PulseCLI:
         starting-value baseline (NORMAL_START:) and flag GPU-track
         variables (GPUTRACK:) from code alone.
         """
+        self._poll_start_prime()
         if self._start_primed:
             return
         self._start_primed = True
@@ -10345,7 +10810,7 @@ class PulseCLI:
             except Exception:
                 mllint_findings = []
             if not mllint_findings:
-                cprint("[Pulse] ✓ Start-of-run ML anti-pattern check: no issues found in the code.", color=_YELLOW)
+                self._report_mllint_clean()
 
         if mllint_findings:
             lines = [f"  {label}:{lineno}: {msg}" for label, lineno, msg in mllint_findings]
@@ -10399,21 +10864,67 @@ class PulseCLI:
             # restart was 154 calls across a 36-run benchmark and changed
             # nothing.
             return
+        self._start_start_prime(deferred=False)
+
+    def _start_start_prime(self, deferred: bool) -> None:
+        """Ask the agent for the start-of-run directives (sensitivity, baseline, GPU-track,
+        first check-in). The snapshot is built here, on the training thread, from CPU-side
+        values only; the wait for the answer happens on a worker thread, so training does not
+        sit idle for the length of a model round trip. The answer is applied by
+        _finish_start_prime, on the training thread, the next time update() runs after it lands."""
         try:
             context = self._build_agent_context(include_code=True)
-            answer = self._call_model(f"{context}\n\n{self._START_PRIME_PROMPT}", max_tokens=_AGENT_MAX_TOKENS)
+        except AgentRequestFailed:
+            return
+        prompt = f"{context}\n\n{self._START_PRIME_PROMPT}"
+        if _async_model_calls_enabled():
+            self._start_prime_call = _BackgroundModelCall(
+                lambda: self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS), deferred=deferred)
+            return
+        try:
+            answer, error = self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS), None
         except AgentRequestFailed as exc:
-            cprint(f"[Pulse] ⚠ Start-of-run sensitivity check skipped (agent request failed: {exc})", color=_YELLOW)
-            answer = None
-        if answer is not None:
-            _, _calc, _promote, gputrack_names, _gpuu, sensitivity_args, normal_start_args, _grep, _view = self._extract_directives(answer)
-            summary = self._apply_directives([], [], gputrack_names, None, sensitivity_args, normal_start_args)
-            if summary:
-                cprint(f"[Pulse] Start-of-run check: {summary}", color=_YELLOW)
-            initial_minutes = self._parse_nextcheck_minutes(answer)
-            if initial_minutes is not None:
-                self.checkin_interval = initial_minutes * 60.0
-                self._last_checkin = time.monotonic()
+            answer, error = None, exc
+        self._finish_start_prime(answer, error, deferred)
+
+    def _poll_start_prime(self) -> None:
+        """Apply a start-of-run answer that finished while training was running."""
+        call = self._start_prime_call
+        if call is not None and call.done:
+            self._start_prime_call = None
+            self._finish_start_prime(call.result, call.error, getattr(call, "deferred", False))
+
+    def _finish_start_prime(self, answer, error, deferred: bool) -> None:
+        if error is not None:
+            expected = isinstance(error, AgentRequestFailed)
+            if not deferred:
+                if expected:
+                    cprint(f"[Pulse] ⚠ Start-of-run sensitivity check skipped (agent request failed: {error})", color=_YELLOW)
+                # Same as before: whatever went wrong with the first attempt, the deferred one
+                # still got its try (it never depended on the first having worked).
+                if not self._start_prime_retried and self.code_text:
+                    self._start_prime_retried = True
+                    self._start_start_prime(deferred=True)
+            if not expected:
+                raise error          # a bug, not an outage: surface it as it always was
+            return
+        self._start_prime_answered = True
+        _, _calc, _promote, gputrack_names, _gpuu, sensitivity_args, normal_start_args, _grep, _view = self._extract_directives(answer)
+        summary = self._apply_directives([], [], gputrack_names, None, sensitivity_args, normal_start_args)
+        if summary:
+            label = "Start-of-run check (deferred, agent now available)" if deferred else "Start-of-run check"
+            cprint(f"[Pulse] {label}: {summary}", color=_YELLOW)
+        initial_minutes = self._parse_nextcheck_minutes(answer)
+        if initial_minutes is not None:
+            self.checkin_interval = initial_minutes * 60.0
+            self._last_checkin = time.monotonic()
+            if deferred:
+                cprint(
+                    f"[Pulse] Agent scheduled its first check-in for {initial_minutes:g} "
+                    "minutes from now.",
+                    color=_YELLOW,
+                )
+            else:
                 cprint(
                     f"[Pulse] Agent scheduled its first check-in for {initial_minutes:g} minutes "
                     "from now.",
@@ -10444,7 +10955,7 @@ class PulseCLI:
             except Exception:
                 mllint_findings = []
             if not mllint_findings:
-                cprint("[Pulse] ✓ Start-of-run ML anti-pattern check: no issues found in the code.", color=_YELLOW)
+                self._report_mllint_clean()
 
         if mllint_findings:
             fixed_deterministically = self._mllint_auto_fix(mllint_findings)
@@ -10468,26 +10979,15 @@ class PulseCLI:
             )
 
         # Also run sensitivity/baseline priming now that we have an agent,
-        # only if the first call didn't get to do it.
-        if not mllint_findings and self.code_text:
-            try:
-                context = self._build_agent_context(include_code=True)
-                answer = self._call_model(f"{context}\n\n{self._START_PRIME_PROMPT}", max_tokens=_AGENT_MAX_TOKENS)
-                _, _calc, _promote, gputrack_names, _gpuu, sensitivity_args, normal_start_args, _grep, _view = self._extract_directives(answer)
-                summary = self._apply_directives([], [], gputrack_names, None, sensitivity_args, normal_start_args)
-                if summary:
-                    cprint(f"[Pulse] Start-of-run check (deferred, agent now available): {summary}", color=_YELLOW)
-                initial_minutes = self._parse_nextcheck_minutes(answer)
-                if initial_minutes is not None:
-                    self.checkin_interval = initial_minutes * 60.0
-                    self._last_checkin = time.monotonic()
-                    cprint(
-                        f"[Pulse] Agent scheduled its first check-in for {initial_minutes:g} "
-                        "minutes from now.",
-                        color=_YELLOW,
-                    )
-            except AgentRequestFailed:
-                pass
+        # only if the first call didn't get to do it. (It used to run unconditionally, so a
+        # normal fresh run -- agent already configured before the first step -- made the same
+        # model call twice before step 1, and a restarted run made one that _prime_at_start
+        # deliberately skips.)
+        if (not mllint_findings and self.code_text
+                and not self._start_prime_answered
+                and self._start_prime_call is None
+                and not self._resumed_from_restart()):
+            self._start_start_prime(deferred=True)
 
         # Drain any problems that were detected before the agent was
         # configured -- these were queued rather than dropped so they
