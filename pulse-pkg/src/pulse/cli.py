@@ -45,14 +45,19 @@ Pulse - a live ML training debugger.
   pulse                          attach to the run on this machine (interactive)
   pulse watch [n|id|name]        attach to a particular run
   pulse sessions                 list the runs Pulse knows about
+  pulse <script.py>              watch the run of that script that is already going
+  sudo pulse <script.py>         watch a run started outside Pulse (finds the process)
+  sudo pulse attach --pid N      the same, when you already know the process id
+  pulse install-sudo             make `sudo pulse` work (once, per machine -- see below)
   pulse run [options] <script.py> [script args]
-                                 run a script under Pulse, like `python script.py`
+                                 START a script under Pulse, like `python script.py`
   pulse code [options] [paths...]
                                  a general coding agent: point it at files (or just open it in
                                  a project) and ask for features, fixes and changes
 
 options for `pulse run` (before the script; everything after it is the script's):
   --stream                       stream to a separate brain instead of tracking in-process
+  --again                        start it even though a copy is already running
   --cwd DIR                      run the script in DIR (default: the directory you ran
                                  `pulse` from, as with `python path/to/script.py`)
 
@@ -67,6 +72,10 @@ options for `pulse` / `pulse watch`:
 `pulse run` sets Pulse up exactly as auto_track() does -- sign-in, workspace, agent --
 and if the script has a syntax error, Pulse fixes it and restarts the run to apply it.
 `pulse code` uses the same setup and the same agent, for changing code rather than debugging a run.
+
+Watching a run Pulse did not start means reading another process's memory, which needs
+root. `sudo pulse` reports "command not found" on a pip install, because sudo replaces
+PATH with its own and pip installs into ~/.local/bin: `pulse install-sudo` fixes that.
 """
 
 _RUN_MODE = "cli"          # what the injected auto_track() is given; "stream" for --stream
@@ -253,11 +262,7 @@ def _execute(code, script_path):
         # a late __del__ (multiprocessing connections, say) runs after `os.path` has been
         # cleared and the tracer's first line raises "'NoneType' has no attribute
         # 'normcase'". After the crash hook above, so a crash is still handled with it.
-        try:
-            from .pulse import _stop_cli_tracing     # also stops the ticker re-arming it
-            _stop_cli_tracing()
-        except Exception:
-            sys.settrace(None)
+        sys.settrace(None)
     return 0
 
 
@@ -364,9 +369,9 @@ class _UsageError(Exception):
 
 
 def _parse_run_args(args):
-    """(stream, cwd, script, script_args). Options end at the first non-option: what
-    follows is the script and its own arguments, which are never inspected."""
-    stream, cwd, i = False, None, 0
+    """(stream, cwd, again, script, script_args). Options end at the first non-option:
+    what follows is the script and its own arguments, which are never inspected."""
+    stream, cwd, again, i = False, None, False, 0
     while i < len(args):
         arg = args[i]
         if arg == "--":
@@ -376,6 +381,8 @@ def _parse_run_args(args):
             break
         if arg == "--stream":
             stream = True
+        elif arg == "--again":
+            again = True
         elif arg == "--cwd":
             if i + 1 >= len(args):
                 raise _UsageError("--cwd needs a directory")
@@ -390,7 +397,61 @@ def _parse_run_args(args):
         i += 1
     if i >= len(args):
         raise _UsageError("no script given")
-    return stream, cwd, args[i], args[i + 1:]
+    return stream, cwd, again, args[i], args[i + 1:]
+
+
+def already_running(script_path):
+    """Processes already running this script, as [(pid, cmdline)].
+
+    Reads /proc only; it never signals or traces anything.
+    """
+    if not os.path.isdir("/proc"):
+        return []
+    target = os.path.abspath(script_path)
+    base = os.path.basename(target)
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as handle:
+                parts = [p.decode("utf-8", "replace") for p in handle.read().split(b"\0") if p]
+        except OSError:
+            continue
+        if not parts or "python" not in os.path.basename(parts[0]).lower():
+            continue
+        # Compare the file, not the name. A relative `python train.py` is resolved
+        # against THAT process's working directory, so an unrelated train.py two
+        # directories away is not mistaken for this one -- which it was, and the run
+        # was refused because of somebody else's file with the same name.
+        try:
+            process_cwd = os.readlink(f"/proc/{entry}/cwd")
+        except OSError:
+            process_cwd = None
+        for argument in parts[1:]:
+            if argument.startswith("-") or not argument.endswith(".py"):
+                continue
+            if os.path.basename(argument) != base:
+                continue
+            if os.path.isabs(argument):
+                resolved = os.path.abspath(argument)
+            elif process_cwd:
+                resolved = os.path.abspath(os.path.join(process_cwd, argument))
+            else:
+                continue            # cannot tell which file it is; do not guess
+            if resolved == target:
+                found.append((int(entry), " ".join(parts)[:100]))
+                break
+    return found
+
+
+def _ptrace_is_restricted():
+    """True when one process may not trace another it did not start (the usual default)."""
+    try:
+        with open("/proc/sys/kernel/yama/ptrace_scope", "r", encoding="utf-8") as handle:
+            return handle.read().strip() != "0"
+    except OSError:
+        return False
 
 
 def _parse_code_args(args):
@@ -440,18 +501,49 @@ def run_code(paths, prompt=None, yes=False, cwd=None):
     from .pulse_code import run as code_run
     return code_run(paths, prompt=prompt, yes=yes, root=root)
 
-
-def run_script(script, script_args, stream=False, cwd=None):
+def run_script(script, script_args, stream=False, cwd=None, again=False):
     """Run `script` under Pulse. Returns the exit status."""
     global _RUN_MODE
     from . import pulse_cli
 
     _RUN_MODE = "stream" if stream else "cli"
+    if stream:
+        # --stream has to reach the auto_track() call whatever wrote it. Injection only
+        # happens for a script that does NOT already call auto_track, so a script written
+        # the way the README shows -- `from pulse import auto_track; auto_track()` -- was
+        # run as it is, in the default cli mode, with --stream silently doing nothing: no
+        # spool, and `pulse` reporting no runs on the machine. auto_track already honours
+        # this variable ahead of its own argument, so it covers the user's own call, a
+        # call inside a helper module, and the injected one alike.
+        os.environ["PULSE_MODE"] = "stream"
 
     # Resolved against where the command was typed, before --cwd can move us.
     script_path = os.path.abspath(script)
     if not os.path.isfile(script_path):
         print(f"Error: training script '{script}' not found.")
+        return 1
+
+    # A restart Pulse itself ordered is replacing the process that asked for it, so the
+    # old one may still be winding down: that is not a second run.
+    from . import pulse_cli as _pc
+    if os.environ.get(_pc._RESTART_CHILD_ENV) == "1":
+        again = True
+    running = [] if again else already_running(script_path)
+    if running:
+        # Starting a second copy of a script that is already training is almost never
+        # what someone means by "watch my run": it competes for the same GPU and the
+        # console then shows two. Pulse cannot join the one already going -- that needs
+        # to read another process's memory, which the kernel only allows a parent or
+        # root -- so say what the choices actually are instead of quietly duplicating it.
+        pids = ", ".join(str(pid) for pid, _ in running)
+        print(f"[Pulse] {os.path.basename(script_path)} is already running (pid {pids}).")
+        print("[Pulse] Pulse cannot attach to a run it did not start: reading another")
+        print("        process's variables needs ptrace, which this kernel allows only")
+        print("        for a parent process or root"
+              f"{' (ptrace_scope is restricted here)' if _ptrace_is_restricted() else ''}.")
+        print("[Pulse] So either:")
+        print(f"          stop it, then:   pulse run --stream {os.path.basename(script_path)}")
+        print(f"          or run another:  pulse run --again --stream {os.path.basename(script_path)}")
         return 1
 
     if cwd is not None:
@@ -494,11 +586,21 @@ def run_script(script, script_args, stream=False, cwd=None):
 
     if _already_uses_pulse(tree):
         if not restarted_by_pulse:
-            print(f"[Pulse] {os.path.basename(script_path)} already uses Pulse; running it as it is.")
+            how = " (streaming, because of --stream)" if stream else ""
+            print(f"[Pulse] {os.path.basename(script_path)} already calls Pulse; "
+                  f"running it as it is{how}.")
     else:
         PulseASTInjector(mode=_RUN_MODE).visit(tree)
         if not restarted_by_pulse:
             print(f"[Pulse] Running {os.path.basename(script_path)} under Pulse.")
+
+    if not stream and not restarted_by_pulse:
+        # Without --stream the run is tracked in this process and writes no stream, so
+        # `pulse` in another terminal finds nothing and the person is left thinking the
+        # console is broken. Say so here rather than letting them discover it.
+        print("[Pulse] Tracking in this terminal. To watch it from another one "
+              "(`pulse`), start it with: pulse run --stream "
+              f"{os.path.basename(script_path)}")
 
     # dont_inherit: nothing from this file's own __future__ imports may leak into the script.
     code = compile(tree, script_path, "exec", dont_inherit=True)
@@ -518,16 +620,38 @@ def main(argv=None):
         print(f"pulse {__version__}")
         return 0
 
+    console_commands = ("watch", "attach", "console", "sessions", "install-sudo")
+    launch_options = ("--stream", "--cwd", "--again")
+
+    # `run` starts a run. Without it, a script name means "the run of this script that is
+    # already going" -- so `pulse train.py` watches, and only `pulse run train.py` starts
+    # a second one. Passing a launch option without `run` is the one ambiguous case, and
+    # it is answered rather than guessed.
+    names_a_script = any(
+        argument.endswith(".py") or (not argument.startswith("-") and os.path.isfile(argument))
+        for argument in argv)
+    if (argv and argv[0] not in console_commands and argv[0] not in ("run", "code")
+            and names_a_script):
+        offered = [a for a in argv if a.split("=", 1)[0] in launch_options]
+        if offered:
+            script = next((a for a in argv if not a.startswith("-")), "train.py")
+            print(f"pulse: {' '.join(offered)} is an option for starting a run.\n")
+            print(f"  to start one:            pulse run {' '.join(offered)} {script}")
+            print(f"  to watch one already going:  pulse {script}\n")
+            return 1
+        from .pulse_console import main as console_main
+        return console_main(argv)
+
     if argv and argv[0] == "run":
         try:
-            stream, cwd, script, script_args = _parse_run_args(argv[1:])
+            stream, cwd, again, script, script_args = _parse_run_args(argv[1:])
         except _UsageError as problem:
             if str(problem):
                 print(f"pulse run: {problem}\n")
             print(USAGE)
             return 1 if str(problem) else 0
         try:
-            return run_script(script, script_args, stream=stream, cwd=cwd)
+            return run_script(script, script_args, stream=stream, cwd=cwd, again=again)
         except KeyboardInterrupt:
             print("\n[Pulse] Interrupted.")
             return 130
@@ -548,7 +672,7 @@ def main(argv=None):
 
     # Bare `pulse`, watch, attach, console, sessions -- and `pulse --model X` -- are the
     # console. Anything else that is not a command is a mistake worth showing usage for.
-    if not argv or argv[0] in ("watch", "attach", "console", "sessions") or argv[0].startswith("-"):
+    if not argv or argv[0] in console_commands or argv[0].startswith("-"):
         from .pulse_console import main as console_main
         return console_main(argv)
 

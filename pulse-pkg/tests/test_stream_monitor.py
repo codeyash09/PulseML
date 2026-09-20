@@ -46,12 +46,15 @@ class HostileTensor:
 
 
 class ScalarTensor:
-    """A 0-d tensor: small enough that reading it is allowed."""
+    """A 0-d tensor. Small enough to read -- if it is on the host.
 
-    def __init__(self, value):
+    `reads` counts .item() calls, which is what a device-to-host copy would cost.
+    """
+
+    def __init__(self, value, device="cpu"):
         self.shape = ()
         self.dtype = "float32"
-        self.device = "cuda:0"
+        self.device = device
         self._value = value
         self.reads = 0
 
@@ -167,10 +170,44 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(tensors[0]["shape"], [1024, 256])
         self.assertEqual(tensors[0]["device"], "cuda:0")
 
-    def test_small_tensors_are_read_big_ones_are_not(self):
-        loss = ScalarTensor(0.25)
+    def test_small_host_tensors_are_read_big_ones_are_not(self):
+        loss = ScalarTensor(0.25, device="cpu")
         monitor = self._monitor()
         monitor.observe_locals({"loss": loss, "weights": HostileTensor()})
+        monitor.close()
+        scalars = self._frames(stream.KIND_SCALARS)
+        self.assertEqual(scalars[0]["values"]["loss"], 0.25)
+        self.assertEqual(loss.reads, 1)
+        self.assertNotIn("weights", scalars[0]["values"])
+
+    def test_sampling_never_syncs_the_device_to_read_a_scalar(self):
+        """A 0-d tensor on the GPU is still a device-to-host copy and a stream sync.
+
+        Sampling the loop's locals must not do that: a 4 Hz sampler calling .item() on
+        every scalar tensor in scope is a sync point the training run never agreed to.
+        """
+        loss = ScalarTensor(0.25, device="cuda:0")
+        monitor = self._monitor()
+        monitor.observe_locals({"loss": loss})
+        monitor.close()
+        self.assertEqual(loss.reads, 0, "sampling read a value off the accelerator")
+
+    def test_a_cpu_mirror_is_read_instead_of_the_device_value(self):
+        # Training code that keeps its own host copy has already paid for the copy.
+        device_loss = ScalarTensor(0.25, device="cuda:0")
+        monitor = self._monitor()
+        monitor.observe_locals({"loss": device_loss, "loss_cpu": 0.25})
+        monitor.close()
+        scalars = self._frames(stream.KIND_SCALARS)
+        self.assertEqual(scalars[0]["values"]["loss"], 0.25)
+        self.assertEqual(device_loss.reads, 0,
+                         "it read the device value even with a host mirror available")
+
+    def test_asking_for_a_value_outright_still_reads_it(self):
+        # observe() is the user naming that value, not Pulse sampling everything in scope.
+        loss = ScalarTensor(0.25, device="cuda:0")
+        monitor = self._monitor()
+        monitor.observe("loss", loss, step=1)
         monitor.close()
         scalars = self._frames(stream.KIND_SCALARS)
         self.assertEqual(scalars[0]["values"]["loss"], 0.25)
