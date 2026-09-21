@@ -60,11 +60,17 @@ options for `pulse run` (before the script; everything after it is the script's)
   --again                        start it even though a copy is already running
   --cwd DIR                      run the script in DIR (default: the directory you ran
                                  `pulse` from, as with `python path/to/script.py`)
+  --think                        think mode: when Pulse fixes something, the agent plans, sizes
+                                 the work, and keeps going until it is fixed (can use many model
+                                 calls; also /think on|off, PULSE_THINK=1)
 
 options for `pulse code`:
   -p, --prompt TEXT              one request, then exit (no interactive session)
   -y, --yes                      apply changes without showing a diff and asking first
   --cwd DIR                      the project root (default: the current directory)
+  --think                        think mode: outline a plan, size the work (steps, tool calls,
+                                 verifications), then work through it until the feature is done
+                                 (can use many model calls; also /think on|off, PULSE_THINK=1)
 
 options for `pulse` / `pulse watch`:
   --model <id>                   the agent to think with (or set PULSE_MODEL)
@@ -369,9 +375,15 @@ class _UsageError(Exception):
 
 
 def _parse_run_args(args):
+<<<<<<< Updated upstream
     """(stream, cwd, again, script, script_args). Options end at the first non-option:
     what follows is the script and its own arguments, which are never inspected."""
     stream, cwd, again, i = False, None, False, 0
+=======
+    """(stream, cwd, script, script_args, think). Options end at the first non-option: what
+    follows is the script and its own arguments, which are never inspected."""
+    stream, cwd, think, i = False, None, False, 0
+>>>>>>> Stashed changes
     while i < len(args):
         arg = args[i]
         if arg == "--":
@@ -381,8 +393,13 @@ def _parse_run_args(args):
             break
         if arg == "--stream":
             stream = True
+<<<<<<< Updated upstream
         elif arg == "--again":
             again = True
+=======
+        elif arg == "--think":
+            think = True
+>>>>>>> Stashed changes
         elif arg == "--cwd":
             if i + 1 >= len(args):
                 raise _UsageError("--cwd needs a directory")
@@ -397,6 +414,7 @@ def _parse_run_args(args):
         i += 1
     if i >= len(args):
         raise _UsageError("no script given")
+<<<<<<< Updated upstream
     return stream, cwd, again, args[i], args[i + 1:]
 
 
@@ -452,11 +470,14 @@ def _ptrace_is_restricted():
             return handle.read().strip() != "0"
     except OSError:
         return False
+=======
+    return stream, cwd, args[i], args[i + 1:], think
+>>>>>>> Stashed changes
 
 
 def _parse_code_args(args):
-    """(prompt, yes, cwd, paths). Options may appear anywhere; `--` ends them."""
-    prompt, yes, cwd, paths, i = None, False, None, [], 0
+    """(prompt, yes, cwd, paths, think). Options may appear anywhere; `--` ends them."""
+    prompt, yes, cwd, paths, think, i = None, False, None, [], False, 0
     while i < len(args):
         arg = args[i]
         if arg == "--":
@@ -471,6 +492,8 @@ def _parse_code_args(args):
             prompt = arg.split("=", 1)[1]
         elif arg in ("-y", "--yes"):
             yes = True
+        elif arg == "--think":
+            think = True
         elif arg == "--cwd":
             if i + 1 >= len(args):
                 raise _UsageError("--cwd needs a directory")
@@ -485,11 +508,13 @@ def _parse_code_args(args):
         else:
             paths.append(arg)
         i += 1
-    return prompt, yes, cwd, paths
+    return prompt, yes, cwd, paths, think
 
 
-def run_code(paths, prompt=None, yes=False, cwd=None):
+def run_code(paths, prompt=None, yes=False, cwd=None, think=False):
     """`pulse code`: the general coding agent. Returns the exit status."""
+    if think:
+        os.environ["PULSE_THINK"] = "1"
     # Paths are read against where the command was typed, before --cwd can move the project root.
     paths = [os.path.abspath(os.path.expanduser(p)) for p in paths]
     root = None
@@ -501,9 +526,16 @@ def run_code(paths, prompt=None, yes=False, cwd=None):
     from .pulse_code import run as code_run
     return code_run(paths, prompt=prompt, yes=yes, root=root)
 
+<<<<<<< Updated upstream
 def run_script(script, script_args, stream=False, cwd=None, again=False):
+=======
+
+def run_script(script, script_args, stream=False, cwd=None, think=False):
+>>>>>>> Stashed changes
     """Run `script` under Pulse. Returns the exit status."""
     global _RUN_MODE
+    if think:
+        os.environ["PULSE_THINK"] = "1"     # read when Pulse sets up; a restarted run inherits it
     from . import pulse_cli
 
     _RUN_MODE = "stream" if stream else "cli"
@@ -644,28 +676,36 @@ def main(argv=None):
 
     if argv and argv[0] == "run":
         try:
+<<<<<<< Updated upstream
             stream, cwd, again, script, script_args = _parse_run_args(argv[1:])
+=======
+            stream, cwd, script, script_args, think = _parse_run_args(argv[1:])
+>>>>>>> Stashed changes
         except _UsageError as problem:
             if str(problem):
                 print(f"pulse run: {problem}\n")
             print(USAGE)
             return 1 if str(problem) else 0
         try:
+<<<<<<< Updated upstream
             return run_script(script, script_args, stream=stream, cwd=cwd, again=again)
+=======
+            return run_script(script, script_args, stream=stream, cwd=cwd, think=think)
+>>>>>>> Stashed changes
         except KeyboardInterrupt:
             print("\n[Pulse] Interrupted.")
             return 130
 
     if argv and argv[0] == "code":
         try:
-            prompt, yes, cwd, paths = _parse_code_args(argv[1:])
+            prompt, yes, cwd, paths, think = _parse_code_args(argv[1:])
         except _UsageError as problem:
             if str(problem):
                 print(f"pulse code: {problem}\n")
             print(USAGE)
             return 1 if str(problem) else 0
         try:
-            return run_code(paths, prompt=prompt, yes=yes, cwd=cwd)
+            return run_code(paths, prompt=prompt, yes=yes, cwd=cwd, think=think)
         except KeyboardInterrupt:
             print("\n[Pulse] Interrupted.")
             return 130

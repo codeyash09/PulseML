@@ -547,6 +547,20 @@ def describe_changes(cli, fix, changes):
 
 _NO_CHANGES_RE = re.compile(r"(?m)^\s*NO_CHANGES\s*$")
 
+_EDIT_RULES = (
+    "Respond with ONLY one JSON object -- no prose, no markdown fences:\n"
+    '{"old": [...], "new": [...], "files": [...], "create": [...], "explanation": "one sentence"}\n'
+    "- old[i] is an exact, verbatim snippet from the file's shown text (WITHOUT the line-number "
+    "prefixes) that occurs exactly once in that file -- include enough neighbouring lines (2-4) to "
+    "be unique. new[i] is what replaces it. files[i] is the exact header label of the file that "
+    "old[i] is in.\n"
+    "- To INSERT code, use a nearby existing line as old and repeat it in new with your addition.\n"
+    '- create: NEW files only -- a list of {"path": "relative/to/project/root.py", "content": '
+    '"full file text"}. Never for a file that already exists. Use [] when there is nothing to create.\n'
+    "- If you only create files, old, new and files are [].\n"
+    "- Preserve indentation exactly. If you delete the only statement in a block, remove the whole block.\n"
+)
+
 
 def _tool_rounds(cli, answer, instruction):
     """If `answer` asked for tools, run them and re-ask -- a bounded number of times.
@@ -570,8 +584,125 @@ def _plain_text(answer):
     return _NO_CHANGES_RE.sub("", cleaned).strip()
 
 
+class CodeAdapter:
+    """Think mode inside Pulse Code. Steps are applied one at a time through the same dry-run,
+    lint gate and applier as a normal request, each as its own commit; the plan is confirmed once
+    up front (when review is on) instead of asking before every step."""
+    outline_extra = (
+        " If the request is only a question, or needs no code change, answer it fully in this "
+        "reply and end with a line containing only NO_CHANGES. Otherwise say which files change, "
+        "what is added, and how the pieces connect."
+    )
+    criterion = "every part of the request is implemented and wired together"
+    format_rules = _EDIT_RULES
+    no_change_re = _NO_CHANGES_RE
+
+    def __init__(self, cli, request):
+        self.cli = cli
+        self.goal = request
+        self.commits = []
+
+    def context(self):
+        self.cli.reload()
+        return build_context(self.cli)
+
+    def service_tools(self, text):
+        return self.cli._service_tool_requests(text)
+
+    def plain_text(self, answer):
+        return _plain_text(answer)
+
+    def parse(self, raw):
+        return parse_change(self.cli, raw)
+
+    def describe(self, fix):
+        return describe_changes(self.cli, fix, {})
+
+    def confirm_plan(self, steps):
+        if not self.cli.review:
+            return True
+        try:
+            answer = _prompt_text(
+                f"Run this {len(steps)}-step plan? Each step is applied and logged as its own change (Y/n) > ",
+                label=f"Run this {len(steps)}-step plan?  (Y/n)").strip().lower()
+        except EOFError:
+            cprint("[Pulse Code] No terminal to confirm on -- plan not run (use -y).", color=_YELLOW)
+            return False
+        return answer in ("", "y", "yes")
+
+    def apply(self, fix, step):
+        from .pulse_think import Applied
+        cli = self.cli
+        changes, settled = _settle(cli, self.goal, "", fix, "")
+        if settled is None:
+            return Applied(False, "", "the change would not apply cleanly")
+        print("\n" + render_diff(cli, changes))
+        if not settled.get("explanation"):
+            settled["explanation"] = f"Pulse Code: {step.title}"
+        cli._last_apply_skipped = []
+        cli._fix_applied_this_turn = False
+        cli._apply_code_fix(settled)
+        ok = (cli._fix_applied_this_turn and not cli._last_apply_skipped
+              and not getattr(cli, "_last_apply_lint_failed", []))
+        if not ok:
+            if cli._fix_applied_this_turn and getattr(cli, "_last_commit_id", None):
+                undo(cli, f"{cli._last_commit_id} force", quiet=True)   # never leave half a step
+            cli.reload()
+            return Applied(False, "", "part of the change did not apply, so none of it was kept")
+        created = [os.path.abspath(os.path.join(cli._project_root, s["path"])) for s in settled.get("create") or []]
+        cli.add_files([p for p in created if os.path.isfile(p)], focus=False)
+        cli.reload()
+        if getattr(cli, "_last_commit_id", None):
+            self.commits.append(cli._last_commit_id)
+        fix.clear()
+        fix.update(settled)
+        return Applied(True)
+
+
+def _run_think_turn(cli, request):
+    """One request in think mode. Returns "applied", "answered", "declined" or "failed"."""
+    from . import pulse_think
+    cli.reload()
+    cli._last_applied_fix = None
+    cli._fix_applied_this_turn = False
+    adapter = CodeAdapter(cli, request)
+    cli.agent_history.append({"role": "user", "content": f"Request: {request}"})
+    outcome = None
+    try:
+        outcome = pulse_think.Engine(cli, adapter).run()
+    except KeyboardInterrupt:
+        if adapter.commits:
+            cprint(f"\n[Pulse Code] Stopped. The {len(adapter.commits)} step(s) that already landed are still applied "
+                   "-- /undo turn reverts them.", color=_YELLOW)
+        raise
+    except Exception as exc:
+        cprint(f"[Pulse Code] ⚠ Unexpected error ({type(exc).__name__}: {exc}).", color=_RED)
+    finally:
+        cli._last_turn_commits = list(adapter.commits)
+    summary = outcome.summary if outcome else ""
+    if summary:
+        cli.agent_history.append({"role": "assistant", "content": summary})
+    try:
+        cli._sync_agent_turn(request, summary or "(no answer)", traceback_signature=None,
+                             fix_applied=cli._last_applied_fix)
+    except Exception:
+        pass
+    if outcome is None:
+        return "failed"
+    if outcome.declined:
+        return "declined"
+    if outcome.steps_landed:
+        if adapter.commits:
+            cprint(f"\n✓ {outcome.steps_landed} step(s) landed  ·  /undo reverts the latest, /undo turn reverts them all",
+                   color=_GREEN)
+        return "applied" if outcome.done else "failed"
+    return "answered" if outcome.done else "failed"
+
+
 def run_turn(cli, request):
     """One request, start to finish. Returns "applied", "answered", "declined" or "failed"."""
+    if getattr(cli, "think", False):
+        return _run_think_turn(cli, request)
     cli.reload()
     cli._last_applied_fix = None
     cli._fix_applied_this_turn = False
@@ -841,6 +972,8 @@ _HELP = [
         ("<request>", "just type it: 'add a --resume flag to train.py', 'why does loader.py drop the last batch?'"),
         ("/review on|off", "show a diff and ask before applying (default on)"),
         ("/undo [id]", "undo the latest change (or a given one); leaves files you've edited since alone"),
+        ("/undo turn", "undo every step the last request applied"),
+        ("/think on|off", "plan, size the work, then keep going step by step until it's done (default off)"),
     ]),
     ("Files", [
         ("/files", "what is in focus (shown to the agent in full) and how many files it can search"),
@@ -919,6 +1052,15 @@ def _handle_command(cli, line):
         arg = rest.strip().lower()
         cli.review = True if arg in ("on", "true", "1") else False if arg in ("off", "false", "0") else not cli.review
         cprint(f"[Pulse Code] Review before applying is {'ON' if cli.review else 'OFF'}.")
+    elif word == "/think":
+        cli._cmd_think(rest)
+    elif word in ("/undo", "/revert") and rest.strip().lower() == "turn":
+        commits = list(getattr(cli, "_last_turn_commits", []))
+        if not commits:
+            cprint("[Pulse Code] Nothing from the last request to undo.")
+        for commit in reversed(commits):
+            undo(cli, commit)
+        cli._last_turn_commits = []
     elif word in ("/undo", "/revert"):
         undo(cli, rest)
     elif word == "/log":

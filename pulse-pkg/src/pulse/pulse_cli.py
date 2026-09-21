@@ -1342,6 +1342,25 @@ _PASS5_SWEEP = (
 _IMPLEMENT_KEYWORDS = ("fix", "edit", "patch", "change the code", "apply", "implement")
 _MAX_VERIFY_ATTEMPTS = 3
 
+# The automatic lint gate can refuse a fix that read fine to the model and to PASS 4: the edit
+# would leave a file that does not compile. Nothing has been written when this fires, and the
+# exact error is known, so the model gets a bounded chance to correct the edit.
+_MAX_LINT_REVISIONS = 2
+_PASS4_LINT_REVISE_TMPL = (
+    "Your analysis:\n{diagnosis}\n\n"
+    "The fix you proposed:\n{fix_desc}\n\n"
+    "Pulse did NOT write it: applying it would leave a file that fails the automatic syntax/lint "
+    "check:\n{errors}\n\n"
+    "The file as your edit would have left it, around the error (line numbers are the file AFTER "
+    "your edit):\n{excerpt}\n\n"
+    "Revise the fix so every file it touches still compiles. A common cause: the edit deletes a "
+    "statement that was the ONLY statement in an if/elif/else/for/while/try/except/with/def/class "
+    "block, leaving the block empty -- in that case remove the whole block, header line included, "
+    "in the same edit, or replace the deleted statement with `pass`. Keep the change as small as "
+    "the root cause allows. Respond with ONLY the corrected code-fix JSON object (old/new/files/"
+    "explanation) -- no prose, no markdown fences."
+)
+
 # How many times the fix pass may ask to see more code before giving up.
 _MAX_FIX_TOOL_ROUNDS = 3
 _PASS3_NO_TOOLS_NOTE = (
@@ -3169,6 +3188,10 @@ class PulseCLI:
         # Look for unrelated bugs after fixing the reported one? Off by
         # default -- see the pass 5 call site.
         self.sweep_enabled: bool = os.environ.get("PULSE_SWEEP", "").strip().lower() in ("1", "true", "yes", "on")
+        # Think mode: plan first, have the agent size the work (steps, tool calls, verifications),
+        # then work through it until the error is fixed / the feature is done. Off by default --
+        # see pulse_think.py. Toggle with /think, --think, PULSE_THINK=1 or "think" in the config.
+        self.think: bool = os.environ.get("PULSE_THINK", "").strip().lower() in ("1", "true", "yes", "on")
         # Dedup bookkeeping so one recurring bug doesn't get treated as N
         # separate incidents within a single run.
         self._traceback_signatures_seen: Dict[str, int] = {}
@@ -3239,6 +3262,7 @@ class PulseCLI:
 
         self.auto_intervene = self._config_bool("autofix", "auto_fix", default=True)
         self.sweep_enabled = self._config_bool("sweep", "sweep_for_other_bugs", default=self.sweep_enabled)
+        self.think = self._config_bool("think", "think_mode", default=self.think)
         self.telemetry_enabled = self._config_bool("telemetry", default=cloud.telemetry_enabled())
         if self._config_has("sensitivity"):
             self._cmd_sensitivity(str(self._config_value("sensitivity")), quiet=True)
@@ -3748,6 +3772,8 @@ class PulseCLI:
             _ui.note("Describe what you want built. Type /help any time for commands.")
             return
         _ui.ready_block(rows, closing="Pulse is ready.")
+        if self.think:
+            _ui.note("Think mode ON -- the agent plans, sizes the work, and keeps going until it is fixed.")
         _ui.note(
             f"Auto-fix {'ON' if self.auto_intervene else 'OFF'}  ·  Sensitivity {self.sensitivity:.2f}  ·  "
             f"Tracking {len(self.tracked_vars)} variable{'s' if len(self.tracked_vars) != 1 else ''}"
@@ -5205,6 +5231,7 @@ class PulseCLI:
             ]),
             ("Auto-fix & sensitivity", [
                 ("/autofix on|off", f"toggle auto-intervention (currently {'ON' if self.auto_intervene else 'OFF'})"),
+                ("/think on|off", f"plan, size the work, then keep going until it's fixed (currently {'ON' if self.think else 'OFF'})"),
                 ("/sensitivity [value]", f"how eagerly spikes/plateaus/oscillation trigger it (currently {self.sensitivity:.2f} -- run with no argument for details)"),
                 ("/revert [id]", "undo a fix Pulse applied (/log to see fix history first)"),
                 ("/commit", "manually refresh the recorded git commit to current HEAD"),
@@ -5925,7 +5952,7 @@ class PulseCLI:
             depth = int(os.environ.get(_RESTART_DEPTH_ENV, "0"))
         except ValueError:
             depth = 0
-        if depth >= _MAX_RESTART_DEPTH:
+        if depth >= (_MAX_RESTART_DEPTH * 2 if self.think else _MAX_RESTART_DEPTH):
             cprint(
                 f"[Pulse] ⚠ Already {depth} restarts deep -- not restarting again. The fix is saved "
                 "to disk; run the script yourself to pick it up.",
@@ -6028,6 +6055,8 @@ class PulseCLI:
         # if every retry fails and this process keeps running the old code,
         # its own later crashes must still go through the agent as normal.
         child_env = dict(os.environ, **{_RESTART_CHILD_ENV: "1", _RESTART_DEPTH_ENV: str(depth + 1)})
+        if self.think:
+            child_env["PULSE_THINK"] = "1"       # the restarted run keeps working the same way
 
         # Retry the restart itself instead of ever falling back to "keep
         # running the old, already-in-memory process" on a bad exit code.
@@ -6045,7 +6074,7 @@ class PulseCLI:
         # deterministically-broken script can't spin forever burning
         # compute/cost unattended; MAX_RESTART_ATTEMPTS is the one knob to
         # raise if that cap is ever too low for a given job.
-        MAX_RESTART_ATTEMPTS = 5
+        MAX_RESTART_ATTEMPTS = 10 if self.think else 5
         RETRY_BACKOFF_SECONDS = 3  # multiplied by attempt number, capped below
 
         attempt = 0
@@ -8722,6 +8751,9 @@ class PulseCLI:
             kw in question.lower() for kw in _IMPLEMENT_KEYWORDS
         )
 
+        if wants_implementation and self.think:
+            return self._think_debug_turn(question, _depth)
+
         try:
             # Pass 1: locate the region(s) of the error.
             with _Spinner("Reading for region of error"):
@@ -8841,6 +8873,27 @@ class PulseCLI:
                     if retry_landed:
                         note = "additional" if first_pass_landed else "retry after correcting a snippet mismatch --"
                         apply_result = apply_result + f"\n\n({note} change applied)\n" + retry_result
+
+            # The lint gate refused the whole fix (nothing was written). The exact error is in
+            # hand, so -- like a snippet mismatch above -- give the model a bounded chance to
+            # correct the edit instead of ending with a bug diagnosed and unfixed. The corrected
+            # edit is checked by the same gate; nothing lands unless it compiles.
+            lint_rounds = 0
+            while (not self._fix_applied_this_turn
+                   and getattr(self, "_last_apply_lint_failed", None)
+                   and not self._last_apply_skipped
+                   and lint_rounds < _MAX_LINT_REVISIONS):
+                lint_rounds += 1
+                revised_fix = self._request_lint_revision(fix, full_answer)
+                if revised_fix is None:
+                    break
+                cprint(f"[Pulse] Retrying with a corrected edit ({lint_rounds}/{_MAX_LINT_REVISIONS})...", color=_YELLOW)
+                retry_result = self._apply_code_fix(revised_fix)
+                if self._fix_applied_this_turn:
+                    fix = revised_fix
+                    apply_result = (apply_result + "\n\n(the automatic lint gate refused the first attempt; "
+                                    "this corrected edit was applied instead)\n" + retry_result)
+                    break
 
             result = f"{full_answer}\n\n{apply_result}"
 
@@ -9373,6 +9426,7 @@ class PulseCLI:
         by_path: Dict[str, List[tuple]] = {}
         unresolved = []
         self._last_apply_lint_failed = []
+        self._last_apply_lint_messages = []      # [(path, [messages], refused_content)]
         for old, new, label in zip(fix["old"], fix["new"], fix["files"]):
             path = self._resolve_fix_path(label)
             if not path:
@@ -9448,6 +9502,7 @@ class PulseCLI:
             lint_ok, lint_messages = self._lint_check(content, path)
             if not lint_ok:
                 self._last_apply_lint_failed.append(path)
+                self._last_apply_lint_messages.append((path, list(lint_messages), content))
                 cprint(f"     lint FAILED -- fix will not be written:\n     " + "\n     ".join(lint_messages), color=_RED)
                 lines.append(
                     f"⚠ Fix for '{path}' failed the automatic syntax/lint gate and was NOT written:\n"
@@ -9499,7 +9554,16 @@ class PulseCLI:
                     )
                 except Exception:
                     pass
-            lines.append("\n⚠ No changes were applied -- none of the proposed snippets matched cleanly:")
+            if self._last_apply_lint_failed and not skipped:
+                # Every snippet matched; it was the RESULT the gate refused. Saying "didn't
+                # match" here sent people looking for a matching problem that did not exist.
+                lines.append("\n⚠ No changes were applied -- the change would leave a file that fails the "
+                             "automatic syntax/lint check, so nothing was written (details above).")
+            elif self._last_apply_lint_failed:
+                lines.append("\n⚠ No changes were applied -- some snippets didn't match, and the rest would "
+                             "have failed the automatic syntax/lint check:")
+            else:
+                lines.append("\n⚠ No changes were applied -- none of the proposed snippets matched cleanly:")
             for old, where, reason in skipped:
                 lines.append(f"  - [{os.path.basename(str(where))}] {reason}: {old.splitlines()[0][:80]}...")
             self._last_apply_skipped = skipped
@@ -9585,6 +9649,76 @@ class PulseCLI:
         cprint("     lint passed", color=_YELLOW)
         self.extra_files[target] = content
         return target, content
+
+    def _think_debug_turn(self, question: str, _depth: int) -> str:
+        """Think mode for a fix request: plan, size the work, execute step by step (pulse_think).
+        Replaces the fixed LOCATE/ANALYZE/DEVELOP/VERIFY passes for this request; the rest of a
+        turn -- the empirical check, and the restart that actually runs the result -- is the same."""
+        from pulse import pulse_think
+        # The engine sends fresh code with every call (earlier steps change it), so the context
+        # message _ask_agent_impl just queued would only be sent a second time.
+        if self.agent_history and self.agent_history[-1].get("role") == "user":
+            self.agent_history.pop()
+        outcome = pulse_think.run_debug(self, question)
+        if outcome.request_failed is not None and not self._fix_applied_this_turn:
+            if _depth == 0:
+                self._last_call_failed_transiently = True
+            msg = f"⚠ AI agent request failed: {outcome.request_failed}"
+            print(f"\n{msg}\n")
+            self.agent_history.append({"role": "assistant", "content": msg})
+            return msg
+        self.agent_history.append({"role": "user", "content": f"Question: {question}"})
+        self.agent_history.append({"role": "assistant", "content": outcome.summary})
+        result = outcome.summary
+        if self._fix_applied_this_turn and outcome.last_fix is not None:
+            try:
+                _fix, empirical_ok, empirical_detail = self._verify_fix_empirically(outcome.last_fix, outcome.summary)
+            except Exception as exc:
+                empirical_ok, empirical_detail = None, f"probe step raised an unexpected error: {exc}"
+            if empirical_ok is True:
+                note = f"[4.5] Empirical check PASSED -- {empirical_detail}"
+            elif empirical_ok is False:
+                note = f"[4.5] Empirical check DID NOT PASS -- {empirical_detail} -- fix left applied as best effort."
+            else:
+                note = f"[4.5] Empirical check skipped -- {empirical_detail}"
+            print(f"\n{note}\n")
+            result = f"{result}\n\n{note}"
+        if _depth == 0 and self._fix_applied_this_turn and not self._suppress_auto_restart:
+            self._restart_process()  # does not return
+        return result
+
+    def _request_lint_revision(self, fix: Dict[str, Any], diagnosis: str) -> Optional[Dict[str, Any]]:
+        """Ask for a corrected fix after the lint gate refused one. Shows the model the gate's
+        exact message and the region of the file as its own edit would have left it (the
+        message's line number refers to that, not to the file on disk). Returns the corrected
+        fix, or None if nothing usable came back or the model just repeated itself."""
+        refusals = getattr(self, "_last_apply_lint_messages", None) or []
+        if not refusals:
+            return None
+        errors, excerpts = [], []
+        for path, messages, content in refusals:
+            name = os.path.basename(path)
+            errors.append(f"- {name}: " + "; ".join(messages))
+            lineno = next((int(m.group(1)) for msg in messages for m in [re.search(r"line (\d+)", msg)] if m), None)
+            lines = content.splitlines()
+            lo, hi = (max(0, lineno - 9), min(len(lines), lineno + 6)) if lineno else (0, min(len(lines), 40))
+            excerpts.append(f"[{name}]\n" + "\n".join(f"{i + 1:>4} | {lines[i]}" for i in range(lo, hi)))
+        try:
+            with _Spinner("Correcting the fix"):
+                answer = self._call_model(
+                    _PASS4_LINT_REVISE_TMPL.format(
+                        diagnosis=diagnosis, fix_desc=self._describe_fix(fix),
+                        errors="\n".join(errors), excerpt="\n\n".join(excerpts)),
+                    max_tokens=_AGENT_MAX_TOKENS,
+                )
+        except AgentRequestFailed:
+            return None
+        revised = self._parse_code_fix(answer)
+        if revised is None:
+            return None
+        if json.dumps([revised["old"], revised["new"]], sort_keys=True) == json.dumps([fix["old"], fix["new"]], sort_keys=True):
+            return None      # the same edit again would be refused again
+        return revised
 
     def _request_corrected_snippets(self, fix: Dict[str, Any], skipped: List[tuple]) -> Optional[Dict[str, Any]]:
         """One bounded retry for snippets that failed to match (verbatim
@@ -9684,6 +9818,23 @@ class PulseCLI:
         else:
             state = "ON" if self.auto_intervene else "OFF"
             print(f"Auto-intervention is currently {state}. Usage: /autofix on|off")
+
+    def _cmd_think(self, arg: str) -> None:
+        """Toggle think mode (off by default): the agent outlines a plan, sizes the work -- how
+        many steps, tool calls before each, verifications after each -- and executes it until
+        the error is fixed or the feature is done."""
+        arg = arg.strip().lower()
+        if arg in ("on", "true", "1", "enable", "enabled"):
+            self.think = True
+            os.environ["PULSE_THINK"] = "1"      # a restarted process keeps working the same way
+            cprint("✓ Think mode is ON -- the agent will outline a plan, size the work, and keep going "
+                   "step by step until it is fixed / done. This can take many model calls.")
+        elif arg in ("off", "false", "0", "disable", "disabled"):
+            self.think = False
+            os.environ.pop("PULSE_THINK", None)
+            cprint("✓ Think mode is OFF -- one focused pass per request.")
+        else:
+            print(f"Think mode is currently {'ON' if self.think else 'OFF'}. Usage: /think on|off")
 
     # Named presets for /sensitivity -- just friendly aliases for a
     # self.sensitivity value, since "0.3" means nothing to most users but
@@ -11925,6 +12076,10 @@ class PulseCLI:
                 self._cmd_autofix(
                     cmd[8:].strip()
                 )
+                continue
+
+            if cmd_lower.startswith("/think"):
+                self._cmd_think(cmd[6:].strip())
                 continue
 
             if cmd_lower.startswith("/sensitivity"):
