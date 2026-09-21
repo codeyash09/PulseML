@@ -258,6 +258,56 @@ def _describe_session(directory: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _is_pulse_itself(script: str) -> bool:
+    """Pulse's own processes, which are not runs to offer somebody.
+
+    Matching "pulse" anywhere in the path also excluded the user's own scripts: a
+    project in ~/pulse-experiments, or a checkout of this repo, made every script in it
+    invisible to `pulse <script>`. Only the file's own name and the package directory
+    it sits in say whether it is Pulse.
+    """
+    base = os.path.basename(script)
+    parent = os.path.basename(os.path.dirname(script))
+    return base.startswith("pulse") or parent == "pulse"
+
+
+def _boot_time() -> Optional[float]:
+    """Epoch seconds at which this machine booted, from /proc/stat."""
+    try:
+        with open("/proc/stat", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("btime "):
+                    return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _process_started(pid: int, boot: Optional[float]) -> Optional[float]:
+    """When a process actually began, in epoch seconds.
+
+    Not the mtime of /proc/<pid>: that is the last time the directory changed, which on
+    some kernels is continually refreshed and reads as "just now" for a process that has
+    been running for hours. Pulse used that to skip processes too new to judge, so on
+    those kernels every run looked one second old and was skipped -- `sudo pulse
+    train.py` found nothing while train.py was plainly running, intermittently, because
+    it depended on when the directory was last touched.
+
+    Field 22 of /proc/<pid>/stat is the start time in clock ticks since boot. The comm
+    field before it is parenthesised and may itself contain spaces and brackets, so the
+    fields are taken from after its last ')'.
+    """
+    if boot is None:
+        return None
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
+            raw = handle.read()
+        fields = raw[raw.rindex(")") + 2:].split()
+        return boot + float(fields[19]) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, AttributeError):
+        return None
+
+
 def unmonitored_python_processes() -> List[Dict[str, Any]]:
     """Python processes running a script that Pulse is not watching.
 
@@ -268,6 +318,7 @@ def unmonitored_python_processes() -> List[Dict[str, Any]]:
     if not os.path.isdir("/proc"):
         return []                   # Linux only; elsewhere the registry is all we have
     monitored = {int(s["pid"]) for s in discover() if s.get("pid")}
+    boot = _boot_time()
     out = []
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -278,15 +329,19 @@ def unmonitored_python_processes() -> List[Dict[str, Any]]:
         try:
             with open(f"/proc/{pid}/cmdline", "rb") as handle:
                 parts = [p.decode("utf-8", "replace") for p in handle.read().split(b"\0") if p]
-            started = os.path.getmtime(f"/proc/{pid}")
         except OSError:
             continue
         if not parts or "python" not in os.path.basename(parts[0]).lower():
             continue
         script = next((p for p in parts[1:] if p.endswith(".py")), None)
-        if not script or "pulse" in script:
+        if not script or _is_pulse_itself(script):
             continue
-        if time.time() - started < 5:
+        started = _process_started(pid, boot)
+        if started is None:
+            # No reliable start time. Listing a run that might be a helper is a far
+            # smaller problem than hiding the one the person is asking about.
+            started = time.time()
+        elif time.time() - started < 5:
             continue                # too new to judge; probably a helper
         out.append({"pid": pid, "script": script, "cmdline": " ".join(parts)[:120],
                     "started": started})
@@ -1063,7 +1118,15 @@ def run_console(session: Dict[str, Any], sessions: List[Dict[str, Any]],
 
     script = session.get("script") or "?"
     directory = console.workdir
-    print(f"\nAttached to {bold(os.path.basename(script))}  {dim(directory)}")
+    # Say so when the run is over. Without this the header read exactly like a live
+    # run and the status line said "healthy" about numbers that stopped moving
+    # yesterday -- the detectors are right, there is nothing wrong with the data, it
+    # is just finished.
+    status = session.get("status")
+    over = "" if status in ("live", "stalled", None) else f"  {yellow(status)}"
+    if over and session.get("last_seen"):
+        over += dim(f" {ago(session['last_seen'])}")
+    print(f"\nAttached to {bold(os.path.basename(script))}  {dim(directory)}{over}")
     print(f"{console.status_line()}")
     print(dim("/help for commands, or just ask a question about the run.\n"))
 
@@ -1214,16 +1277,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not wanted:
         report_unmonitored(idle)
 
-    session = pick_session(sessions, wanted)
-    if (session is not None and wanted
-            and session.get("status") not in ("live", "stalled")):
-        # A finished run of this script should not stand in for one that is going now.
-        # Asking for train.py while train.py is running means the running one, even if
-        # Pulse still has yesterday's session for it.
-        name = os.path.basename(wanted)
-        if any(os.path.basename(p["script"]) == name for p in idle):
-            return watch_by_name(wanted, model=model)
+    if wanted:
+        # A run of this script going NOW beats any number of finished sessions for it.
+        # Pulse keeps sessions after a run ends, so they pile up: by the second day,
+        # `pulse train.py` was offering a choice between yesterday's corpses while the
+        # process that is actually training went unwatched. This has to consider every
+        # match, not just the one pick_session would have chosen -- several dead
+        # sessions are still all dead, and that was the case it missed.
+        matched = matching_sessions(sessions, wanted)
+        if not any(s["status"] in ("live", "stalled") for s in matched):
+            name = os.path.basename(wanted)
+            if any(os.path.basename(p["script"]) == name for p in idle):
+                return watch_by_name(wanted, model=model)
 
+    session = pick_session(sessions, wanted)
     if session is None:
         matches = matching_sessions(sessions, wanted) if wanted else [
             s for s in sessions if s["status"] in ("live", "stalled")]

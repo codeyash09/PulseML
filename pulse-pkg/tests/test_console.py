@@ -1104,5 +1104,238 @@ class AskingBeforeSudoTest(unittest.TestCase):
             self.assertFalse(console.offer_sudo(["train.py"]))
 
 
+
+class ProcessStartTimeTest(unittest.TestCase):
+    """How old a process is has to come from the process, not from /proc's mtime.
+
+    Pulse skips processes younger than a few seconds, on the grounds that they are
+    probably helpers rather than the run being asked about. It measured that age with
+    the mtime of /proc/<pid>, which is not the start time: on some kernels it tracks
+    the last change to the directory and reads as "just now" for a process that has
+    been training for hours. Every run then looked one second old and was skipped, so
+    `sudo pulse train.py` reported nothing while train.py was plainly running --
+    intermittently, depending on when the directory was last touched.
+    """
+
+    def setUp(self):
+        if not os.path.isdir("/proc"):
+            self.skipTest("Linux /proc only")
+        self.tmp = tempfile.mkdtemp(prefix="starttime-check-")
+        self.addCleanup(_remove_tree, self.tmp)
+
+    def test_it_reads_the_real_start_time_of_this_process(self):
+        boot = console._boot_time()
+        self.assertIsNotNone(boot, "could not read btime from /proc/stat")
+        started = console._process_started(os.getpid(), boot)
+        self.assertIsNotNone(started, "could not read the start time of this process")
+        # This test process is certainly not from the future, nor older than the boot.
+        self.assertLessEqual(started, time.time() + 1)
+        self.assertGreaterEqual(started, boot - 1)
+
+    def test_the_answer_does_not_come_from_the_directory_mtime(self):
+        import unittest.mock as mock
+        boot = console._boot_time()
+        real = console._process_started(os.getpid(), boot)
+        # If mtime were the source, pretending it is "now" would change the answer.
+        with mock.patch.object(os.path, "getmtime", return_value=time.time()):
+            again = console._process_started(os.getpid(), boot)
+        self.assertEqual(real, again, "the start time still comes from /proc mtime")
+
+    def test_a_long_running_script_is_found_even_when_mtime_says_it_is_new(self):
+        import unittest.mock as mock
+        script = os.path.join(self.tmp, "longrun.py")
+        with open(script, "w", encoding="utf-8") as handle:
+            handle.write("import time\nfor _ in range(600):\n    time.sleep(0.1)\n")
+        process = subprocess.Popen([sys.executable, script], cwd=self.tmp,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+        self.addCleanup(_kill_group, process)
+        time.sleep(6)                       # older than the "probably a helper" window
+
+        with mock.patch.object(console, "discover", return_value=[]), \
+             mock.patch.object(os.path, "getmtime", return_value=time.time()):
+            found = console.unmonitored_python_processes()
+        self.assertIn(process.pid, [p["pid"] for p in found],
+                      "a process running for 6s was dropped as 'too new'")
+
+    def test_a_process_that_really_is_new_is_still_skipped(self):
+        import unittest.mock as mock
+        script = os.path.join(self.tmp, "brandnew.py")
+        with open(script, "w", encoding="utf-8") as handle:
+            handle.write("import time\nfor _ in range(600):\n    time.sleep(0.1)\n")
+        process = subprocess.Popen([sys.executable, script], cwd=self.tmp,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+        self.addCleanup(_kill_group, process)
+        with mock.patch.object(console, "discover", return_value=[]):
+            found = console.unmonitored_python_processes()
+        self.assertNotIn(process.pid, [p["pid"] for p in found],
+                         "a process started moments ago was offered as a run to watch")
+
+    def test_an_unreadable_start_time_lists_the_process_rather_than_hiding_it(self):
+        # Hiding the run somebody is asking about is the worse failure.
+        self.assertIsNone(console._process_started(999999, console._boot_time()))
+
+
+class PulsesOwnProcessesTest(unittest.TestCase):
+    """Telling Pulse's processes from the user's, without swallowing the user's.
+
+    The test was `"pulse" in script`, which matched the whole path: every script in
+    ~/pulse-experiments, or in a checkout of this repo, was invisible to
+    `pulse <script>` -- the tool could not watch runs in its own source tree.
+    """
+
+    def test_pulses_own_modules_are_recognised(self):
+        for script in ("/usr/lib/python3/site-packages/pulse/cli.py",
+                       "/home/me/.local/lib/python3.11/site-packages/pulse/pulse.py",
+                       "pulse_cli.py", "/opt/x/pulse_console.py"):
+            self.assertTrue(console._is_pulse_itself(script), script)
+
+    def test_a_users_script_in_a_pulse_named_directory_is_not(self):
+        for script in ("/home/me/pulse-experiments/train.py",
+                       "/home/me/pulseml/benchmarks/run_case.py",
+                       "/tmp/pulse-test-1234/longrun.py",
+                       "/home/me/my-pulse-project/finetune.py"):
+            self.assertFalse(console._is_pulse_itself(script),
+                             f"{script} would be hidden from `pulse <script>`")
+
+
+class StaleSessionsDoNotHideALiveRunTest(unittest.TestCase):
+    """Sessions outlive their runs, so by the second day there are several dead ones.
+
+    Asking for train.py while train.py is running has one right answer, and it is never
+    "choose between yesterday's two finished sessions". The earlier fix only covered a
+    single stale session; with two or more, pick_session returned None and the console
+    printed a menu of corpses instead of looking at the process.
+    """
+
+    def _run(self, sessions, processes, wanted="train.py"):
+        import unittest.mock as mock
+        called = {}
+
+        def fake_watch_by_name(name, model=""):
+            called["watched"] = name
+            return 0
+
+        with mock.patch.object(console, "discover", return_value=sessions), \
+             mock.patch.object(console, "unmonitored_python_processes",
+                               return_value=processes), \
+             mock.patch.object(console, "watch_by_name", fake_watch_by_name), \
+             mock.patch.object(console, "run_console",
+                               side_effect=lambda s, *a, **k: called.setdefault("console", s) and 0):
+            import io, contextlib
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                status = console.main([wanted])
+        return status, called, buffer.getvalue()
+
+    @staticmethod
+    def _session(session_id, status, script="/home/me/train.py"):
+        return {"session_id": session_id, "status": status, "script": script,
+                "directory": "/tmp/" + session_id, "step": 10, "loss": 1.0,
+                "last_seen": time.time() - 86400}
+
+    @staticmethod
+    def _process(pid, script="/home/me/train.py"):
+        return {"pid": pid, "script": script, "cmdline": "python3 " + script,
+                "started": time.time() - 600}
+
+    def test_two_finished_sessions_do_not_hide_the_running_process(self):
+        status, called, output = self._run(
+            [self._session("yesterday-a", "finished"), self._session("yesterday-b", "ended")],
+            [self._process(4242)])
+        self.assertEqual(called.get("watched"), "train.py",
+                         f"it offered a menu of finished runs instead:\n{output}")
+        self.assertEqual(status, 0)
+
+    def test_one_finished_session_still_does_not_hide_it(self):
+        _, called, _ = self._run([self._session("yesterday-a", "finished")],
+                                 [self._process(4242)])
+        self.assertEqual(called.get("watched"), "train.py")
+
+    def test_a_live_session_is_preferred_over_attaching_from_outside(self):
+        # Pulse is already inside that run: reading it from outside would be worse.
+        _, called, _ = self._run(
+            [self._session("today", "live"), self._session("yesterday", "finished")],
+            [self._process(4242)])
+        self.assertNotIn("watched", called,
+                         "it attached from outside to a run Pulse is already tracking")
+        self.assertEqual((called.get("console") or {}).get("session_id"), "today")
+
+    def test_with_no_process_running_it_still_reports_the_finished_ones(self):
+        status, called, output = self._run(
+            [self._session("yesterday-a", "finished"), self._session("yesterday-b", "ended")],
+            [])
+        self.assertNotIn("watched", called)
+        self.assertEqual(status, 1)
+        self.assertIn("Which one?", output)
+
+    def test_attaching_to_a_run_that_is_over_says_so(self):
+        """"healthy" about numbers that stopped moving yesterday reads as live.
+
+        The detectors are right -- nothing is wrong with the data, it is just finished
+        -- so the header has to carry that, or the whole screen looks like a live run.
+        """
+        import io, contextlib, unittest.mock as mock
+        from pulse.pulse_brain import Brain
+
+        session = self._session("yesterday", "ended")
+        session["last_seen"] = time.time() - 86400
+        buffer = io.StringIO()
+
+        class FakeConsole:
+            workdir = "/home/me"
+            brain = mock.MagicMock(spec=Brain)
+
+            def __init__(self, *a, **k):
+                pass
+
+            def start(self):
+                pass
+
+            def stop(self, join=False):
+                pass
+
+            def status_line(self):
+                return "step 1,531 . healthy"
+
+        with mock.patch.object(console, "Console", FakeConsole), \
+             mock.patch.object(console, "input", create=True, side_effect=EOFError), \
+             contextlib.redirect_stdout(buffer):
+            console.run_console(session, [session])
+        header = next(l for l in buffer.getvalue().splitlines() if l.startswith("Attached to"))
+        self.assertIn("ended", header, f"a finished run looked live: {header!r}")
+
+    def test_attaching_to_a_live_run_is_not_labelled(self):
+        import io, contextlib, unittest.mock as mock
+        from pulse.pulse_brain import Brain
+
+        session = self._session("today", "live")
+        buffer = io.StringIO()
+
+        class FakeConsole:
+            workdir = "/home/me"
+            brain = mock.MagicMock(spec=Brain)
+
+            def __init__(self, *a, **k):
+                pass
+
+            def start(self):
+                pass
+
+            def stop(self, join=False):
+                pass
+
+            def status_line(self):
+                return "step 10 . healthy"
+
+        with mock.patch.object(console, "Console", FakeConsole), \
+             mock.patch.object(console, "input", create=True, side_effect=EOFError), \
+             contextlib.redirect_stdout(buffer):
+            console.run_console(session, [session])
+        header = next(l for l in buffer.getvalue().splitlines() if l.startswith("Attached to"))
+        self.assertNotIn("live", header, f"a live run was labelled anyway: {header!r}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
