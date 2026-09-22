@@ -6320,30 +6320,42 @@ class PulseCLI:
                 pass
 
     def _build_file_labels(self) -> None:
-        """Give every file (entry script + extra project files) a short,
-        unique display label -- usually just its basename -- used both in
-        the code shown to the agent and later to resolve which real file a
-        proposed fix's "file" field refers to.
+        """Give every file (entry script + extra project files) a label that
+        names it unambiguously: its path relative to the root the files share,
+        the same scheme `pulse code` already uses.
+
+        Labelling by basename looked tidier and was wrong on any project that
+        has two files with the same name -- and frameworks are full of them
+        (optim/base.py and config/base.py, one registry.py per package). The
+        first file seen took the bare name, every later one got parent/name,
+        and _resolve_fix_path's basename fallback then sent every request for
+        one of the later ones to the first: the agent asked to VIEW
+        optim/base.py and was shown config/base.py under a header reading
+        "base.py", and a fix targeting optim/base.py was applied against
+        config/base.py.
         """
+        paths = [p for p in [self.script_path] + list(self.extra_files) if p]
+        absolute = {p: os.path.abspath(p) for p in paths}
+        try:
+            root = os.path.commonpath(list(absolute.values())) if absolute else ""
+        except ValueError:                      # different drives (Windows)
+            root = ""
+        if root in absolute.values():           # a single file: its own directory is the root
+            root = os.path.dirname(root)
+
         label_for_path: Dict[str, str] = {}
         path_for_label: Dict[str, str] = {}
-        used: set = set()
-
-        def add(path: Optional[str]) -> None:
-            if not path or path in label_for_path:
-                return
-            base = os.path.basename(path)
-            label = base
-            if label in used:
-                parent = os.path.basename(os.path.dirname(path))
-                label = f"{parent}/{base}"
-            used.add(label)
+        for path in paths:
+            if path in label_for_path:
+                continue
+            if root:
+                label = os.path.relpath(absolute[path], root).replace(os.sep, "/")
+            else:
+                label = os.path.basename(path)
+            if label in path_for_label:         # the same file under two spellings
+                continue
             label_for_path[path] = label
             path_for_label[label] = path
-
-        add(self.script_path)
-        for p in self.extra_files:
-            add(p)
 
         self._label_for_path = label_for_path
         self._path_for_label = path_for_label
@@ -6366,27 +6378,36 @@ class PulseCLI:
         return hits[0] if len(hits) == 1 else None
 
     def _resolve_fix_path(self, file_label: Optional[str]) -> Optional[str]:
-        """Map a fix entry's optional "file" label back to a real path on
-        disk, defaulting to the entry script when unset. Falls back to
-        substring matching (case-insensitive) since the agent may not
-        reproduce a header exactly."""
+        """Map a fix entry's optional "file" label (or a VIEW's file) back to a
+        real path on disk, defaulting to the entry script when unset.
+
+        The agent does not always reproduce a header exactly -- it may write a
+        longer path than the label ("src/optim/base.py" for "optim/base.py") or
+        a shorter one -- so a near miss still resolves, but only while exactly
+        one known file matches. An ambiguous name resolves to nothing rather
+        than to whichever file happened to be seen first: showing or editing
+        the wrong file is worse than saying the label could not be resolved.
+        """
         if not file_label or not file_label.strip():
             return self.script_path
-        label = file_label.strip()
-        if label in self._path_for_label:
-            return self._path_for_label[label]
+        label = file_label.strip().replace("\\", "/").lstrip("./").lower()
+        if file_label.strip() in self._path_for_label:
+            return self._path_for_label[file_label.strip()]
         # Already a real path: _apply_code_fix records resolved paths (not
         # labels) in `skipped`, and _request_corrected_snippets resolves
         # those again -- without this, every re-quote retry silently found
         # no file to show the model and gave up.
-        if os.path.isfile(label):
-            return os.path.abspath(label)
-        basename = os.path.basename(label).lower()
+        if os.path.isfile(file_label.strip()):
+            return os.path.abspath(file_label.strip())
+        # One path is a tail of the other: "a/b/model.py" for label "b/model.py".
         matches = [p for lbl, p in self._path_for_label.items()
-                   if label.lower() in lbl.lower() or basename == lbl.lower()]
-        if len(matches) == 1:
-            return matches[0]
-        return None
+                   if lbl.lower() == label or lbl.lower().endswith("/" + label)
+                   or label.endswith("/" + lbl.lower())]
+        if len(matches) != 1:
+            basename = os.path.basename(label)
+            matches = [p for lbl, p in self._path_for_label.items()
+                       if os.path.basename(lbl).lower() == basename]
+        return matches[0] if len(matches) == 1 else None
 
     def _build_agent_context(self, include_code: bool = False) -> str:
         variables = self.discover_variables()
