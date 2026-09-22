@@ -27,8 +27,14 @@ What is different, on purpose, because this is a coding session and not a traini
   * its own system prompt and passes -- the debugger's are "fix the bug and only the bug";
   * new files, which the fix format could not express (`create`);
   * nothing restarts, no training probe runs, and your git tree is never stashed;
-  * the agent may only edit files it has loaded from inside the project, and may only run the
-    read-only tools -- not `REPL:` (an eval in this process);
+  * the agent may only edit files it has loaded from inside the project, and its toolset is the
+    debugger's read-only tools plus `TERMINAL:` (a real subprocess in the project directory,
+    serviced by the same shared executor the debugger's `TERMINAL:` uses) -- not `REPL:`/`DRYRUN:`
+    (an eval against a live *training* process, which doesn't exist in a coding session);
+  * after a change is applied, the agent gets one more turn to verify it for real -- compile/syntax
+    -check, run a targeted test, reproduce the original problem -- via `TERMINAL:`, and can propose a
+    follow-up fix if that verification fails (`_run_verification_pass`, bounded like everything else
+    here);
   * changes are shown as a diff and confirmed first (`/review off` or `-y` to skip);
   * a request is all-or-nothing: if any part fails to match or lint, none of it is kept;
   * `/undo` reverts only the files still exactly as the agent left them, because the
@@ -73,6 +79,8 @@ _INDEX_MAX_LINES = 160               # entries in the project index shown to the
 _MAX_TOOL_ROUNDS = 3
 _MAX_REVISE_ROUNDS = 2
 _DIFF_MAX_LINES = 240
+_MAX_VERIFY_TOOL_ROUNDS = 5     # TERMINAL/GREP/VIEW rounds within one verification pass
+_MAX_VERIFY_FIX_CYCLES = 2      # additional change->verify loops if verification fails
 
 _TEXT_EXTS = {
     ".py", ".pyi", ".md", ".rst", ".txt", ".toml", ".yaml", ".yml", ".json", ".cfg", ".ini",
@@ -87,9 +95,15 @@ _SKIP_DIRS = {
 }
 _PROTECTED_PARTS = (".git", ".pulse_history")
 
-# Read-only tools only. The debugger's toolset also has REPL:/DRYRUN: (an eval / a call in this
-# process), REPLAY:, ROLLBACK: and training-run statistics; none belong in a coding session.
-_ALLOWED_TOOLS = {"defof", "callers", "depgraph", "doclookup", "changelog"}
+# Read-only tools, plus TERMINAL -- a coding session's one execution primitive. The
+# debugger's toolset also has REPL:/DRYRUN: (an eval / a call in the live training
+# process), REPLAY:, ROLLBACK: and training-run statistics; none of those belong here --
+# there is no live training process to eval against, and this session has its own
+# `/undo` for reverting edits. TERMINAL runs a real subprocess in the project directory,
+# which is exactly what a coding session needs for tests/linters/repro scripts and is
+# handled by the same shared executor + confirmation policy as the debugging agent's
+# TERMINAL: (see PulseCLI._run_terminal / pulse_terminal.py).
+_ALLOWED_TOOLS = {"defof", "callers", "depgraph", "doclookup", "changelog", "terminal"}
 
 # ---------------------------------------------------------------------------------------
 # Prompts
@@ -107,7 +121,9 @@ CODE_SYSTEM_PROMPT = (
     "naming and structure. Do not reformat, rename, restructure or 'improve' code the request "
     "does not need touched. Do not add a dependency the project does not already use unless asked.\n"
     "- If the request is a question, or needs no change, just answer it.\n"
-    "- You cannot run code or tests here. Never say you ran or tested something.\n\n"
+    "- You have a real terminal (TERMINAL:, below). Never say you ran or tested something unless you "
+    "actually did and are reporting the real exit code/output you got back -- not what you expect it "
+    "to say.\n\n"
     "TOOLS -- put the directive alone on its own line; Pulse runs it and replies with the "
     "results, then you continue. Use file labels exactly as they appear in the headers.\n"
     "  GREP: <pattern>            search every project file (word, phrase or regex), with context\n"
@@ -117,6 +133,16 @@ CODE_SYSTEM_PROMPT = (
     "  DEPGRAPH:                  the import graph between project files\n"
     "  DOCLOOKUP: <library>.<symbol>  the real signature/docstring of an installed library function\n"
     "  CHANGELOG:                 what has changed in the project files since the session started\n"
+    "  TERMINAL: <shell command>  run a REAL command in the project directory; get back the actual "
+    "stdout, stderr, exit code and duration -- e.g. 'TERMINAL: pytest tests/test_model.py', "
+    "'TERMINAL: python -m py_compile src/model.py', 'TERMINAL: git status', 'TERMINAL: python "
+    "repro.py'. This is a general terminal, not a fixed set of commands -- compose whatever command "
+    "actually answers your question. Prefer it over guessing: to see whether a file parses, to "
+    "reproduce a bug before proposing a fix, to run a project's existing tests/linters, or to check "
+    "git state. A command that deletes files, rewrites git history, reaches outside the project, or "
+    "starts a background process pauses for the user's confirmation first -- expect that only for "
+    "those cases, not for ordinary read/run/test commands. Large output comes back truncated (head "
+    "and tail kept); narrow the command if you need a different slice.\n"
 )
 
 _PLAN = (
@@ -162,6 +188,24 @@ _REVISE = (
     "Revise it. Respond with ONLY the corrected, complete JSON object from step 2 -- every change, "
     "not just the fixed one -- no prose, no fences."
 )
+
+_VERIFY_TERMINAL = (
+    "STEP 4 -- VERIFY FOR REAL. This change was just applied:\n{explanation}\n\n{diff}\n\n"
+    "Use TERMINAL: (and GREP:/VIEW: if useful) to actually check it -- don't just reason about "
+    "whether it should work. Pick whatever's appropriate: compile/syntax-check the changed file(s), "
+    "run a targeted existing test, or write and run a tiny repro script for the specific behavior "
+    "that was asked for. Put one or more directives on their own lines and stop; you'll get the real "
+    "output back and can run more before deciding. When you're done checking, respond with ONLY "
+    '{{"verified": true or false, "reason": "one sentence, citing what you actually saw (exit code / '
+    'output), not what you expect"}}.'
+)
+
+_VERIFY_NO_TOOLS_NOTE = (
+    "That was neither a tool directive nor the JSON verdict. Either run a TERMINAL:/GREP:/VIEW: "
+    'directive, or respond with ONLY {"verified": true or false, "reason": "..."}.'
+)
+
+
 
 
 # ---------------------------------------------------------------------------------------
@@ -649,7 +693,80 @@ def _run_turn_passes(cli, request):
             if fix2 is not None:
                 changes, fix = changes2, fix2
 
-    return _confirm_and_apply(cli, request, plan, fix, changes)
+    outcome, summary = _confirm_and_apply(cli, request, plan, fix, changes)
+    if outcome != "applied":
+        return outcome, summary
+
+    for _cycle in range(_MAX_VERIFY_FIX_CYCLES):
+        verified, verify_note = _run_verification_pass(cli, fix, changes)
+        summary = f"{summary}\n\n{verify_note}" if verify_note else summary
+        if verified is not False:
+            # True, or unresolved after using up its tool rounds -- either way there is
+            # nothing further to automatically retry; unresolved is reported, not silently
+            # treated as success.
+            break
+        cprint(f"[Pulse Code] Verification failed -- attempting a fix "
+               f"({_cycle + 1}/{_MAX_VERIFY_FIX_CYCLES})", color=_YELLOW)
+        revised = _revise(cli, _IMPLEMENT.format(plan=plan), f"Verification found: {verify_note or 'verification failed'}")
+        if revised is None:
+            cprint("[Pulse Code] ⚠ Could not produce a fix for the verification failure; stopping here.", color=_RED)
+            break
+        new_changes, new_fix = _settle(cli, request, plan, revised, _IMPLEMENT.format(plan=plan))
+        if new_fix is None:
+            break
+        outcome, apply_summary = _confirm_and_apply(cli, request, plan, new_fix, new_changes)
+        summary = f"{summary}\n\n{apply_summary}"
+        if outcome != "applied":
+            return outcome, summary
+        fix, changes = new_fix, new_changes
+
+    return outcome, summary
+
+
+def _run_verification_pass(cli, fix, changes):
+    """STEP 4. After a change is applied, give the agent one more turn -- bounded by
+    _MAX_VERIFY_TOOL_ROUNDS -- to actually check it with TERMINAL:/GREP:/VIEW: instead of
+    just asserting it works. Returns (verified, note): verified is True/False/None
+    (None = the model never produced a clear verdict after using its tool rounds -- treated
+    as "not proven to have failed", but reported to the user either way, not silently
+    swallowed)."""
+    explanation = fix.get("explanation") or "(no explanation given)"
+    diff = render_diff(cli, changes)
+    prompt = _VERIFY_TERMINAL.format(explanation=explanation, diff=diff)
+    cli._in_verification_pass = True   # tags any TERMINAL: run in this pass -- see PulseCLI._run_terminal
+    try:
+        with _Spinner("Verifying"):
+            answer = cli._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS)
+
+        for _round in range(_MAX_VERIFY_TOOL_ROUNDS):
+            verdict = cli._parse_json_obj(answer)
+            if verdict is not None and "verified" in verdict:
+                passed = bool(verdict.get("verified"))
+                reason = str(verdict.get("reason", "")).strip()
+                icon = "✓" if passed else "✗"
+                color = _GREEN if passed else _RED
+                cprint(f"[4] Verification {icon}{(': ' + reason) if reason else ''}", color=color)
+                return passed, reason
+            notes = cli._service_tool_requests(answer)
+            if not notes:
+                # Neither a verdict nor a tool request -- nudge once more rather than looping
+                # forever on an unparsable reply.
+                cli.agent_history.append({"role": "assistant", "content": answer})
+                cli.agent_history.append({"role": "user", "content": _VERIFY_NO_TOOLS_NOTE})
+                with _Spinner("Verifying"):
+                    answer = cli._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS)
+                continue
+            print(f"\n[verify tool results]\n{notes}\n")
+            cli.agent_history.append({"role": "assistant", "content": answer})
+            cli.agent_history.append({"role": "user", "content": notes})
+            with _Spinner("Verifying"):
+                answer = cli._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS)
+
+        cprint("[4] Verification: no clear pass/fail after checking -- treating the change as applied "
+               "but unverified.", color=_YELLOW)
+        return None, "Verification inconclusive after available checks."
+    finally:
+        cli._in_verification_pass = False
 
 
 def _revise(cli, implement, problem):

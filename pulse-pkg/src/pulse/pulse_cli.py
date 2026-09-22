@@ -47,6 +47,7 @@ from pulse.pulse_pdf import generate_heatmap_pdf
 from pulse import pulse_detect as _pulse_detect
 from pulse import pulse_supabase as cloud
 from pulse import pulse_ui as _ui
+from pulse import pulse_terminal as _terminal
 try:
     import litellm
     # Quiets litellm's own verbose provider-runtime logging unless explicitly enabled.
@@ -941,6 +942,23 @@ SYSTEM_PROMPT = (
     "among tracked variables that recomputes the current loss -- if none exists, Pulse will say so.\n"
     "    REPLAY: <n_steps> -- replay the last n_steps from an isolated checkpoint (with a zero-arg "
     "`train_step` callable you define) and report the resulting loss curve, then restore live state.\n"
+    "    TERMINAL: <shell command> -- run a REAL command in the project's working directory and get "
+    "back its actual stdout, stderr, exit code and duration -- e.g. 'TERMINAL: pytest tests/test_model.py', "
+    "'TERMINAL: python -m py_compile model.py', 'TERMINAL: git status', 'TERMINAL: grep -R \"loss_val\" .'. "
+    "This is not one of the narrow tools above with a fixed shape -- you compose the command yourself, the "
+    "way you would at a real shell. Use it to inspect files, search code, run linters/tests, check git "
+    "state, reproduce a bug, or run a small diagnostic script. NEVER assume a command succeeded because "
+    "you ran it or because a fix 'should' work -- always read the exit code and stdout/stderr you get back "
+    "before saying something is fixed. After changing code, prefer verifying it for real: compile/syntax-"
+    "check the file, run the specific failing test or a small repro script, and only report success once "
+    "you've actually seen it pass. If a command you ran fails, investigate the real output (another GREP/ "
+    "VIEW/TERMINAL) and try again rather than guessing at a second fix blind. A command that deletes "
+    "files, rewrites git history, reaches outside the project, or starts a background process will ask "
+    "the user to confirm before it runs -- expect that pause for those specific cases, not for ordinary "
+    "commands like running a test or reading a file. Large output is truncated (head and tail kept, with "
+    "a note); narrow the command (grep/head/tail, a single test) if you need something you can't see. Add "
+    "' --timeout=<seconds>' at the end of the line to override the default timeout for a long-running "
+    f"command (default {int(_terminal.DEFAULT_TIMEOUT_SECONDS)}s, capped at {int(_terminal.MAX_TIMEOUT_SECONDS)}s).\n"
     "  Code intelligence beyond GREP/VIEW (structure, not text search):\n"
     "    DEFOF: <symbol> -- AST-based jump-to-definition across every tracked file.\n"
     "    CALLERS: <symbol> -- every call site of a function/class.\n"
@@ -6748,6 +6766,7 @@ class PulseCLI:
         "dryrun": re.compile(r"^\s*DRYRUN:\s*(.+)$", re.MULTILINE),
         "repl": re.compile(r"^\s*REPL:\s*(.+)$", re.MULTILINE),
         "replay": re.compile(r"^\s*REPLAY:\s*(.+)$", re.MULTILINE),
+        "terminal": re.compile(r"^\s*TERMINAL:\s*(.+)$", re.MULTILINE),
         "gradcheck": re.compile(r"^\s*GRADCHECK:\s*(.+)$", re.MULTILINE),
         "shapetrace": re.compile(r"^\s*SHAPETRACE:\s*(.*)$", re.MULTILINE),
         "gpustatus": re.compile(r"^\s*GPUSTATUS:\s*(.*)$", re.MULTILINE),
@@ -7177,6 +7196,67 @@ class PulseCLI:
         if "error" in result:
             return f"DRYRUN '{call_expr}': raised\n{_format_exc_short(result['error'])}"
         return f"DRYRUN '{call_expr}' -> {_describe_exec_value(result.get('value'))}"
+
+    # ------------------------------------------------------------------
+    # TERMINAL: -- shared agent terminal execution (pulse_terminal.py).
+    # Same infrastructure backs Pulse Code's TERMINAL: handling
+    # (pulse_code.py only widens/narrows the safety-confirmation policy,
+    # never the executor itself).
+    # ------------------------------------------------------------------
+    def _get_terminal_executor(self) -> "_terminal.TerminalExecutor":
+        executor = getattr(self, "_terminal_executor", None)
+        if executor is None:
+            root = os.path.abspath(getattr(self, "_project_root", None) or self._repo_cwd or os.getcwd())
+            executor = _terminal.TerminalExecutor(default_cwd=root)
+            self._terminal_executor = executor
+        return executor
+
+    def _terminal_needs_confirmation(self, command: str) -> Optional[Dict[str, bool]]:
+        """None if the command can just run; otherwise the classification flags that
+        triggered a confirmation prompt. `self.review` (set on Pulse Code sessions,
+        toggled by /review or -y) explicitly OFF skips confirmation entirely -- the same
+        opt-out an applied code-fix already respects. Sessions with no `review` attribute
+        (the plain debugging agent) default to always confirming destructive commands,
+        since there is no equivalent 'apply without asking' flag there yet."""
+        if getattr(self, "review", True) is False:
+            return None
+        flags = _terminal.classify_command(command)
+        return flags if any(flags.values()) else None
+
+    def _confirm_terminal_command(self, command: str, flags: Dict[str, bool]) -> bool:
+        why = _terminal.describe_classification(flags)
+        cprint(f"[Pulse] ⚠ This command {why}: {command}", color=_YELLOW)
+        try:
+            _flush_stdin()
+            resp = _prompt_text(f"Run it anyway? (y/N) > ", label="Run it anyway? (y/N)").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return resp in ("y", "yes")
+
+    def _run_terminal(self, arg: str, *, is_verification: bool = False) -> str:
+        """TERMINAL: <command> -- run a real shell command via the shared TerminalExecutor
+        and hand back a structured result the model can actually reason about (never just
+        a 'done' -- see pulse_terminal.TerminalResult.render). Destructive-looking commands
+        (delete files, rewrite git state, reach outside the workspace, start a background
+        process) pause for a y/n first, exactly like applying a code fix already does;
+        everything else -- reading files, grepping, running tests/linters, git status,
+        launching a script -- runs immediately."""
+        command, inline_timeout = _terminal.parse_inline_timeout(arg.strip())
+        if not command:
+            return "TERMINAL: empty command -- nothing to run."
+        flags = self._terminal_needs_confirmation(command)
+        if flags and not self._confirm_terminal_command(command, flags):
+            return f"TERMINAL '{command}': the user declined to run this command -- try a different " \
+                   "approach, or ask a read-only tool (GREP/VIEW) instead if you were only trying to " \
+                   "inspect something."
+        executor = self._get_terminal_executor()
+        request = _terminal.TerminalRequest(
+            command=command,
+            timeout=inline_timeout or _terminal.DEFAULT_TIMEOUT_SECONDS,
+        )
+        result = executor.run(request, is_verification=is_verification or getattr(self, "_in_verification_pass", False))
+        cprint(executor.summary_line(result), color=(_GREEN if result.ok else _RED))
+        return result.render()
 
     def _run_exec_shapetrace(self, arg: str) -> str:
         """SHAPETRACE: [optional model var name] -- forward pass with a
@@ -7869,6 +7949,8 @@ class PulseCLI:
             notes.append(self._run_exec_repl(arg))
         for arg in requests.get("replay", []):
             notes.append(self._run_exec_replay(arg))
+        for arg in requests.get("terminal", []):
+            notes.append(self._run_terminal(arg))
         for arg in requests.get("gradcheck", []):
             notes.append(self._run_exec_gradcheck(arg))
         if "shapetrace" in requests:
