@@ -101,13 +101,38 @@ class ChecksTest(unittest.TestCase):
 
 
 class StateMachineTest(unittest.TestCase):
-    def test_one_noisy_sample_does_not_fire(self):
+    def test_a_gradual_finding_still_needs_two_evaluations(self):
+        """The confirmation gate, on a check whose evidence is still there next time."""
+        engine = DetectionEngine(sensitivity=0.3, confirmations=2)
+        rising = [0.30, 0.32, 0.34, 0.36, 0.38, 0.40, 0.42, 0.44, 0.46, 0.48, 0.50, 0.52]
+        first = engine.update({"val_loss": rising})
+        self.assertEqual(first["raised"], [], "fired on a single evaluation")
+        second = engine.update({"val_loss": rising})
+        self.assertTrue(checks(second["raised"]), "never confirmed on the second look")
+
+    def test_a_spike_is_reported_the_moment_it_happens(self):
+        """A transient cannot wait for confirmation, because it is gone by then.
+
+        The gate asks for the same finding on two consecutive evaluations. That is
+        right for a trend, which is still there next time, and impossible for a spike:
+        the engine is only re-run when new readings arrive, and by then the spike is
+        no longer the latest value, so the finding never comes back to be confirmed.
+        Measured on a ladder of single-epoch spikes, nothing from 1.25x to 1000x was
+        ever reported -- 0 of 8 -- until this was made immediate.
+        """
         engine = DetectionEngine(sensitivity=0.3, confirmations=2)
         history = [1.0, 0.9, 0.8, 0.75, 0.7, 0.68, 0.66]
-        first = engine.update({"loss": history + [40.0]})
-        self.assertEqual(first["raised"], [], "fired on a single evaluation")
-        second = engine.update({"loss": history + [40.0]})
-        self.assertEqual(checks(second["raised"]), ["loss_spike"])
+        raised = engine.update({"loss": history + [40.0]})["raised"]
+        self.assertEqual(checks(raised), ["loss_spike"])
+
+    def test_ordinary_noise_is_not_a_spike(self):
+        """The reason the gate was put there in the first place, still held."""
+        engine = DetectionEngine(sensitivity=0.3, confirmations=2)
+        history = [1.0, 0.9, 0.8, 0.75, 0.7, 0.68, 0.66]
+        for wobble in (0.72, 0.80, 0.95, 1.1):
+            engine = DetectionEngine(sensitivity=0.3, confirmations=2)
+            raised = engine.update({"loss": history + [wobble]})["raised"]
+            self.assertEqual(raised, [], f"fired on a single reading of {wobble}")
 
     def test_a_finding_is_raised_once_not_every_round(self):
         engine = DetectionEngine(sensitivity=0.3)
