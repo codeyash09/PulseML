@@ -47,6 +47,7 @@ from pulse.pulse_pdf import generate_heatmap_pdf
 from pulse import pulse_detect as _pulse_detect
 from pulse import pulse_supabase as cloud
 from pulse import pulse_ui as _ui
+from pulse import pulse_terminal as _terminal
 try:
     import litellm
     # Quiets litellm's own verbose provider-runtime logging unless explicitly enabled.
@@ -941,6 +942,23 @@ SYSTEM_PROMPT = (
     "among tracked variables that recomputes the current loss -- if none exists, Pulse will say so.\n"
     "    REPLAY: <n_steps> -- replay the last n_steps from an isolated checkpoint (with a zero-arg "
     "`train_step` callable you define) and report the resulting loss curve, then restore live state.\n"
+    "    TERMINAL: <shell command> -- run a REAL command in the project's working directory and get "
+    "back its actual stdout, stderr, exit code and duration -- e.g. 'TERMINAL: pytest tests/test_model.py', "
+    "'TERMINAL: python -m py_compile model.py', 'TERMINAL: git status', 'TERMINAL: grep -R \"loss_val\" .'. "
+    "This is not one of the narrow tools above with a fixed shape -- you compose the command yourself, the "
+    "way you would at a real shell. Use it to inspect files, search code, run linters/tests, check git "
+    "state, reproduce a bug, or run a small diagnostic script. NEVER assume a command succeeded because "
+    "you ran it or because a fix 'should' work -- always read the exit code and stdout/stderr you get back "
+    "before saying something is fixed. After changing code, prefer verifying it for real: compile/syntax-"
+    "check the file, run the specific failing test or a small repro script, and only report success once "
+    "you've actually seen it pass. If a command you ran fails, investigate the real output (another GREP/ "
+    "VIEW/TERMINAL) and try again rather than guessing at a second fix blind. A command that deletes "
+    "files, rewrites git history, reaches outside the project, or starts a background process will ask "
+    "the user to confirm before it runs -- expect that pause for those specific cases, not for ordinary "
+    "commands like running a test or reading a file. Large output is truncated (head and tail kept, with "
+    "a note); narrow the command (grep/head/tail, a single test) if you need something you can't see. Add "
+    "' --timeout=<seconds>' at the end of the line to override the default timeout for a long-running "
+    f"command (default {int(_terminal.DEFAULT_TIMEOUT_SECONDS)}s, capped at {int(_terminal.MAX_TIMEOUT_SECONDS)}s).\n"
     "  Code intelligence beyond GREP/VIEW (structure, not text search):\n"
     "    DEFOF: <symbol> -- AST-based jump-to-definition across every tracked file.\n"
     "    CALLERS: <symbol> -- every call site of a function/class.\n"
@@ -1271,17 +1289,25 @@ class _BackgroundModelCall:
 _PASS1_LOCATE = (
     "PASS 1 -- LOCATE: Read through everything you were given (stats, code, history) and identify "
     "the specific region(s) where the problem likely originates -- file/line numbers, variable "
-    "names, or code sections. Aim for the smallest region that could plausibly contain the root "
-    "cause (often a single line or a few adjacent lines), not a whole function or file, unless the "
-    "evidence genuinely doesn't narrow further than that. Respond with ONLY a short bullet list of "
-    "the suspect location(s). No diagnosis, no fix yet."
+    "names, or code sections. If that isn't enough to narrow it down, investigate before guessing: "
+    "GREP:/VIEW: to see more code, or TERMINAL: to check real state directly (git log/diff on a "
+    "suspect file, grep for other call sites, a quick check of a config value) -- put the directive "
+    "on its own line and stop; you'll get the result back and can keep looking before answering. "
+    "Aim for the smallest region that could plausibly contain the root cause (often a single line or "
+    "a few adjacent lines), not a whole function or file, unless the evidence genuinely doesn't "
+    "narrow further than that. Once you're not just guessing, respond with ONLY a short bullet list "
+    "of the suspect location(s). No diagnosis, no fix yet."
 )
 _PASS2_ANALYZE_TMPL = (
     "Suspect region(s) from your first read:\n{regions}\n\n"
-    "PASS 2 -- ANALYZE: Take a focused second look at just those regions. Give the Diagnosis (one "
-    "sentence, the specific root cause) and the Reasoning behind it (grounded in the actual "
-    "numbers/code you were given, with real math, referencing line numbers). Do not implement the "
-    "fix yet."
+    "PASS 2 -- ANALYZE: Take a focused second look at just those regions. If the numbers/code you "
+    "have don't settle the root cause, check before diagnosing -- TERMINAL: to inspect real state "
+    "(recent git diff on the suspect lines, a grep for every other place a suspect variable is set, "
+    "a quick python -c check on a value you're unsure of), or GREP:/VIEW: for more code -- rather "
+    "than reasoning from a guess. Put directives on their own lines and stop; you'll get the results "
+    "and can diagnose once you've actually checked. Once you have, give the Diagnosis (one sentence, "
+    "the specific root cause) and the Reasoning behind it (grounded in the actual numbers/code/tool "
+    "results you have, with real math, referencing line numbers). Do not implement the fix yet."
 )
 _PASS3_FIX_TEXT_TMPL = (
     "Your analysis so far:\n{diagnosis}\n\n"
@@ -1295,7 +1321,9 @@ _PASS3_IMPLEMENT_TMPL = (
     "Fix the bug and only the bug: no optimisation, no refactoring, no renaming, no added "
     "callbacks or seeds, no style or formatting changes, no 'while I am here' improvements -- "
     "even where you can see something you would write differently. Every line you touch beyond "
-    "the bug is a line that can break a run that is otherwise working. "
+    "the bug is a line that can break a run that is otherwise working. If you notice a second, "
+    "unrelated problem while you're in here, do not fix it in this change -- mention it in the "
+    "explanation field as something worth a separate look. "
     "Implement the fix for the root cause diagnosed above. The user wants this fix applied to their code. Default to the "
     "smallest possible change -- a single line or a few adjacent lines -- and only widen the edit if "
     "the root cause genuinely can't be fixed that narrowly. Do not refactor, restructure, or rewrite "
@@ -1307,10 +1335,14 @@ _PASS4_VERIFY_TMPL = (
     "The fix you are about to apply:\n{fix_desc}\n\n"
     "PASS 4 -- VERIFY: Carefully check the math/logic of this fix against the numbers and code you "
     'were given. Also check its SCOPE: does it change only what\'s needed to fix the diagnosed root '
-    "cause, or does it also rewrite/restructure/reformat code that didn't need to change? Respond "
-    'with ONLY a JSON object of the form {{"passes": true or false, "reason": "one sentence"}}. '
-    "passes=true only if the fix is logically/numerically correct, actually addresses the diagnosed "
-    "root cause, AND is no larger than necessary to do so."
+    "cause, or does it also rewrite/restructure/reformat code that didn't need to change -- every "
+    "line in the diff should trace directly to the diagnosed root cause, with nothing swept in "
+    "alongside it. If you can quickly confirm any of this for real instead of just reasoning about "
+    "it -- TERMINAL: python -m py_compile on the changed file, GREP: for other call sites that would "
+    "need the same change -- do that first; you'll get the result back before you have to answer. "
+    'Once you have, respond with ONLY a JSON object of the form {{"passes": true or false, "reason": '
+    '"one sentence"}}. passes=true only if the fix is logically/numerically correct, actually '
+    "addresses the diagnosed root cause, AND is no larger than necessary to do so."
 )
 _PASS4_REVISE_TMPL = (
     "Your analysis:\n{diagnosis}\n\n"
@@ -1342,27 +1374,15 @@ _PASS5_SWEEP = (
 _IMPLEMENT_KEYWORDS = ("fix", "edit", "patch", "change the code", "apply", "implement")
 _MAX_VERIFY_ATTEMPTS = 3
 
-# The automatic lint gate can refuse a fix that read fine to the model and to PASS 4: the edit
-# would leave a file that does not compile. Nothing has been written when this fires, and the
-# exact error is known, so the model gets a bounded chance to correct the edit.
-_MAX_LINT_REVISIONS = 2
-_PASS4_LINT_REVISE_TMPL = (
-    "Your analysis:\n{diagnosis}\n\n"
-    "The fix you proposed:\n{fix_desc}\n\n"
-    "Pulse did NOT write it: applying it would leave a file that fails the automatic syntax/lint "
-    "check:\n{errors}\n\n"
-    "The file as your edit would have left it, around the error (line numbers are the file AFTER "
-    "your edit):\n{excerpt}\n\n"
-    "Revise the fix so every file it touches still compiles. A common cause: the edit deletes a "
-    "statement that was the ONLY statement in an if/elif/else/for/while/try/except/with/def/class "
-    "block, leaving the block empty -- in that case remove the whole block, header line included, "
-    "in the same edit, or replace the deleted statement with `pass`. Keep the change as small as "
-    "the root cause allows. Respond with ONLY the corrected code-fix JSON object (old/new/files/"
-    "explanation) -- no prose, no markdown fences."
-)
-
 # How many times the fix pass may ask to see more code before giving up.
 _MAX_FIX_TOOL_ROUNDS = 3
+# Same idea, one turn earlier: how many times PASS 1/2 may investigate (GREP/VIEW/TERMINAL/etc.)
+# before they have to commit to a suspect region / diagnosis instead of looking forever.
+_MAX_LOCATE_TOOL_ROUNDS = 3
+_MAX_ANALYZE_TOOL_ROUNDS = 3
+# How many times PASS 4 may check a directive (e.g. TERMINAL: py_compile) before it has to
+# actually answer the passes/fails verdict.
+_MAX_VERIFY_TOOL_ROUNDS = 3
 _PASS3_NO_TOOLS_NOTE = (
     "You did not return the code-fix JSON. Everything you were given is above. If you need to "
     "see more code, ask for it with a directive line -- e.g. 'VIEW: <file>:<start>-<end>' or "
@@ -3188,10 +3208,6 @@ class PulseCLI:
         # Look for unrelated bugs after fixing the reported one? Off by
         # default -- see the pass 5 call site.
         self.sweep_enabled: bool = os.environ.get("PULSE_SWEEP", "").strip().lower() in ("1", "true", "yes", "on")
-        # Think mode: plan first, have the agent size the work (steps, tool calls, verifications),
-        # then work through it until the error is fixed / the feature is done. Off by default --
-        # see pulse_think.py. Toggle with /think, --think, PULSE_THINK=1 or "think" in the config.
-        self.think: bool = os.environ.get("PULSE_THINK", "").strip().lower() in ("1", "true", "yes", "on")
         # Dedup bookkeeping so one recurring bug doesn't get treated as N
         # separate incidents within a single run.
         self._traceback_signatures_seen: Dict[str, int] = {}
@@ -3262,7 +3278,6 @@ class PulseCLI:
 
         self.auto_intervene = self._config_bool("autofix", "auto_fix", default=True)
         self.sweep_enabled = self._config_bool("sweep", "sweep_for_other_bugs", default=self.sweep_enabled)
-        self.think = self._config_bool("think", "think_mode", default=self.think)
         self.telemetry_enabled = self._config_bool("telemetry", default=cloud.telemetry_enabled())
         if self._config_has("sensitivity"):
             self._cmd_sensitivity(str(self._config_value("sensitivity")), quiet=True)
@@ -3772,8 +3787,6 @@ class PulseCLI:
             _ui.note("Describe what you want built. Type /help any time for commands.")
             return
         _ui.ready_block(rows, closing="Pulse is ready.")
-        if self.think:
-            _ui.note("Think mode ON -- the agent plans, sizes the work, and keeps going until it is fixed.")
         _ui.note(
             f"Auto-fix {'ON' if self.auto_intervene else 'OFF'}  ·  Sensitivity {self.sensitivity:.2f}  ·  "
             f"Tracking {len(self.tracked_vars)} variable{'s' if len(self.tracked_vars) != 1 else ''}"
@@ -5231,7 +5244,6 @@ class PulseCLI:
             ]),
             ("Auto-fix & sensitivity", [
                 ("/autofix on|off", f"toggle auto-intervention (currently {'ON' if self.auto_intervene else 'OFF'})"),
-                ("/think on|off", f"plan, size the work, then keep going until it's fixed (currently {'ON' if self.think else 'OFF'})"),
                 ("/sensitivity [value]", f"how eagerly spikes/plateaus/oscillation trigger it (currently {self.sensitivity:.2f} -- run with no argument for details)"),
                 ("/revert [id]", "undo a fix Pulse applied (/log to see fix history first)"),
                 ("/commit", "manually refresh the recorded git commit to current HEAD"),
@@ -5952,7 +5964,7 @@ class PulseCLI:
             depth = int(os.environ.get(_RESTART_DEPTH_ENV, "0"))
         except ValueError:
             depth = 0
-        if depth >= (_MAX_RESTART_DEPTH * 2 if self.think else _MAX_RESTART_DEPTH):
+        if depth >= _MAX_RESTART_DEPTH:
             cprint(
                 f"[Pulse] ⚠ Already {depth} restarts deep -- not restarting again. The fix is saved "
                 "to disk; run the script yourself to pick it up.",
@@ -6055,8 +6067,6 @@ class PulseCLI:
         # if every retry fails and this process keeps running the old code,
         # its own later crashes must still go through the agent as normal.
         child_env = dict(os.environ, **{_RESTART_CHILD_ENV: "1", _RESTART_DEPTH_ENV: str(depth + 1)})
-        if self.think:
-            child_env["PULSE_THINK"] = "1"       # the restarted run keeps working the same way
 
         # Retry the restart itself instead of ever falling back to "keep
         # running the old, already-in-memory process" on a bad exit code.
@@ -6074,7 +6084,7 @@ class PulseCLI:
         # deterministically-broken script can't spin forever burning
         # compute/cost unattended; MAX_RESTART_ATTEMPTS is the one knob to
         # raise if that cap is ever too low for a given job.
-        MAX_RESTART_ATTEMPTS = 10 if self.think else 5
+        MAX_RESTART_ATTEMPTS = 5
         RETRY_BACKOFF_SECONDS = 3  # multiplied by attempt number, capped below
 
         attempt = 0
@@ -6331,30 +6341,42 @@ class PulseCLI:
                 pass
 
     def _build_file_labels(self) -> None:
-        """Give every file (entry script + extra project files) a short,
-        unique display label -- usually just its basename -- used both in
-        the code shown to the agent and later to resolve which real file a
-        proposed fix's "file" field refers to.
+        """Give every file (entry script + extra project files) a label that
+        names it unambiguously: its path relative to the root the files share,
+        the same scheme `pulse code` already uses.
+
+        Labelling by basename looked tidier and was wrong on any project that
+        has two files with the same name -- and frameworks are full of them
+        (optim/base.py and config/base.py, one registry.py per package). The
+        first file seen took the bare name, every later one got parent/name,
+        and _resolve_fix_path's basename fallback then sent every request for
+        one of the later ones to the first: the agent asked to VIEW
+        optim/base.py and was shown config/base.py under a header reading
+        "base.py", and a fix targeting optim/base.py was applied against
+        config/base.py.
         """
+        paths = [p for p in [self.script_path] + list(self.extra_files) if p]
+        absolute = {p: os.path.abspath(p) for p in paths}
+        try:
+            root = os.path.commonpath(list(absolute.values())) if absolute else ""
+        except ValueError:                      # different drives (Windows)
+            root = ""
+        if root in absolute.values():           # a single file: its own directory is the root
+            root = os.path.dirname(root)
+
         label_for_path: Dict[str, str] = {}
         path_for_label: Dict[str, str] = {}
-        used: set = set()
-
-        def add(path: Optional[str]) -> None:
-            if not path or path in label_for_path:
-                return
-            base = os.path.basename(path)
-            label = base
-            if label in used:
-                parent = os.path.basename(os.path.dirname(path))
-                label = f"{parent}/{base}"
-            used.add(label)
+        for path in paths:
+            if path in label_for_path:
+                continue
+            if root:
+                label = os.path.relpath(absolute[path], root).replace(os.sep, "/")
+            else:
+                label = os.path.basename(path)
+            if label in path_for_label:         # the same file under two spellings
+                continue
             label_for_path[path] = label
             path_for_label[label] = path
-
-        add(self.script_path)
-        for p in self.extra_files:
-            add(p)
 
         self._label_for_path = label_for_path
         self._path_for_label = path_for_label
@@ -6377,27 +6399,36 @@ class PulseCLI:
         return hits[0] if len(hits) == 1 else None
 
     def _resolve_fix_path(self, file_label: Optional[str]) -> Optional[str]:
-        """Map a fix entry's optional "file" label back to a real path on
-        disk, defaulting to the entry script when unset. Falls back to
-        substring matching (case-insensitive) since the agent may not
-        reproduce a header exactly."""
+        """Map a fix entry's optional "file" label (or a VIEW's file) back to a
+        real path on disk, defaulting to the entry script when unset.
+
+        The agent does not always reproduce a header exactly -- it may write a
+        longer path than the label ("src/optim/base.py" for "optim/base.py") or
+        a shorter one -- so a near miss still resolves, but only while exactly
+        one known file matches. An ambiguous name resolves to nothing rather
+        than to whichever file happened to be seen first: showing or editing
+        the wrong file is worse than saying the label could not be resolved.
+        """
         if not file_label or not file_label.strip():
             return self.script_path
-        label = file_label.strip()
-        if label in self._path_for_label:
-            return self._path_for_label[label]
+        label = file_label.strip().replace("\\", "/").lstrip("./").lower()
+        if file_label.strip() in self._path_for_label:
+            return self._path_for_label[file_label.strip()]
         # Already a real path: _apply_code_fix records resolved paths (not
         # labels) in `skipped`, and _request_corrected_snippets resolves
         # those again -- without this, every re-quote retry silently found
         # no file to show the model and gave up.
-        if os.path.isfile(label):
-            return os.path.abspath(label)
-        basename = os.path.basename(label).lower()
+        if os.path.isfile(file_label.strip()):
+            return os.path.abspath(file_label.strip())
+        # One path is a tail of the other: "a/b/model.py" for label "b/model.py".
         matches = [p for lbl, p in self._path_for_label.items()
-                   if label.lower() in lbl.lower() or basename == lbl.lower()]
-        if len(matches) == 1:
-            return matches[0]
-        return None
+                   if lbl.lower() == label or lbl.lower().endswith("/" + label)
+                   or label.endswith("/" + lbl.lower())]
+        if len(matches) != 1:
+            basename = os.path.basename(label)
+            matches = [p for lbl, p in self._path_for_label.items()
+                       if os.path.basename(lbl).lower() == basename]
+        return matches[0] if len(matches) == 1 else None
 
     def _build_agent_context(self, include_code: bool = False) -> str:
         variables = self.discover_variables()
@@ -6777,6 +6808,7 @@ class PulseCLI:
         "dryrun": re.compile(r"^\s*DRYRUN:\s*(.+)$", re.MULTILINE),
         "repl": re.compile(r"^\s*REPL:\s*(.+)$", re.MULTILINE),
         "replay": re.compile(r"^\s*REPLAY:\s*(.+)$", re.MULTILINE),
+        "terminal": re.compile(r"^\s*TERMINAL:\s*(.+)$", re.MULTILINE),
         "gradcheck": re.compile(r"^\s*GRADCHECK:\s*(.+)$", re.MULTILINE),
         "shapetrace": re.compile(r"^\s*SHAPETRACE:\s*(.*)$", re.MULTILINE),
         "gpustatus": re.compile(r"^\s*GPUSTATUS:\s*(.*)$", re.MULTILINE),
@@ -7206,6 +7238,67 @@ class PulseCLI:
         if "error" in result:
             return f"DRYRUN '{call_expr}': raised\n{_format_exc_short(result['error'])}"
         return f"DRYRUN '{call_expr}' -> {_describe_exec_value(result.get('value'))}"
+
+    # ------------------------------------------------------------------
+    # TERMINAL: -- shared agent terminal execution (pulse_terminal.py).
+    # Same infrastructure backs Pulse Code's TERMINAL: handling
+    # (pulse_code.py only widens/narrows the safety-confirmation policy,
+    # never the executor itself).
+    # ------------------------------------------------------------------
+    def _get_terminal_executor(self) -> "_terminal.TerminalExecutor":
+        executor = getattr(self, "_terminal_executor", None)
+        if executor is None:
+            root = os.path.abspath(getattr(self, "_project_root", None) or self._repo_cwd or os.getcwd())
+            executor = _terminal.TerminalExecutor(default_cwd=root)
+            self._terminal_executor = executor
+        return executor
+
+    def _terminal_needs_confirmation(self, command: str) -> Optional[Dict[str, bool]]:
+        """None if the command can just run; otherwise the classification flags that
+        triggered a confirmation prompt. `self.review` (set on Pulse Code sessions,
+        toggled by /review or -y) explicitly OFF skips confirmation entirely -- the same
+        opt-out an applied code-fix already respects. Sessions with no `review` attribute
+        (the plain debugging agent) default to always confirming destructive commands,
+        since there is no equivalent 'apply without asking' flag there yet."""
+        if getattr(self, "review", True) is False:
+            return None
+        flags = _terminal.classify_command(command)
+        return flags if any(flags.values()) else None
+
+    def _confirm_terminal_command(self, command: str, flags: Dict[str, bool]) -> bool:
+        why = _terminal.describe_classification(flags)
+        cprint(f"[Pulse] ⚠ This command {why}: {command}", color=_YELLOW)
+        try:
+            _flush_stdin()
+            resp = _prompt_text(f"Run it anyway? (y/N) > ", label="Run it anyway? (y/N)").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return resp in ("y", "yes")
+
+    def _run_terminal(self, arg: str, *, is_verification: bool = False) -> str:
+        """TERMINAL: <command> -- run a real shell command via the shared TerminalExecutor
+        and hand back a structured result the model can actually reason about (never just
+        a 'done' -- see pulse_terminal.TerminalResult.render). Destructive-looking commands
+        (delete files, rewrite git state, reach outside the workspace, start a background
+        process) pause for a y/n first, exactly like applying a code fix already does;
+        everything else -- reading files, grepping, running tests/linters, git status,
+        launching a script -- runs immediately."""
+        command, inline_timeout = _terminal.parse_inline_timeout(arg.strip())
+        if not command:
+            return "TERMINAL: empty command -- nothing to run."
+        flags = self._terminal_needs_confirmation(command)
+        if flags and not self._confirm_terminal_command(command, flags):
+            return f"TERMINAL '{command}': the user declined to run this command -- try a different " \
+                   "approach, or ask a read-only tool (GREP/VIEW) instead if you were only trying to " \
+                   "inspect something."
+        executor = self._get_terminal_executor()
+        request = _terminal.TerminalRequest(
+            command=command,
+            timeout=inline_timeout or _terminal.DEFAULT_TIMEOUT_SECONDS,
+        )
+        result = executor.run(request, is_verification=is_verification or getattr(self, "_in_verification_pass", False))
+        cprint(executor.summary_line(result), color=(_GREEN if result.ok else _RED))
+        return result.render()
 
     def _run_exec_shapetrace(self, arg: str) -> str:
         """SHAPETRACE: [optional model var name] -- forward pass with a
@@ -7898,6 +7991,8 @@ class PulseCLI:
             notes.append(self._run_exec_repl(arg))
         for arg in requests.get("replay", []):
             notes.append(self._run_exec_replay(arg))
+        for arg in requests.get("terminal", []):
+            notes.append(self._run_terminal(arg))
         for arg in requests.get("gradcheck", []):
             notes.append(self._run_exec_gradcheck(arg))
         if "shapetrace" in requests:
@@ -8367,9 +8462,32 @@ class PulseCLI:
                 return fix, False, f"(verification request failed: {exc})"
             verdict = self._parse_json_obj(verify_answer)
             if verdict is None:
-                # Unparsable verdict -- don't block the user on a formatting
-                # slip; hand off the fix as-is with a note.
-                return fix, True, "(verification response was unparsable; proceeding anyway)"
+                # Not the JSON verdict -- most likely a TERMINAL:/GREP:/VIEW: directive
+                # checking something for real before answering. Service it and give the
+                # model another chance to actually answer, bounded so a confused reply
+                # can't stall verification forever.
+                for _tool_round in range(_MAX_VERIFY_TOOL_ROUNDS):
+                    note = self._service_tool_requests(verify_answer)
+                    if not note:
+                        break
+                    print(f"[tool results]\n{note}\n")
+                    self.agent_history.append({"role": "assistant", "content": verify_answer})
+                    self.agent_history.append({"role": "user", "content": note})
+                    try:
+                        with _Spinner("Checking the fix"):
+                            verify_answer = self._call_model(
+                                _PASS4_VERIFY_TMPL.format(diagnosis=diagnosis, fix_desc=fix_desc),
+                                max_tokens=_AGENT_MAX_TOKENS,
+                            )
+                    except AgentRequestFailed as exc:
+                        return fix, False, f"(verification request failed: {exc})"
+                    verdict = self._parse_json_obj(verify_answer)
+                    if verdict is not None:
+                        break
+                if verdict is None:
+                    # Still nothing usable after giving it a chance to check -- don't
+                    # block the user on a formatting slip; hand off as best effort.
+                    return fix, True, "(verification response was unparsable; proceeding anyway)"
             passes = bool(verdict.get("passes"))
             reason = str(verdict.get("reason", "")).strip()
             if passes:
@@ -8751,39 +8869,60 @@ class PulseCLI:
             kw in question.lower() for kw in _IMPLEMENT_KEYWORDS
         )
 
-        if wants_implementation and self.think:
-            return self._think_debug_turn(question, _depth)
-
         try:
-            # Pass 1: locate the region(s) of the error.
+            # Pass 1: locate the region(s) of the error. May itself investigate first via
+            # GREP:/VIEW:/TERMINAL:/etc. instead of guessing -- serviced and looped the same
+            # way PASS 3's fix loop already is, bounded so it can't stall forever.
             with _Spinner("Reading for region of error"):
                 regions = self._call_model(_PASS1_LOCATE, max_tokens=_AGENT_MAX_TOKENS)
+            for _round in range(_MAX_LOCATE_TOOL_ROUNDS):
+                note = self._service_tool_requests(regions)
+                if not note:
+                    break
+                print(f"[tool results]\n{note}\n")
+                self.agent_history.append({"role": "assistant", "content": regions})
+                self.agent_history.append({"role": "user", "content": note})
+                with _Spinner("Reading for region of error"):
+                    regions = self._call_model(_PASS1_LOCATE, max_tokens=_AGENT_MAX_TOKENS)
             print(f"\n[1] Region of error\n{regions}\n")
 
-            # Pass 2: focused second read + diagnosis/reasoning. May include
-            # CALC:/PROMOTE:/GPUTRACK:/GPUUNTRACK: directives, stripped out and
-            # executed deterministically rather than trusted from the model.
-            with _Spinner("Analyzing"):
-                raw_analysis = self._call_model(
-                    _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=_AGENT_MAX_TOKENS
+            # Pass 2: focused second read + diagnosis/reasoning. Investigative directives
+            # (GREP:/VIEW:/TERMINAL:/etc.) are looped the same way, so the diagnosis below is
+            # written after seeing what they turned up, not before. CALC:/PROMOTE:/GPUTRACK:/
+            # GPUUNTRACK: are instrumentation side-effects, not investigation -- applied
+            # deterministically same-turn either way, no need to loop on those alone.
+            raw_analysis = analysis = ""
+            new_requests: Dict[str, List[str]] = {}
+            for _round in range(_MAX_ANALYZE_TOOL_ROUNDS + 1):
+                with _Spinner("Analyzing"):
+                    raw_analysis = self._call_model(
+                        _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=_AGENT_MAX_TOKENS
+                    )
+                (
+                    analysis, calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
+                    sensitivity_args, normal_start_args, grep_patterns, view_requests,
+                ) = self._extract_directives(raw_analysis)
+                analysis, new_requests = self._extract_new_directives(analysis)
+                directive_note = self._apply_directives(
+                    calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
+                    sensitivity_args, normal_start_args, grep_patterns, view_requests,
                 )
-            (
-                analysis, calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
-                sensitivity_args, normal_start_args, grep_patterns, view_requests,
-            ) = self._extract_directives(raw_analysis)
-            analysis, new_requests = self._extract_new_directives(analysis)
-            print(f"[2] Diagnosis & reasoning\n{analysis}\n")
-            directive_note = self._apply_directives(
-                calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
-                sensitivity_args, normal_start_args, grep_patterns, view_requests,
-            )
-            if directive_note:
-                self.agent_history.append({"role": "user", "content": directive_note})
-            if new_requests:
-                new_note = self._apply_new_directives(new_requests)
+                new_note = self._apply_new_directives(new_requests) if new_requests else ""
                 if new_note:
                     print(f"[tool results]\n{new_note}\n")
-                    self.agent_history.append({"role": "user", "content": new_note})
+                combined_note = "\n\n".join(n for n in (directive_note, new_note) if n)
+                investigating = bool(grep_patterns or view_requests or new_requests)
+                if investigating and _round < _MAX_ANALYZE_TOOL_ROUNDS:
+                    # Still gathering evidence -- feed the results back and diagnose on a
+                    # later round, once there's actually something to diagnose from.
+                    self.agent_history.append({"role": "assistant", "content": raw_analysis})
+                    if combined_note:
+                        self.agent_history.append({"role": "user", "content": combined_note})
+                    continue
+                if combined_note:
+                    self.agent_history.append({"role": "user", "content": combined_note})
+                break
+            print(f"[2] Diagnosis & reasoning\n{analysis}\n")
 
             full_answer = f"{regions}\n\n{analysis}"
 
@@ -8873,27 +9012,6 @@ class PulseCLI:
                     if retry_landed:
                         note = "additional" if first_pass_landed else "retry after correcting a snippet mismatch --"
                         apply_result = apply_result + f"\n\n({note} change applied)\n" + retry_result
-
-            # The lint gate refused the whole fix (nothing was written). The exact error is in
-            # hand, so -- like a snippet mismatch above -- give the model a bounded chance to
-            # correct the edit instead of ending with a bug diagnosed and unfixed. The corrected
-            # edit is checked by the same gate; nothing lands unless it compiles.
-            lint_rounds = 0
-            while (not self._fix_applied_this_turn
-                   and getattr(self, "_last_apply_lint_failed", None)
-                   and not self._last_apply_skipped
-                   and lint_rounds < _MAX_LINT_REVISIONS):
-                lint_rounds += 1
-                revised_fix = self._request_lint_revision(fix, full_answer)
-                if revised_fix is None:
-                    break
-                cprint(f"[Pulse] Retrying with a corrected edit ({lint_rounds}/{_MAX_LINT_REVISIONS})...", color=_YELLOW)
-                retry_result = self._apply_code_fix(revised_fix)
-                if self._fix_applied_this_turn:
-                    fix = revised_fix
-                    apply_result = (apply_result + "\n\n(the automatic lint gate refused the first attempt; "
-                                    "this corrected edit was applied instead)\n" + retry_result)
-                    break
 
             result = f"{full_answer}\n\n{apply_result}"
 
@@ -9426,7 +9544,6 @@ class PulseCLI:
         by_path: Dict[str, List[tuple]] = {}
         unresolved = []
         self._last_apply_lint_failed = []
-        self._last_apply_lint_messages = []      # [(path, [messages], refused_content)]
         for old, new, label in zip(fix["old"], fix["new"], fix["files"]):
             path = self._resolve_fix_path(label)
             if not path:
@@ -9502,7 +9619,6 @@ class PulseCLI:
             lint_ok, lint_messages = self._lint_check(content, path)
             if not lint_ok:
                 self._last_apply_lint_failed.append(path)
-                self._last_apply_lint_messages.append((path, list(lint_messages), content))
                 cprint(f"     lint FAILED -- fix will not be written:\n     " + "\n     ".join(lint_messages), color=_RED)
                 lines.append(
                     f"⚠ Fix for '{path}' failed the automatic syntax/lint gate and was NOT written:\n"
@@ -9554,16 +9670,7 @@ class PulseCLI:
                     )
                 except Exception:
                     pass
-            if self._last_apply_lint_failed and not skipped:
-                # Every snippet matched; it was the RESULT the gate refused. Saying "didn't
-                # match" here sent people looking for a matching problem that did not exist.
-                lines.append("\n⚠ No changes were applied -- the change would leave a file that fails the "
-                             "automatic syntax/lint check, so nothing was written (details above).")
-            elif self._last_apply_lint_failed:
-                lines.append("\n⚠ No changes were applied -- some snippets didn't match, and the rest would "
-                             "have failed the automatic syntax/lint check:")
-            else:
-                lines.append("\n⚠ No changes were applied -- none of the proposed snippets matched cleanly:")
+            lines.append("\n⚠ No changes were applied -- none of the proposed snippets matched cleanly:")
             for old, where, reason in skipped:
                 lines.append(f"  - [{os.path.basename(str(where))}] {reason}: {old.splitlines()[0][:80]}...")
             self._last_apply_skipped = skipped
@@ -9649,76 +9756,6 @@ class PulseCLI:
         cprint("     lint passed", color=_YELLOW)
         self.extra_files[target] = content
         return target, content
-
-    def _think_debug_turn(self, question: str, _depth: int) -> str:
-        """Think mode for a fix request: plan, size the work, execute step by step (pulse_think).
-        Replaces the fixed LOCATE/ANALYZE/DEVELOP/VERIFY passes for this request; the rest of a
-        turn -- the empirical check, and the restart that actually runs the result -- is the same."""
-        from pulse import pulse_think
-        # The engine sends fresh code with every call (earlier steps change it), so the context
-        # message _ask_agent_impl just queued would only be sent a second time.
-        if self.agent_history and self.agent_history[-1].get("role") == "user":
-            self.agent_history.pop()
-        outcome = pulse_think.run_debug(self, question)
-        if outcome.request_failed is not None and not self._fix_applied_this_turn:
-            if _depth == 0:
-                self._last_call_failed_transiently = True
-            msg = f"⚠ AI agent request failed: {outcome.request_failed}"
-            print(f"\n{msg}\n")
-            self.agent_history.append({"role": "assistant", "content": msg})
-            return msg
-        self.agent_history.append({"role": "user", "content": f"Question: {question}"})
-        self.agent_history.append({"role": "assistant", "content": outcome.summary})
-        result = outcome.summary
-        if self._fix_applied_this_turn and outcome.last_fix is not None:
-            try:
-                _fix, empirical_ok, empirical_detail = self._verify_fix_empirically(outcome.last_fix, outcome.summary)
-            except Exception as exc:
-                empirical_ok, empirical_detail = None, f"probe step raised an unexpected error: {exc}"
-            if empirical_ok is True:
-                note = f"[4.5] Empirical check PASSED -- {empirical_detail}"
-            elif empirical_ok is False:
-                note = f"[4.5] Empirical check DID NOT PASS -- {empirical_detail} -- fix left applied as best effort."
-            else:
-                note = f"[4.5] Empirical check skipped -- {empirical_detail}"
-            print(f"\n{note}\n")
-            result = f"{result}\n\n{note}"
-        if _depth == 0 and self._fix_applied_this_turn and not self._suppress_auto_restart:
-            self._restart_process()  # does not return
-        return result
-
-    def _request_lint_revision(self, fix: Dict[str, Any], diagnosis: str) -> Optional[Dict[str, Any]]:
-        """Ask for a corrected fix after the lint gate refused one. Shows the model the gate's
-        exact message and the region of the file as its own edit would have left it (the
-        message's line number refers to that, not to the file on disk). Returns the corrected
-        fix, or None if nothing usable came back or the model just repeated itself."""
-        refusals = getattr(self, "_last_apply_lint_messages", None) or []
-        if not refusals:
-            return None
-        errors, excerpts = [], []
-        for path, messages, content in refusals:
-            name = os.path.basename(path)
-            errors.append(f"- {name}: " + "; ".join(messages))
-            lineno = next((int(m.group(1)) for msg in messages for m in [re.search(r"line (\d+)", msg)] if m), None)
-            lines = content.splitlines()
-            lo, hi = (max(0, lineno - 9), min(len(lines), lineno + 6)) if lineno else (0, min(len(lines), 40))
-            excerpts.append(f"[{name}]\n" + "\n".join(f"{i + 1:>4} | {lines[i]}" for i in range(lo, hi)))
-        try:
-            with _Spinner("Correcting the fix"):
-                answer = self._call_model(
-                    _PASS4_LINT_REVISE_TMPL.format(
-                        diagnosis=diagnosis, fix_desc=self._describe_fix(fix),
-                        errors="\n".join(errors), excerpt="\n\n".join(excerpts)),
-                    max_tokens=_AGENT_MAX_TOKENS,
-                )
-        except AgentRequestFailed:
-            return None
-        revised = self._parse_code_fix(answer)
-        if revised is None:
-            return None
-        if json.dumps([revised["old"], revised["new"]], sort_keys=True) == json.dumps([fix["old"], fix["new"]], sort_keys=True):
-            return None      # the same edit again would be refused again
-        return revised
 
     def _request_corrected_snippets(self, fix: Dict[str, Any], skipped: List[tuple]) -> Optional[Dict[str, Any]]:
         """One bounded retry for snippets that failed to match (verbatim
@@ -9818,23 +9855,6 @@ class PulseCLI:
         else:
             state = "ON" if self.auto_intervene else "OFF"
             print(f"Auto-intervention is currently {state}. Usage: /autofix on|off")
-
-    def _cmd_think(self, arg: str) -> None:
-        """Toggle think mode (off by default): the agent outlines a plan, sizes the work -- how
-        many steps, tool calls before each, verifications after each -- and executes it until
-        the error is fixed or the feature is done."""
-        arg = arg.strip().lower()
-        if arg in ("on", "true", "1", "enable", "enabled"):
-            self.think = True
-            os.environ["PULSE_THINK"] = "1"      # a restarted process keeps working the same way
-            cprint("✓ Think mode is ON -- the agent will outline a plan, size the work, and keep going "
-                   "step by step until it is fixed / done. This can take many model calls.")
-        elif arg in ("off", "false", "0", "disable", "disabled"):
-            self.think = False
-            os.environ.pop("PULSE_THINK", None)
-            cprint("✓ Think mode is OFF -- one focused pass per request.")
-        else:
-            print(f"Think mode is currently {'ON' if self.think else 'OFF'}. Usage: /think on|off")
 
     # Named presets for /sensitivity -- just friendly aliases for a
     # self.sensitivity value, since "0.3" means nothing to most users but
@@ -12076,10 +12096,6 @@ class PulseCLI:
                 self._cmd_autofix(
                     cmd[8:].strip()
                 )
-                continue
-
-            if cmd_lower.startswith("/think"):
-                self._cmd_think(cmd[6:].strip())
                 continue
 
             if cmd_lower.startswith("/sensitivity"):
