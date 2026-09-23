@@ -1289,17 +1289,25 @@ class _BackgroundModelCall:
 _PASS1_LOCATE = (
     "PASS 1 -- LOCATE: Read through everything you were given (stats, code, history) and identify "
     "the specific region(s) where the problem likely originates -- file/line numbers, variable "
-    "names, or code sections. Aim for the smallest region that could plausibly contain the root "
-    "cause (often a single line or a few adjacent lines), not a whole function or file, unless the "
-    "evidence genuinely doesn't narrow further than that. Respond with ONLY a short bullet list of "
-    "the suspect location(s). No diagnosis, no fix yet."
+    "names, or code sections. If that isn't enough to narrow it down, investigate before guessing: "
+    "GREP:/VIEW: to see more code, or TERMINAL: to check real state directly (git log/diff on a "
+    "suspect file, grep for other call sites, a quick check of a config value) -- put the directive "
+    "on its own line and stop; you'll get the result back and can keep looking before answering. "
+    "Aim for the smallest region that could plausibly contain the root cause (often a single line or "
+    "a few adjacent lines), not a whole function or file, unless the evidence genuinely doesn't "
+    "narrow further than that. Once you're not just guessing, respond with ONLY a short bullet list "
+    "of the suspect location(s). No diagnosis, no fix yet."
 )
 _PASS2_ANALYZE_TMPL = (
     "Suspect region(s) from your first read:\n{regions}\n\n"
-    "PASS 2 -- ANALYZE: Take a focused second look at just those regions. Give the Diagnosis (one "
-    "sentence, the specific root cause) and the Reasoning behind it (grounded in the actual "
-    "numbers/code you were given, with real math, referencing line numbers). Do not implement the "
-    "fix yet."
+    "PASS 2 -- ANALYZE: Take a focused second look at just those regions. If the numbers/code you "
+    "have don't settle the root cause, check before diagnosing -- TERMINAL: to inspect real state "
+    "(recent git diff on the suspect lines, a grep for every other place a suspect variable is set, "
+    "a quick python -c check on a value you're unsure of), or GREP:/VIEW: for more code -- rather "
+    "than reasoning from a guess. Put directives on their own lines and stop; you'll get the results "
+    "and can diagnose once you've actually checked. Once you have, give the Diagnosis (one sentence, "
+    "the specific root cause) and the Reasoning behind it (grounded in the actual numbers/code/tool "
+    "results you have, with real math, referencing line numbers). Do not implement the fix yet."
 )
 _PASS3_FIX_TEXT_TMPL = (
     "Your analysis so far:\n{diagnosis}\n\n"
@@ -1313,7 +1321,9 @@ _PASS3_IMPLEMENT_TMPL = (
     "Fix the bug and only the bug: no optimisation, no refactoring, no renaming, no added "
     "callbacks or seeds, no style or formatting changes, no 'while I am here' improvements -- "
     "even where you can see something you would write differently. Every line you touch beyond "
-    "the bug is a line that can break a run that is otherwise working. "
+    "the bug is a line that can break a run that is otherwise working. If you notice a second, "
+    "unrelated problem while you're in here, do not fix it in this change -- mention it in the "
+    "explanation field as something worth a separate look. "
     "Implement the fix for the root cause diagnosed above. The user wants this fix applied to their code. Default to the "
     "smallest possible change -- a single line or a few adjacent lines -- and only widen the edit if "
     "the root cause genuinely can't be fixed that narrowly. Do not refactor, restructure, or rewrite "
@@ -1325,10 +1335,14 @@ _PASS4_VERIFY_TMPL = (
     "The fix you are about to apply:\n{fix_desc}\n\n"
     "PASS 4 -- VERIFY: Carefully check the math/logic of this fix against the numbers and code you "
     'were given. Also check its SCOPE: does it change only what\'s needed to fix the diagnosed root '
-    "cause, or does it also rewrite/restructure/reformat code that didn't need to change? Respond "
-    'with ONLY a JSON object of the form {{"passes": true or false, "reason": "one sentence"}}. '
-    "passes=true only if the fix is logically/numerically correct, actually addresses the diagnosed "
-    "root cause, AND is no larger than necessary to do so."
+    "cause, or does it also rewrite/restructure/reformat code that didn't need to change -- every "
+    "line in the diff should trace directly to the diagnosed root cause, with nothing swept in "
+    "alongside it. If you can quickly confirm any of this for real instead of just reasoning about "
+    "it -- TERMINAL: python -m py_compile on the changed file, GREP: for other call sites that would "
+    "need the same change -- do that first; you'll get the result back before you have to answer. "
+    'Once you have, respond with ONLY a JSON object of the form {{"passes": true or false, "reason": '
+    '"one sentence"}}. passes=true only if the fix is logically/numerically correct, actually '
+    "addresses the diagnosed root cause, AND is no larger than necessary to do so."
 )
 _PASS4_REVISE_TMPL = (
     "Your analysis:\n{diagnosis}\n\n"
@@ -1362,6 +1376,13 @@ _MAX_VERIFY_ATTEMPTS = 3
 
 # How many times the fix pass may ask to see more code before giving up.
 _MAX_FIX_TOOL_ROUNDS = 3
+# Same idea, one turn earlier: how many times PASS 1/2 may investigate (GREP/VIEW/TERMINAL/etc.)
+# before they have to commit to a suspect region / diagnosis instead of looking forever.
+_MAX_LOCATE_TOOL_ROUNDS = 3
+_MAX_ANALYZE_TOOL_ROUNDS = 3
+# How many times PASS 4 may check a directive (e.g. TERMINAL: py_compile) before it has to
+# actually answer the passes/fails verdict.
+_MAX_VERIFY_TOOL_ROUNDS = 3
 _PASS3_NO_TOOLS_NOTE = (
     "You did not return the code-fix JSON. Everything you were given is above. If you need to "
     "see more code, ask for it with a directive line -- e.g. 'VIEW: <file>:<start>-<end>' or "
@@ -8441,9 +8462,32 @@ class PulseCLI:
                 return fix, False, f"(verification request failed: {exc})"
             verdict = self._parse_json_obj(verify_answer)
             if verdict is None:
-                # Unparsable verdict -- don't block the user on a formatting
-                # slip; hand off the fix as-is with a note.
-                return fix, True, "(verification response was unparsable; proceeding anyway)"
+                # Not the JSON verdict -- most likely a TERMINAL:/GREP:/VIEW: directive
+                # checking something for real before answering. Service it and give the
+                # model another chance to actually answer, bounded so a confused reply
+                # can't stall verification forever.
+                for _tool_round in range(_MAX_VERIFY_TOOL_ROUNDS):
+                    note = self._service_tool_requests(verify_answer)
+                    if not note:
+                        break
+                    print(f"[tool results]\n{note}\n")
+                    self.agent_history.append({"role": "assistant", "content": verify_answer})
+                    self.agent_history.append({"role": "user", "content": note})
+                    try:
+                        with _Spinner("Checking the fix"):
+                            verify_answer = self._call_model(
+                                _PASS4_VERIFY_TMPL.format(diagnosis=diagnosis, fix_desc=fix_desc),
+                                max_tokens=_AGENT_MAX_TOKENS,
+                            )
+                    except AgentRequestFailed as exc:
+                        return fix, False, f"(verification request failed: {exc})"
+                    verdict = self._parse_json_obj(verify_answer)
+                    if verdict is not None:
+                        break
+                if verdict is None:
+                    # Still nothing usable after giving it a chance to check -- don't
+                    # block the user on a formatting slip; hand off as best effort.
+                    return fix, True, "(verification response was unparsable; proceeding anyway)"
             passes = bool(verdict.get("passes"))
             reason = str(verdict.get("reason", "")).strip()
             if passes:
@@ -8826,35 +8870,59 @@ class PulseCLI:
         )
 
         try:
-            # Pass 1: locate the region(s) of the error.
+            # Pass 1: locate the region(s) of the error. May itself investigate first via
+            # GREP:/VIEW:/TERMINAL:/etc. instead of guessing -- serviced and looped the same
+            # way PASS 3's fix loop already is, bounded so it can't stall forever.
             with _Spinner("Reading for region of error"):
                 regions = self._call_model(_PASS1_LOCATE, max_tokens=_AGENT_MAX_TOKENS)
+            for _round in range(_MAX_LOCATE_TOOL_ROUNDS):
+                note = self._service_tool_requests(regions)
+                if not note:
+                    break
+                print(f"[tool results]\n{note}\n")
+                self.agent_history.append({"role": "assistant", "content": regions})
+                self.agent_history.append({"role": "user", "content": note})
+                with _Spinner("Reading for region of error"):
+                    regions = self._call_model(_PASS1_LOCATE, max_tokens=_AGENT_MAX_TOKENS)
             print(f"\n[1] Region of error\n{regions}\n")
 
-            # Pass 2: focused second read + diagnosis/reasoning. May include
-            # CALC:/PROMOTE:/GPUTRACK:/GPUUNTRACK: directives, stripped out and
-            # executed deterministically rather than trusted from the model.
-            with _Spinner("Analyzing"):
-                raw_analysis = self._call_model(
-                    _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=_AGENT_MAX_TOKENS
+            # Pass 2: focused second read + diagnosis/reasoning. Investigative directives
+            # (GREP:/VIEW:/TERMINAL:/etc.) are looped the same way, so the diagnosis below is
+            # written after seeing what they turned up, not before. CALC:/PROMOTE:/GPUTRACK:/
+            # GPUUNTRACK: are instrumentation side-effects, not investigation -- applied
+            # deterministically same-turn either way, no need to loop on those alone.
+            raw_analysis = analysis = ""
+            new_requests: Dict[str, List[str]] = {}
+            for _round in range(_MAX_ANALYZE_TOOL_ROUNDS + 1):
+                with _Spinner("Analyzing"):
+                    raw_analysis = self._call_model(
+                        _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=_AGENT_MAX_TOKENS
+                    )
+                (
+                    analysis, calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
+                    sensitivity_args, normal_start_args, grep_patterns, view_requests,
+                ) = self._extract_directives(raw_analysis)
+                analysis, new_requests = self._extract_new_directives(analysis)
+                directive_note = self._apply_directives(
+                    calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
+                    sensitivity_args, normal_start_args, grep_patterns, view_requests,
                 )
-            (
-                analysis, calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
-                sensitivity_args, normal_start_args, grep_patterns, view_requests,
-            ) = self._extract_directives(raw_analysis)
-            analysis, new_requests = self._extract_new_directives(analysis)
-            print(f"[2] Diagnosis & reasoning\n{analysis}\n")
-            directive_note = self._apply_directives(
-                calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
-                sensitivity_args, normal_start_args, grep_patterns, view_requests,
-            )
-            if directive_note:
-                self.agent_history.append({"role": "user", "content": directive_note})
-            if new_requests:
-                new_note = self._apply_new_directives(new_requests)
+                new_note = self._apply_new_directives(new_requests) if new_requests else ""
                 if new_note:
                     print(f"[tool results]\n{new_note}\n")
-                    self.agent_history.append({"role": "user", "content": new_note})
+                combined_note = "\n\n".join(n for n in (directive_note, new_note) if n)
+                investigating = bool(grep_patterns or view_requests or new_requests)
+                if investigating and _round < _MAX_ANALYZE_TOOL_ROUNDS:
+                    # Still gathering evidence -- feed the results back and diagnose on a
+                    # later round, once there's actually something to diagnose from.
+                    self.agent_history.append({"role": "assistant", "content": raw_analysis})
+                    if combined_note:
+                        self.agent_history.append({"role": "user", "content": combined_note})
+                    continue
+                if combined_note:
+                    self.agent_history.append({"role": "user", "content": combined_note})
+                break
+            print(f"[2] Diagnosis & reasoning\n{analysis}\n")
 
             full_answer = f"{regions}\n\n{analysis}"
 
