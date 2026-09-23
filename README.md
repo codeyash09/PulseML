@@ -127,6 +127,12 @@ Pulse gives the debugging agent access to that evidence instead of requiring it 
 
 ## Benchmark
 
+Two different questions get measured separately: whether the agent can *repair* a fault,
+and whether the detectors *notice* one. This section is the first. For the second —
+94 failure families as difficulty ladders, what holds and what does not, and the five
+faults that are still invisible — see
+[docs/detection-benchmark.md](docs/detection-benchmark.md).
+
 Pulse was evaluated against Claude Code on a **28-case ML debugging benchmark** designed to test whether an AI coding agent could identify and repair injected ML faults.
 
 ### Results
@@ -555,6 +561,11 @@ You can then control tracking while the run is active:
 | JAX | Yes |
 
 Pulse uses a shared backend abstraction so the debugging workflow can remain consistent across frameworks.
+
+**Keras is the one case that needs a line of setup when streaming.** Its metrics live in
+the callback `logs` dict rather than in local variables, so the stream monitor cannot see
+them by sampling: see [docs/streaming-keras.md](docs/streaming-keras.md). In-process
+modes (`cli`, `ui`) patch `Model.fit` and need nothing.
 
 ---
 
