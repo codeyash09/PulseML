@@ -119,7 +119,9 @@ CODE_SYSTEM_PROMPT = (
     "been shown -- signatures, imports, names, file layout.\n"
     "- Make the smallest change that fully does what was asked. Match the surrounding style, "
     "naming and structure. Do not reformat, rename, restructure or 'improve' code the request "
-    "does not need touched. Do not add a dependency the project does not already use unless asked.\n"
+    "does not need touched. Do not add a dependency the project does not already use unless asked. "
+    "If you notice a second, unrelated bug while you're in a file, do not fix it -- mention it in "
+    "your explanation as worth a separate look, and leave that code untouched.\n"
     "- If the request is a question, or needs no change, just answer it.\n"
     "- You have a real terminal (TERMINAL:, below). Never say you ran or tested something unless you "
     "actually did and are reporting the real exit code/output you got back -- not what you expect it "
@@ -150,11 +152,18 @@ _PLAN = (
     "tools (one directive per line) and stop; you will get the results. Otherwise: if the request "
     "is a question or needs no code change, answer it fully and end with a line containing only "
     "NO_CHANGES. If it does need changes, give a short plan -- which files and regions change, "
-    "what is added, and anything risky or ambiguous. Do not write the code yet."
+    "what is added, and anything risky or ambiguous. Scope the plan to exactly what was asked; note "
+    "anything else you noticed as a separate observation, not as part of this plan. Do not write "
+    "the code yet."
 )
 
 _IMPLEMENT = (
     "STEP 2 -- IMPLEMENT the plan.\n"
+    "Fix the request and only the request: no unrelated formatting, no renaming, no reordering "
+    "imports, no 'while I am here' cleanups, no speculative refactors -- even where you can see "
+    "something you would write differently. If you notice a second, unrelated problem, do not fix "
+    "it in this change; mention it in the explanation field as worth a separate look. Every line "
+    "you touch beyond what the request needs is a line that can break something that already works.\n"
     "Respond with ONLY one JSON object -- no prose, no markdown fences:\n"
     '{{"old": [...], "new": [...], "files": [...], "create": [...], "explanation": "one sentence"}}\n'
     "- old[i] is an exact, verbatim snippet from the file's shown text (WITHOUT the line-number "
@@ -178,8 +187,10 @@ _NO_TOOLS_NOTE = (
 _VERIFY = (
     "STEP 3 -- VERIFY. The request was:\n{request}\n\nThe change you are about to make:\n{changes}\n\n"
     "Check it against the code you were shown: does it fully do what was asked? Any syntax errors, "
-    "undefined names, missing imports, wrong signatures, or missing wiring between files? Is it "
-    "larger than the request needs? Respond with ONLY "
+    "undefined names, missing imports, wrong signatures, or missing wiring between files? Check "
+    "SCOPE too: does every changed line trace directly to the request, or does the diff also carry "
+    "formatting changes, renames, reordered imports, or a fix to something unrelated that crept in "
+    "alongside it? Respond with ONLY "
     '{{"passes": true or false, "reason": "one sentence"}}.'
 )
 
