@@ -46,9 +46,8 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------------------
-# Limits -- same spirit as the hard caps already used for GREP/VIEW output and the
-# empirical-verify probe subprocess (see pulse_cli.py's _GREP_MAX_MATCHES / _VIEW_MAX_LINES
-# and _PROBE_HARD_TIMEOUT_SECONDS): keep the model's context bounded without throwing away
+# Limits -- same spirit as the hard caps already used for GREP/VIEW output (see
+# pulse_cli.py's _GREP_MAX_MATCHES / _VIEW_MAX_LINES): keep the model's context bounded without throwing away
 # the diagnostics that make the tool useful in the first place.
 # ---------------------------------------------------------------------------------------
 DEFAULT_TIMEOUT_SECONDS = 120.0

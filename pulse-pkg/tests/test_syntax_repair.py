@@ -216,51 +216,6 @@ class RepairGivesUpHonestly(unittest.TestCase):
             self.assertEqual(cli.run_script(os.path.join(work, "nope.py"), []), 1)
 
 
-class RepairCLIDropsWhatNeedsARun(unittest.TestCase):
-    """Two of PulseCLI's safeguards are wrong for a file that has never run."""
-
-    def _repair_cli(self):
-        class Base:
-            def __init__(self):
-                self.stashed = False
-
-            def _verify_fix_empirically(self, fix, diagnosis):
-                raise AssertionError("ran the training loop to check a file that never ran")
-
-            def _git_autostash(self):
-                raise AssertionError("stashed the very file being repaired")
-
-        module = mock.MagicMock()
-        module.PulseCLI = Base
-        with mock.patch.dict(sys.modules, {"pulse.pulse_cli": module}):
-            return cli._make_syntax_repair_cli()
-
-    def test_the_empirical_check_is_skipped(self):
-        # It runs a probe of the training loop and reverts the fix if the loss does not
-        # fall. There is no loss yet, and the syntax error is already known to be gone.
-        repair_cli = self._repair_cli()
-        fix, reverted, note = repair_cli._verify_fix_empirically("the fix", "the diagnosis")
-        self.assertEqual(fix, "the fix")
-        self.assertIsNone(reverted)
-        self.assertIn("compiles", note)
-
-    def test_the_git_autostash_is_skipped(self):
-        # It stashes the working tree before writing a fix -- including the file being
-        # repaired, which is uncommitted precisely because someone is editing it.
-        self.assertIsNone(self._repair_cli()._git_autostash())
-
-    def test_both_overrides_still_override_something(self):
-        """The tests above fake the base class, so they cannot see this going stale.
-
-        If PulseCLI renames either method, the subclass quietly stops overriding it and
-        the repair starts running the checks again -- passing tests the whole way.
-        """
-        from pulse.pulse_cli import PulseCLI
-        for name in ("_verify_fix_empirically", "_git_autostash"):
-            self.assertTrue(hasattr(PulseCLI, name),
-                            f"the repair overrides PulseCLI.{name}, which no longer exists")
-
-
 class EntryPoint(unittest.TestCase):
     def test_python_m_pulse_is_the_same_entry_point(self):
         from pulse import __main__ as module

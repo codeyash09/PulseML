@@ -228,14 +228,6 @@ class _CodeAgentCLI(PulseCLI):
     debugger's -- minus the behaviours that only make sense for a training run."""
 
     # -- what a training run does that a coding session must not ------------------------
-    def _git_autostash(self):
-        # Stashing the working tree before an edit would stash the very files being worked on
-        # (a coding session's tree is dirty by definition) and hide the user's own changes.
-        return None
-
-    def _verify_fix_empirically(self, fix, diagnosis):
-        return fix, None, "no training run to measure"
-
     def _restart_process(self):
         return None
 

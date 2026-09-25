@@ -60,6 +60,10 @@ options for `pulse run` (before the script; everything after it is the script's)
   --again                        start it even though a copy is already running
   --cwd DIR                      run the script in DIR (default: the directory you ran
                                  `pulse` from, as with `python path/to/script.py`)
+  --agent-log[=PATH]             record what Pulse's AI was shown, what it answered and what
+                                 Pulse did (fixes, restarts...) to PATH (default:
+                                 pulse_agent.log). Off unless given: it holds every prompt in
+                                 full, code included. Same as PULSE_AGENT_LOG=1 or =PATH.
 
 options for `pulse code`:
   -p, --prompt TEXT              one request, then exit (no interactive session)
@@ -296,29 +300,12 @@ def _restart_argv(python_exe, script_path, script_args):
 # ---------------------------------------------------------------------------------------
 
 def _make_syntax_repair_cli():
-    """PulseCLI, minus two behaviours that are wrong for a script that does not parse.
-
-    Everything else is inherited untouched, including setup, the agent pipeline, fix
-    logging (/log, /revert) and `_restart_process`.
-
-    * The empirical check runs a probe of the training loop and reverts the fix if the
-      loss does not fall. A file that has not run yet has no loss to measure, and the
-      syntax error is already known to be gone: the automatic lint gate compiles the file
-      before it is written.
-    * The git autostash stashes the working tree before a fix is written -- including,
-      here, the very file being repaired, which is uncommitted precisely because the
-      person is editing it.
-    """
+    """The PulseCLI that repairs a script that does not parse: setup, the agent pipeline,
+    fix logging (/log, /revert) and `_restart_process`, all as for a training run. (It used
+    to switch off the post-fix loss probe, which no longer exists.)"""
     from .pulse_cli import PulseCLI
 
-    class _SyntaxRepairCLI(PulseCLI):
-        def _verify_fix_empirically(self, fix, diagnosis):
-            return fix, None, "syntax fix: the file compiles, and there is no loss to measure yet"
-
-        def _git_autostash(self):
-            return None
-
-    return _SyntaxRepairCLI()
+    return PulseCLI()
 
 
 def _repair_and_restart(script_path, source, exc):
@@ -383,6 +370,15 @@ def _parse_run_args(args):
             stream = True
         elif arg == "--again":
             again = True
+        elif arg == "--agent-log":
+            # Applied to the environment, where Pulse reads it -- which also carries it
+            # into a fix-triggered restart.
+            os.environ["PULSE_AGENT_LOG"] = os.path.abspath("pulse_agent.log")
+        elif arg.startswith("--agent-log="):
+            target = arg.split("=", 1)[1]
+            if not target:
+                raise _UsageError("--agent-log= needs a path (or use --agent-log alone)")
+            os.environ["PULSE_AGENT_LOG"] = os.path.abspath(os.path.expanduser(target))
         elif arg == "--cwd":
             if i + 1 >= len(args):
                 raise _UsageError("--cwd needs a directory")
@@ -621,7 +617,7 @@ def main(argv=None):
         return 0
 
     console_commands = ("watch", "attach", "console", "sessions", "install-sudo")
-    launch_options = ("--stream", "--cwd", "--again")
+    launch_options = ("--stream", "--cwd", "--again", "--agent-log")
 
     # `run` starts a run. Without it, a script name means "the run of this script that is
     # already going" -- so `pulse train.py` watches, and only `pulse run train.py` starts

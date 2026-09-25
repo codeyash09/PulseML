@@ -31,7 +31,7 @@ import tempfile
 import atexit
 import numpy as np
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from pulse.pulse_backend import (
     available_backends,
@@ -136,6 +136,14 @@ def _build_keras_tracker_class(callback_base):
                     except Exception:
                         pass
                 return
+
+            # What a fix-time checkpoint needs: the model being trained and where it is.
+            try:
+                self.pulse._keras_model = self.model
+                self.pulse._keras_epoch = epoch
+                self.pulse._keras_epochs = (self.params or {}).get("epochs")
+            except Exception:
+                pass
 
             # The epoch boundary is the correct point to run diagnosis.
             # We do NOT run the expensive detector on every batch.
@@ -290,6 +298,7 @@ def _install_keras_fit_hook():
     original_fit = model_cls.fit
 
     def pulse_fit(self, *args, **kwargs):
+        _resume_from_fix_checkpoint(self, args, kwargs)
         callbacks = kwargs.get("callbacks")
 
         if callbacks is None:
@@ -315,6 +324,59 @@ def _install_keras_fit_hook():
     _pulse_log("KERAS FIT HOOK installed")
 
 
+# Checkpoint-and-resume around a fix. When Pulse starts fixing a running Keras job it saves
+# the model's weights (PulseCLI._save_fix_checkpoint); after the fix is written, the
+# restarted script continues from that point instead of retraining from scratch:
+# _resume_from_fix_checkpoint loads the weights into the first model.fit() and starts it
+# at the next epoch. A fresh start is used instead when the fix asked for one ("resume":
+# false -- e.g. an initializer, architecture, data or label fix, where the saved weights
+# carry the bug), when the saved weights were not finite, or when they do not fit the fixed
+# model. Keras only; other frameworks restart from the beginning as before.
+_RESUME_ENV = "PULSE_RESUME_CHECKPOINT"
+
+
+def _fit_epochs(args, kwargs) -> Optional[int]:
+    """The `epochs` a model.fit() call was given, positionally or by keyword."""
+    if "epochs" in kwargs:
+        return kwargs["epochs"]
+    # fit(x, y, batch_size, epochs, ...)
+    return args[3] if len(args) > 3 else 1
+
+
+def _resume_from_fix_checkpoint(model, args, kwargs) -> None:
+    meta_path = os.environ.pop(_RESUME_ENV, "")      # once: the first fit() of the restarted run
+    if not meta_path:
+        return
+    try:
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        if not getattr(model, "built", False):
+            _agent_log_event("RESUME SKIPPED -- the model is not built before fit(), starting fresh")
+            return
+        before = [w.copy() for w in model.get_weights()]
+        model.load_weights(meta["weights"], skip_mismatch=True)
+        after = model.get_weights()
+        loaded = sum(1 for a, b in zip(before, after) if a.shape == b.shape and not np.array_equal(a, b))
+        if not all(np.all(np.isfinite(w)) for w in after):
+            model.set_weights(before)
+            _agent_log_event("RESUME ABANDONED -- loaded weights were not finite, starting fresh")
+            return
+        epochs = _fit_epochs(args, kwargs)
+        start = int(meta.get("epoch", -1)) + 1
+        if isinstance(epochs, int) and epochs > 0:
+            start = max(0, min(start, epochs - 1))     # always train at least one epoch
+        kwargs["initial_epoch"] = max(int(kwargs.get("initial_epoch", 0) or 0), start)
+        msg = (f"[Pulse] Resuming from the checkpoint taken when the fix started: "
+               f"{loaded}/{len(after)} weight tensors restored, continuing at epoch {kwargs['initial_epoch'] + 1}.")
+        cprint(msg, color=_YELLOW)
+        _agent_log_event("RESUMED FROM CHECKPOINT",
+                         f"{loaded}/{len(after)} weight tensors restored; continuing at epoch "
+                         f"{kwargs['initial_epoch'] + 1} of {epochs}")
+    except Exception as exc:
+        cprint(f"[Pulse] Could not resume from the fix checkpoint ({type(exc).__name__}: {exc}) -- training from the start.", color=_YELLOW)
+        _agent_log_event("RESUME FAILED -- starting fresh", f"{type(exc).__name__}: {exc}")
+
+
 def _install_keras_pulse_hook(pulse_instance):
     """Arrange for Pulse to see Keras training, whenever Keras shows up.
 
@@ -336,6 +398,101 @@ def _install_keras_pulse_hook(pulse_instance):
     watcher = _KerasImportWatcher()
     sys.meta_path.insert(0, watcher)
     _PULSE_KERAS_IMPORT_WATCHER = watcher
+# Agent log: what Pulse's AI was shown, what it answered, and what Pulse did about it --
+# every model call (system prompt, conversation, reply, timing, failures) plus the actions
+# that follow (check-in verdicts, escalations, applied fixes, restarts). Plain
+# text, readable as-is. pulse.log above is the internal trace; this one is for people
+# asking "why did Pulse do that?".
+#
+# OFF unless asked for: it records every prompt in full, code included, so a long run
+# writes megabytes. Turn it on with `pulse run --agent-log[=PATH] script.py`, or
+# PULSE_AGENT_LOG=1 (-> ./pulse_agent.log) / PULSE_AGENT_LOG=<path>. Read at write time,
+# not import time, so the flag works however Pulse was imported, and a fix-triggered
+# restart (which inherits the environment) keeps logging to the same file.
+_AGENT_LOG_ENV = "PULSE_AGENT_LOG"
+_agent_log_lock = threading.Lock()
+_agent_log_seen: Dict[str, int] = {}     # message hash -> the number it was logged under
+_agent_log_call_no = 0
+_agent_log_resolved: Dict[str, str] = {}  # setting -> absolute path, fixed at first write
+
+
+def _agent_log_path() -> Optional[str]:
+    setting = os.environ.get(_AGENT_LOG_ENV, "").strip()
+    if setting.lower() in ("", "0", "off", "false", "no"):
+        return None
+    if setting not in _agent_log_resolved:
+        target = "pulse_agent.log" if setting.lower() in ("1", "on", "true", "yes") else setting
+        _agent_log_resolved[setting] = os.path.abspath(os.path.expanduser(target))
+        # Pin it for anything this process starts (a restart may run from elsewhere).
+        os.environ[_AGENT_LOG_ENV] = _agent_log_resolved[setting]
+        _agent_log_resolved[_agent_log_resolved[setting]] = _agent_log_resolved[setting]
+    return _agent_log_resolved[setting]
+
+
+def _agent_log_write(text: str) -> None:
+    path = _agent_log_path()
+    if not path:
+        return
+    try:
+        with _agent_log_lock, open(path, "a", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        pass
+
+
+def _agent_log_event(title: str, body: str = "") -> None:
+    """One thing Pulse did: a verdict, an escalation, a fix, a restart."""
+    stamp = time.strftime("%H:%M:%S")
+    text = f"\n>>> [{stamp}] {title}\n"
+    if body:
+        text += "".join(f"    {line}\n" for line in str(body).splitlines())
+    _agent_log_write(text)
+
+
+def _agent_log_call(purpose: str, messages: List[Dict[str, str]], model: str) -> int:
+    """Log what a model call is being shown. Each distinct message is written out in full
+    the first time and referred to by number after that -- the investigation passes resend
+    the same conversation on every call, and the log should show that without repeating it."""
+    global _agent_log_call_no
+    if not _agent_log_path():
+        return 0
+    with _agent_log_lock:
+        _agent_log_call_no += 1
+        call_no = _agent_log_call_no
+    parts = [f"\n{'=' * 78}\nCALL #{call_no} [{time.strftime('%H:%M:%S')}] {purpose}  ({model})\n"
+             f"{'=' * 78}\nThe model sees {len(messages)} message(s):\n"]
+    for msg in messages:
+        content = str(msg.get("content", ""))
+        key = hashlib.sha1((msg.get("role", "") + "\0" + content).encode("utf-8", "replace")).hexdigest()
+        with _agent_log_lock:
+            seen = _agent_log_seen.get(key)
+            if seen is None:
+                _agent_log_seen[key] = seen = len(_agent_log_seen) + 1
+                first = True
+            else:
+                first = False
+        if first:
+            parts.append(f"--- {msg.get('role', '?')} [message M{seen}, {len(content):,} chars] ---\n{content}\n")
+        else:
+            parts.append(f"--- {msg.get('role', '?')} [message M{seen}, same as before, {len(content):,} chars] ---\n")
+    _agent_log_write("".join(parts))
+    return call_no
+
+
+def _agent_log_reply(call_no: int, reply: Optional[str], seconds: float, usage=None,
+                     error: Optional[str] = None) -> None:
+    if not _agent_log_path():
+        return
+    tokens = ""
+    if usage is not None:
+        tokens = (f", {getattr(usage, 'prompt_tokens', '?')} tokens in / "
+                  f"{getattr(usage, 'completion_tokens', '?')} out")
+    if error is not None:
+        _agent_log_write(f"--- CALL #{call_no} FAILED after {seconds:.1f}s: {error}\n")
+    else:
+        _agent_log_write(f"--- CALL #{call_no} reply ({seconds:.1f}s{tokens}) ---\n{reply}\n")
+
+
 def _pulse_log(message: str, *, console: bool = False) -> None:
     if not _PULSE_LOGGING:
         return
@@ -1010,12 +1167,10 @@ SYSTEM_PROMPT = (
     "    RUNCOMPARE: -- this run's current scalar values vs the most recent previous run recorded for "
     "this project, so a regression against last time is visible without anyone remembering the numbers.\n"
     "    COST: -- running token/cost usage for this chat session's agent calls so far.\n\n"
-    "PERIODIC GPU CHECK-IN:\n"
-    "Every 15 minutes after Pulse starts, if you have an AI provider configured, Pulse will send "
-    "you an automated check-in message asking whether you still want any variables GPU-tracked. "
-    "When you get that message, reply with ONLY these two lines and nothing else:\n"
-    "  GPUTRACK: <comma-separated names to track, or 'none'>\n"
-    "  GPUUNTRACK: <comma-separated names to stop tracking, or 'none'>\n\n"
+    "PERIODIC CHECK-INS:\n"
+    "While training runs, a separate check-in agent reviews it for bugs and instability. When a "
+    "message here starts '[periodic check-in]', that is its finding, with its evidence: verify it "
+    "against the code and numbers yourself rather than taking it on trust.\n\n"
 
     "CODE FIXES:\n"
     "If, and only if, the user explicitly asks you to fix, edit, patch, or change the code "
@@ -1039,6 +1194,12 @@ SYSTEM_PROMPT = (
     "(e.g. \"model.py\") that old[i]/new[i] belongs to, if more than one file was sent this turn. "
     "Omit this field entirely (or use null/\"\" for an entry) to default to the main script.\n"
     "  explanation: a short, concise text description of what changed and why.\n"
+    "  resume: OPTIONAL, true or false. Training resumes from the weights it had when this fix "
+    "started (true, the default) unless you set false. Set false when those weights carry the "
+    "bug and must be retrained from scratch: the fix changes initialization, the architecture, "
+    "the data, the labels or the preprocessing, or the weights are already damaged (NaN, "
+    "exploded, collapsed to a constant output). Keep true for a learning rate, loss, optimizer, "
+    "regularization or logging fix.\n"
     "Rules for old/new:\n"
     "  - Each snippet in old must appear VERBATIM and exactly ONCE in its target file. Include "
     "enough surrounding lines (not just the single changed line) so the match is unambiguous -- but "
@@ -1242,6 +1403,10 @@ def _async_model_calls_enabled() -> bool:
     return os.environ.get("PULSE_ASYNC_MODEL_CALLS", "1").strip().lower() not in ("0", "off", "false", "no")
 
 
+class _EmptyModelResponse(Exception):
+    """A model call that came back with no text. Retried; AgentRequestFailed once retries run out."""
+
+
 class _BackgroundModelCall:
     """One model call running on a worker thread, so the training thread never waits for it.
 
@@ -1403,181 +1568,6 @@ _PASS4_RECHECK_TMPL = (
     '- {{"decision": "drop", "reason": "one sentence"}} if it should not be applied at all\n'
     "Fix only the bug; a revision must stay as small as the bug requires."
 )
-
-# ---------------------------------------------------------------------------
-# PASS 4.5 -- MEASURE: Pass 4 only asks the model whether its own fix *looks*
-# right. That misses anything that only shows up once the code actually
-# runs -- e.g. a loss/label-encoding mismatch that doesn't crash but also
-# doesn't train. This pass builds a fast, time-boxed copy of the REAL
-# training script (same model, same data, same loss -- just fewer
-# epochs/steps so it finishes quickly) and empirically checks whether the
-# loss actually moves the right way, instead of trusting a self-report.
-_PASS4B_PROBE_TMPL = (
-    "The fix has already been applied to the file below.\n\n"
-    "PASS 4.5 -- BUILD A FAST PROBE: Produce a modified copy of this file that runs a QUICK but "
-    "REPRESENTATIVE slice of its own training loop, so the actual loss trend can be checked "
-    "empirically. Use the REAL model architecture, REAL loss function/optimizer, and REAL data "
-    "pipeline exactly as they are -- do NOT swap in dummy data, do NOT shrink the network, do NOT "
-    "change the fix that was just applied. The ONLY thing you should change is how much of the loop "
-    "actually runs: cut epochs/steps down to the smallest number that still shows a real trend "
-    "(as few as 2-4 data points is fine), and/or subsample the dataset if loading or preprocessing "
-    "it is what dominates the runtime. If training is a manual loop rather than a framework .fit() "
-    "call, cap its iteration count the same way and make sure it still prints or otherwise surfaces "
-    "the loss each iteration. Keep everything else byte-for-byte identical.\n\n"
-    "Respond with ONLY the full modified file contents in a single ```python fenced code block -- "
-    "no prose, no explanation, no markdown outside that one block.\n\n"
-    "--- {filename} ---\n{content}"
-)
-_PASS4B_REVISE_WITH_EVIDENCE_TMPL = (
-    "Your analysis:\n{diagnosis}\n\n"
-    "The fix you applied:\n{fix_desc}\n\n"
-    "This was actually run (briefly, on the real model/data) to check the loss empirically, and it "
-    "did not pass: {evidence}\n\n"
-    "Revise the fix so the loss actually decreases -- this is real measured behavior, not a guess, "
-    "so make sure the revision addresses what the numbers show rather than re-applying the same "
-    "change. Respond with ONLY the corrected code-fix JSON object (old/new/explanation) -- no prose, "
-    "no markdown fences."
-)
-_MAX_EMPIRICAL_ATTEMPTS = 2
-# Soft, in-process budget handed to the probe harness itself: once this much
-# wall-clock time has elapsed, it sets model.stop_training so a currently
-# in-flight run ends gracefully (and gets to flush whatever loss values it
-# already has) rather than being killed mid-write.
-_PROBE_SOFT_TIME_BUDGET_SECONDS = 45.0
-# Hard backstop at the subprocess level, independent of anything the probe
-# script or harness does -- covers a hang before .fit() is ever reached
-# (e.g. stuck data loading) that the in-process budget can't see.
-_PROBE_HARD_TIMEOUT_SECONDS = 75.0
-_PROBE_MIN_POINTS = 2
-
-_STDOUT_LOSS_RE = re.compile(r"(?<![a-zA-Z_])loss:\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)")
-
-
-def _scrape_stdout_losses(text: str) -> List[float]:
-    """Fallback loss source when the probe harness's own callback hook
-    didn't catch anything (e.g. a training setup it doesn't recognize):
-    Keras' default verbose=1 progress bar prints 'loss: <num>' per
-    batch/epoch on its own, with no instrumentation needed."""
-    out: List[float] = []
-    for m in _STDOUT_LOSS_RE.finditer(text or ""):
-        try:
-            out.append(float(m.group(1)))
-        except ValueError:
-            pass
-    return out
-
-
-def _loss_probe_verdict(losses: List[float]):
-    """Returns ("pass"|"fail"|"inconclusive", detail_str)."""
-    n = len(losses)
-    if n < _PROBE_MIN_POINTS:
-        return "inconclusive", f"only {n} loss reading(s) captured during the probe -- not enough to judge a trend"
-    if any((v != v) or (abs(v) == float("inf")) for v in losses):  # NaN/Inf
-        return "fail", f"loss went NaN/Inf during the probe run: {losses[:10]}"
-    k = max(1, n // 3)
-    first = sum(losses[:k]) / k
-    last = sum(losses[-k:]) / k
-    detail = f"loss {first:.4g} -> {last:.4g} over {n} reading(s)"
-    if last < first - 1e-9:
-        return "pass", f"loss trended down over the probe run ({detail})"
-    return "fail", f"loss did NOT trend down over the probe run ({detail})"
-
-
-# Standalone module written next to the probe copy and imported as its very
-# first line. Two jobs: (1) silence Pulse's own tracking/agent/cloud-sync
-# machinery inside this throwaway run (auto_track() is a real call baked
-# into the tracked script itself -- see pulse.py's auto_track -- so it would
-# otherwise fire here too), and (2) hook whatever training API is in use so
-# real per-epoch loss values get written to PULSE_PROBE_METRICS_PATH as they
-# happen, surviving even a hard kill once at least one epoch has landed.
-_PROBE_HARNESS_SRC = '''
-import os as _os, sys as _sys, json as _json, time as _time, atexit as _atexit
-
-for _modname in ("pulse", "pulse_cli", "pulse.pulse_cli"):
-    try:
-        __import__(_modname)
-    except Exception:
-        pass
-for _modname in ("pulse", "pulse_cli", "pulse.pulse_cli"):
-    _m = _sys.modules.get(_modname)
-    if _m is not None:
-        try:
-            _m.auto_track = lambda *a, **k: None
-        except Exception:
-            pass
-
-_METRICS_PATH = _os.environ.get("PULSE_PROBE_METRICS_PATH")
-_TIME_BUDGET = float(_os.environ.get("PULSE_PROBE_TIME_BUDGET", "45"))
-_START = _time.time()
-_LOSSES = []
-
-def _pulse_probe_flush():
-    if not _METRICS_PATH:
-        return
-    try:
-        with open(_METRICS_PATH, "w", encoding="utf-8") as _f:
-            _json.dump({"loss": _LOSSES}, _f)
-    except Exception:
-        pass
-
-_atexit.register(_pulse_probe_flush)
-
-def _pulse_probe_record(logs):
-    try:
-        val = None
-        if isinstance(logs, dict):
-            for _k in ("loss", "val_loss", "training_loss"):
-                if logs.get(_k) is not None:
-                    val = float(logs[_k])
-                    break
-        elif logs is not None:
-            val = float(logs)
-        if val is not None and val == val and abs(val) != float("inf"):
-            _LOSSES.append(val)
-            _pulse_probe_flush()
-    except Exception:
-        pass
-
-def _pulse_probe_time_up():
-    return (_time.time() - _START) >= _TIME_BUDGET
-
-def _pulse_probe_hook_keras(_keras_mod):
-    try:
-        _Base = _keras_mod.callbacks.Callback
-
-        class _PulseProbeCB(_Base):
-            def on_epoch_end(self, epoch, logs=None):
-                _pulse_probe_record(logs)
-                if _pulse_probe_time_up():
-                    self.model.stop_training = True
-
-            def on_batch_end(self, batch, logs=None):
-                if _pulse_probe_time_up():
-                    self.model.stop_training = True
-
-        _orig_fit = _keras_mod.Model.fit
-
-        def _pulse_probe_patched_fit(self, *args, **kwargs):
-            cbs = list(kwargs.get("callbacks") or [])
-            cbs.append(_PulseProbeCB())
-            kwargs["callbacks"] = cbs
-            return _orig_fit(self, *args, **kwargs)
-
-        _keras_mod.Model.fit = _pulse_probe_patched_fit
-    except Exception:
-        pass
-
-try:
-    import tensorflow as _tf
-    _pulse_probe_hook_keras(_tf.keras)
-except Exception:
-    pass
-try:
-    import keras as _keras_standalone
-    _pulse_probe_hook_keras(_keras_standalone)
-except Exception:
-    pass
-'''
 
 # Output-token budget for every agent call. Deliberately generous: reasoning
 # models spend part of it on hidden reasoning before any visible text, and a
@@ -2989,6 +2979,8 @@ class PulseCLI:
         self._last_checkin: float = time.monotonic()
         # Model calls made off the training thread (see _BackgroundModelCall).
         self._checkin_call: Optional[_BackgroundModelCall] = None
+        # What the agent that scheduled the next check-in wants it to look at (CHECKNOTE:).
+        self._checkin_note: str = ""
         self._start_prime_call: Optional[_BackgroundModelCall] = None
         self._start_prime_answered: bool = False
         self._start_prime_retried: bool = False
@@ -5909,6 +5901,7 @@ class PulseCLI:
         # restart chain", i.e. what _auto_rollback_after_failed_restarts
         # rolls back to if every retry in this chain still crashes.
         chain_start_commit_id = self._last_commit_id
+        _agent_log_event("RESTARTING the training script to run the fixed code")
 
         # Finalize the pending agent-downtime timer (if any) and log the
         # incident now, before doing anything else below -- a successful
@@ -6066,7 +6059,7 @@ class PulseCLI:
         # Only the child gets the marker (not this process's os.environ):
         # if every retry fails and this process keeps running the old code,
         # its own later crashes must still go through the agent as normal.
-        child_env = dict(os.environ, **{_RESTART_CHILD_ENV: "1", _RESTART_DEPTH_ENV: str(depth + 1)})
+        child_env = self._restart_env(depth)
 
         # Retry the restart itself instead of ever falling back to "keep
         # running the old, already-in-memory process" on a bad exit code.
@@ -6569,7 +6562,10 @@ class PulseCLI:
         # very long body (full request/response dump).
         return msg[:200] + ("…" if len(msg) > 200 else "")
 
-    def _call_model(self, instruction: str, max_tokens: int = _AGENT_MAX_TOKENS) -> str:
+    def _call_model(self, instruction: str, max_tokens: int = _AGENT_MAX_TOKENS, *,
+                    system: Optional[str] = None,
+                    history: Optional[List[Dict[str, str]]] = None,
+                    purpose: Optional[str] = None) -> str:
         """One lightweight completion call: system prompt + recent history +
         a one-off stage instruction. Does not touch self.agent_history --
         callers decide what (if anything) gets persisted once the whole
@@ -6587,17 +6583,24 @@ class PulseCLI:
         try/except, the one chokepoint that catches it for the whole
         multi-pass pipeline, and the GPU check-in's own try/except for
         the one call site outside that pipeline.
+
+        `system`/`history` replace the default system prompt and the shared
+        conversation -- the periodic check-in runs its own conversation on a
+        worker thread and must neither read nor grow agent_history.
         """
         messages = (
-            [{"role": "system", "content": getattr(self, "_system_prompt_override", None) or SYSTEM_PROMPT}]
-            + self.agent_history[-10:]
+            [{"role": "system", "content": system or getattr(self, "_system_prompt_override", None) or SYSTEM_PROMPT}]
+            + (self.agent_history[-10:] if history is None else list(history))
             + [{"role": "user", "content": instruction}]
         )
         model = self.agent_model_string or PROVIDERS[self.agent_provider]["model"]
         max_tokens = _clamp_output_tokens(model, max_tokens)
         max_attempts = 3
         last_exc: Optional[Exception] = None
+        label = purpose or (instruction.strip().splitlines() or ["(empty)"])[0][:90]
+        call_no = _agent_log_call(label, messages, model)
         for attempt in range(1, max_attempts + 1):
+            started = time.monotonic()
             try:
                 response = litellm.completion(
                     model=model,
@@ -6609,14 +6612,22 @@ class PulseCLI:
                 )
                 content = (response.choices[0].message.content or "").strip()
                 if not content:
-                    raise AgentRequestFailed("the provider returned an empty response")
+                    # Seen with reasoning models: the whole answer went into reasoning and none
+                    # came back. It is billed like any other call, and the same request usually
+                    # succeeds on a second try, so it is retried like a transient error.
+                    self._record_usage(response)
+                    raise _EmptyModelResponse("the provider returned an empty response")
                 self._record_usage(response)
+                _agent_log_reply(call_no, content, time.monotonic() - started, getattr(response, "usage", None))
                 return content
             except AgentRequestFailed:
                 raise
             except Exception as exc:
                 last_exc = exc
-                if attempt < max_attempts and self._is_retryable_model_error(exc):
+                _agent_log_reply(call_no, None, time.monotonic() - started,
+                                 error=f"attempt {attempt}/{max_attempts}: {self._classify_model_error(exc)}")
+                if attempt < max_attempts and (isinstance(exc, _EmptyModelResponse)
+                                               or self._is_retryable_model_error(exc)):
                     backoff = 2 ** (attempt - 1)  # 1s, 2s, 4s
                     cprint(
                         f"[Pulse] ⚠ Agent request hit a transient error (attempt {attempt}/{max_attempts}), "
@@ -6625,6 +6636,7 @@ class PulseCLI:
                     )
                     time.sleep(backoff)
                     continue
+                _agent_log_event("AGENT REQUEST FAILED", f"{label}: {self._classify_model_error(exc)}")
                 raise AgentRequestFailed(self._classify_model_error(exc)) from exc
         # Unreachable in practice (the loop above always returns or raises),
         # but keeps type-checkers happy and fails safe if that ever changes.
@@ -8132,25 +8144,115 @@ class PulseCLI:
 
         return "\n\n".join(notes)
 
-    _PERIODIC_CHECKIN_PROMPT = (
-        "[Automated Pulse check-in -- sent automatically since it's been {mins:g} minutes since "
-        "the last one] Here is the current state Pulse is tracking:\n\n{snapshot}\n\n"
-        "Currently GPU-tracked variable(s): {tracked}. GPU stat probes force a device-to-host sync "
-        "on every probe, which slows down training, so nothing should stay GPU-tracked longer than "
-        "you actually need it -- and if training currently looks like it needs a closer look at a "
-        "GPU-resident variable you're NOT already tracking, this is also your chance to start.\n\n"
-        "Take an actual look at the values/trends above rather than assuming Pulse's own detectors "
-        "would already have caught anything worth catching -- you may notice something they "
-        "wouldn't (a metric moving far slower than it should even though it's technically still "
-        "moving, a suspicious-looking value, anything about the run that just looks off).\n\n"
-        "Reply in exactly this format, and nothing else -- no other prose:\n"
-        "STATUS: <'ok' if training looks healthy, otherwise a short description of the problem>\n"
-        "GPUTRACK: <comma-separated variable names to track, or 'none'>\n"
-        "GPUUNTRACK: <comma-separated variable names to stop tracking, or 'none'>\n"
-        "NEXTCHECK: <minutes until your next check-in should happen -- as low as {min_mins:g} if "
-        "anything looks borderline and worth watching closely, as high as {max_mins:g} if training "
-        "looks stable and boring, or {mins:g} again if you have no particular reason to change it>"
+    # The periodic check-in is its own agent, not the investigation pipeline: its own system
+    # prompt, its own conversation (never agent_history), and only the tools it can really run.
+    # It runs on a worker thread while training carries on, so tools that execute against live
+    # training objects (REPL, DRYRUN, REPLAY, GRADCHECK, SHAPETRACE...) are not offered -- the
+    # training thread is using those objects at the same moment. TERMINAL covers experiments:
+    # it runs a separate process, under the same confirmation rules as everywhere else.
+    _CHECKIN_SYSTEM_PROMPT = (
+        "You are Pulse's periodic check-in: an ML engineer looking over a training run that is in "
+        "progress, while it keeps running. Your job is to decide whether this run will produce a "
+        "model and numbers that can be trusted, and if not, to say exactly why. That is the whole "
+        "scope: something that makes the trained model worse than it should be, or its reported "
+        "metrics wrong or misleading. Saving, logging, file layout, warnings, speed and style are "
+        "out of scope unless they change the model or the numbers.\n\n"
+        "Look for both kinds of problem:\n"
+        "- INSTABILITY: divergence, NaN/inf, loss spikes, oscillation, a metric stuck at a constant "
+        "or at chance, dead units, vanishing or exploding values.\n"
+        "- BUGS that let training look healthy while the result is wrong. These are the ones a "
+        "loss curve will never show, and the reason you read the code:\n"
+        "    data leakage (a scaler/encoder fitted before the train/test split; test data or the "
+        "target reaching the inputs; a window that includes the value being predicted),\n"
+        "    validation that is not held out (validation_data built from the training set),\n"
+        "    features and labels misaligned (one shuffled or permuted without the other, labels "
+        "computed over the wrong axis),\n"
+        "    wrong output activation or loss for the task (relu/linear into cross-entropy, softmax "
+        "into a from_logits loss, a regression loss on class labels),\n"
+        "    data scaled twice or not at all, targets on a different scale from what the loss "
+        "expects,\n"
+        "    capacity or hyperparameters far outside sane (a 1-unit layer, learning rate >= 0.1 "
+        "for Adam, dropout near 1, zero-initialised weights) -- judged by what they do to this "
+        "run, as below,\n"
+        "    errors swallowed by try/except, so the script 'finishes' without training.\n"
+        "  Warning signs in the numbers: validation better than training, a train/validation gap "
+        "that keeps growing, accuracy suspiciously close to 1.0, or no epochs at all.\n\n"
+        "TOOLS -- put each on its own line. Results come back to you as the next message, and you "
+        "can keep investigating over several rounds before answering:\n"
+        "  GREP: <pattern>              search the project's files (regex or plain text)\n"
+        "  VIEW: <file>:<start>-<end>   exact line range; omit '<file>:' for the main script\n"
+        "  CALC: <expression>           exact arithmetic (numbers, operators, math.*)\n"
+        "  CORR: <var1> <var2>          correlation between two recorded histories\n"
+        "  OUTLIER: <var>               z-score outliers in a recorded history\n"
+        "  DIFFSTATS: <var> <i> <j>     exact change between two recorded points\n"
+        "  HISTOGRAM: <var>             distribution of a recorded history\n"
+        "  MLLINT:                      Pulse's static ML anti-pattern scan of the code\n"
+        "  TERMINAL: <shell command>    ONE line -- only the text after 'TERMINAL:' on that line is "
+        "run, so a heredoc or a quoted script spread over several lines arrives cut off. For "
+        "Python, join statements with ';' in one python3 -c \"...\" line. It runs in the project "
+        "directory, where the files you were shown live: cat/grep/head the "
+        "code and data files, run a short python snippet to check a shape, a range, whether "
+        "labels line up with features, what a split contains. It runs as a separate process, so "
+        "it cannot see the live variables of the running script -- reload what you need. "
+        "Commands that delete files, rewrite git state, reach outside the project, start a "
+        "background process or overwrite a file via redirect ask the user first and may be "
+        "declined; plain reads and short scripts run straight away. Keep scripts short: a slow "
+        "command holds up this check. Read the exit code and output before relying on a result.\n"
+        "  GPUTRACK: / GPUUNTRACK: <names>  start/stop the costly GPU-synced look at a variable\n\n"
+        "The script is part-way through. Code after the current point has not run yet, so a file, "
+        "folder, variable or value that does not exist yet is not evidence of a bug -- check where "
+        "in the script execution is before concluding anything from what is missing.\n\n"
+        "A bug in the code is a problem even when the numbers look healthy. Leakage and validation "
+        "that is not held out make the numbers look BETTER, not worse; healthy-looking metrics are "
+        "exactly how those bugs hide. If you find a defect that makes the model or its reported "
+        "numbers wrong, the verdict is 'problem', whatever the curves look like.\n\n"
+        "Also check that the run performs about as well as this setup can. From the code and the "
+        "data, work out what a working version should reach -- the noise level in generated data, "
+        "how separable the classes are, the scale of the target -- and compare the recorded "
+        "numbers on a scale that means something: error relative to the target's spread, accuracy "
+        "relative to chance and to what the data allows. Not 'better than chance': 'about what "
+        "this setup should get'. This is a check, not a hunt. If the numbers are in the range this "
+        "setup should reach, or you cannot tell what that range is, that is fine and not a "
+        "problem. Slow progress, a run still part-way through, a small shortfall, or a choice that "
+        "is merely small, simple or unusual is not a problem by itself. A shortfall is a problem "
+        "only when it is large, the remaining epochs cannot plausibly close it, and you can point "
+        "to what in the code causes it.\n\n"
+        "Investigate before judging. The snapshot shows values, not intent; the code shows intent. "
+        "When the code and the numbers disagree, trust neither until you have checked -- that "
+        "disagreement is usually the bug. Report a problem only with evidence you can point to "
+        "(a line, a value, a command's output), and do not report style or harmless choices.\n\n"
+        "When you are done investigating, answer with ONLY these lines, and no tool lines:\n"
+        "VERDICT: ok | problem\n"
+        "PROBLEM: <if problem: what is wrong, where (file:line), and the evidence. Omit if ok.>\n"
+        "NEXTCHECK: <minutes until the next check-in, {min_mins:g}-{max_mins:g}>\n"
+        "CHECKNOTE: <a note to the next check-in: what to look at then and why -- a suspicion "
+        "still to confirm, a number to watch, a line to re-read. 'none' if nothing.>"
     )
+
+    _PERIODIC_CHECKIN_PROMPT = (
+        "[Automatic check-in, {mins:g} minutes after the last one. Training is still running.]\n\n"
+        "Note left for this check-in by the previous one:\n{note}\n\n"
+        "Recorded metric history (evenly sampled, oldest first):\n{history}\n\n"
+        "{snapshot}\n\n"
+        "Currently GPU-tracked: {tracked}.\n\n"
+        "Is this run healthy and its result trustworthy? Investigate with the tools, then give "
+        "your final answer in the VERDICT/PROBLEM/NEXTCHECK/CHECKNOTE format."
+    )
+
+    _CHECKIN_VERDICT_ONLY = (
+        "Your last reply had no VERDICT line, and no more tool results will come back. Based on "
+        "everything you have seen, reply now with ONLY the VERDICT/PROBLEM/NEXTCHECK/CHECKNOTE lines."
+    )
+
+    _CHECKIN_LAST_ROUND = (
+        "That was your last tool round -- no more tool results will come back. Answer now, with "
+        "ONLY the VERDICT/PROBLEM/NEXTCHECK/CHECKNOTE lines, based on everything you have seen."
+    )
+
+    # Rounds of tool use a check-in may take before it must answer. Each round is one model
+    # call, so this caps a check-in's cost at MAX_ROUNDS + 1 calls.
+    _CHECKIN_MAX_ROUNDS = int(os.environ.get("PULSE_CHECKIN_ROUNDS", "6") or 6)
+    _CHECKIN_TOOL_NAMES = ("terminal", "corr", "outlier", "diffstats", "histogram", "mllint")
 
     # Bounds on the agent-negotiated NEXTCHECK: interval -- keeps the
     # cadence genuinely dynamic (see _maybe_periodic_checkin and the
@@ -8165,6 +8267,11 @@ class PulseCLI:
         "looks healthy", "nominal", "good", "none", "no issues", "no problems",
     }
     _STATUS_RE = re.compile(r"^\s*STATUS:\s*(.+)$", re.MULTILINE)
+    _VERDICT_RE = re.compile(r"^\s*VERDICT:\s*(.+)$", re.MULTILINE)
+    _PROBLEM_RE = re.compile(r"^\s*PROBLEM:\s*(.+?)(?=^\s*(?:NEXTCHECK|CHECKNOTE|VERDICT|GPUTRACK|GPUUNTRACK):|\Z)",
+                             re.MULTILINE | re.DOTALL)
+    _CHECKNOTE_RE = re.compile(r"^\s*CHECKNOTE:\s*(.+?)(?=^\s*(?:NEXTCHECK|VERDICT|PROBLEM|GPUTRACK|GPUUNTRACK):|\Z)",
+                               re.MULTILINE | re.DOTALL)
     _NEXTCHECK_RE = re.compile(r"^\s*NEXTCHECK:\s*([0-9]*\.?[0-9]+)", re.MULTILINE)
 
     @classmethod
@@ -8188,6 +8295,57 @@ class PulseCLI:
         lo, hi = cls._CHECKIN_MIN_INTERVAL / 60.0, cls._CHECKIN_MAX_INTERVAL / 60.0
         return max(lo, min(hi, minutes))
 
+    def _restart_env(self, depth: int) -> Dict[str, str]:
+        """The environment for the restarted, fixed script: marked as a restart, and told
+        where to resume from when there is a usable checkpoint and the fix did not ask for a
+        fresh start."""
+        env = dict(os.environ, **{_RESTART_CHILD_ENV: "1", _RESTART_DEPTH_ENV: str(depth + 1)})
+        env.pop(_RESUME_ENV, None)
+        checkpoint = getattr(self, "_fix_checkpoint", None)
+        if not checkpoint:
+            return env
+        try:
+            with open(checkpoint, encoding="utf-8") as f:
+                finite = json.load(f).get("finite", False)
+        except Exception:
+            finite = False
+        if not getattr(self, "_resume_after_fix", True):
+            _agent_log_event("RESTARTING FROM SCRATCH -- the fix asked for a fresh start (resume: false)")
+        elif not finite:
+            _agent_log_event("RESTARTING FROM SCRATCH -- the checkpointed weights were not finite")
+        else:
+            env[_RESUME_ENV] = checkpoint
+        return env
+
+    def _save_fix_checkpoint(self) -> None:
+        """Save the Keras model's weights as they are right now -- the point a fix starts --
+        so the restarted, fixed script can resume from here (see _resume_from_fix_checkpoint).
+        Nothing to save for non-Keras runs or before the first epoch; failures only mean the
+        restart trains from the beginning, as it always did."""
+        self._fix_checkpoint = None
+        self._resume_after_fix = True
+        model = getattr(self, "_keras_model", None)
+        if model is None or not self.script_path:
+            return
+        try:
+            folder = os.path.join(os.path.dirname(os.path.abspath(self.script_path)), ".pulse_checkpoints")
+            os.makedirs(folder, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            weights = os.path.join(folder, f"fix-{stamp}.weights.h5")
+            model.save_weights(weights)
+            finite = all(bool(np.all(np.isfinite(w))) for w in model.get_weights())
+            meta = {"weights": weights, "epoch": getattr(self, "_keras_epoch", -1),
+                    "epochs": getattr(self, "_keras_epochs", None), "finite": finite}
+            meta_path = os.path.join(folder, f"fix-{stamp}.json")
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+            self._fix_checkpoint = meta_path
+            _agent_log_event(f"CHECKPOINT SAVED before fixing (after epoch {meta['epoch'] + 1})",
+                             f"{weights}\nweights finite: {finite}")
+        except Exception as exc:
+            _agent_log_event("CHECKPOINT FAILED -- a restart will train from the beginning",
+                             f"{type(exc).__name__}: {exc}")
+
     def _escalate_training_problem(self, problem: Optional[str]) -> None:
         """Shared escalation path for anything that decides training
         looks like it's going wrong -- either _check_for_trouble's
@@ -8203,6 +8361,8 @@ class PulseCLI:
         if not problem or problem == self._last_intervention_signature:
             return
         self._last_intervention_signature = problem
+        _agent_log_event("ESCALATED -- pausing to investigate and fix", problem)
+        self._save_fix_checkpoint()
         self.continuous = True
 
         ui = _ui.enabled()
@@ -8262,30 +8422,23 @@ class PulseCLI:
             cprint("[Pulse] Continuing training automatically.")
 
     def _maybe_periodic_checkin(self) -> None:
-        """Every checkin_interval seconds (15 min by default, but
-        dynamic -- see the NEXTCHECK: line in _START_PRIME_PROMPT for
-        the first interval, and the one parsed out of this check-in's
-        own reply for every one after) since the last check-in,
-        proactively ask the agent two things it would otherwise only
-        ever get asked reactively:
-        1. Whether it still wants to GPU-track anything (as before).
-        2. To actually look at the current training snapshot and flag
-           anything that looks off via a STATUS: line, even if Pulse's
-           own step-by-step detectors haven't already caught it --
-           escalated through the same _escalate_training_problem path
-           as a deterministic detection, if it's not just 'ok'.
-        It also lets the agent set its own NEXTCHECK: interval, so a
-        run that looks fine can go longer between check-ins and a
-        borderline one can ask to be checked again sooner, instead of a
-        fixed cadence.
+        """Every checkin_interval seconds (agent-chosen: NEXTCHECK: from the start-of-run
+        prime, then from each check-in's own answer), run a check-in: an agent that reads the
+        code, the metric history and the current snapshot, investigates over several tool
+        rounds, and returns a VERDICT. A 'problem' verdict goes through the same
+        _escalate_training_problem path as a deterministic detection. Whoever schedules a
+        check-in also leaves it a CHECKNOTE -- what to look at and why -- which it is given.
+
+        The conversation (model calls and tool use) runs on a worker thread, so training
+        never waits on it; its answer is applied here, on the training thread, once it lands.
         """
-        # A check-in whose model call was started earlier is applied here once it has landed.
         pending = self._checkin_call
         if pending is not None:
             if not pending.done:
-                return                      # still thinking; the loop carries on meanwhile
+                return                      # still investigating; the loop carries on meanwhile
             self._checkin_call = None
-            self._finish_periodic_checkin(pending.result, pending.error, pending.prompt)
+            answer, transcript = pending.result if pending.result else (None, [])
+            self._finish_periodic_checkin(answer, pending.error, pending.prompt, transcript)
             return
         if not self.agent_provider or not self.agent_key:
             return
@@ -8294,63 +8447,209 @@ class PulseCLI:
             return
         self._last_checkin = now
 
+        # Everything the check-in reads from live state is captured here, on the training thread.
         tracked = ", ".join(sorted(self.gpu_tracked_vars)) if self.gpu_tracked_vars else "(none)"
         try:
-            snapshot = self._build_agent_context(include_code=False)
+            snapshot = self._build_agent_context(include_code=bool(self.code_text))
         except Exception as exc:
             snapshot = f"(unable to build a variable snapshot: {exc})"
+        try:
+            history = self._checkin_history_summary()
+        except Exception as exc:
+            history = f"(unable to summarise metric history: {exc})"
         prompt = self._PERIODIC_CHECKIN_PROMPT.format(
             mins=self.checkin_interval / 60.0, tracked=tracked, snapshot=snapshot,
-            min_mins=self._CHECKIN_MIN_INTERVAL / 60.0, max_mins=self._CHECKIN_MAX_INTERVAL / 60.0,
+            history=history, note=(getattr(self, "_checkin_note", "") or "(none)"),
         )
         cprint(
-            f"\n[Pulse] ⏱ {self.checkin_interval / 60:g}-min check-in -- asking agent to review "
-            "training health and GPU tracking...",
+            f"\n[Pulse] ⏱ {self.checkin_interval / 60:g}-min check-in -- agent is reviewing the run "
+            "for bugs and instability (training continues)...",
             color=_YELLOW,
         )
+        _agent_log_event(f"PERIODIC CHECK-IN started ({self.checkin_interval / 60:g} min after the last)")
         if _async_model_calls_enabled():
-            # The wait for the model happens on a worker thread; see _finish_periodic_checkin.
-            self._checkin_call = _BackgroundModelCall(
-                lambda: self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS), prompt=prompt)
+            self._checkin_call = _BackgroundModelCall(lambda: self._run_checkin(prompt), prompt=prompt)
             return
         try:
-            answer, error = self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS), None
+            (answer, transcript), error = self._run_checkin(prompt), None
         except AgentRequestFailed as exc:
-            answer, error = None, exc
-        self._finish_periodic_checkin(answer, error, prompt)
+            answer, transcript, error = None, [], exc
+        self._finish_periodic_checkin(answer, error, prompt, transcript)
 
-    def _finish_periodic_checkin(self, answer, error, prompt) -> None:
-        """Everything a check-in does with the model's answer. Runs on the training thread."""
+    def _checkin_history_summary(self, max_points: int = 12, max_series: int = 40) -> str:
+        """Each recorded scalar history as a short evenly-sampled series. The snapshot alone
+        is one instant; trends (validation parting from training, a metric pinned at a
+        constant) need the history, and a check-in cannot ask the live process for it."""
+        histories = self._detector_histories()
+        lines = []
+        for name in sorted(histories)[:max_series]:
+            values = []
+            for v in histories[name]:
+                try:
+                    values.append(float(v))
+                except (TypeError, ValueError):
+                    continue
+            if not values:
+                continue
+            n = len(values)
+            if n <= max_points:
+                picked = values
+            else:
+                step = (n - 1) / (max_points - 1)
+                picked = [values[round(i * step)] for i in range(max_points)]
+            shown = ", ".join(f"{v:.4g}" for v in picked)
+            lines.append(f"- {name} ({n} readings): {shown}")
+        return "\n".join(lines) if lines else "(no scalar history recorded yet)"
+
+    def _checkin_service_tools(self, answer: str) -> Tuple[str, List[str]]:
+        """Run the tools a check-in asked for. Returns (results for the model, one-line
+        summaries for the console). Only the check-in's toolset: nothing here touches live
+        training objects, since this runs on a worker thread while training continues."""
+        results: List[str] = []
+        summary: List[str] = []
+        for expr in (m.strip() for m in self._CALC_RE.findall(answer)):
+            if expr:
+                results.append(f"CALC {expr} = {_safe_eval_math(expr)}")
+                summary.append(f"CALC {expr}")
+        for pattern in (m.strip() for m in self._GREP_RE.findall(answer)):
+            if pattern:
+                results.append(self._run_grep(pattern))
+                summary.append(f"GREP {pattern}")
+        for arg in (m.strip() for m in self._VIEW_RE.findall(answer)):
+            if arg:
+                results.append(self._run_view(arg))
+                summary.append(f"VIEW {arg}")
+        _clean, requests = self._extract_new_directives(answer)
+        runners = {
+            "terminal": self._run_terminal, "corr": self._run_corr, "outlier": self._run_outlier,
+            "diffstats": self._run_diffstats, "histogram": self._run_histogram,
+            "mllint": lambda _arg: self._run_mllint(),
+        }
+        for name in self._CHECKIN_TOOL_NAMES:
+            for arg in requests.get(name, []):
+                try:
+                    results.append(runners[name](arg))
+                except Exception as exc:          # one broken tool must not end the check-in
+                    results.append(f"{name.upper()} {arg}: failed ({type(exc).__name__}: {exc})")
+                summary.append(f"{name.upper()} {arg}".strip())
+        refused = sorted(set(requests) - set(self._CHECKIN_TOOL_NAMES))
+        if refused:
+            results.append(
+                "Not available during a check-in (training is using the live objects right now): "
+                + ", ".join(r.upper() for r in refused) + ". Use TERMINAL to run a separate check instead.")
+            summary.append("refused " + ", ".join(r.upper() for r in refused))
+        return "\n\n".join(r for r in results if r), summary
+
+    def _run_checkin(self, prompt: str) -> Tuple[str, List[str]]:
+        """The check-in conversation: up to _CHECKIN_MAX_ROUNDS rounds of tool use, then an
+        answer. Its own system prompt and its own message list -- never agent_history.
+        Returns (final answer, console transcript of the tools it used)."""
+        system = self._CHECKIN_SYSTEM_PROMPT.format(
+            min_mins=self._CHECKIN_MIN_INTERVAL / 60.0, max_mins=self._CHECKIN_MAX_INTERVAL / 60.0)
+        history: List[Dict[str, str]] = []
+        message = prompt
+        transcript: List[str] = []
+        answer = ""
+        for round_no in range(self._CHECKIN_MAX_ROUNDS + 1):
+            answer = self._call_model(message, max_tokens=_AGENT_MAX_TOKENS, system=system, history=history,
+                                      purpose=f"periodic check-in, round {round_no + 1}")
+            if self._checkin_verdict(answer)[0] is not None:
+                break                               # answered -- any stray tool lines are ignored
+            results, used = self._checkin_service_tools(answer)
+            if not used:
+                break                               # neither a verdict nor a tool: take it as is
+            transcript.extend(f"round {round_no + 1}: {u}" for u in used)
+            history += [{"role": "user", "content": message}, {"role": "assistant", "content": answer}]
+            last = round_no + 1 >= self._CHECKIN_MAX_ROUNDS
+            message = (results or "(the tools returned nothing)") + "\n\n" + (
+                self._CHECKIN_LAST_ROUND if last else
+                "Keep investigating with more tool lines, or give your final VERDICT answer now.")
+        if self._checkin_verdict(answer)[0] is None:
+            # Ran out of rounds mid-investigation, or answered in prose: one more call, for the
+            # verdict alone, rather than throwing away everything it has looked at.
+            history += [{"role": "user", "content": message}, {"role": "assistant", "content": answer}]
+            answer = self._call_model(self._CHECKIN_VERDICT_ONLY, max_tokens=_AGENT_MAX_TOKENS,
+                                      system=system, history=history,
+                                      purpose="periodic check-in, asking for the missing verdict")
+            transcript.append("verdict: asked again for a missing VERDICT line")
+        return answer, transcript
+
+    @classmethod
+    def _checkin_verdict(cls, answer: Optional[str]) -> Tuple[Optional[bool], str]:
+        """(is_problem, description). is_problem is None when the answer carries no verdict.
+
+        VERDICT: ok|problem is the format; the old free-text STATUS: line is still read so an
+        answer in that shape is not lost. Either way only the verdict's first word decides --
+        'ok -- everything finite, scaler fitted on train' is ok. Matching the whole line against
+        a list of exact phrases used to turn every explained 'ok' into an escalation."""
+        text = answer or ""
+        m = cls._VERDICT_RE.search(text)
+        if m:
+            first = re.split(r"[\s.,;:!\-—–(]+", m.group(1).strip().lower(), maxsplit=1)[0]
+            problem_m = cls._PROBLEM_RE.search(text)
+            problem = problem_m.group(1).strip() if problem_m else ""
+            if first in ("ok", "okay", "healthy", "fine", "good", "none"):
+                return False, ""
+            return True, problem or m.group(1).strip()
+        m = cls._STATUS_RE.search(text)
+        if m:
+            status = m.group(1).strip()
+            first = re.split(r"[\s.,;:!\-—–(]+", status.lower(), maxsplit=1)[0]
+            if first in ("ok", "okay", "healthy", "fine", "good", "none", "nominal"):
+                return False, ""
+            if status.lower().rstrip(".") in cls._CHECKIN_OK_STATUSES:
+                return False, ""
+            return True, status
+        return None, ""
+
+    def _finish_periodic_checkin(self, answer, error, prompt, transcript=None) -> None:
+        """Everything a check-in does with the agent's answer. Runs on the training thread."""
         if error is not None:
             if not isinstance(error, AgentRequestFailed):
                 raise error
-            # This is a periodic, low-stakes background check -- never
-            # worth interrupting training over. Quietly skip this round
-            # and try again at the next interval.
+            # A periodic, low-stakes background check -- never worth interrupting training
+            # over. Skip this round and try again at the next interval.
             cprint(f"[Pulse] ⚠ Check-in skipped (agent request failed: {error})", color=_RED)
+            _agent_log_event("CHECK-IN SKIPPED: agent request failed", str(error))
             return
+        answer = answer or ""
+        if transcript:
+            cprint(f"[Pulse] Check-in investigated with {len(transcript)} tool call(s): "
+                   + "; ".join(t.split(': ', 1)[1][:80] for t in transcript), color=_YELLOW)
+
         _, _calc, _promote, gputrack_names, gpuuntrack_names, _sens, _norm, _grep, _view = self._extract_directives(answer)
         summary = self._apply_directives([], [], gputrack_names, gpuuntrack_names)
         if summary:
+            cprint(f"[Pulse] {summary}", color=_YELLOW)
+
+        note_m = self._CHECKNOTE_RE.search(answer)
+        note = note_m.group(1).strip() if note_m else ""
+        self._checkin_note = "" if note.lower().rstrip(".") in ("", "none", "n/a") else note
+
+        is_problem, problem = self._checkin_verdict(answer)
+        _agent_log_event(
+            "CHECK-IN VERDICT: " + {None: "none (inconclusive)", False: "ok", True: "problem"}[is_problem],
+            "\n".join(x for x in (problem, f"tools used: {len(transcript or [])}",
+                                    f"note for the next check-in: {self._checkin_note or 'none'}") if x))
+        if is_problem is None:
+            cprint("[Pulse] Check-in gave no verdict -- treating this one as inconclusive.", color=_YELLOW)
+        elif not is_problem:
+            cprint("[Pulse] Check-in verdict: ok", color=_YELLOW)
+        else:
+            cprint(f"[Pulse] Check-in verdict: problem -- {problem}", color=_YELLOW)
+            # The investigation that follows starts from what the check-in found.
             self.agent_history.append({"role": "user", "content": prompt})
             self.agent_history.append({"role": "assistant", "content": answer})
-            cprint(f"[Pulse] {summary}", color=_YELLOW)
-        else:
-            cprint("[Pulse] Agent made no GPU-tracking changes at this check-in.", color=_YELLOW)
-
-        status_match = self._STATUS_RE.search(answer)
-        status_text = status_match.group(1).strip() if status_match else ""
-        if status_text:
-            cprint(f"[Pulse] Agent's check-in analysis: {status_text}", color=_YELLOW)
-            if status_text.strip().lower().rstrip(".") not in self._CHECKIN_OK_STATUSES:
-                if self.auto_intervene:
-                    self._escalate_training_problem(f"[periodic check-in] {status_text}")
-                else:
-                    cprint(
-                        "[Pulse] Auto-intervene is off -- not auto-pausing for this, but flagging "
-                        "it for you to look at.",
-                        color=_YELLOW,
-                    )
+            if self.auto_intervene:
+                self._escalate_training_problem(f"[periodic check-in] {problem}")
+            else:
+                cprint(
+                    "[Pulse] Auto-intervene is off -- not auto-pausing for this, but flagging "
+                    "it for you to look at.",
+                    color=_YELLOW,
+                )
+        if self._checkin_note:
+            cprint(f"[Pulse] Note for the next check-in: {self._checkin_note}", color=_YELLOW)
 
         next_minutes = self._parse_nextcheck_minutes(answer)
         if next_minutes is not None:
@@ -8521,205 +8820,6 @@ class PulseCLI:
         return fix, False, (reason or "(verification did not clearly pass after retries)")
 
     _PROBE_CODEBLOCK_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
-
-    def _build_fast_probe_source(self, path: str, content: str) -> Optional[str]:
-        """Ask the agent for a fast-but-faithful copy of `content`: same
-        model/data/loss, just iteration-capped. Returns the probe source,
-        or None if the agent didn't return something that at least parses
-        as Python (in which case the empirical check is skipped rather
-        than run against garbage)."""
-        try:
-            with _Spinner("Building fast probe of the fix"):
-                answer = self._call_model(
-                    _PASS4B_PROBE_TMPL.format(filename=os.path.basename(path), content=content),
-                    max_tokens=_AGENT_MAX_TOKENS,
-                )
-        except AgentRequestFailed:
-            return None
-        m = self._PROBE_CODEBLOCK_RE.search(answer or "")
-        probe_src = (m.group(1) if m else (answer or "")).strip()
-        if not probe_src:
-            return None
-        try:
-            ast.parse(probe_src)
-        except SyntaxError:
-            return None
-        return probe_src
-
-    def _run_loss_probe(self, target_path: str, probe_src: str) -> Dict[str, Any]:
-        """Write `probe_src` next to the real script, run it as a short,
-        hard-capped subprocess, and return whatever loss readings it
-        reported before finishing or being cut off. Always cleans up
-        every file it created -- the probe copy, the harness, the metrics
-        sidecar, and anything the run itself wrote to disk (checkpoints,
-        saved models, csv logs, __pycache__ entries) -- so a throwaway
-        smoke test never leaves artifacts in the user's project.
-        """
-        directory = os.path.dirname(os.path.abspath(target_path)) or "."
-        token = uuid.uuid4().hex[:10]
-        probe_path = os.path.join(directory, f".__pulse_probe_{token}.py")
-        harness_name = f"_pulse_probe_harness_{token}"
-        harness_path = os.path.join(directory, f"{harness_name}.py")
-        metrics_path = os.path.join(directory, f".__pulse_probe_{token}.json")
-
-        try:
-            before_entries = set(os.listdir(directory))
-        except OSError:
-            before_entries = set()
-
-        result: Dict[str, Any] = {"loss": [], "note": "", "stdout_tail": "", "stderr_tail": ""}
-        try:
-            with open(harness_path, "w", encoding="utf-8") as f:
-                f.write(_PROBE_HARNESS_SRC)
-            with open(probe_path, "w", encoding="utf-8") as f:
-                f.write(f"import {harness_name}  # noqa -- Pulse empirical-verify harness, deleted after this probe\n")
-                f.write(probe_src)
-
-            depth = 0
-            try:
-                depth = int(os.environ.get(_RESTART_DEPTH_ENV, "0"))
-            except ValueError:
-                depth = 0
-            env = dict(
-                os.environ,
-                **{
-                    # Same markers _restart_process uses -- keeps auto_track()
-                    # in this child quiet/non-interactive and stops it from
-                    # starting its own nested fix/restart chain if the probe
-                    # script hits an unrelated crash.
-                    _RESTART_CHILD_ENV: "1",
-                    _RESTART_DEPTH_ENV: str(depth + 1),
-                    "PULSE_AUTO_RESTART": "1",
-                    "PULSE_PROBE_METRICS_PATH": metrics_path,
-                    "PULSE_PROBE_TIME_BUDGET": str(_PROBE_SOFT_TIME_BUDGET_SECONDS),
-                },
-            )
-            python_exe = self._resolve_restart_interpreter() or sys.executable
-
-            try:
-                proc = subprocess.run(
-                    [python_exe, probe_path], cwd=directory, env=env,
-                    capture_output=True, text=True, timeout=_PROBE_HARD_TIMEOUT_SECONDS,
-                )
-                result["stdout_tail"] = (proc.stdout or "")[-4000:]
-                result["stderr_tail"] = (proc.stderr or "")[-4000:]
-                if proc.returncode != 0:
-                    result["note"] = f"probe process exited with code {proc.returncode}"
-            except subprocess.TimeoutExpired as exc:
-                result["note"] = f"probe run hit the hard {_PROBE_HARD_TIMEOUT_SECONDS:.0f}s cap and was stopped"
-                result["stdout_tail"] = (exc.stdout or "")[-4000:]
-                result["stderr_tail"] = (exc.stderr or "")[-4000:]
-            except Exception as exc:
-                result["note"] = f"probe run failed to launch: {exc}"
-
-            if os.path.exists(metrics_path):
-                try:
-                    with open(metrics_path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    if isinstance(data, dict) and isinstance(data.get("loss"), list):
-                        result["loss"] = [v for v in data["loss"] if isinstance(v, (int, float))]
-                except Exception:
-                    pass
-
-            if not result["loss"]:
-                result["loss"] = _scrape_stdout_losses(result["stdout_tail"])
-        finally:
-            for p in (probe_path, harness_path, metrics_path):
-                try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except OSError:
-                    pass
-            try:
-                after_entries = set(os.listdir(directory))
-            except OSError:
-                after_entries = set()
-            for name in after_entries - before_entries:
-                full = os.path.join(directory, name)
-                try:
-                    if os.path.isdir(full):
-                        shutil.rmtree(full, ignore_errors=True)
-                    else:
-                        os.remove(full)
-                except OSError:
-                    pass
-        return result
-
-    def _verify_fix_empirically(self, fix: Dict[str, Any], diagnosis: str):
-        """PASS 4.5 -- MEASURE: Pass 4 is the model grading its own
-        homework; this actually runs a fast, time-boxed slice of the real
-        training loop and checks whether the loss really moves the right
-        way. On a bad or NaN'ing verdict, reverts this attempt, asks the
-        agent to revise using the measured curve as evidence, and tries
-        again (bounded by _MAX_EMPIRICAL_ATTEMPTS). Never silently claims
-        a pass it didn't earn: if every attempt fails or is inconclusive,
-        the LAST attempted fix is left applied (same philosophy as Pass 4
-        -- a fix already developed goes ahead as best effort rather than
-        being discarded) but the return value says so clearly.
-
-        Returns (fix, ok, detail) where ok is True (measured improvement),
-        False (measured, but didn't improve / NaN'd / still applied best
-        effort after retries), or None (skipped -- nothing to measure,
-        e.g. the fix didn't touch the main tracked script, or a probe
-        couldn't be built/run at all).
-        """
-        target_path = self.script_path
-        if not target_path or target_path not in self._pending_revert_backups:
-            return fix, None, "fix didn't touch the main tracked script -- nothing to run standalone"
-
-        original_content = self._pending_revert_backups[target_path]
-        evidence = ""
-        for attempt in range(_MAX_EMPIRICAL_ATTEMPTS):
-            try:
-                with open(target_path, "r", encoding="utf-8") as f:
-                    current_content = f.read()
-            except OSError as exc:
-                return fix, None, f"couldn't re-read {os.path.basename(target_path)}: {exc}"
-
-            probe_src = self._build_fast_probe_source(target_path, current_content)
-            if probe_src is None:
-                return fix, None, "couldn't build a runnable fast probe of the fix"
-
-            with _Spinner(f"Running fast probe (hard cap {_PROBE_HARD_TIMEOUT_SECONDS:.0f}s)"):
-                probe_result = self._run_loss_probe(target_path, probe_src)
-
-            verdict, detail = _loss_probe_verdict(probe_result["loss"])
-            note = probe_result.get("note") or ""
-            evidence = detail + (f" [{note}]" if note else "")
-
-            if verdict == "pass":
-                return fix, True, evidence
-            if verdict == "inconclusive":
-                return fix, None, evidence
-
-            # verdict == "fail" -- revert this attempt and try a revision,
-            # if there's a retry left.
-            if attempt == _MAX_EMPIRICAL_ATTEMPTS - 1:
-                break
-            try:
-                with open(target_path, "w", encoding="utf-8") as f:
-                    f.write(original_content)
-            except OSError:
-                break
-            fix_desc = self._describe_fix(fix)
-            try:
-                with _Spinner("Revising fix using probe results"):
-                    revised_answer = self._call_model(
-                        _PASS4B_REVISE_WITH_EVIDENCE_TMPL.format(
-                            diagnosis=diagnosis, fix_desc=fix_desc, evidence=evidence,
-                        ),
-                        max_tokens=_AGENT_MAX_TOKENS,
-                    )
-            except AgentRequestFailed:
-                break
-            revised = self._parse_code_fix(revised_answer)
-            if revised is None:
-                break
-            self._apply_code_fix(revised)
-            if not self._fix_applied_this_turn:
-                break
-            fix = revised
-        return fix, False, evidence or "loss did not improve after retries"
 
     def _service_tool_requests(self, answer: str) -> str:
         """Run any directives the model put in `answer` (GREP:/VIEW:/CALC:
@@ -9015,26 +9115,12 @@ class PulseCLI:
 
             result = f"{full_answer}\n\n{apply_result}"
 
-            # Pass 4.5: don't just trust Pass 4's self-report -- actually run
-            # a fast, hard-capped slice of the real training loop and check
-            # the loss for real. Only meaningful once a fix has actually
-            # landed on disk (there's nothing to run otherwise).
-            if self._fix_applied_this_turn:
-                try:
-                    fix, empirical_ok, empirical_detail = self._verify_fix_empirically(fix, full_answer)
-                except Exception as exc:
-                    empirical_ok, empirical_detail = None, f"probe step raised an unexpected error: {exc}"
-                if empirical_ok is True:
-                    empirical_note = f"[4.5] Empirical check PASSED -- {empirical_detail}"
-                elif empirical_ok is False:
-                    empirical_note = (
-                        f"[4.5] Empirical check DID NOT PASS -- {empirical_detail} "
-                        "-- fix left applied as best effort."
-                    )
-                else:
-                    empirical_note = f"[4.5] Empirical check skipped -- {empirical_detail}"
-                print(f"\n{empirical_note}\n")
-                result = f"{result}\n\n{empirical_note}"
+            # There is no probe step here any more (it was "Pass 4.5"). It re-ran a 75 s
+            # slice of training after each fix and, when the loss had not visibly fallen in
+            # that window, wrote the ORIGINAL code back and asked for a revision; when the
+            # revision could not be parsed it stopped there, leaving the bug on disk while
+            # reporting "fix left applied". The resumed run and the post-run confirmation
+            # (_confirm_fix_did_its_job) judge the fix instead, on the whole run.
 
             # Pass 5 (+ 6): a re-read of the whole file looking for OTHER,
             # unrelated bugs, which then recurses into a fresh diagnose/fix
@@ -9484,46 +9570,6 @@ class PulseCLI:
                 print(f"    - {os.path.basename(p)}: {err}")
         return bool(restored)
 
-    def _git_autostash(self) -> Optional[str]:
-        """Best-effort git-level safety net, on top of (not instead of)
-        the .pulse_history changelog/revert system above: right before
-        Pulse writes an agent-proposed fix to disk, stash any of the
-        user's OWN uncommitted changes in the repo first, so a fix never
-        gets silently mixed into work the user hadn't committed yet, and
-        `git stash pop` alone (independent of Pulse) is always enough to
-        get back to exactly the pre-fix working tree. No-op (returns
-        None) if this isn't a git repo, git isn't installed, git is
-        already mid-operation (rebase/merge -- stashing there can make
-        things worse), or there's nothing uncommitted to stash. Never
-        raises and never blocks applying the fix -- this is a convenience
-        net, not a requirement.
-        """
-        repo = self._repo_cwd or (os.path.dirname(os.path.abspath(self.script_path)) if self.script_path else None)
-        if not repo or not os.path.isdir(os.path.join(repo, ".git")):
-            return None
-        try:
-            status = subprocess.run(
-                ["git", "-C", repo, "status", "--porcelain"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if status.returncode != 0 or not status.stdout.strip():
-                return None  # not a repo (already checked) or nothing dirty to protect
-
-            for marker in ("MERGE_HEAD", "rebase-merge", "rebase-apply"):
-                if os.path.exists(os.path.join(repo, ".git", marker)):
-                    return None  # mid-merge/rebase -- don't touch the working tree
-
-            label = f"pulse-autostash-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-            stash = subprocess.run(
-                ["git", "-C", repo, "stash", "push", "--include-untracked", "-m", label],
-                capture_output=True, text=True, timeout=10,
-            )
-            if stash.returncode != 0:
-                return None
-            return label
-        except Exception:
-            return None
-
     def _apply_code_fix(self, fix: Dict[str, Any]) -> str:
         """Apply an agent-proposed code fix to the file(s) it targets.
 
@@ -9534,12 +9580,15 @@ class PulseCLI:
         once in its target file's current contents; snippets that don't
         match cleanly, or whose file can't be resolved, are skipped and
         reported rather than guessed at. On success, backups of every
-        touched file are kept so the user can revert them all together.
-        Also takes a best-effort git-level backup first -- see
-        _git_autostash.
+        touched file are kept so the user can revert them all together
+        (/revert, via .pulse_history).
+
+        There is no git stash here any more. Stashing the working tree before
+        each fix also stashed Pulse's own earlier fix from the same run, so a
+        second fix was written onto the original code and the first one
+        vanished into `git stash` -- a correct fix undone by the next attempt.
         """
         self._build_file_labels()
-        autostash_label = self._git_autostash()
 
         by_path: Dict[str, List[tuple]] = {}
         unresolved = []
@@ -9637,6 +9686,11 @@ class PulseCLI:
             originals[path] = original_content
             applied_by_path[path] = applied
             after_by_path[path] = content
+            _agent_log_event(
+                f"CODE FIX WRITTEN to {os.path.basename(path)}",
+                (fix.get("explanation", "") or "").strip() + "\n" + "".join(difflib.unified_diff(
+                    original_content.splitlines(True), content.splitlines(True),
+                    fromfile="before", tofile="after", n=1)))
             for old, new in applied:
                 self._append_fixlog(path, old, new, fix.get("explanation", ""))
             if path == self.script_path:
@@ -9659,17 +9713,6 @@ class PulseCLI:
             skipped.append((old, label or "(unspecified file)", "couldn't determine which file this targets"))
 
         if not applied_by_path:
-            if autostash_label:
-                # Nothing was actually applied -- pop the stash back immediately
-                # rather than leaving the user's own changes sitting stashed
-                # for no reason.
-                try:
-                    subprocess.run(
-                        ["git", "-C", self._repo_cwd or os.path.dirname(os.path.abspath(self.script_path)), "stash", "pop"],
-                        capture_output=True, text=True, timeout=10,
-                    )
-                except Exception:
-                    pass
             lines.append("\n⚠ No changes were applied -- none of the proposed snippets matched cleanly:")
             for old, where, reason in skipped:
                 lines.append(f"  - [{os.path.basename(str(where))}] {reason}: {old.splitlines()[0][:80]}...")
@@ -9703,16 +9746,13 @@ class PulseCLI:
                 "fix_applied", fix.get("explanation") or "(no explanation given)",
                 commit_id=commit_id, files=[os.path.basename(p) for p in applied_by_path],
             )
-        if autostash_label:
-            lines.append(
-                f"🛟 Your own uncommitted changes were stashed first (git stash: '{autostash_label}') -- "
-                f"`git stash pop` restores them independent of Pulse's own /revert."
-            )
 
         cprint("\n".join(lines), color=_BLUE)
 
         self._pending_revert_backups = dict(originals)  # path -> original content
         self._fix_applied_this_turn = True  # tells ask_agent's top-level call to restart afterward
+        if fix.get("resume") is False or str(fix.get("resume", "")).strip().lower() == "false":
+            self._resume_after_fix = False
         self._last_applied_fix = fix  # structured old/new/files/explanation, for cross-session reuse
         self._last_apply_skipped = skipped
 
@@ -10805,18 +10845,26 @@ class PulseCLI:
         "GPU memory -- that are worth the closer, GPU-synced look from step one, to catch memory "
         "spikes or numerical instability early rather than after they've already caused visible "
         "damage.\n"
-        "4. Pulse will periodically check back in with you (to review training health and GPU-"
-        "tracking needs, and to let you re-set this same interval each time) -- decide how long "
-        "until your FIRST check-in should be, based on how quickly you'd expect problems to show "
-        "up in this specific run: a short, fast-iterating script might warrant just a couple of "
-        "minutes; a long, slow training run might warrant much longer. Anywhere from 2 to 60 "
-        "minutes.\n\n"
-        "Reply with ONLY these four lines, in exactly this format, and nothing else -- no diagnosis, "
+        "4. Pulse will periodically check back in while training runs: an agent reads the code, "
+        "the metric history and the tracked values, investigates with tools (grep, view, a shell), "
+        "and looks for instability AND for bugs that let training look healthy while the result is "
+        "wrong (leakage, validation that is not held out, misaligned labels, the wrong output "
+        "activation or loss, bad scaling, absurd hyperparameters). Decide how long until the FIRST "
+        "check-in, based on how quickly problems would show in this specific run: a short, "
+        "fast-iterating script warrants just a couple of minutes; a long, slow run much longer. "
+        "Anywhere from 2 to 60 minutes.\n"
+        "5. Leave that first check-in a note. You have the code now and it will be busy with a "
+        "live run: say what in this code deserves a closer look once real numbers exist, and why "
+        "-- a line that looks wrong, an assumption to verify, which metric would expose it. Be "
+        "specific (file:line, variable names). 'none' only if the code gives you nothing to "
+        "suspect.\n\n"
+        "Reply with ONLY these five lines, in exactly this format, and nothing else -- no diagnosis, "
         "no prose:\n"
         "SENSITIVITY: <0.0-1.0, a preset (loose/medium/tight), or 'spike|plateau|oscillation <value|auto>'>\n"
         "NORMAL_START: <comma-separated var=value pairs for loss-like tracked variables you can justify, or 'none'>\n"
         "GPUTRACK: <comma-separated variable names to track closely from the start, or 'none'>\n"
-        "NEXTCHECK: <minutes (2-60) until your first periodic check-in>"
+        "NEXTCHECK: <minutes (2-60) until your first periodic check-in>\n"
+        "CHECKNOTE: <your note to the first check-in, or 'none'>"
     )
 
     def _mllint_auto_fix(self, findings: List[tuple]) -> bool:
@@ -10931,6 +10979,7 @@ class PulseCLI:
                 path, src, new_src,
                 f"Automatic MLLINT fix (start-of-run): {msg[:200]}"
             )
+            _agent_log_event(f"START-OF-RUN LINT FIX written to {os.path.basename(path)}", msg[:300])
             cprint(
                 f"[Pulse] ✓ Auto-fixed '{label}' at line {lineno}: {msg[:120]}",
                 color=_GREEN
@@ -11050,10 +11099,11 @@ class PulseCLI:
         prompt = f"{context}\n\n{self._START_PRIME_PROMPT}"
         if _async_model_calls_enabled():
             self._start_prime_call = _BackgroundModelCall(
-                lambda: self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS), deferred=deferred)
+                lambda: self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS, purpose="start-of-run check"),
+                deferred=deferred)
             return
         try:
-            answer, error = self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS), None
+            answer, error = self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS, purpose="start-of-run check"), None
         except AgentRequestFailed as exc:
             answer, error = None, exc
         self._finish_start_prime(answer, error, deferred)
@@ -11085,8 +11135,15 @@ class PulseCLI:
         if summary:
             label = "Start-of-run check (deferred, agent now available)" if deferred else "Start-of-run check"
             cprint(f"[Pulse] {label}: {summary}", color=_YELLOW)
+        note_m = self._CHECKNOTE_RE.search(answer or "")
+        note = note_m.group(1).strip() if note_m else ""
+        if note and note.lower().rstrip(".") not in ("none", "n/a"):
+            self._checkin_note = note
+            cprint(f"[Pulse] Note for the first check-in: {note}", color=_YELLOW)
+            _agent_log_event("NOTE FOR THE FIRST CHECK-IN", note)
         initial_minutes = self._parse_nextcheck_minutes(answer)
         if initial_minutes is not None:
+            _agent_log_event(f"FIRST CHECK-IN SCHEDULED in {initial_minutes:g} min")
             self.checkin_interval = initial_minutes * 60.0
             self._last_checkin = time.monotonic()
             if deferred:

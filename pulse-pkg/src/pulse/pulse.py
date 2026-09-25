@@ -74,9 +74,6 @@ import shutil
 from  pulse.pulse_cli import (
     _install_keras_pulse_hook, _RESTART_CHILD_ENV, _RESTART_DEPTH_ENV,
     _AGENT_MAX_TOKENS, _AGENT_TIMEOUT_SECONDS, _clamp_output_tokens,
-    _PASS4B_PROBE_TMPL, _PASS4B_REVISE_WITH_EVIDENCE_TMPL, _PROBE_HARNESS_SRC,
-    _loss_probe_verdict, _scrape_stdout_losses, _MAX_EMPIRICAL_ATTEMPTS,
-    _PROBE_SOFT_TIME_BUDGET_SECONDS, _PROBE_HARD_TIMEOUT_SECONDS,
 )
 
 import numpy as np
@@ -1224,6 +1221,9 @@ def discover_static_names(caller_frame):
     return discover_static_names_from_file(caller_frame.f_code.co_filename)
 
 
+_PULSE_PACKAGE_DIR = os.path.normcase(os.path.dirname(os.path.abspath(__file__))) + os.sep
+
+
 def _discover_project_files(entry_path, root=None, max_files=25):
     """Find other local (non-stdlib, non-site-packages) .py files this
     script imports, directly or transitively, so a modularized project's
@@ -1280,6 +1280,14 @@ def _discover_project_files(entry_path, root=None, max_files=25):
             seen.add(resolved)
 
             if _is_library_frame(spec.origin):
+                continue
+            # Pulse itself is not the user's project. Installed normally it sits in
+            # site-packages and is skipped above; run from a source checkout it does not,
+            # and was sent to the agent as one of the user's files -- which also moved the
+            # labels' shared root up to wherever the checkout and the project meet (the
+            # home directory), so every file reached the agent under a path it could not
+            # find from the project directory.
+            if resolved.startswith(_PULSE_PACKAGE_DIR):
                 continue
             if root and not resolved.startswith(root):
                 continue
@@ -5052,193 +5060,6 @@ def _chat_panel_class():
 
         _PROBE_CODEBLOCK_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
 
-        def _build_fast_probe_source(self, model_name, path, content):
-            """Ask the agent for a fast-but-faithful copy of `content` (same
-            model/data/loss, just iteration-capped) -- see pulse_cli's copy
-            for the full rationale. Returns None if nothing parseable came
-            back, so the empirical check is skipped rather than run on
-            garbage."""
-            try:
-                answer = self._call_model(
-                    model_name,
-                    _PASS4B_PROBE_TMPL.format(filename=os.path.basename(path), content=content),
-                    max_tokens=_AGENT_MAX_TOKENS,
-                )
-            except AgentRequestFailed:
-                return None
-            m = self._PROBE_CODEBLOCK_RE.search(answer or "")
-            probe_src = (m.group(1) if m else (answer or "")).strip()
-            if not probe_src:
-                return None
-            try:
-                ast.parse(probe_src)
-            except SyntaxError:
-                return None
-            return probe_src
-
-        def _run_loss_probe(self, target_path, probe_src):
-            """Write `probe_src` next to the real script, run it as a short,
-            hard-capped subprocess, and return whatever loss readings it
-            reported. Always cleans up every file it created, including
-            anything the run itself wrote to disk. Same mechanics as
-            PulseCLI._run_loss_probe -- kept as a separate copy here since the
-            GUI has no _resolve_restart_interpreter of its own and instead
-            just uses sys.executable."""
-            directory = os.path.dirname(os.path.abspath(target_path)) or "."
-            token = uuid.uuid4().hex[:10]
-            probe_path = os.path.join(directory, f".__pulse_probe_{token}.py")
-            harness_name = f"_pulse_probe_harness_{token}"
-            harness_path = os.path.join(directory, f"{harness_name}.py")
-            metrics_path = os.path.join(directory, f".__pulse_probe_{token}.json")
-
-            try:
-                before_entries = set(os.listdir(directory))
-            except OSError:
-                before_entries = set()
-
-            result = {"loss": [], "note": "", "stdout_tail": "", "stderr_tail": ""}
-            try:
-                with open(harness_path, "w", encoding="utf-8") as f:
-                    f.write(_PROBE_HARNESS_SRC)
-                with open(probe_path, "w", encoding="utf-8") as f:
-                    f.write(f"import {harness_name}  # noqa -- Pulse empirical-verify harness, deleted after this probe\n")
-                    f.write(probe_src)
-
-                depth = 0
-                try:
-                    depth = int(os.environ.get(_RESTART_DEPTH_ENV, "0"))
-                except ValueError:
-                    depth = 0
-                env = dict(
-                    os.environ,
-                    **{
-                        _RESTART_CHILD_ENV: "1",
-                        _RESTART_DEPTH_ENV: str(depth + 1),
-                        "PULSE_AUTO_RESTART": "1",
-                        "PULSE_PROBE_METRICS_PATH": metrics_path,
-                        "PULSE_PROBE_TIME_BUDGET": str(_PROBE_SOFT_TIME_BUDGET_SECONDS),
-                    },
-                )
-                try:
-                    proc = subprocess.run(
-                        [sys.executable, probe_path], cwd=directory, env=env,
-                        capture_output=True, text=True, timeout=_PROBE_HARD_TIMEOUT_SECONDS,
-                    )
-                    result["stdout_tail"] = (proc.stdout or "")[-4000:]
-                    result["stderr_tail"] = (proc.stderr or "")[-4000:]
-                    if proc.returncode != 0:
-                        result["note"] = f"probe process exited with code {proc.returncode}"
-                except subprocess.TimeoutExpired as exc:
-                    result["note"] = f"probe run hit the hard {_PROBE_HARD_TIMEOUT_SECONDS:.0f}s cap and was stopped"
-                    result["stdout_tail"] = (exc.stdout or "")[-4000:]
-                    result["stderr_tail"] = (exc.stderr or "")[-4000:]
-                except Exception as exc:
-                    result["note"] = f"probe run failed to launch: {exc}"
-
-                if os.path.exists(metrics_path):
-                    try:
-                        with open(metrics_path, "r", encoding="utf-8") as f:
-                            data = json.load(f)
-                        if isinstance(data, dict) and isinstance(data.get("loss"), list):
-                            result["loss"] = [v for v in data["loss"] if isinstance(v, (int, float))]
-                    except Exception:
-                        pass
-
-                if not result["loss"]:
-                    result["loss"] = _scrape_stdout_losses(result["stdout_tail"])
-            finally:
-                for p in (probe_path, harness_path, metrics_path):
-                    try:
-                        if os.path.exists(p):
-                            os.remove(p)
-                    except OSError:
-                        pass
-                try:
-                    after_entries = set(os.listdir(directory))
-                except OSError:
-                    after_entries = set()
-                for name in after_entries - before_entries:
-                    full = os.path.join(directory, name)
-                    try:
-                        if os.path.isdir(full):
-                            shutil.rmtree(full, ignore_errors=True)
-                        else:
-                            os.remove(full)
-                    except OSError:
-                        pass
-            return result
-
-        def _verify_fix_empirically(self, model_name, fix, diagnosis, original_content):
-            """PASS 4.5 -- MEASURE: same idea as PulseCLI._verify_fix_empirically
-            -- actually run a fast, hard-capped slice of the real training loop
-            and check the loss for real, instead of trusting Pass 4's
-            self-report. On failure, reverts this attempt, asks the agent to
-            revise using the measured curve, and retries (bounded). If every
-            attempt fails/is inconclusive, the LAST attempted fix is left
-            applied (same best-effort philosophy as Pass 4) but flagged.
-
-            `original_content` is this fix's pre-edit content for script_path
-            (from _write_code_fix's `originals` return), since the GUI doesn't
-            keep a standing _pending_revert_backups the way the CLI does.
-
-            Returns (fix, ok, detail): ok is True/False/None (None = skipped,
-            nothing to measure or a probe couldn't be built/run at all).
-            """
-            target_path = self.script_path
-            if not target_path or original_content is None:
-                return fix, None, "fix didn't touch the main tracked script -- nothing to run standalone"
-
-            evidence = ""
-            for attempt in range(_MAX_EMPIRICAL_ATTEMPTS):
-                try:
-                    with open(target_path, "r", encoding="utf-8") as f:
-                        current_content = f.read()
-                except OSError as exc:
-                    return fix, None, f"couldn't re-read {os.path.basename(target_path)}: {exc}"
-
-                probe_src = self._build_fast_probe_source(model_name, target_path, current_content)
-                if probe_src is None:
-                    return fix, None, "couldn't build a runnable fast probe of the fix"
-
-                self.after(0, lambda: self._set_stage(f"Running fast probe (hard cap {_PROBE_HARD_TIMEOUT_SECONDS:.0f}s)"))
-                probe_result = self._run_loss_probe(target_path, probe_src)
-
-                verdict, detail = _loss_probe_verdict(probe_result["loss"])
-                note = probe_result.get("note") or ""
-                evidence = detail + (f" [{note}]" if note else "")
-
-                if verdict == "pass":
-                    return fix, True, evidence
-                if verdict == "inconclusive":
-                    return fix, None, evidence
-
-                if attempt == _MAX_EMPIRICAL_ATTEMPTS - 1:
-                    break
-                try:
-                    with open(target_path, "w", encoding="utf-8") as f:
-                        f.write(original_content)
-                except OSError:
-                    break
-                fix_desc = self._describe_fix(fix)
-                try:
-                    revised_answer = self._call_model(
-                        model_name,
-                        _PASS4B_REVISE_WITH_EVIDENCE_TMPL.format(
-                            diagnosis=diagnosis, fix_desc=fix_desc, evidence=evidence,
-                        ),
-                        max_tokens=_AGENT_MAX_TOKENS,
-                    )
-                except AgentRequestFailed:
-                    break
-                revised = self._parse_code_fix(revised_answer)
-                if revised is None:
-                    break
-                _write_lines2, applied_by_path2, _orig2, _skipped2 = self._write_code_fix(revised)
-                if not applied_by_path2:
-                    break
-                fix = revised
-            return fix, False, evidence or "loss did not improve after retries"
-
         def _run_sweep_and_maybe_recurse(self, model_name, include_code, provider_name, _depth):
             """PASS 5: re-read everything for OTHER, unrelated errors. If any
             turn up, ask the user whether to fix those too (PASS 6 recurses
@@ -5389,25 +5210,8 @@ def _chat_panel_class():
                 if applied_by_path:
                     self._fix_applied_this_turn = True
 
-                # Pass 4.5: don't just trust Pass 4's self-report -- actually run
-                # a fast, hard-capped slice of the real training loop and check
-                # the loss for real. Only meaningful once a fix landed on disk.
-                if applied_by_path:
-                    script_original = _originals.get(self.script_path) if self.script_path else None
-                    try:
-                        fix, empirical_ok, empirical_detail = self._verify_fix_empirically(
-                            model_name, fix, full_answer, script_original,
-                        )
-                    except Exception as exc:
-                        empirical_ok, empirical_detail = None, f"probe step raised an unexpected error: {exc}"
-                    if empirical_ok is True:
-                        empirical_note = f"PASSED -- {empirical_detail}"
-                    elif empirical_ok is False:
-                        empirical_note = f"DID NOT PASS -- {empirical_detail} -- fix left applied as best effort."
-                    else:
-                        empirical_note = f"skipped -- {empirical_detail}"
-                    self.after(0, lambda: self._set_stage(None))
-                    self.after(0, lambda: self._append("Pulse (4.5 · Empirical check)", empirical_note))
+                # No probe step here any more (it was "Pass 4.5"): it could write the original
+                # code back after a fix and leave it there -- see the note in pulse_cli.py.
 
                 # Pass 5 (+ 6): only worth a full re-read if a fix actually landed.
                 # The fix is already on disk, so a failed sweep request must not
