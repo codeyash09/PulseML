@@ -103,7 +103,7 @@ _PROTECTED_PARTS = (".git", ".pulse_history")
 # which is exactly what a coding session needs for tests/linters/repro scripts and is
 # handled by the same shared executor + confirmation policy as the debugging agent's
 # TERMINAL: (see PulseCLI._run_terminal / pulse_terminal.py).
-_ALLOWED_TOOLS = {"defof", "callers", "depgraph", "doclookup", "changelog", "terminal"}
+_ALLOWED_TOOLS = {"defof", "callers", "depgraph", "trace", "doclookup", "changelog", "terminal"}
 
 # ---------------------------------------------------------------------------------------
 # Prompts
@@ -133,6 +133,9 @@ CODE_SYSTEM_PROMPT = (
     "  DEFOF: <symbol>            jump to where a function/class is defined\n"
     "  CALLERS: <symbol>          every call site of a function/class\n"
     "  DEPGRAPH:                  the import graph between project files\n"
+    "  TRACE: <var>[:<file>[:<line>]]  the variable's whole connected influence path: everything "
+    "that feeds it (across function/file boundaries) and everything it feeds in turn, from the "
+    "real assignment chain, not a guess. self.<attr> works too.\n"
     "  DOCLOOKUP: <library>.<symbol>  the real signature/docstring of an installed library function\n"
     "  CHANGELOG:                 what has changed in the project files since the session started\n"
     "  TERMINAL: <shell command>  run a REAL command in the project directory; get back the actual "

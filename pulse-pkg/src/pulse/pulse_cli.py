@@ -48,6 +48,7 @@ from pulse import pulse_detect as _pulse_detect
 from pulse import pulse_supabase as cloud
 from pulse import pulse_ui as _ui
 from pulse import pulse_terminal as _terminal
+from pulse import pulse_trace as _pulse_trace
 try:
     import litellm
     # Quiets litellm's own verbose provider-runtime logging unless explicitly enabled.
@@ -526,7 +527,24 @@ def safe_print(*args, **kwargs):
         # the escape is not a control sequence, just junk at the start of every line.
         if kwargs.get("file") in (None, sys.stdout) and _stdout_is_tty():
             sys.stdout.write("\r\033[K")
-        _original_print(*args, **kwargs)
+        try:
+            _original_print(*args, **kwargs)
+        except UnicodeEncodeError:
+            # Pulse's own status lines lean on decorative Unicode (checkmarks, warning signs,
+            # box-drawing for the ASCII chart, a stopwatch on the periodic check-in) that a
+            # non-UTF-8 console -- the still-common default on Windows -- cannot represent.
+            # That must never crash the process: this print is background narration around a
+            # live training loop, and losing the loop over a glyph the terminal can't show
+            # would be a training run destroyed by its own debugger. Degrade the message
+            # instead of losing it (or the run): re-encode with the stream's own codec,
+            # replacing only the characters it can't represent.
+            stream = kwargs.get("file") or sys.stdout
+            encoding = getattr(stream, "encoding", None) or "ascii"
+            safe_args = [
+                a.encode(encoding, errors="replace").decode(encoding) if isinstance(a, str) else a
+                for a in args
+            ]
+            _original_print(*safe_args, **kwargs)
 
 def safe_input(prompt=""):
     # Clear formatting and force prompt to a clean new line. Off a terminal keep the new line
@@ -1120,6 +1138,12 @@ SYSTEM_PROMPT = (
     "    DEFOF: <symbol> -- AST-based jump-to-definition across every tracked file.\n"
     "    CALLERS: <symbol> -- every call site of a function/class.\n"
     "    DEPGRAPH: -- the import graph between tracked local files.\n"
+    "    TRACE: <variable>[:<file>[:<line>]] -- the variable's whole connected influence path: "
+    "everything that feeds it (transitively, across function and file boundaries -- a parameter's "
+    "real source, a return value's real destination), and everything it feeds in turn, reconstructed "
+    "from the real assignment chain rather than guessed. Use this before proposing a fix for a bad "
+    "value instead of reasoning about where it 'probably' came from -- e.g. 'TRACE: loss' or "
+    "'TRACE: self.running_mean:model.py:88'. self.<attr> works and is shared across a class's methods.\n"
     "  Statistics over a variable's whole recorded history (scalars only), not eyeballing a chart:\n"
     "    CORR: <var1> <var2> -- real correlation coefficient between two histories.\n"
     "    OUTLIER: <var> -- deterministic z-score anomaly detection, flags exact points.\n"
@@ -2888,10 +2912,22 @@ class PulseCLI:
         self.auto_mode: bool = False
         self.scalar_histories: Dict[str, List[float]] = {}
         self.step = 0
+        # Global step advances from the first confident signal available, in priority order:
+        # an explicit step number passed to update(), a real loop-counter variable in the
+        # traced code that visibly advanced (see _detect_loop_step_delta), and only then the
+        # older loss-changed / every-tick fallbacks below. self._loop_var_last_seen tracks the
+        # last value seen for each loop-variable name candidate, across calls, so a delta of
+        # exactly the right size can be computed rather than guessed.
+        self._loop_var_last_seen: Dict[str, int] = {}
         # Global step only advances when the loss/metric scalar (the first
         # tracked var that looks like a loss) actually changes value -- see
         # update(). None until a loss-like var is seen at least once.
         self._last_loss_value: Optional[float] = None
+        # Wall-clock pacing, fed to the agent alongside the step count so it can reason about
+        # whether "N steps since the last check-in" represents a fast or a slow run -- see
+        # _record_step_advance and the {time_per_step} slot in the check-in/agent-context text.
+        self._last_step_time: float = time.monotonic()
+        self._time_per_step_ema: Optional[float] = None
         self.generate_pdfs = False
         self.pdf_dir = pdf_dir
         self.agent_provider: Optional[str] = None
@@ -2958,25 +2994,24 @@ class PulseCLI:
         # device-to-host sync, which costs real training throughput, so
         # this is opt-in, always folded into the slow gpu_probe_interval
         # cadence (never the fast per-step one), and reviewed on a
-        # schedule: every checkin_interval seconds after the last one,
-        # Pulse proactively asks the agent whether it still wants each
+        # schedule: every checkin_interval_steps real steps after the last
+        # one, Pulse proactively asks the agent whether it still wants each
         # GPU-tracked variable (or wants to add one) -- see
         # _maybe_periodic_checkin. That same check-in also asks the
         # agent to actually look at the current run and flag anything
         # that looks off (a STATUS: line, escalated the same way as
         # _check_for_trouble's own detections -- see
         # _escalate_training_problem), and lets the agent set its own
-        # next interval via a NEXTCHECK: reply, so the cadence is
-        # dynamic rather than a fixed 15 minutes: a run that looks fine
-        # can go longer between check-ins, a borderline one can ask to
-        # be checked again sooner. The very first interval is itself
+        # next interval via a NEXTCHECK: reply, so the cadence is dynamic
+        # rather than a fixed step count: a run that looks fine can go
+        # longer between check-ins, a borderline one can ask to be
+        # checked again sooner. The very first interval is itself
         # negotiable the same way, via NEXTCHECK: in the one-time
-        # _START_PRIME_PROMPT reply (see _prime_at_start) -- 900s below
-        # is only the fallback if the agent doesn't set one.
+        # _START_PRIME_PROMPT reply (see _prime_at_start) -- the default
+        # below is only the fallback if the agent doesn't set one.
         self.gpu_tracked_vars: set[str] = set()
         self._last_gpu_probe: float = 0.0
         self.gpu_probe_interval: float = 600.0  # 10 minutes
-        self._last_checkin: float = time.monotonic()
         # Model calls made off the training thread (see _BackgroundModelCall).
         self._checkin_call: Optional[_BackgroundModelCall] = None
         # What the agent that scheduled the next check-in wants it to look at (CHECKNOTE:).
@@ -2984,7 +3019,14 @@ class PulseCLI:
         self._start_prime_call: Optional[_BackgroundModelCall] = None
         self._start_prime_answered: bool = False
         self._start_prime_retried: bool = False
-        self.checkin_interval: float = 900.0  # 15 minutes, first one 15 min after start unless negotiated sooner
+        # Check-ins are scheduled on STEPS, not wall-clock time (see _maybe_periodic_checkin):
+        # a run doing hundreds of steps/sec would otherwise get the same fixed cadence as one
+        # doing a step a minute -- either the fast run goes far longer between reviews than the
+        # amount of real progress warrants, or the slow run burns a check-in (and a model call)
+        # before it's taken more than a couple of real steps. self.step (see update() and
+        # _detect_loop_step_delta) is the ground truth this is measured against.
+        self._last_checkin_step: int = 0
+        self.checkin_interval_steps: int = self._DEFAULT_CHECKIN_STEPS
 
         # Auto-intervention: watch tracked values for signs training is
         # going bad (a scalar going non-finite, or a loss-like scalar
@@ -3335,7 +3377,7 @@ class PulseCLI:
         sync, which is real overhead on a training loop, so this only
         ever folds the variable into the slow gpu_probe_interval cadence
         (never the fast per-step one) and the agent gets asked every
-        checkin_interval whether it's still needed -- see
+        checkin_interval_steps real steps whether it's still needed -- see
         _maybe_periodic_checkin. Returns the variable name on success, else
         None (mirrors _set_var_state's contract so it composes the same
         way in _apply_directives).
@@ -5233,6 +5275,7 @@ class PulseCLI:
                 ("/delete <var> / /deletepdf <var>", "stop tracking / delete saved heatmap PDFs"),
                 ("/vars / /tracked", "list all seen variables / currently tracked ones"),
                 ("/chart [var]", "ASCII loss/metric curve for a tracked scalar (defaults to the main loss)"),
+                ("/trace <var>", "the variable's whole influence graph: what feeds it, and what it feeds"),
             ]),
             ("Auto-fix & sensitivity", [
                 ("/autofix on|off", f"toggle auto-intervention (currently {'ON' if self.auto_intervene else 'OFF'})"),
@@ -6425,7 +6468,10 @@ class PulseCLI:
 
     def _build_agent_context(self, include_code: bool = False) -> str:
         variables = self.discover_variables()
-        lines = ["Current Pulse variable state:"]
+        lines = [
+            f"Current Pulse variable state (step {self.step}, "
+            f"{self._format_time_per_step()} per step):"
+        ]
         for name in sorted(variables):
             val = self._cpu_observation(name, variables[name])
             if val is None and variables[name] is not None:
@@ -6810,6 +6856,7 @@ class PulseCLI:
         "defof": re.compile(r"^\s*DEFOF:\s*(.+)$", re.MULTILINE),
         "callers": re.compile(r"^\s*CALLERS:\s*(.+)$", re.MULTILINE),
         "depgraph": re.compile(r"^\s*DEPGRAPH:\s*(.*)$", re.MULTILINE),
+        "trace": re.compile(r"^\s*TRACE:\s*(.+)$", re.MULTILINE),
         "corr": re.compile(r"^\s*CORR:\s*(.+)$", re.MULTILINE),
         "outlier": re.compile(r"^\s*OUTLIER:\s*(.+)$", re.MULTILINE),
         "diffstats": re.compile(r"^\s*DIFFSTATS:\s*(.+)$", re.MULTILINE),
@@ -7311,6 +7358,25 @@ class PulseCLI:
         result = executor.run(request, is_verification=is_verification or getattr(self, "_in_verification_pass", False))
         cprint(executor.summary_line(result), color=(_GREEN if result.ok else _RED))
         return result.render()
+
+    # ------------------------------------------------------------------
+    # TRACE: -- the variable influence graph: what feeds a variable, and what it feeds,
+    # both directions, across function and file boundaries. AST-based, like DEFOF/CALLERS/
+    # DEPGRAPH above, not a live taint tracker -- a heuristic reconstruction of the real
+    # assignment/parameter/return chain, good enough to point at where a bad value actually
+    # originated (and everywhere it has already spread) without needing to re-run anything.
+    # The actual graph-building lives in pulse_trace.py, shared with `pulse code`'s TRACE:
+    # and `pulse watch`'s /trace so all three see the exact same answer for the same code.
+    # ------------------------------------------------------------------
+    def _run_trace(self, arg: str) -> str:
+        """TRACE: <variable>[:<file>[:<line>]] -- the variable's whole connected influence
+        path: everything that feeds it (transitively), and everything it feeds in turn,
+        reconstructed from the real assignment/parameter/return chain in the tracked
+        project rather than asked of the model. `self.<attr>` works too, and is shared
+        across every method of its class. See pulse_trace.py for what this does and does
+        not follow."""
+        files = list(self._iter_searchable_files())
+        return _pulse_trace.trace(files, arg, color=_COLOR_ENABLED)
 
     def _run_exec_shapetrace(self, arg: str) -> str:
         """SHAPETRACE: [optional model var name] -- forward pass with a
@@ -7979,6 +8045,8 @@ class PulseCLI:
             notes.append(self._run_callers(symbol))
         if "depgraph" in requests:
             notes.append(self._run_depgraph())
+        for arg in requests.get("trace", []):
+            notes.append(self._run_trace(arg))
         for arg in requests.get("corr", []):
             notes.append(self._run_corr(arg))
         for var in requests.get("outlier", []):
@@ -8187,6 +8255,8 @@ class PulseCLI:
         "  DIFFSTATS: <var> <i> <j>     exact change between two recorded points\n"
         "  HISTOGRAM: <var>             distribution of a recorded history\n"
         "  MLLINT:                      Pulse's static ML anti-pattern scan of the code\n"
+        "  TRACE: <var>[:<file>[:<line>]]  what feeds a variable and what it feeds, across the code "
+        "-- e.g. how a label or a scaled array reaches the model\n"
         "  TERMINAL: <shell command>    ONE line -- only the text after 'TERMINAL:' on that line is "
         "run, so a heredoc or a quoted script spread over several lines arrives cut off. For "
         "Python, join statements with ';' in one python3 -c \"...\" line. It runs in the project "
@@ -8224,13 +8294,16 @@ class PulseCLI:
         "When you are done investigating, answer with ONLY these lines, and no tool lines:\n"
         "VERDICT: ok | problem\n"
         "PROBLEM: <if problem: what is wrong, where (file:line), and the evidence. Omit if ok.>\n"
-        "NEXTCHECK: <minutes until the next check-in, {min_mins:g}-{max_mins:g}>\n"
+        "NEXTCHECK: <training steps until the next check-in, {min_steps}-{max_steps}. You are told "
+        "the time per step: fewer steps when steps are slow or something needs watching, more when "
+        "the run is stable.>\n"
         "CHECKNOTE: <a note to the next check-in: what to look at then and why -- a suspicion "
         "still to confirm, a number to watch, a line to re-read. 'none' if nothing.>"
     )
 
     _PERIODIC_CHECKIN_PROMPT = (
-        "[Automatic check-in, {mins:g} minutes after the last one. Training is still running.]\n\n"
+        "[Automatic check-in, {steps} training step(s) after the last one, at roughly "
+        "{time_per_step} per step. Training is still running.]\n\n"
         "Note left for this check-in by the previous one:\n{note}\n\n"
         "Recorded metric history (evenly sampled, oldest first):\n{history}\n\n"
         "{snapshot}\n\n"
@@ -8252,16 +8325,16 @@ class PulseCLI:
     # Rounds of tool use a check-in may take before it must answer. Each round is one model
     # call, so this caps a check-in's cost at MAX_ROUNDS + 1 calls.
     _CHECKIN_MAX_ROUNDS = int(os.environ.get("PULSE_CHECKIN_ROUNDS", "6") or 6)
-    _CHECKIN_TOOL_NAMES = ("terminal", "corr", "outlier", "diffstats", "histogram", "mllint")
+    _CHECKIN_TOOL_NAMES = ("terminal", "trace", "corr", "outlier", "diffstats", "histogram", "mllint")
 
-    # Bounds on the agent-negotiated NEXTCHECK: interval -- keeps the
-    # cadence genuinely dynamic (see _maybe_periodic_checkin and the
-    # NEXTCHECK: line added to _START_PRIME_PROMPT) without letting a
-    # malformed or adversarial reply set it to something absurd (a
-    # near-0 value hammering the API in a loop, or a near-infinite value
-    # that never checks in again).
-    _CHECKIN_MIN_INTERVAL = 120.0    # 2 minutes
-    _CHECKIN_MAX_INTERVAL = 3600.0   # 60 minutes
+    # Bounds on the agent-negotiated NEXTCHECK: interval -- keeps the cadence genuinely dynamic
+    # (see _maybe_periodic_checkin and the NEXTCHECK: line added to _START_PRIME_PROMPT) without
+    # letting a malformed or adversarial reply set it to something absurd (a near-0 value
+    # hammering the API every step, or a near-infinite value that never checks in again).
+    # Step-based, not time-based -- see the comment on checkin_interval_steps in __init__ for why.
+    _CHECKIN_MIN_STEPS = 20
+    _CHECKIN_MAX_STEPS = 20_000
+    _DEFAULT_CHECKIN_STEPS = 500
     _CHECKIN_OK_STATUSES = {
         "ok", "ok.", "okay", "fine", "healthy", "looks good", "looks fine",
         "looks healthy", "nominal", "good", "none", "no issues", "no problems",
@@ -8272,28 +8345,25 @@ class PulseCLI:
                              re.MULTILINE | re.DOTALL)
     _CHECKNOTE_RE = re.compile(r"^\s*CHECKNOTE:\s*(.+?)(?=^\s*(?:NEXTCHECK|VERDICT|PROBLEM|GPUTRACK|GPUUNTRACK):|\Z)",
                                re.MULTILINE | re.DOTALL)
-    _NEXTCHECK_RE = re.compile(r"^\s*NEXTCHECK:\s*([0-9]*\.?[0-9]+)", re.MULTILINE)
+    _NEXTCHECK_RE = re.compile(r"^\s*NEXTCHECK:\s*([0-9]+)", re.MULTILINE)
 
     @classmethod
-    def _parse_nextcheck_minutes(cls, text: Optional[str]) -> Optional[float]:
-        """Pull a NEXTCHECK: <minutes> line out of an agent reply (the
-        periodic check-in prompt below, or the one-time
-        _START_PRIME_PROMPT), clamped to [_CHECKIN_MIN_INTERVAL,
-        _CHECKIN_MAX_INTERVAL] so a malformed or extreme reply can't set
-        an unreasonable cadence. Returns None if there's no parseable
-        NEXTCHECK: line at all, in which case the caller should leave
-        the existing interval alone rather than guess."""
+    def _parse_nextcheck_steps(cls, text: Optional[str]) -> Optional[int]:
+        """Pull a NEXTCHECK: <steps> line out of an agent reply (the periodic check-in prompt
+        below, or the one-time _START_PRIME_PROMPT), clamped to [_CHECKIN_MIN_STEPS,
+        _CHECKIN_MAX_STEPS] so a malformed or extreme reply can't set an unreasonable cadence.
+        Returns None if there's no parseable NEXTCHECK: line at all, in which case the caller
+        should leave the existing interval alone rather than guess."""
         m = cls._NEXTCHECK_RE.search(text or "")
         if not m:
             return None
         try:
-            minutes = float(m.group(1))
+            steps = int(m.group(1))
         except ValueError:
             return None
-        if minutes <= 0 or not math.isfinite(minutes):
+        if steps <= 0:
             return None
-        lo, hi = cls._CHECKIN_MIN_INTERVAL / 60.0, cls._CHECKIN_MAX_INTERVAL / 60.0
-        return max(lo, min(hi, minutes))
+        return max(cls._CHECKIN_MIN_STEPS, min(cls._CHECKIN_MAX_STEPS, steps))
 
     def _restart_env(self, depth: int) -> Dict[str, str]:
         """The environment for the restarted, fixed script: marked as a restart, and told
@@ -8421,9 +8491,42 @@ class PulseCLI:
         else:
             cprint("[Pulse] Continuing training automatically.")
 
+    def _format_time_per_step(self) -> str:
+        """Human-readable wall-clock pace, fed to the agent alongside the step count so it can
+        reason in time terms too (e.g. 'this is a slow, expensive step, maybe don't wait for
+        as many of them'). Not used for scheduling itself -- see checkin_interval_steps -- only
+        for giving the agent the context to reason about time if it wants to."""
+        ema = self._time_per_step_ema
+        if ema is None or ema <= 0:
+            return "an unknown amount of time (not enough steps observed yet)"
+        if ema < 1.0:
+            return f"~{ema * 1000:.0f}ms"
+        return f"~{ema:.2f}s"
+
+    def _record_step_advance(self, n: int) -> None:
+        """Called whenever self.step actually advances (see update()), to maintain the
+        time-per-step estimate fed to the agent. An exponential moving average, not a raw
+        instantaneous measurement, so one slow tick (a GC pause, a probe that happened to
+        land on this step) doesn't swing the number the agent sees."""
+        if n <= 0:
+            return
+        now = time.monotonic()
+        elapsed = now - self._last_step_time
+        self._last_step_time = now
+        if elapsed <= 0:
+            return
+        per_step = elapsed / n
+        if self._time_per_step_ema is None:
+            self._time_per_step_ema = per_step
+        else:
+            alpha = 0.2  # same smoothing weight as the other EMAs in this file
+            self._time_per_step_ema = alpha * per_step + (1 - alpha) * self._time_per_step_ema
+
     def _maybe_periodic_checkin(self) -> None:
-        """Every checkin_interval seconds (agent-chosen: NEXTCHECK: from the start-of-run
-        prime, then from each check-in's own answer), run a check-in: an agent that reads the
+        """Every checkin_interval_steps real training steps (agent-chosen: NEXTCHECK: from the
+        start-of-run prime, then from each check-in's own answer; step-based, so a fast run is
+        reviewed in proportion to how much has happened and a slow one is not charged a
+        check-in before it has taken more than a couple of steps), run a check-in: an agent that reads the
         code, the metric history and the current snapshot, investigates over several tool
         rounds, and returns a VERDICT. A 'problem' verdict goes through the same
         _escalate_training_problem path as a deterministic detection. Whoever schedules a
@@ -8442,10 +8545,9 @@ class PulseCLI:
             return
         if not self.agent_provider or not self.agent_key:
             return
-        now = time.monotonic()
-        if now - self._last_checkin < self.checkin_interval:
+        if self.step - self._last_checkin_step < self.checkin_interval_steps:
             return
-        self._last_checkin = now
+        self._last_checkin_step = self.step
 
         # Everything the check-in reads from live state is captured here, on the training thread.
         tracked = ", ".join(sorted(self.gpu_tracked_vars)) if self.gpu_tracked_vars else "(none)"
@@ -8457,16 +8559,19 @@ class PulseCLI:
             history = self._checkin_history_summary()
         except Exception as exc:
             history = f"(unable to summarise metric history: {exc})"
+        time_per_step = self._format_time_per_step()
         prompt = self._PERIODIC_CHECKIN_PROMPT.format(
-            mins=self.checkin_interval / 60.0, tracked=tracked, snapshot=snapshot,
-            history=history, note=(getattr(self, "_checkin_note", "") or "(none)"),
+            steps=self.checkin_interval_steps, time_per_step=time_per_step, tracked=tracked,
+            snapshot=snapshot, history=history, note=(getattr(self, "_checkin_note", "") or "(none)"),
         )
         cprint(
-            f"\n[Pulse] ⏱ {self.checkin_interval / 60:g}-min check-in -- agent is reviewing the run "
-            "for bugs and instability (training continues)...",
+            f"\n[Pulse] ⏱ {self.checkin_interval_steps}-step check-in (step {self.step}, "
+            f"{time_per_step}/step) -- agent is reviewing the run for bugs and instability "
+            "(training continues)...",
             color=_YELLOW,
         )
-        _agent_log_event(f"PERIODIC CHECK-IN started ({self.checkin_interval / 60:g} min after the last)")
+        _agent_log_event(f"PERIODIC CHECK-IN started at step {self.step} "
+                         f"({self.checkin_interval_steps} steps after the last, {time_per_step}/step)")
         if _async_model_calls_enabled():
             self._checkin_call = _BackgroundModelCall(lambda: self._run_checkin(prompt), prompt=prompt)
             return
@@ -8521,7 +8626,8 @@ class PulseCLI:
                 summary.append(f"VIEW {arg}")
         _clean, requests = self._extract_new_directives(answer)
         runners = {
-            "terminal": self._run_terminal, "corr": self._run_corr, "outlier": self._run_outlier,
+            "terminal": self._run_terminal, "trace": self._run_trace,
+            "corr": self._run_corr, "outlier": self._run_outlier,
             "diffstats": self._run_diffstats, "histogram": self._run_histogram,
             "mllint": lambda _arg: self._run_mllint(),
         }
@@ -8545,7 +8651,7 @@ class PulseCLI:
         answer. Its own system prompt and its own message list -- never agent_history.
         Returns (final answer, console transcript of the tools it used)."""
         system = self._CHECKIN_SYSTEM_PROMPT.format(
-            min_mins=self._CHECKIN_MIN_INTERVAL / 60.0, max_mins=self._CHECKIN_MAX_INTERVAL / 60.0)
+            min_steps=self._CHECKIN_MIN_STEPS, max_steps=self._CHECKIN_MAX_STEPS)
         history: List[Dict[str, str]] = []
         message = prompt
         transcript: List[str] = []
@@ -8651,16 +8757,15 @@ class PulseCLI:
         if self._checkin_note:
             cprint(f"[Pulse] Note for the next check-in: {self._checkin_note}", color=_YELLOW)
 
-        next_minutes = self._parse_nextcheck_minutes(answer)
-        if next_minutes is not None:
-            next_seconds = next_minutes * 60.0
-            if abs(next_seconds - self.checkin_interval) > 1e-6:
+        next_steps = self._parse_nextcheck_steps(answer)
+        if next_steps is not None:
+            if next_steps != self.checkin_interval_steps:
                 cprint(
-                    f"[Pulse] Agent set its next check-in for {next_minutes:g} minutes from now "
-                    f"(was {self.checkin_interval / 60:g}).",
+                    f"[Pulse] Agent set its next check-in for {next_steps} steps from now "
+                    f"(was {self.checkin_interval_steps}).",
                     color=_YELLOW,
                 )
-            self.checkin_interval = next_seconds
+            self.checkin_interval_steps = next_steps
 
     @staticmethod
     def _parse_json_obj(answer: str) -> Optional[Dict[str, Any]]:
@@ -10849,10 +10954,13 @@ class PulseCLI:
         "the metric history and the tracked values, investigates with tools (grep, view, a shell), "
         "and looks for instability AND for bugs that let training look healthy while the result is "
         "wrong (leakage, validation that is not held out, misaligned labels, the wrong output "
-        "activation or loss, bad scaling, absurd hyperparameters). Decide how long until the FIRST "
-        "check-in, based on how quickly problems would show in this specific run: a short, "
-        "fast-iterating script warrants just a couple of minutes; a long, slow run much longer. "
-        "Anywhere from 2 to 60 minutes.\n"
+        "activation or loss, bad scaling, absurd hyperparameters). Decide how many "
+        "real training steps until your FIRST check-in should be, based on how quickly you'd "
+        "expect problems to show up in this specific run: a short, fast-iterating script might "
+        "warrant checking back in after just a few dozen steps; a long, slow training run doing "
+        "expensive steps can safely go for many more before its first check-in. Think in steps, "
+        "not time -- Pulse will tell you the per-step pace at each check-in so you can convert to "
+        "wall-clock time if that helps you reason about it. Anywhere from 20 to 20000 steps.\n"
         "5. Leave that first check-in a note. You have the code now and it will be busy with a "
         "live run: say what in this code deserves a closer look once real numbers exist, and why "
         "-- a line that looks wrong, an assumption to verify, which metric would expose it. Be "
@@ -10863,7 +10971,7 @@ class PulseCLI:
         "SENSITIVITY: <0.0-1.0, a preset (loose/medium/tight), or 'spike|plateau|oscillation <value|auto>'>\n"
         "NORMAL_START: <comma-separated var=value pairs for loss-like tracked variables you can justify, or 'none'>\n"
         "GPUTRACK: <comma-separated variable names to track closely from the start, or 'none'>\n"
-        "NEXTCHECK: <minutes (2-60) until your first periodic check-in>\n"
+        "NEXTCHECK: <steps (20-20000) until your first periodic check-in>\n"
         "CHECKNOTE: <your note to the first check-in, or 'none'>"
     )
 
@@ -11141,23 +11249,15 @@ class PulseCLI:
             self._checkin_note = note
             cprint(f"[Pulse] Note for the first check-in: {note}", color=_YELLOW)
             _agent_log_event("NOTE FOR THE FIRST CHECK-IN", note)
-        initial_minutes = self._parse_nextcheck_minutes(answer)
-        if initial_minutes is not None:
-            _agent_log_event(f"FIRST CHECK-IN SCHEDULED in {initial_minutes:g} min")
-            self.checkin_interval = initial_minutes * 60.0
-            self._last_checkin = time.monotonic()
-            if deferred:
-                cprint(
-                    f"[Pulse] Agent scheduled its first check-in for {initial_minutes:g} "
-                    "minutes from now.",
-                    color=_YELLOW,
-                )
-            else:
-                cprint(
-                    f"[Pulse] Agent scheduled its first check-in for {initial_minutes:g} minutes "
-                    "from now.",
-                    color=_YELLOW,
-                )
+        initial_steps = self._parse_nextcheck_steps(answer)
+        if initial_steps is not None:
+            _agent_log_event(f"FIRST CHECK-IN SCHEDULED in {initial_steps} steps")
+            self.checkin_interval_steps = initial_steps
+            self._last_checkin_step = self.step
+            cprint(
+                f"[Pulse] Agent scheduled its first check-in for {initial_steps} steps from now.",
+                color=_YELLOW,
+            )
 
     def _prime_with_agent_if_needed(self) -> None:
         """Called every update() once an agent is confirmed available.
@@ -11384,6 +11484,65 @@ class PulseCLI:
         return self.scalar_histories.get(name, [])
 
 
+    # Names checked in priority order when looking for a real loop counter in the traced
+    # code's locals (self.watch_locals) -- finest-grained/most-specific first, since the goal
+    # is to catch every real step, not just every epoch. Only a plain int that visibly
+    # increased since the last observation counts; see _detect_loop_step_delta.
+    _LOOP_VAR_CANDIDATES = (
+        "global_step", "train_step", "cur_step", "step", "it", "iter", "iteration",
+        "batch_idx", "batch_i", "n_iter", "idx", "i", "epoch",
+    )
+    # A single observation-to-observation jump bigger than this is more likely a variable
+    # that isn't actually a step counter (a sample count, a byte offset, ...) than dozens of
+    # real steps happening between two ticks -- capped so a false match can't silently
+    # fast-forward the step count.
+    _LOOP_VAR_MAX_STEP_JUMP = 200
+
+    def _detect_loop_step_delta(self) -> Optional[int]:
+        """Look for a plain integer loop counter in the code Pulse is watching
+        (self.watch_locals, refreshed from the real training-loop frame's locals on every
+        traced line -- see pulse.py) and, if one is confidently behaving like a real
+        per-iteration counter, return how much it advanced since the last observation. This
+        is the direct signal of "did a real step happen, and how many," tied to the user's
+        own loop variable updating rather than inferred indirectly from whether the loss
+        value happened to move.
+
+        A candidate only counts if:
+          - it's a plain int (not a tensor, not a float, not a bool) -- a real Python loop
+            counter, not something that merely looks like one;
+          - it did not decrease since last seen -- a decrease means a new loop/run started
+            (or this name isn't the counter we think it is), so it's re-baselined instead of
+            reported as a step;
+          - the increase is within _LOOP_VAR_MAX_STEP_JUMP, so a variable that happens to
+            jump by a huge amount (it's actually a sample count, not a step count) doesn't
+            get reported as hundreds of steps in one tick.
+
+        Returns None (not zero) only when no recognized loop-counter name has enough history
+        yet to judge -- callers should fall through to their own fallback in that case only.
+        A value of 0 is itself a confident answer ("a real loop counter exists and it did NOT
+        advance this tick") and callers should trust that over any other heuristic, the same
+        way a positive delta is trusted.
+        """
+        locals_map = getattr(self, "watch_locals", None) or {}
+        last_seen = self._loop_var_last_seen
+        for name in self._LOOP_VAR_CANDIDATES:
+            if name not in locals_map:
+                continue
+            raw = locals_map[name]
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                continue  # only a plain int counts -- not a tensor, float, numpy scalar, etc.
+            prev = last_seen.get(name)
+            last_seen[name] = raw
+            if prev is None:
+                continue  # first sighting -- nothing to diff against yet, try the next candidate
+            delta = raw - prev
+            if delta < 0:
+                return 0  # the loop/run restarted -- confidently "no step this tick," not a guess
+            if delta > self._LOOP_VAR_MAX_STEP_JUMP:
+                continue  # implausible jump for one tick -- probably not a step counter after all
+            return delta  # first (finest-grained) match wins, including a confident 0
+        return None
+
     def update(self, step: Optional[int] = None,
             generate_pdfs: Optional[bool] = None) -> None:
         """Called at every training step/checkpoint."""
@@ -11502,9 +11661,28 @@ class PulseCLI:
 
         # ------------------------------------------------------------
         # STEP COUNTER
+        #
+        # Priority order, most trustworthy first:
+        #   1. An explicit step number handed in (e.g. a Keras callback's batch/epoch index) --
+        #      already authoritative, unchanged.
+        #   2. A real loop-counter variable spotted in the traced code that visibly advanced
+        #      since last time (see _detect_loop_step_delta) -- tied directly to the user's own
+        #      loop incrementing, not inferred indirectly from whether some other value moved.
+        #      This is what keeps the count from drifting too fast (a variable that hasn't
+        #      actually moved contributes nothing) or too slow (an advance of more than 1 -- the
+        #      observation callback firing less often than every single iteration -- is credited
+        #      in full, not flattened to +1).
+        #   3. The older heuristics, kept as a fallback for code with no recognizable loop
+        #      counter in scope: advance once per tick if there's no loss signal to compare at
+        #      all, or once whenever the loss value visibly changes.
         # ------------------------------------------------------------
+        loop_step_delta = self._detect_loop_step_delta()
+        prev_step = self.step
         if step is not None:
             self.step = step
+
+        elif loop_step_delta is not None:
+            self.step += loop_step_delta
 
         elif loss_var is None and new_loss_value is None:
             self.step += 1
@@ -11514,6 +11692,9 @@ class PulseCLI:
             new_loss_value,
         ):
             self.step += 1
+
+        if self.step > prev_step:
+            self._record_step_advance(self.step - prev_step)
 
         if new_loss_value is not None:
             self._last_loss_value = new_loss_value
@@ -12217,6 +12398,15 @@ class PulseCLI:
                 )
                 continue
 
+            if (
+                cmd_lower == "/trace"
+                or cmd_lower.startswith("/trace ")
+            ):
+                self._cmd_trace(
+                    cmd[6:].strip()
+                )
+                continue
+
             if cmd_lower == "/tracked":
                 cfg_strs = [
                     (
@@ -12339,6 +12529,19 @@ class PulseCLI:
             return
         cprint(f"--- {name} ({len(hist)} point(s)) ---")
         self._print_ascii_chart(name, hist)
+
+    def _cmd_trace(self, arg: str) -> None:
+        """/trace <var>[:<file>[:<line>]] -- the same variable influence graph the agent
+        gets from a TRACE: directive, callable directly without going through the AI: what
+        feeds this variable (transitively, across function/file boundaries), and everything
+        it feeds in turn. self.<attr> works too."""
+        if not arg.strip():
+            cprint("  usage: /trace <variable>  (or /trace <variable>:<file>:<line>, self.<attr> works too)",
+                   color=_YELLOW)
+            return
+        print()
+        print(self._run_trace(arg))
+        print()
 
     def _print_ascii_chart(
         self,

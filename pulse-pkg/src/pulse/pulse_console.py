@@ -40,6 +40,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from . import pulse_detect as detect
 from . import pulse_stream as stream
+from . import pulse_trace as trace_engine
 
 LIVE_WINDOW_SECONDS = 30.0        # no new frames for this long and a run is not "live"
 MIN_SAMPLE_INTERVAL = 0.01
@@ -359,6 +360,7 @@ HELP = """\
   /vars              every value being tracked
   /audit             run the full wake-up audit now (uses the agent)
   /code              show the training script
+  /trace <var>       the variable's whole influence graph: what feeds it, and what it feeds
   /sessions          list runs on this machine again
   /attach <n|id>     watch a different run
   /cd                print the directory this run's file lives in
@@ -582,6 +584,20 @@ class Console:
             print(f"  {dim(f'{number:>4}')} {line}")
         if len(lines) > 200:
             print(dim(f"  ... {len(lines) - 200} more lines"))
+        print()
+
+    def show_trace(self, arg: str) -> None:
+        """/trace <var>[:<file>[:<line>]] -- the variable's whole connected influence
+        path: everything that feeds it (across function/file boundaries, following
+        parameters back to call sites and returns forward into callers), and everything
+        it feeds in turn, from the run's own project files on disk."""
+        if not arg.strip():
+            print("\n  usage: /trace <variable>  (or /trace <variable>:<file>:<line>, self.<attr> works too)\n")
+            return
+        script = self.session.get("script")
+        files = trace_engine.project_files(self.workdir, entry=script)
+        print()
+        print(trace_engine.trace(files, arg, color=_COLOR))
         print()
 
     # -------------------------------------------------------------- actions
@@ -1160,6 +1176,8 @@ def run_console(session: Dict[str, Any], sessions: List[Dict[str, Any]],
             console.show_vars()
         elif command == "code":
             console.show_code()
+        elif command == "trace":
+            console.show_trace(argument)
         elif command == "audit":
             console.audit()
         elif command == "cd":

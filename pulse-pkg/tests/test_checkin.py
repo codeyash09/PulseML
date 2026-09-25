@@ -18,7 +18,7 @@ def make_cli(replies, tools=None):
         return replies.pop(0)
 
     cli._call_model = call_model
-    for name in ("_run_grep", "_run_view", "_run_terminal", "_run_corr", "_run_outlier",
+    for name in ("_run_grep", "_run_view", "_run_terminal", "_run_trace", "_run_corr", "_run_outlier",
                  "_run_diffstats", "_run_histogram"):
         setattr(cli, name, (lambda n: lambda arg: cli.ran.append((n, arg)) or f"<{n} {arg}>")(name))
     cli._run_mllint = lambda: cli.ran.append(("_run_mllint", "")) or "<mllint>"
@@ -95,7 +95,7 @@ def test_a_failing_tool_does_not_end_the_checkin():
 
 def finished_cli():
     cli = make_cli([])
-    cli.checkin_interval = 180.0
+    cli.checkin_interval_steps = 100
     cli.auto_intervene = True
     cli.agent_history = []
     cli.escalated = []
@@ -108,11 +108,11 @@ def test_note_is_kept_for_the_next_checkin_and_problem_escalates():
     cli = finished_cli()
     cli._finish_periodic_checkin(
         "VERDICT: problem\nPROBLEM: relu output into binary_crossentropy (train.py:32)\n"
-        "NEXTCHECK: 4\nCHECKNOTE: after the fix, val_accuracy should leave 0.48",
+        "NEXTCHECK: 40\nCHECKNOTE: after the fix, val_accuracy should leave 0.48",
         None, "prompt", ["round 1: GREP relu"])
     assert cli.escalated == ["[periodic check-in] relu output into binary_crossentropy (train.py:32)"]
     assert cli._checkin_note == "after the fix, val_accuracy should leave 0.48"
-    assert cli.checkin_interval == 240.0
+    assert cli.checkin_interval_steps == 40
 
 
 def test_ok_does_not_escalate_and_none_clears_the_note():
@@ -131,8 +131,9 @@ def test_history_summary_samples_evenly():
 
 
 def test_prompt_formats():
-    PulseCLI._CHECKIN_SYSTEM_PROMPT.format(min_mins=2, max_mins=60)
-    PulseCLI._PERIODIC_CHECKIN_PROMPT.format(mins=3, tracked="(none)", snapshot="s", history="h", note="n")
+    PulseCLI._CHECKIN_SYSTEM_PROMPT.format(min_steps=20, max_steps=20000)
+    PulseCLI._PERIODIC_CHECKIN_PROMPT.format(steps=100, time_per_step="1s", tracked="(none)",
+                                             snapshot="s", history="h", note="n")
     assert "CHECKNOTE:" in PulseCLI._START_PRIME_PROMPT
 
 
@@ -219,3 +220,9 @@ def test_pulse_itself_is_not_sent_as_a_project_file(tmp_path):
     finally:
         sys.path.remove(str(tmp_path))
     assert found == [str(tmp_path / "helpers.py")]
+
+
+def test_trace_is_a_checkin_tool():
+    cli = make_cli(["TRACE: y_train", "VERDICT: ok"])
+    cli._run_checkin("the run")
+    assert ("_run_trace", "y_train") in cli.ran
