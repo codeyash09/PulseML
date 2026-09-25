@@ -11,6 +11,7 @@ import sys
 import io
 import ast
 import copy
+import collections
 import json
 import time
 import math
@@ -109,6 +110,10 @@ def _build_keras_tracker_class(callback_base):
 
         def on_train_batch_end(self, batch, logs=None):
             # Keep batch handling extremely cheap.
+            # Steps are batches, counted across every fit() of the run: check-ins are scheduled
+            # in steps, and one step per epoch left a 15-epoch Keras run short of the 20-step
+            # minimum -- never checked at all.
+            self.pulse._keras_steps = getattr(self.pulse, "_keras_steps", 0) + 1
             try:
                 self.pulse._record_keras_batch_logs(logs)
             except Exception as exc:
@@ -150,7 +155,7 @@ def _build_keras_tracker_class(callback_base):
             # We do NOT run the expensive detector on every batch.
             try:
                 if getattr(self.pulse, "auto_intervene", False):
-                    self.pulse.update()
+                    self.pulse.update(step=getattr(self.pulse, "_keras_steps", None) or None)
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
@@ -355,13 +360,23 @@ def _resume_from_fix_checkpoint(model, args, kwargs) -> None:
             _agent_log_event("RESUME SKIPPED -- the model is not built before fit(), starting fresh")
             return
         before = [w.copy() for w in model.get_weights()]
-        model.load_weights(meta["weights"], skip_mismatch=True)
+        try:
+            # Strict: every weight must fit. A partial load -- the fix changed the
+            # architecture -- is neither the trained model nor a clean start.
+            model.load_weights(meta["weights"])
+        except Exception as exc:
+            model.set_weights(before)
+            cprint("[Pulse] The fixed model no longer matches the checkpoint -- training from the "
+                   "start instead of resuming.", color=_YELLOW)
+            _agent_log_event("RESUME ABANDONED -- the fix changed the model, starting fresh",
+                             f"{type(exc).__name__}: {str(exc)[:300]}")
+            return
         after = model.get_weights()
-        loaded = sum(1 for a, b in zip(before, after) if a.shape == b.shape and not np.array_equal(a, b))
         if not all(np.all(np.isfinite(w)) for w in after):
             model.set_weights(before)
             _agent_log_event("RESUME ABANDONED -- loaded weights were not finite, starting fresh")
             return
+        loaded = len(after)
         epochs = _fit_epochs(args, kwargs)
         start = int(meta.get("epoch", -1)) + 1
         if isinstance(epochs, int) and epochs > 0:
@@ -520,7 +535,18 @@ def _stdout_is_tty() -> bool:
         return False
 
 
+# The last lines a script printed, for the end-of-run review (PulseCLI._end_of_run_review):
+# a script that catches its own exception and prints it ends "normally", and what it printed
+# is the only trace of what went wrong.
+_RECENT_OUTPUT: "collections.deque[str]" = collections.deque(maxlen=40)
+
+
 def safe_print(*args, **kwargs):
+    if kwargs.get("file") in (None, sys.stdout, sys.stderr):
+        try:
+            _RECENT_OUTPUT.append(kwargs.get("sep", " ").join(str(a) for a in args))
+        except Exception:
+            pass
     with _io_lock:
         # Move cursor to column 0 and clear line before printing background text -- but only
         # when this print is going to a terminal. Into a pipe, a log file or a notebook cell
@@ -1600,6 +1626,11 @@ _PASS4_RECHECK_TMPL = (
 # so non-reasoning models don't get longer. Clamped per model in _call_model.
 _AGENT_MAX_TOKENS = 32000
 _AGENT_TIMEOUT_SECONDS = 600.0
+# The start-of-run check and the periodic check-ins run beside training and finish in 8-40 s
+# when the provider answers at all. With the 10-minute timeout above, one request that hung
+# cost 11 minutes before its retry answered in 8 s -- long enough for a 15-minute run to end
+# before its first check-in. They get a short timeout, so a hung request is retried quickly.
+_BACKGROUND_CALL_TIMEOUT_SECONDS = float(os.environ.get("PULSE_BACKGROUND_TIMEOUT", "120") or 120)
 
 # Restarted runs launched by _restart_process get this set: their crashes are
 # reported back to the parent process (which feeds the output to the agent
@@ -3016,6 +3047,8 @@ class PulseCLI:
         self._checkin_call: Optional[_BackgroundModelCall] = None
         # What the agent that scheduled the next check-in wants it to look at (CHECKNOTE:).
         self._checkin_note: str = ""
+        # A run that ends without training, and without a visible crash, is reviewed at exit.
+        atexit.register(self._end_of_run_review)
         self._start_prime_call: Optional[_BackgroundModelCall] = None
         self._start_prime_answered: bool = False
         self._start_prime_retried: bool = False
@@ -5468,6 +5501,45 @@ class PulseCLI:
         tail = "\n".join(lines[-4:])
         return hashlib.sha1(tail.encode("utf-8")).hexdigest()[:12]
 
+    def _end_of_run_review(self) -> None:
+        """At exit: a run that trained nothing, and whose script did not crash visibly, is
+        escalated like any other problem, with the last lines the script printed.
+
+        That is what a script looks like when it wraps training in try/except and prints the
+        error: it exits normally after a few seconds, the crash handler never sees anything,
+        and any start-of-run check still in flight used to die with the process. Waits briefly
+        for that check, so its reading of the code is not lost, then hands the agent the
+        output. Registered with atexit, which runs while background threads are still alive.
+        """
+        if getattr(self, "_end_review_done", False):
+            return
+        self._end_review_done = True
+        try:
+            if not (self.auto_intervene and self.agent_provider and self.agent_key and self.code_text):
+                return
+            if getattr(self, "_crash_seen", False):
+                return
+            histories = getattr(self, "epoch_scalar_histories", {}) or {}
+            if self.step > 0 or any(histories.values()):
+                return
+            call = getattr(self, "_start_prime_call", None)
+            if call is not None:
+                deadline = time.monotonic() + 90
+                while not call.done and time.monotonic() < deadline:
+                    time.sleep(0.5)
+                self._poll_start_prime()
+            own = ("[Pulse]", "  ", "─", "Pulse is ready", "Type /help")
+            tail = [l for l in list(_RECENT_OUTPUT) if l.strip() and not l.startswith(own)][-15:]
+            problem = ("The script finished without training a single step, and nothing crashed "
+                       "visibly -- an error may have been caught and printed instead of raised. "
+                       "Its last output:\n" + ("\n".join(tail) or "(nothing)"))
+            _agent_log_event("END OF RUN WITHOUT TRAINING -- escalating", "\n".join(tail))
+            self._escalate_training_problem(problem)
+        except SystemExit:
+            pass        # a fix restarted the script, and the restarted run finished
+        except Exception as exc:
+            _pulse_log(f"END-OF-RUN REVIEW failed: {type(exc).__name__}: {exc}")
+
     def handle_crash(self, tb_text: str) -> Optional[str]:
         """Called from pulse.py's excepthook for every uncaught exception.
         Always logs the traceback to Debug_Sessions.error_tracebacks, then
@@ -5477,6 +5549,7 @@ class PulseCLI:
         deciding what to do next (offer a known fix, ask the agent, or
         just note it's the same one as before).
         """
+        self._crash_seen = True
         self.log_traceback(tb_text)
         sig = self._traceback_signature(tb_text)
         self._traceback_signatures_seen[sig] = self._traceback_signatures_seen.get(sig, 0) + 1
@@ -6153,6 +6226,13 @@ class PulseCLI:
                 sys.stderr.write(result.stderr or "")
                 message = (f"The re-run finished, but the fix does not appear to have done its job "
                            f"(attempt {attempt}/{MAX_RESTART_ATTEMPTS}): {reason}")
+                if child_env.get(_RESUME_ENV):
+                    # It resumed from weights trained under the bug, and that did not work: the
+                    # weights may carry the damage (e.g. a learning rate that wrecked them while
+                    # leaving them finite). Every later attempt in this chain starts fresh.
+                    self._resume_after_fix = False
+                    child_env = self._restart_env(depth)
+                    _agent_log_event("RESUMED RUN DID NOT WORK -- later attempts start from scratch", reason)
             else:
                 sys.stdout.write(result.stdout or "")
                 sys.stderr.write(result.stderr or "")
@@ -6611,7 +6691,8 @@ class PulseCLI:
     def _call_model(self, instruction: str, max_tokens: int = _AGENT_MAX_TOKENS, *,
                     system: Optional[str] = None,
                     history: Optional[List[Dict[str, str]]] = None,
-                    purpose: Optional[str] = None) -> str:
+                    purpose: Optional[str] = None,
+                    timeout: Optional[float] = None) -> str:
         """One lightweight completion call: system prompt + recent history +
         a one-off stage instruction. Does not touch self.agent_history --
         callers decide what (if anything) gets persisted once the whole
@@ -6652,7 +6733,7 @@ class PulseCLI:
                     model=model,
                     messages=messages,
                     max_tokens=max_tokens,
-                    timeout=_AGENT_TIMEOUT_SECONDS,
+                    timeout=timeout or _AGENT_TIMEOUT_SECONDS,
                     api_base=self.agent_api_base,  # only set for local/self-hosted providers
                     api_key=(self.agent_key if self.agent_key and self.agent_key != "local" else None),
                 )
@@ -8658,7 +8739,8 @@ class PulseCLI:
         answer = ""
         for round_no in range(self._CHECKIN_MAX_ROUNDS + 1):
             answer = self._call_model(message, max_tokens=_AGENT_MAX_TOKENS, system=system, history=history,
-                                      purpose=f"periodic check-in, round {round_no + 1}")
+                                      purpose=f"periodic check-in, round {round_no + 1}",
+                                      timeout=_BACKGROUND_CALL_TIMEOUT_SECONDS)
             if self._checkin_verdict(answer)[0] is not None:
                 break                               # answered -- any stray tool lines are ignored
             results, used = self._checkin_service_tools(answer)
@@ -8676,7 +8758,8 @@ class PulseCLI:
             history += [{"role": "user", "content": message}, {"role": "assistant", "content": answer}]
             answer = self._call_model(self._CHECKIN_VERDICT_ONLY, max_tokens=_AGENT_MAX_TOKENS,
                                       system=system, history=history,
-                                      purpose="periodic check-in, asking for the missing verdict")
+                                      purpose="periodic check-in, asking for the missing verdict",
+                                      timeout=_BACKGROUND_CALL_TIMEOUT_SECONDS)
             transcript.append("verdict: asked again for a missing VERDICT line")
         return answer, transcript
 
@@ -11207,7 +11290,8 @@ class PulseCLI:
         prompt = f"{context}\n\n{self._START_PRIME_PROMPT}"
         if _async_model_calls_enabled():
             self._start_prime_call = _BackgroundModelCall(
-                lambda: self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS, purpose="start-of-run check"),
+                lambda: self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS, purpose="start-of-run check",
+                                         timeout=_BACKGROUND_CALL_TIMEOUT_SECONDS),
                 deferred=deferred)
             return
         try:
@@ -11252,8 +11336,10 @@ class PulseCLI:
         initial_steps = self._parse_nextcheck_steps(answer)
         if initial_steps is not None:
             _agent_log_event(f"FIRST CHECK-IN SCHEDULED in {initial_steps} steps")
+            # Counted from the start of the run, not from when this answer arrived: a slow
+            # answer (one hung for 11 minutes) must not push the first check-in past the end of
+            # training. If the run is already past it, the check-in is simply due now.
             self.checkin_interval_steps = initial_steps
-            self._last_checkin_step = self.step
             cprint(
                 f"[Pulse] Agent scheduled its first check-in for {initial_steps} steps from now.",
                 color=_YELLOW,

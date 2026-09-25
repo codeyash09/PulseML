@@ -7572,6 +7572,8 @@ def _start_cli_tracker(
         # to make the CPU the bottleneck and starve the GPU of kernel launches.
         if event == "call" and not window["open"]:
             return None
+        if threading is None:
+            return None     # interpreter shutdown: module globals are already torn down
         if _disarm_between_windows and threading.get_ident() != _training_thread_id:
             # A window arms every thread (see above); only the training thread is ever traced.
             return None

@@ -72,9 +72,13 @@ def test_a_changed_architecture_does_not_break_the_restart(tmp_path, monkeypatch
     cli._save_fix_checkpoint()
     monkeypatch.setenv(pc._RESUME_ENV, cli._fix_checkpoint)
     widened = small_model(hidden=8, seed=4)
+    fresh = [w.copy() for w in widened.get_weights()]
     kwargs = {"epochs": 10}
     pc._resume_from_fix_checkpoint(widened, (), kwargs)   # must not raise
-    assert all(np.all(np.isfinite(w)) for w in widened.get_weights())
+    # half-old, half-new is neither the trained model nor a clean start: start clean
+    for a, b in zip(fresh, widened.get_weights()):
+        np.testing.assert_array_equal(a, b)
+    assert "initial_epoch" not in kwargs
 
 
 def test_non_finite_weights_restart_from_scratch(tmp_path, monkeypatch):
@@ -110,3 +114,64 @@ def test_no_checkpoint_restarts_as_before(tmp_path, monkeypatch):
 
 def test_the_fix_can_ask_for_a_fresh_start():
     assert "resume: OPTIONAL" in pc.SYSTEM_PROMPT
+
+
+def test_keras_steps_are_batches_across_the_whole_run():
+    class FakePulse:
+        auto_intervene = True
+        def __init__(self):
+            self.steps_seen = []
+        def _record_keras_batch_logs(self, logs): pass
+        def _record_keras_logs(self, logs, epoch=None): pass
+        def update(self, step=None):
+            self.steps_seen.append(step)
+    tracker_cls = pc._build_keras_tracker_class(keras.callbacks.Callback)
+    pulse = FakePulse()
+    for fit_call in range(2):
+        tracker = tracker_cls(pulse)
+        tracker.set_model(small_model())
+        tracker.set_params({"epochs": 2})
+        tracker.on_train_begin()
+        for epoch in range(2):
+            for batch in range(30):
+                tracker.on_train_batch_end(batch)
+            tracker.on_epoch_end(epoch, {"loss": 0.5})
+    assert pulse.steps_seen == [30, 60, 90, 120]
+
+
+class _SessionFreeCLI(PulseCLI):
+    """PulseCLI without a live session: any state _restart_process reads that a real run
+    would have set up is simply absent (None)."""
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return None
+
+
+def test_after_a_resumed_rerun_fails_the_next_attempt_starts_fresh(tmp_path, monkeypatch):
+    cli = _SessionFreeCLI.__new__(_SessionFreeCLI)
+    cli.script_path = str(tmp_path / "train.py")
+    cli._keras_model, cli._keras_epoch, cli._keras_epochs = small_model(), 4, 10
+    open(cli.script_path, "w").write("pass\n")
+    cli._save_fix_checkpoint()
+    cli._log_incident = lambda *a, **k: None
+    cli._finalize_agent_downtime = lambda: None
+    cli._resolve_restart_interpreter = lambda: "python3"
+    verdicts = iter([(False, "val_loss still stuck"), (True, "")])
+    cli._confirm_fix_did_its_job = lambda result: next(verdicts)
+    launched = []
+
+    class Done:
+        returncode, stdout, stderr = 0, "", ""
+
+    def fake_run(argv, capture_output=True, text=True, env=None, **kw):
+        launched.append(env.get(pc._RESUME_ENV))
+        return Done()
+
+    monkeypatch.setattr(pc.subprocess, "run", fake_run)
+    monkeypatch.setattr(pc.time, "sleep", lambda s: None)
+    monkeypatch.delenv("PULSE_AUTO_RESTART", raising=False)
+    with pytest.raises(SystemExit):
+        cli._restart_process()
+    assert launched[0] == cli._fix_checkpoint      # first attempt resumes
+    assert launched[1] is None                     # it did not work: the next starts fresh

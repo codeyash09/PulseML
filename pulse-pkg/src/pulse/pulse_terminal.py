@@ -236,6 +236,15 @@ class TerminalExecutor:
         timeout = min(max(float(request.timeout or DEFAULT_TIMEOUT_SECONDS), 1.0), MAX_TIMEOUT_SECONDS)
 
         env = dict(os.environ)
+        # `python` in a command means the interpreter this run uses, as it would in the user's
+        # activated environment. A script started as /path/to/venv/bin/python train.py, with
+        # the venv never activated, otherwise sent `python3 -c "import numpy"` to the system
+        # interpreter -- and every check the agent ran failed on the import.
+        interpreter_dir = os.path.dirname(os.path.abspath(sys.executable)) if sys.executable else ""
+        if interpreter_dir:
+            path = env.get("PATH", "")
+            if path.split(os.pathsep)[0] != interpreter_dir:
+                env["PATH"] = interpreter_dir + (os.pathsep + path if path else "")
         if request.env:
             env.update(request.env)
 

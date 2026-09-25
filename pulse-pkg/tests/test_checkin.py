@@ -13,8 +13,9 @@ def make_cli(replies, tools=None):
     cli.ran = []
     replies = list(replies)
 
-    def call_model(message, max_tokens=0, *, system=None, history=None, purpose=None):
-        cli.calls.append({"message": message, "system": system, "history": list(history or [])})
+    def call_model(message, max_tokens=0, *, system=None, history=None, purpose=None, timeout=None):
+        cli.calls.append({"message": message, "system": system, "history": list(history or []),
+                          "timeout": timeout})
         return replies.pop(0)
 
     cli._call_model = call_model
@@ -226,3 +227,68 @@ def test_trace_is_a_checkin_tool():
     cli = make_cli(["TRACE: y_train", "VERDICT: ok"])
     cli._run_checkin("the run")
     assert ("_run_trace", "y_train") in cli.ran
+
+
+def test_checkin_calls_use_the_short_background_timeout():
+    import pulse.pulse_cli as pc
+    cli = make_cli(["GREP: x", "VERDICT: ok"])
+    cli._run_checkin("the run")
+    assert all(c["timeout"] == pc._BACKGROUND_CALL_TIMEOUT_SECONDS for c in cli.calls)
+    assert pc._BACKGROUND_CALL_TIMEOUT_SECONDS < pc._AGENT_TIMEOUT_SECONDS
+
+
+def test_a_late_start_answer_does_not_push_the_first_checkin_back():
+    cli = finished_cli()
+    cli.step, cli._last_checkin_step = 300, 0
+    cli._start_prime_retried = True
+    cli._finish_start_prime("SENSITIVITY: medium\nNEXTCHECK: 50\nCHECKNOTE: watch val_loss", None, False)
+    assert cli.checkin_interval_steps == 50
+    assert cli._last_checkin_step == 0          # due now, not 50 steps after the answer arrived
+
+
+def reviewing_cli(printed, step=0):
+    import pulse.pulse_cli as pc
+    cli = finished_cli()
+    cli.agent_provider, cli.agent_key, cli.code_text = "p", "k", "print(1)"
+    cli.step, cli.epoch_scalar_histories = step, {}
+    pc._RECENT_OUTPUT.clear()
+    for line in printed:
+        pc._RECENT_OUTPUT.append(line)
+    return cli
+
+
+def test_a_run_that_trained_nothing_is_escalated_at_exit():
+    cli = reviewing_cli(["[Pulse] ✓ Start-of-run ML anti-pattern check: no issues found in the code.",
+                         "Found input variables with inconsistent numbers of samples: [1000, 12]"])
+    cli._end_of_run_review()
+    assert len(cli.escalated) == 1
+    assert "without training a single step" in cli.escalated[0]
+    assert "inconsistent numbers of samples" in cli.escalated[0]
+    assert "anti-pattern" not in cli.escalated[0]        # Pulse's own lines are left out
+
+
+def test_a_run_that_trained_is_not_reviewed_at_exit():
+    cli = reviewing_cli(["Epoch 1/10"], step=120)
+    cli._end_of_run_review()
+    assert cli.escalated == []
+
+
+def test_a_crash_pulse_already_handled_is_not_reviewed_again():
+    cli = reviewing_cli(["Traceback ..."])
+    cli._crash_seen = True
+    cli._end_of_run_review()
+    assert cli.escalated == []
+
+
+def test_the_exit_review_runs_once():
+    cli = reviewing_cli(["oops"])
+    cli._end_of_run_review()
+    cli._end_of_run_review()
+    assert len(cli.escalated) == 1
+
+
+def test_terminal_python_is_the_runs_own_interpreter(tmp_path):
+    import os, sys
+    from pulse import pulse_terminal as t
+    result = t.TerminalExecutor(default_cwd=str(tmp_path)).run(t.TerminalRequest(command='echo "$PATH"'))
+    assert result.stdout.strip().split(os.pathsep)[0] == os.path.dirname(os.path.abspath(sys.executable))
