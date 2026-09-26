@@ -117,7 +117,7 @@ def test_bug_frozen_loss_never_confirmed_once_history_hits_the_cap():
             problems.append(problem)
     assert len(cli._detector_scalar_histories["loss"]) == 2000
     engine = cli._detection_engine()
-    assert engine._streak.get(("frozen", "loss")) == 1      # it fires on every check...
+    assert engine._streak.get(("frozen", "loss")) >= 1      # it fires on every check...
     assert problems, "a loss frozen at 0.65 for 60 new readings was never reported"
 
 
@@ -302,7 +302,7 @@ def test_bug_static_all_zero_tensor_can_never_be_confirmed_in_cli():
         if problem:
             problems.append(problem)
     engine = cli._detection_engine()
-    assert engine._streak.get(("tensor_all_zeros", "fc2.weight")) == 1   # fires every time...
+    assert engine._streak.get(("tensor_all_zeros", "fc2.weight")) >= 1   # fires every time...
     assert any("entirely zero" in p for p in problems), problems
 
 
@@ -463,3 +463,220 @@ def test_bug_vae_kl_term_rising_reported_as_divergence():
            "loss": [125 - 45 * (1 - math.exp(-i / 40)) + rng.gauss(0, 1) for i in range(n)]}
     raised = checks_of(feed(run), "kl_loss")
     assert not raised & {"divergence", "progress_lost"}, raised
+
+
+# ============================================================================ FROZEN vs CONVERGED
+#
+# The confirmation fix above lets `frozen` (and plateau/stagnation, which share its
+# fingerprint) be confirmed past the 2,000-reading cap. A run that is genuinely
+# converging can repeat a value exactly too -- rounded logging, float32, a loss that
+# has reached 0.0, a fixed point -- and must never be told it is frozen, before or after
+# the cap. Every run below is a long, realistic, healthy curve fed through the CLI the
+# way a live run is (one reading at a time, capped histories, the engine kept across
+# checks) and also straight into an uncapped engine.
+
+def _cli_findings(values, stride=7, keras=False):
+    """Every (check, severity) the CLI's engine held at any point of the run."""
+    np = pytest.importorskip("numpy")
+    cli = make_cli()
+    cli.tracked_vars = ["loss"]
+    seen = set()
+    with contextlib.redirect_stdout(io.StringIO()):
+        for i, value in enumerate(values):
+            if keras:
+                cli._record_keras_logs({"loss": np.float32(value)}, epoch=i)
+            else:
+                cli._record_detector_scalar("loss", float(value), source=None)
+            if i >= 3 and (i % stride == 0 or i == len(values) - 1):
+                cli._check_for_trouble()
+                seen |= {(f.check, f.severity) for f in cli._detection_engine().active.values()}
+    return seen
+
+
+def _engine_findings(values, stride=13):
+    engine = DetectionEngine(require_new_data=True)
+    seen = set()
+    for k in range(4, len(values) + 1, stride):
+        engine.update({"loss": values[:k]}, step=k)
+        seen |= {(f.check, f.severity) for f in engine.active.values()}
+    return seen
+
+
+def _descent(n, start=2.3, floor=0.5, tau=150, sigma=1e-3, seed=0):
+    rng = random.Random(seed)
+    return [floor + (start - floor) * math.exp(-i / tau) + rng.gauss(0, sigma) for i in range(n)]
+
+
+def _assert_not_frozen(values, keras=False):
+    for seen in (_cli_findings(values, keras=keras), _engine_findings(values)):
+        checks = {c for c, _ in seen}
+        assert not checks & {"frozen", "repeating"}, sorted(seen)
+
+
+def test_ok_loss_creeping_down_1e6_per_step_is_not_frozen():
+    rng = random.Random(20)
+    values = _descent(1000, seed=20)
+    level = values[-1]
+    for _ in range(9000):
+        level *= 1 - 1e-6
+        values.append(level * (1 + rng.gauss(0, 1e-9)))
+    _assert_not_frozen(values)
+
+
+def test_ok_converged_loss_jittering_on_its_floor_is_not_frozen():
+    rng = random.Random(21)
+    values = [0.3 + 2.0 * math.exp(-i / 200) + rng.gauss(0, 0.002) for i in range(10000)]
+    _assert_not_frozen(values)
+
+
+@pytest.mark.parametrize("jitter", [2e-6, 3e-5])
+def test_ok_loss_logged_rounded_to_4_decimals_is_not_frozen(jitter):
+    """round(loss, 4): once the run improves by less than 1e-4 per step the logged value
+    repeats for hundreds of readings while the model is still learning -- or flickers
+    between two neighbouring values when it sits on a rounding boundary."""
+    rng = random.Random(22)
+    values = [round(0.3 + 2.0 * math.exp(-i / 400) + rng.gauss(0, jitter), 4) for i in range(10000)]
+    _assert_not_frozen(values)
+    # Past the cap the fingerprint now confirms what repeats; a range of zero that is
+    # only the rounding is not a plateau, and rounding jitter is not a cycle.
+    assert not {c for c, _ in _cli_findings(values)} & {"plateau", "periodic"}
+
+
+def test_ok_loss_printed_as_float32_and_parsed_back_is_not_frozen():
+    np = pytest.importorskip("numpy")
+    rng = random.Random(23)
+    values = _descent(1000, seed=23)
+    level = values[-1]
+    for _ in range(7000):
+        level *= 1 - 2e-8
+        values.append(float("%.8g" % np.float32(level * (1 + rng.gauss(0, 1e-10)))))
+    _assert_not_frozen(values)
+
+
+def test_ok_keras_epoch_loss_converged_onto_a_fixed_point_is_not_frozen():
+    """Full-batch Keras, no shuffling: the float32 epoch loss converges onto one value and
+    stays on it, bit for bit, for thousands of epochs -- longer than the whole analysis
+    window. It converged; it did not freeze."""
+    values = [0.05 + 0.5 * math.exp(-e / 30) for e in range(3000)]
+    _assert_not_frozen(values, keras=True)
+
+
+def test_ok_keras_epoch_loss_converged_with_shuffling_noise_is_not_frozen():
+    rng = random.Random(24)
+    values = [0.05 + 0.5 * math.exp(-e / 30) + rng.gauss(0, 1e-4) for e in range(3000)]
+    _assert_not_frozen(values, keras=True)
+
+
+@pytest.mark.parametrize("shape", ["hinge", "underflow"])
+def test_ok_loss_at_exactly_zero_after_fitting_a_tiny_dataset_is_not_frozen(shape):
+    rng = random.Random(25)
+    if shape == "hinge":
+        values = [max(0.0, 0.5 - 0.001 * i + rng.gauss(0, 0.002)) if i < 600 else 0.0
+                  for i in range(5000)]
+    else:                               # MSE on an exactly fittable set, decaying to 0.0
+        values, level = [], 1.0
+        for _ in range(8000):
+            level *= 0.9
+            values.append(level if level > 1e-300 else 0.0)
+    _assert_not_frozen(values)
+
+
+def test_ok_lr_decayed_finetune_barely_moving_is_not_frozen():
+    np = pytest.importorskip("numpy")
+    rng = random.Random(26)
+    steps = [0.25 - 0.002 * (1 - 0.5 * (1 + math.cos(math.pi * i / 10000))) + rng.gauss(0, 0.01)
+             for i in range(10000)]
+    _assert_not_frozen(steps)
+    epochs, level = [], 0.25
+    for e in range(3000):
+        lr = 1e-5 * 0.5 * (1 + math.cos(math.pi * e / 3000))
+        level -= lr * 0.01
+        epochs.append(float(np.float32(level + rng.gauss(0, 1e-7) * lr / 1e-5)))
+    _assert_not_frozen(epochs, keras=True)
+
+
+def test_ok_frozen_after_rounded_logging_is_still_frozen():
+    """Rounded logging does not hide a real freeze: a loss that was moving by many grid
+    steps per reading and then stops dead is frozen, past the cap too."""
+    rng = random.Random(27)
+    values = [round(0.3 + 2.0 * math.exp(-i / 400) + rng.gauss(0, 0.02), 4) for i in range(2500)]
+    values += [values[-1]] * 40
+    checks = {c for c, _ in _cli_findings(values, stride=3)}
+    assert "frozen" in checks
+
+
+def test_ok_loss_stuck_at_zero_from_the_start_is_frozen():
+    raised = feed({"loss": [0.0] * 12})
+    assert "frozen" in checks_of(raised)
+
+
+def test_ok_keras_epoch_loss_frozen_past_the_cap_is_confirmed():
+    """The fingerprint counts readings for Keras epoch histories too."""
+    np = pytest.importorskip("numpy")
+    rng = random.Random(28)
+    cli = make_cli()
+    problems = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        for epoch in range(2030):
+            loss = 0.3 + 2.0 * math.exp(-epoch / 400) + rng.gauss(0, 0.02) if epoch < 2010 else 0.65
+            cli._record_keras_logs({"loss": np.float32(loss)}, epoch=epoch)
+            if epoch >= 2000:
+                problems.append(cli._check_for_trouble())
+    assert len(cli.epoch_scalar_histories["loss"]) == 2000
+    assert any(p and "exactly" in p for p in problems), problems
+
+
+def test_bug_a_check_that_throws_is_never_mentioned():
+    """DetectionEngine records a failing check in last_error, and nothing ever read it: a
+    check could crash on every update and be silently gone for the whole run. Correct:
+    the CLI says so once per distinct failure (and logs it)."""
+    cli = make_cli()
+    cli.tracked_vars = ["loss"]
+    cli._detector_scalar_histories = {"loss": [1.0, 0.9, 0.8, 0.7, 0.6]}
+    engine = cli._detection_engine()
+
+    def boom(*a, **k):
+        raise RuntimeError("pairs exploded")
+    engine._check_pairs = boom
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        cli._check_for_trouble()
+        cli._record_detector_scalar("loss", 0.5)
+        cli._check_for_trouble()
+    text = out.getvalue()
+    assert "pairs exploded" in text, text
+    assert text.count("pairs exploded") == 1, text
+
+
+def test_ok_counter_ticking_once_per_epoch_is_not_stalled_under_the_tracer():
+    """The per-tick reading for counters is per tick on which the run moved on, and the
+    counter that does move is seen moving."""
+    cli = make_cli()
+    cli.tracked_vars = ["loss", "checkpoints_saved"]
+    frames = [{"loss": float(repr(2.0 * math.exp(-i / 20) + 0.1)), "checkpoints_saved": i // 4}
+              for i in range(40)]
+    run_updates(cli, frames)
+    assert ("counter_stalled", "checkpoints_saved") not in fired(cli._detector_histories())
+
+
+def test_bug_single_variable_delete_keeps_its_opening():
+    """/delete <name> drops the history; the engine's opening for it must go too, or a
+    re-tracked series inherits it."""
+    cli = make_cli()
+    rng = random.Random(29)
+    cli.tracked_vars = ["loss"]
+    cli._matrix_cached_vars = set()
+    cli._detector_scalar_histories = {"loss": [2.0 * math.exp(-i / 300) + 0.1 + rng.gauss(0, 0.01)
+                                               for i in range(1600)]}
+    cli._check_for_trouble()
+    assert "loss" in cli._detection_engine()._openings
+    with contextlib.redirect_stdout(io.StringIO()):
+        cli._cmd_delete("loss")
+    assert "loss" not in cli._detection_engine()._openings
+
+
+def test_ok_objective_namespace_reward_is_not_a_loss():
+    """TRL logs objective/rlhf_reward, which rises by design: a score, not a loss."""
+    assert not D.looks_like_loss("objective/rlhf_reward")
+    assert D.looks_like_score("objective/rlhf_reward")
+    assert D.looks_like_loss("kl_loss") and D.looks_like_loss("objective")

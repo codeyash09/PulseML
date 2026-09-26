@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import math
 import re
+import struct
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -57,12 +58,13 @@ _IMMEDIATE_CHECKS = frozenset({"nonfinite", "tensor_nonfinite", "lr_jump", "loss
 
 LOSS_NAME_HINTS = ("loss", "cost", "nll", "cross_entropy", "crossentropy", "objective", "err",
                    "kl", "kld", "divergence", "ppl", "perplexity", "mse", "mae", "rmse")
-METRIC_NAME_HINTS = ("acc", "accuracy", "f1", "auc", "precision", "recall", "iou", "dice",
-                     "bleu", "rouge", "map", "mrr", "r2", "score")
+METRIC_NAME_HINTS = ("acc", "accuracy", "f1", "auc", "auroc", "auprc", "precision", "recall",
+                     "iou", "dice", "bleu", "rouge", "map", "mrr", "r2", "score")
 # The short ones are matched as whole name tokens, not substrings: `acc` is inside
 # `grad_accum_steps`, `dice` inside `indices`, `map` inside `heatmap`, `r2` inside
 # `layer2`, `iou` inside `previous` -- and each of those was checked as a score.
-_TOKEN_METRIC_HINTS = frozenset({"acc", "f1", "auc", "iou", "miou", "dice", "map", "mrr", "r2"})
+_TOKEN_METRIC_HINTS = frozenset({"acc", "f1", "auc", "auroc", "auprc", "iou", "miou", "dice", "map",
+                                 "mrr", "r2"})
 # A coefficient on a loss term is not a loss. `kl` is a loss hint, so the KL-annealing
 # weight every VAE ramps from 0 to 1 was reported as a loss "climbing, not falling";
 # `error_count` is a counter, and `loss_scale` is AMP's scaler.
@@ -79,9 +81,21 @@ LR_NAME_HINTS = ("lr", "learning_rate", "learningrate", "step_size")
 # meaningless for these, and the checks that say so are turned off for them -- while
 # NaN, a frozen value and a hundredfold spike stay on, because those are real anywhere.
 # What carries the signal in RL is the reward, and that is checked like any other score.
+# Matched as whole words of the name (see looks_like_moving_target): as substrings,
+# `g_loss` was inside running_loss, avg_loss and training_loss, `d_loss` inside
+# fastai's valid_loss, and every check that says "this loss is going the wrong way" was
+# off for the most common names a training loss has.
 MOVING_TARGET_HINTS = ("policy_loss", "value_loss", "actor_loss", "critic_loss", "q_loss",
-                       "td_error", "entropy_loss", "g_loss", "d_loss", "gen_loss",
-                       "disc_loss", "generator_loss", "discriminator_loss", "adversarial")
+                       "qf_loss", "td_error", "entropy_loss", "g_loss", "d_loss", "gen_loss",
+                       "disc_loss", "generator_loss", "discriminator_loss", "adversarial",
+                       # RLlib's vf_loss, CleanRL's v_loss and pg_loss, SB3's
+                       # policy_gradient_loss / value_function_loss.
+                       "vf_loss", "v_loss", "pg_loss", "policy_gradient_loss",
+                       "value_function_loss")
+# GAN losses named after the network rather than with a g_/d_ prefix: the PyTorch DCGAN
+# tutorial's errG/errD, CycleGAN's loss_G/loss_D, and lossG/lossD.
+_GAN_NETWORK_TOKENS = frozenset({"g", "d", "gen", "disc", "generator", "discriminator"})
+_GAN_OBJECTIVE_TOKENS = frozenset({"loss", "err", "error"})
 # How long a step takes is not a loss, a score, a norm or a learning rate, so nothing
 # looked at it -- and a run whose step time climbs all the way through is leaking, and
 # usually ends as an out-of-memory kill several hours in.
@@ -163,11 +177,36 @@ def _has_token(name: str, hints: Iterable[str]) -> bool:
     return any(token in hints or token.rstrip("0123456789") in hints for token in _tokens(name))
 
 
+def _looks_like_kl_diagnostic(name: str) -> bool:
+    """A KL that measures how far a policy has moved, not a loss that should fall.
+
+    TRL's objective/kl (distance from the reference model) and PPO's approx_kl grow by
+    design as the policy learns, and as losses they read as a loss "climbing, not
+    falling" on every healthy RLHF run. A VAE's KL *term* (kl_loss, kl_term) is part of
+    the objective and stays a loss.
+    """
+    tokens = _tokens(name)
+    if {"loss", "term", "cost"} & set(tokens):
+        return False
+    if any(token.startswith("approxkl") for token in tokens) or {"approx", "kl"} <= set(tokens):
+        return True
+    return "kl" in tokens and bool({"objective", "ref", "reference", "policy", "ppo", "rlhf"}
+                                   & set(tokens))
+
+
 def looks_like_loss(name: str) -> bool:
     low = _lower(name)
     if not any(hint in low for hint in LOSS_NAME_HINTS):
         return False
-    return not any(token in _COEFFICIENT_TOKENS for token in _tokens(name))
+    tokens = _tokens(name)
+    if any(token in _COEFFICIENT_TOKENS for token in tokens) or _looks_like_kl_diagnostic(name):
+        return False
+    # `objective/` is TRL's namespace for everything it reports about the policy --
+    # objective/rlhf_reward, objective/scores, objective/entropy -- not a loss. Judge the
+    # name by what follows it.
+    if len(tokens) > 1 and tokens[0] == "objective":
+        return looks_like_loss("_".join(tokens[1:]))
+    return True
 
 
 def looks_like_metric(name: str) -> bool:
@@ -183,15 +222,50 @@ def looks_like_norm(name: str) -> bool:
 
 
 def looks_like_lr(name: str) -> bool:
-    low = _lower(name).replace("-", "_")
+    # '/' and '.' separate words like '_' does: a run mirroring W&B or TensorBoard names
+    # logs train/lr and optim/lr, and those are learning rates too.
+    low = re.sub(r"[-/.]", "_", _lower(name))
     return low in LR_NAME_HINTS or any(low.endswith("_" + hint) or low.startswith(hint + "_")
                                        for hint in LR_NAME_HINTS)
 
 
 def looks_like_moving_target(name: str) -> bool:
-    """Is this an objective whose direction carries no information?"""
-    low = _lower(name).replace("-", "_")
-    return any(hint in low for hint in MOVING_TARGET_HINTS)
+    """Is this an objective whose direction carries no information?
+
+    Whole words, in order: `g_loss` is a generator loss and `running_loss` is not.
+    """
+    tokens = [token.rstrip("0123456789") or token for token in _tokens(name)]
+    for hint in MOVING_TARGET_HINTS:
+        words = hint.split("_")
+        if any(tokens[i:i + len(words)] == words for i in range(len(tokens) - len(words) + 1)):
+            return True
+    for token in tokens:
+        # errG, lossD: one word to the tokenizer, a GAN network's objective to a reader.
+        for objective in _GAN_OBJECTIVE_TOKENS:
+            if token.startswith(objective) and token[len(objective):] in _GAN_NETWORK_TOKENS:
+                return True
+    # loss_G, err_D, D_loss: the network and the objective as two adjacent words.
+    return any({a, b} & _GAN_NETWORK_TOKENS and {a, b} & _GAN_OBJECTIVE_TOKENS
+               and {a, b} <= (_GAN_NETWORK_TOKENS | _GAN_OBJECTIVE_TOKENS)
+               for a, b in zip(tokens, tokens[1:]))
+
+
+def records_every_tick(name: str) -> bool:
+    """Is this a counter or a configured constant, whose reading is the same object from
+    one sampled update to the next while it does not change?
+
+    A sampler that only counts a repeated value as a new reading when the loop
+    recomputed it (a new object) never sees these stand still: a stopped counter is not
+    reassigned, and neither is `adam_eps`. For these, every tick on which the run moved
+    on is a reading. Losses and scores stay out -- an epoch-level `val_loss` read many
+    times an epoch is the same reading again, not a frozen loss.
+    """
+    if looks_like_loss(name) or looks_like_metric(name):
+        return False
+    if looks_like_counter(name):
+        return True
+    padded = "_" + re.sub(r"[^a-z0-9]+", "_", _lower(name)).strip("_") + "_"
+    return any(f"_{key}_" in padded for key in DetectionEngine.SANE_RANGES)
 
 
 def looks_like_step_time(name: str) -> bool:
@@ -206,6 +280,12 @@ def _has(name: str, hints: Tuple[str, ...]) -> bool:
 
 def looks_like_score(name: str) -> bool:
     """Higher is better. A fall is the fault, which is the opposite of a loss."""
+    # DPO's implicit rewards of the chosen and the rejected completion are not scores:
+    # the rejected one is *supposed* to fall (that is what the margin growing means),
+    # and the chosen one often falls with it on a healthy run. rewards/margins and
+    # rewards/accuracies carry the signal, and they stay scores.
+    if {"chosen", "rejected"} & set(_tokens(name)):
+        return False
     return looks_like_metric(name) or _has(name, SCORE_NAME_HINTS)
 
 
@@ -530,6 +610,43 @@ def _quantile(values: Sequence[float], q: float) -> float:
     return ordered[min(len(ordered) - 1, max(0, int(round(q * (len(ordered) - 1)))))]
 
 
+def _resolution(value: float) -> float:
+    """The smallest step this reading could have shown: the last decimal it was written
+    with, or the spacing of the narrowest float format that holds it exactly.
+
+    0.1235 came out of round(x, 4) or a log line, and says nothing finer than 1e-4;
+    a float32 loss cannot move by less than its own ulp. A full-precision float64
+    resolves ~1e-16 of itself, and two of those repeating is not an accident.
+    """
+    if value == 0.0 or not math.isfinite(value):
+        return 0.0
+    text = repr(value)
+    mantissa, _, exponent = text.partition("e")
+    fraction = mantissa.partition(".")[2]
+    fraction = "" if fraction == "0" else fraction
+    decimal = 10.0 ** ((int(exponent) if exponent else 0) - len(fraction))
+    binary = math.ulp(value)
+    for fmt, bits in (("<e", 10), ("<f", 23)):
+        try:
+            if struct.unpack(fmt, struct.pack(fmt, value))[0] == value:
+                binary = 2.0 ** (math.frexp(abs(value))[1] - 1 - bits)
+                break
+        except (OverflowError, struct.error):
+            continue
+    return max(decimal, binary)
+
+
+def _grid(values: Sequence[float]) -> float:
+    """The finest step a series has shown it can resolve (see _resolution)."""
+    steps = [_resolution(v) for v in values if v != 0.0]
+    return min(steps) if steps else 0.0
+
+
+# NORMAL_START (an agent's estimate of where a loss should start) stands in for the
+# run's own floor this long, and no longer.
+_ANCHOR_READINGS = 20
+
+
 def _confidence(observed: float, threshold: float, points: int) -> float:
     """How much past the line it is, tempered by how much data we have."""
     if threshold <= 0:
@@ -563,6 +680,16 @@ class DetectionEngine:
         # window: after that the window's first reading is ~1,500 readings in, and a run
         # that came down 2.1 -> 0.1 and converged read as "no better than when it started".
         self._openings: Dict[str, float] = {}
+        # How long each history was, and how many readings it had taken, last time: a
+        # history that got shorter is a new series (a /delete, a fresh fit()), and what
+        # was remembered about the old one -- its opening above all -- must go with it.
+        self._lengths: Dict[str, int] = {}
+        self._counts: Dict[str, int] = {}
+        # The value each variable was last judged to have *settled* on rather than
+        # frozen at, so the verdict outlives the readings that justified it: a converged
+        # run can sit on one value for longer than the whole analysis window.
+        self._settled_at: Dict[str, float] = {}
+        self._finite_all: Dict[str, List[float]] = {}
         self.last_error: Optional[str] = None
         # Pinning one signal without moving the whole dial: /sensitivity spike 5 sets
         # the explosion multiplier and leaves everything else deriving from the dial.
@@ -584,17 +711,37 @@ class DetectionEngine:
         """Tell the engine what normal looks like for a variable (the agent can know this)."""
         self._baselines[variable] = float(value)
 
+    def forget(self, variable: str) -> None:
+        """Drop what is remembered about one variable's series: it is starting again."""
+        for memory in (self._openings, self._lengths, self._counts, self._settled_at):
+            memory.pop(variable, None)
+
     def update(self, histories: Dict[str, Sequence[Any]], *, step: Optional[int] = None,
-               tensor_stats: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, List[Finding]]:
-        """Evaluate every check against every history. Returns {"raised": [...], "cleared": [...]}."""
+               tensor_stats: Optional[Dict[str, Dict[str, Any]]] = None,
+               counts: Optional[Dict[str, int]] = None) -> Dict[str, List[Finding]]:
+        """Evaluate every check against every history. Returns {"raised": [...], "cleared": [...]}.
+
+        `counts`, optional: for each history (or tensor), how many readings (probes) it
+        has taken in total. A caller that caps its histories should pass it: at the cap
+        the length stops changing, and without a count a value that repeats -- a frozen
+        loss -- looks like the same data being re-checked, so it is never confirmed.
+        """
         t = thresholds(self.sensitivity)
         t.update({name: value for name, value in self.overrides.items() if value is not None})
         fired: Dict[Tuple[str, str], Finding] = {}
+        counts = dict(counts or {})
         # Lists, once. `if history` on a numpy array raises ValueError, which took the
         # whole update down for a caller that passed arrays instead of lists.
         histories = {name: list(history) for name, history in (histories or {}).items()
                      if _nonempty(history)}
         for name, history in histories.items():
+            count = counts.get(name)
+            if (len(history) < self._lengths.get(name, 0)
+                    or (count is not None and count < self._counts.get(name, count))):
+                self.forget(name)            # a new series under an old name
+            self._lengths[name] = len(history)
+            if count is not None:
+                self._counts[name] = count
             if name not in self._openings and len(history) > ANALYSIS_WINDOW:
                 head = _finite(history[:ANALYSIS_WINDOW // 5])
                 if head:
@@ -605,6 +752,7 @@ class DetectionEngine:
         # training thread in cli mode.
         finite = {name: _finite(history[-ANALYSIS_WINDOW:])
                   for name, history in histories.items()}
+        self._finite_all = finite
         self._already_good = self._success_metric_is_high(finite)
         self._run_is_moving = self._something_is_still_changing(finite)
         self._lr_restarts = self._learning_rate_restarts(finite)
@@ -620,26 +768,42 @@ class DetectionEngine:
         fired.update(self._guarded(self._check_pairs, finite, t, step))
         fired.update(self._guarded(self._check_relations, finite, histories, t, step))
 
-        return self._settle(fired, self._evidence(histories, tensor_stats))
+        return self._settle(fired, self._evidence(histories, tensor_stats, counts))
 
     def _guarded(self, check, *args) -> Dict[Tuple[str, str], Finding]:
         """Run one check; on an exception, note it and carry on without its findings."""
         try:
             return {f.key: f for f in check(*args) if f is not None}
         except Exception as exc:
-            # Deliberately everything: the detector runs on the training thread.
-            self.last_error = f"{type(exc).__name__}: {exc}"
+            # Deliberately everything: the detector runs on the training thread. The
+            # check is named so that whoever reads last_error knows which one went quiet.
+            where = getattr(check, "__name__", "check")
+            where = "_check_tensor" if where == "<lambda>" else where
+            self.last_error = f"{where}: {type(exc).__name__}: {exc}"
             return {}
 
     @staticmethod
     def _evidence(histories: Dict[str, List[Any]],
-                  tensor_stats: Optional[Dict[str, Dict[str, Any]]]) -> Dict[str, Any]:
-        """A cheap fingerprint of each input: has anything arrived since last time?"""
-        evidence: Dict[str, Any] = {name: (len(history), repr(history[-1]))
+                  tensor_stats: Optional[Dict[str, Dict[str, Any]]],
+                  counts: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+        """A cheap fingerprint of each input: has anything arrived since last time?
+
+        The number of readings taken, not the length: a capped history stops growing,
+        and a frozen value repeats, so (length, last value) stopped changing exactly when
+        a loss froze past the cap. Without a count from the caller, the first reading
+        stands in for one -- at the cap it moves on with every new reading.
+        """
+        counts = counts or {}
+        evidence: Dict[str, Any] = {name: (counts.get(name, len(history)), repr(history[0]),
+                                           repr(history[-1]))
                                     for name, history in histories.items()}
         for name, stats in (tensor_stats or {}).items():
             if isinstance(stats, dict):
-                evidence[name] = repr(sorted(stats.items(), key=lambda kv: str(kv[0])))
+                # A probe of a tensor that has not changed (a weight stuck at zero) gives
+                # identical statistics every time; the probe count is what says it is a
+                # new look rather than the same one again.
+                evidence[name] = (counts.get(name),
+                                  repr(sorted(stats.items(), key=lambda kv: str(kv[0]))))
         return evidence
 
     @staticmethod
@@ -792,11 +956,22 @@ class DetectionEngine:
         # and it is only "frozen" or "repeating" when the model is not already doing well.
         frozen_matters = is_loss or not getattr(self, "_already_good", False)
         if frozen_matters and (is_loss or is_metric) and len(values) >= 12:
+            grid = _grid(values[-40:])
             for period in range(2, min(13, len(values) // 3 + 1)):
                 tail = values[-period:]
                 if len(set(tail)) == 1:
                     break            # that is "frozen", and it is reported as frozen
-                if tail == values[-2 * period:-period] == values[-3 * period:-2 * period]:
+                # Readings on a coarse grid -- a loss logged as round(loss, 4), a metric
+                # that is k-out-of-N -- repeat by chance: jitter across two or three
+                # levels lands on the same pattern again sooner or later. Ask for as
+                # many cycles as it takes for chance to be out of the question
+                # (1 in 10 million); with full-precision floats that is the usual three.
+                levels = (max(tail) - min(tail)) / grid + 1.0 if grid > 0 else float("inf")
+                cycles = (3 if levels > 1e6 else
+                          max(3, 1 + math.ceil(16.1 / (period * math.log(max(levels, 1.0001))))))
+                if cycles * period > len(values):
+                    continue
+                if all(values[-(k + 1) * period:-k * period] == tail for k in range(1, cycles)):
                     out.append(Finding("repeating", name, WARNING,
                                        f"{name} is repeating the same {period} readings exactly "
                                        f"({', '.join(f'{v:g}' for v in tail)}): the same data is "
@@ -805,9 +980,11 @@ class DetectionEngine:
                     break
 
         if frozen_matters and (is_loss or is_metric) and len(values) >= 6 and len(set(values[-6:])) == 1:
-            out.append(Finding("frozen", name, WARNING,
-                               f"{name} has been exactly {latest:g} for {min(len(values), 6)} readings",
-                               step, {"value": latest}, 0.85))
+            run = self._frozen_run(name, values, is_loss)
+            if run:
+                out.append(Finding("frozen", name, WARNING,
+                                   f"{name} has been exactly {latest:g} for {run} readings",
+                                   step, {"value": latest, "readings": run}, 0.85))
 
         if looks_like_norm(name) and len(values) >= 5:
             baseline = _mean(values[-50:-1]) if len(values) > 1 else latest
@@ -894,6 +1071,55 @@ class DetectionEngine:
         elif is_metric:
             out.extend(self._check_metric(name, values, t, step))
         return out
+
+    def _frozen_run(self, name: str, values: List[float], is_loss: bool) -> int:
+        """How many readings the variable has been stuck on its last value, or 0 if
+        that is a run that converged onto it rather than one that froze.
+
+        "Frozen" means the number stopped: a detached graph, an optimizer that never
+        steps, a stale value being logged. A converging run can repeat a value exactly
+        too, and must not be told it is broken:
+
+        * a loss at exactly 0.0 has reached its floor (a tiny dataset fitted perfectly);
+        * a value logged rounded (round(loss, 4), float32 printing) or held in float32
+          repeats once the run moves by less than one step of that grid per reading,
+          and so does a float that has converged onto a fixed point.
+
+        What tells the two apart is how the value arrived. A run that converged crept
+        up on it: the last move before the repeats was within a few grid steps, and
+        either the readings before it already repeated (the grid was already coarser
+        than the progress) or the moves were shrinking. A run that froze was moving
+        normally and stopped: its last move was as big as its usual ones, or far bigger
+        than the grid it is recorded on. A value that has never moved at all is frozen.
+        """
+        latest = values[-1]
+        run = 1
+        while run < len(values) and values[-run - 1] == latest:
+            run += 1
+        if run < 6:
+            return 0
+        before = values[-run - 20:-run] if run < len(values) else []
+        if not before:
+            # Everything the window holds is this one value. Either it never moved --
+            # frozen from the start -- or it settled here long enough ago that the
+            # readings showing how it arrived have left the window; the verdict from
+            # when they were visible stands.
+            return 0 if self._settled_at.get(name) == latest else run
+        if len(before) < 20 and self._settled_at.get(name) == latest:
+            return 0                 # the window has slid past how it arrived; see above
+        if is_loss and latest == 0.0:
+            self._settled_at[name] = latest
+            return 0
+        grid = _grid(before + [latest])
+        arrival = abs(latest - before[-1])
+        moves = [abs(b - a) for a, b in zip(before, before[1:])]
+        usual = sorted(moves)[len(moves) // 2] if moves else arrival
+        crept = len(set(before)) < len(before) or arrival < 0.5 * usual
+        if arrival <= 4.0 * grid and crept:
+            self._settled_at[name] = latest
+            return 0
+        self._settled_at.pop(name, None)
+        return run
 
     # ------------------------------------------------------------------ roles
 
@@ -1068,7 +1294,7 @@ class DetectionEngine:
         # that blew the weights out -- progress that was already made has been given
         # back, and a threshold on "how fast is it getting worse" does not see that.
         if (is_loss and len(values) >= 12 and not looks_like_moving_target(name)
-                and not self._lr_restarts):
+                and not self._lr_restarts and not self._component_of_improving_total(name)):
             window = max(3, len(values) // 5)
             history = values[:-window] or values
             best = _lowest_sustained(history, min(len(history), max(3, window // 2)))
@@ -1115,6 +1341,32 @@ class DetectionEngine:
             if finding is not None:
                 out.append(finding)
         return out
+
+    _TOTAL_LOSS_NAMES = ("loss", "total_loss", "train_loss", "total", "elbo", "neg_elbo")
+
+    def _component_of_improving_total(self, name: str) -> bool:
+        """Is this one term of a composite loss whose total is getting better?
+
+        The terms of an objective trade off against each other: a VAE's KL term rises
+        while the reconstruction term falls faster, and that is the model starting to
+        use its latent, not a divergence. The total is what has to improve; a term
+        moving the "wrong" way under an improving total is the optimiser's choice.
+        """
+        tokens = set(_tokens(name))
+        if _lower(name) in self._TOTAL_LOSS_NAMES or not {"loss", "term"} & tokens:
+            return False
+        split = is_validation(name)
+        for total in self._TOTAL_LOSS_NAMES:
+            for candidate, values in (getattr(self, "_finite_all", None) or {}).items():
+                if candidate == name or _loss_stem(candidate) != total or is_validation(candidate) != split:
+                    continue
+                if len(values) < 8:
+                    continue
+                span = max(3, len(values) // 4)
+                early, late = _mean(values[:span]), _mean(values[-span:])
+                if abs(early) > 0 and (early - late) / abs(early) > 0.02:
+                    return True
+        return False
 
     @staticmethod
     def _is_error_rate(name: str) -> bool:
@@ -1205,6 +1457,8 @@ class DetectionEngine:
         scale = (denominator / n) ** 0.5
         if scale <= abs(_mean(window)) * 1e-6:
             return None                      # residuals are numerical dust
+        if scale <= _grid(window):
+            return None                      # what wiggles is the rounding of a logged value
 
         def correlation(lag: int) -> float:
             pairs = list(zip(residuals, residuals[lag:]))
@@ -1256,7 +1510,9 @@ class DetectionEngine:
         # For a generator or a policy loss, everything below this point -- the plateau,
         # the bouncing, the climb, the "no better than when it started" -- is normal
         # behaviour rather than evidence, so only the spike check runs.
-        directionless = looks_like_moving_target(name)
+        # A term of a composite objective whose total is improving is in the same
+        # position: a VAE's KL term rises by design while the ELBO improves.
+        directionless = looks_like_moving_target(name) or self._component_of_improving_total(name)
 
         if len(values) >= 5:
             # The floor is the low end of the recent readings, not the single lowest one:
@@ -1265,7 +1521,10 @@ class DetectionEngine:
             recent = values[-50:-1]
             baseline = _quantile(recent, 0.1)
             anchor = self._baselines.get(name)
-            if anchor is not None:
+            # NORMAL_START is an estimate for before the run has a history of its own.
+            # Kept for good, a low guess turned every ordinary bump hundreds of readings
+            # in into a CRITICAL "30x its recent floor".
+            if anchor is not None and len(values) <= _ANCHOR_READINGS:
                 baseline = min(baseline, anchor)
             noise = _stdev(recent)
             big_for_this_run = latest > _mean(recent) + 4.0 * noise
@@ -1301,7 +1560,11 @@ class DetectionEngine:
             scale = _mean([abs(v) for v in window]) or 1.0
             converged = (abs(opening) > 1e-12
                          and (opening - _mean(window)) / abs(opening) >= 0.9)
-            if (max(window) - min(window)) <= scale * t["plateau_range_frac"] and not converged:
+            # A loss logged rounded (round(loss, 4)) cannot show movement finer than its
+            # last digit, so "moved less than X" is unanswerable when X is below that:
+            # a range of zero there is the rounding, not the run.
+            resolvable = scale * t["plateau_range_frac"] >= _grid(window)
+            if (max(window) - min(window)) <= scale * t["plateau_range_frac"] and not converged and resolvable:
                 out.append(Finding("plateau", name, WARNING,
                                    f"{name} has barely moved over its last {len(window)} readings "
                                    f"(range {max(window) - min(window):.3g} around {scale:.3g})",
