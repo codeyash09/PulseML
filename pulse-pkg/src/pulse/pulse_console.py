@@ -152,8 +152,35 @@ def _pid_alive(pid: Optional[int]) -> bool:
     try:
         os.kill(pid, 0)             # POSIX signal 0: existence check, changes nothing
         return True
-    except (OSError, ValueError, TypeError):
+    except PermissionError:
+        return True                 # EPERM: it exists, it is just not ours to signal
+    except (OSError, ValueError, TypeError, OverflowError):
+        return False                # OverflowError: a pid beyond C long, from a bad spool
+
+
+# How much later than its session a process may seem to have started and still be the
+# session's own: /proc/stat's boot time is whole seconds, and clocks get nudged.
+_START_SLACK_SECONDS = 5.0
+
+
+def session_process_alive(pid: Optional[int], started: Any = None) -> bool:
+    """Is the process that wrote this session still running?
+
+    Not just "is something running with that pid": pids are reused, and a run killed
+    without a word whose pid now belongs to some other program looked stalled forever --
+    and `pulse` auto-attached to it. A process that started after the session did is not
+    the session's process.
+    """
+    if not _pid_alive(pid):
         return False
+    try:
+        started = float(started)
+    except (TypeError, ValueError):
+        return True
+    if not started or not math.isfinite(started):
+        return True
+    began = _process_started(int(pid), _boot_time())
+    return began is None or began <= started + _START_SLACK_SECONDS
 
 
 def _scan_for_spools(root: str, max_depth: int = 4) -> List[str]:
@@ -231,12 +258,14 @@ def _describe_session(directory: str) -> Optional[Dict[str, Any]]:
         return None
     session_id = session.get("session_id") or os.path.basename(directory)
     pid = session.get("pid")
-    alive = _pid_alive(pid)
+    alive = session_process_alive(pid, session.get("started"))
     fresh = (time.time() - last_seen) < LIVE_WINDOW_SECONDS
-    if state.get("finished"):
-        status = "finished"
-    elif state.get("crashed"):
+    # Crashed first: the crash hook records it and then closing adds `finished`, so a run
+    # that died of a CUDA OOM has both, and was listed as having finished normally.
+    if state.get("crashed"):
         status = "crashed"
+    elif state.get("finished"):
+        status = "finished"
     elif alive and fresh:
         status = "live"
     elif alive:
@@ -259,6 +288,10 @@ def _describe_session(directory: str) -> Optional[Dict[str, Any]]:
     }
 
 
+# Files of the package that are not named pulse*: a user's ~/pulse/train.py is not Pulse.
+_PULSE_ENTRY_FILES = ("cli.py", "__main__.py", "__init__.py")
+
+
 def _is_pulse_itself(script: str) -> bool:
     """Pulse's own processes, which are not runs to offer somebody.
 
@@ -269,7 +302,7 @@ def _is_pulse_itself(script: str) -> bool:
     """
     base = os.path.basename(script)
     parent = os.path.basename(os.path.dirname(script))
-    return base.startswith("pulse") or parent == "pulse"
+    return base.startswith("pulse") or (parent == "pulse" and base in _PULSE_ENTRY_FILES)
 
 
 def _boot_time() -> Optional[float]:
@@ -411,7 +444,10 @@ class Console:
         self.quiet = False
         self.running = True
         self._lock = threading.Lock()          # serialises writes to the terminal
-        self._brain_lock = threading.RLock()   # the pump writes what the views read
+        # The pump writes what the views read. The brain's own lock, which it holds only
+        # while ingesting or gathering evidence -- never across a model call, or a
+        # scheduled audit froze /status, /vars and the rest for minutes.
+        self._brain_lock = self.brain.state_lock
         self._thread: Optional[threading.Thread] = None
         self.brain.on_finding = self._announce
 
@@ -434,8 +470,7 @@ class Console:
     def _pump(self) -> None:
         while self.running:
             try:
-                with self._brain_lock:
-                    result = self.brain.poll_once()
+                result = self.brain.poll_once()
             except Exception as exc:
                 self._print(dim(f"  (monitor read failed: {type(exc).__name__}: {exc})"))
             else:
@@ -455,6 +490,11 @@ class Console:
             self._print(red(f"\n  audit failed: {record.get('error')}"))
             return
         text = (record.get("text") or "").strip()
+        if record.get("status") == "problem":
+            # A problem the checks did not see: say so where it cannot be missed.
+            found = "; ".join(str(f) for f in (record.get("findings") or [])[:3])
+            self._print("\n" + red("  AUDIT FOUND A PROBLEM") + (f" {found}" if found else "")
+                        + dim("  (ask about it here, or /findings)"))
         if text:
             self._print("\n" + bold("  audit") + "\n  " + text.replace("\n", "\n  "))
 
@@ -606,8 +646,7 @@ class Console:
         if self.agent is None:
             print("\n  No model configured. Start with --model, or set PULSE_MODEL.\n")
             return
-        with self._brain_lock:
-            pack = self.brain.evidence(include_code=True)
+        pack = self.brain.evidence(include_code=True)
         prompt = (
             "You are Pulse, watching a training run for someone who is sitting at a "
             "terminal looking at it with you. Answer their question from the evidence "
@@ -627,8 +666,7 @@ class Console:
             print("\n  No model configured, so there is nothing to audit with.\n")
             return
         print(dim("\n  auditing the whole run...\n"))
-        with self._brain_lock:
-            record = self.brain.audit()
+        record = self.brain.audit()
         if record.get("status") == "busy":
             print(dim("  an audit is already running; its answer will print here\n"))
             return
@@ -705,20 +743,27 @@ def world_writable_by_others(path: str) -> Optional[str]:
     on the way to it, is writable by others: then anyone who can write there chooses
     what root runs. Returns the offending path, or None.
     """
-    current = os.path.abspath(path)
-    seen = set()
-    while current and current not in seen:
-        seen.add(current)
-        try:
-            info = os.lstat(current)
-        except OSError:
-            return None
-        if info.st_mode & 0o002 and not (info.st_mode & 0o1000):
-            return current          # world-writable and not sticky
-        parent = os.path.dirname(current)
-        if parent == current:
-            break
-        current = parent
+    import stat
+
+    # Both chains: the path as given (whoever can write a directory holding the symlink
+    # can repoint it) and the file it resolves to, which is what root would actually run.
+    # A symlink's own mode is always 0777 on Linux and means nothing, so it is skipped.
+    for start in (os.path.abspath(path), os.path.realpath(path)):
+        current = start
+        seen = set()
+        while current and current not in seen:
+            seen.add(current)
+            try:
+                info = os.lstat(current)
+            except OSError:
+                return None
+            if (not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o002
+                    and not (info.st_mode & 0o1000)):
+                return current      # world-writable and not sticky
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
     return None
 
 
@@ -1094,6 +1139,10 @@ def matching_sessions(sessions: List[Dict[str, Any]], wanted: str) -> List[Dict[
     exact = [s for s in sessions if s.get("session_id") == wanted]
     if exact:
         return exact
+    if wanted.isdigit():
+        # An index that is out of range. Substring-matching it against ids -- timestamps
+        # full of digits -- attached `pulse watch 4` to whichever run contained a 4.
+        return []
     name = os.path.basename(wanted)
     return [s for s in sessions
             if wanted in (s.get("session_id") or "")
@@ -1155,78 +1204,83 @@ def run_console(session: Dict[str, Any], sessions: List[Dict[str, Any]],
         if not line:
             continue
 
-        if not line.startswith("/"):
-            console.ask(line)
-            continue
+        # One failing command must not take the console with it: /interval on a spool
+        # this user cannot write raised PermissionError out of here and ended the session.
+        try:
+            if not line.startswith("/"):
+                console.ask(line)
+                continue
 
-        command, _, argument = line[1:].partition(" ")
-        command, argument = command.lower(), argument.strip()
+            command, _, argument = line[1:].partition(" ")
+            command, argument = command.lower(), argument.strip()
 
-        if command in ("quit", "exit", "q"):
-            break
-        elif command == "help":
-            print("\n" + HELP)
-        elif command == "status":
-            console.show_status()
-        elif command == "findings":
-            console.show_findings()
-        elif command == "curve":
-            console.show_curve(argument or "loss")
-        elif command == "vars":
-            console.show_vars()
-        elif command == "code":
-            console.show_code()
-        elif command == "trace":
-            console.show_trace(argument)
-        elif command == "audit":
-            console.audit()
-        elif command == "cd":
-            print(f"\n  {directory}\n")
-        elif command == "sessions":
-            sessions = discover()
-            print()
-            render_session_list(sessions, attached=session["session_id"])
-            print()
-        elif command == "attach":
-            sessions = discover()
-            chosen = pick_session(sessions, argument)
-            if chosen is None:
-                print("\n  Which one? Give a number or an id:\n")
+            if command in ("quit", "exit", "q"):
+                break
+            elif command == "help":
+                print("\n" + HELP)
+            elif command == "status":
+                console.show_status()
+            elif command == "findings":
+                console.show_findings()
+            elif command == "curve":
+                console.show_curve(argument or "loss")
+            elif command == "vars":
+                console.show_vars()
+            elif command == "code":
+                console.show_code()
+            elif command == "trace":
+                console.show_trace(argument)
+            elif command == "audit":
+                console.audit()
+            elif command == "cd":
+                print(f"\n  {directory}\n")
+            elif command == "sessions":
+                sessions = discover()
+                print()
                 render_session_list(sessions, attached=session["session_id"])
                 print()
-                continue
-            console.stop(join=True)      # its pump must not print into the next session
-            session = chosen
-            console = Console(session, agent=agent, sensitivity=sensitivity)
-            console.brain.poll_once()
-            console.start()
-            directory = console.workdir
-            print(f"\nAttached to {bold(os.path.basename(session.get('script') or '?'))}  "
-                  f"{dim(directory)}")
-            print(f"{console.status_line()}\n")
-        elif command == "interval":
-            try:
-                seconds = float(argument)
-            except (TypeError, ValueError):
-                print("\n  /interval takes a number of seconds, e.g. /interval 0.5\n")
-                continue
-            if not math.isfinite(seconds) or not (MIN_SAMPLE_INTERVAL <= seconds <= MAX_SAMPLE_INTERVAL):
-                print(f"\n  /interval takes {MIN_SAMPLE_INTERVAL:g} to {MAX_SAMPLE_INTERVAL:g} "
-                      f"seconds. Longer than that and the run would stop answering.\n")
-                continue
-            console.send_control(stream.CONTROL_SET_INTERVAL, interval=seconds)
-        elif command == "stop":
-            if not confirm("Stop the training run?"):
-                continue
-            console.send_control(stream.CONTROL_STOP, reason="asked from the Pulse console")
-        elif command == "quiet":
-            console.quiet = True
-            print(dim("\n  findings will not interrupt you now\n"))
-        elif command == "loud":
-            console.quiet = False
-            print(dim("\n  findings will print as they happen\n"))
-        else:
-            print(f"\n  No such command: /{command}. /help lists them.\n")
+            elif command == "attach":
+                sessions = discover()
+                chosen = pick_session(sessions, argument)
+                if chosen is None:
+                    print("\n  Which one? Give a number or an id:\n")
+                    render_session_list(sessions, attached=session["session_id"])
+                    print()
+                    continue
+                console.stop(join=True)      # its pump must not print into the next session
+                session = chosen
+                console = Console(session, agent=agent, sensitivity=sensitivity)
+                console.brain.poll_once()
+                console.start()
+                directory = console.workdir
+                print(f"\nAttached to {bold(os.path.basename(session.get('script') or '?'))}  "
+                      f"{dim(directory)}")
+                print(f"{console.status_line()}\n")
+            elif command == "interval":
+                try:
+                    seconds = float(argument)
+                except (TypeError, ValueError):
+                    print("\n  /interval takes a number of seconds, e.g. /interval 0.5\n")
+                    continue
+                if not math.isfinite(seconds) or not (MIN_SAMPLE_INTERVAL <= seconds <= MAX_SAMPLE_INTERVAL):
+                    print(f"\n  /interval takes {MIN_SAMPLE_INTERVAL:g} to {MAX_SAMPLE_INTERVAL:g} "
+                          f"seconds. Longer than that and the run would stop answering.\n")
+                    continue
+                console.send_control(stream.CONTROL_SET_INTERVAL, interval=seconds)
+            elif command == "stop":
+                if not confirm("Stop the training run?"):
+                    continue
+                console.send_control(stream.CONTROL_STOP, reason="asked from the Pulse console")
+            elif command == "quiet":
+                console.quiet = True
+                print(dim("\n  findings will not interrupt you now\n"))
+            elif command == "loud":
+                console.quiet = False
+                print(dim("\n  findings will print as they happen\n"))
+            else:
+                print(f"\n  No such command: /{command}. /help lists them.\n")
+        except Exception as exc:
+            print(red(f"\n  That failed: {type(exc).__name__}: {exc}\n"))
 
     console.stop()
     print(dim("bye"))
@@ -1284,6 +1338,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     idle = unmonitored_python_processes()
     if not sessions:
+        # `pulse train.py` on a machine where Pulse has never streamed a run -- a run
+        # started with plain `python train.py` -- is exactly what watch_by_name is for.
+        if wanted and any(os.path.basename(p["script"]) == os.path.basename(wanted) for p in idle):
+            return watch_by_name(wanted, model=model)
         print("  Nothing Pulse is watching yet. Start a run with either:\n")
         print("    pulse run --stream train.py   (no changes to your script)")
         print("    auto_track(mode=\"stream\")     (from inside it)")

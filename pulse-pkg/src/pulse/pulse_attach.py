@@ -33,6 +33,7 @@ import json
 import math
 import os
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -42,11 +43,22 @@ from . import pulse_stream as stream
 
 DEFAULT_INTERVAL = 1.0
 MIN_INTERVAL = 0.2
+MAX_INTERVAL = 60.0
 _SAMPLE_TIMEOUT = 20.0
 
 # Frames from these do not belong to the user's training loop.
 _NOT_USER_CODE = (os.sep + "site-packages" + os.sep, os.sep + "lib" + os.sep + "python",
-                  os.sep + "pulse" + os.sep, "<frozen", "<string>")
+                  "<frozen", "<string>")
+
+# Pulse's own package. Not "any directory called pulse": that skipped ~/pulse/train.py,
+# and attach reported a loop plainly inside a function as unreadable module globals. The
+# other process may run Pulse from a different place, so a file of Pulse's own name in a
+# directory called pulse counts too.
+_PULSE_DIR = os.path.dirname(os.path.abspath(__file__))
+try:
+    _PULSE_FILES = frozenset(n for n in os.listdir(_PULSE_DIR) if n.endswith(".py"))
+except OSError:
+    _PULSE_FILES = frozenset()
 
 
 def pyspy_path() -> Optional[str]:
@@ -121,9 +133,17 @@ def read_frames(pid: int, pyspy: Optional[str] = None, use_sudo: Optional[bool] 
     return (loaded if isinstance(loaded, list) else []), ""
 
 
+def _is_pulse_file(filename: str) -> bool:
+    directory, base = os.path.split(filename)
+    if directory == _PULSE_DIR:
+        return True
+    return os.path.basename(directory) == "pulse" and base in _PULSE_FILES
+
+
 def _is_user_frame(frame: Dict[str, Any]) -> bool:
     filename = frame.get("filename") or ""
-    return bool(filename) and not any(marker in filename for marker in _NOT_USER_CODE)
+    return (bool(filename) and not any(marker in filename for marker in _NOT_USER_CODE)
+            and not _is_pulse_file(filename))
 
 
 def _as_number(text: Any) -> Optional[float]:
@@ -237,8 +257,9 @@ class AttachedMonitor:
         self._info = info
         self._registered = False
         self.writer.write_session(info)
-        self.writer.emit(stream.KIND_HELLO,
-                         {k: v for k, v in info.items() if k != "started"})
+        # With the start time: a brain that read the hello before session.json had
+        # nothing else to go on, and showed '0.0s elapsed' for the life of the run.
+        self.writer.emit(stream.KIND_HELLO, dict(info))
 
     # ------------------------------------------------------------------ sampling
 
@@ -261,7 +282,8 @@ class AttachedMonitor:
             stream.register_session(self.session_id, self.directory, self._info)
             self._registered = True
         self.samples += 1
-        step = values.get("step") or values.get("global_step") or values.get("i")
+        # The first name that is present, not the first that is truthy: step 0.0 is a step.
+        step = next((values[name] for name in ("step", "global_step", "i") if name in values), None)
         self._step = int(step) if isinstance(step, float) and step.is_integer() else self._step + 1
         self.writer.emit(stream.KIND_SCALARS, {"step": self._step, "values": values})
         for name, value in values.items():
@@ -275,6 +297,10 @@ class AttachedMonitor:
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval):
+            try:
+                self._handle_control()
+            except Exception as exc:                 # a bad message must not stop sampling
+                self.last_error = f"{type(exc).__name__}: {exc}"
             if not self._alive():
                 self.writer.emit(stream.KIND_EVENT, {"event": "finished", "reason": "process exited"})
                 self.snapshot({"finished": True})
@@ -287,11 +313,48 @@ class AttachedMonitor:
             if self.samples and self.samples % 5 == 0:
                 self.snapshot()
 
+    def _handle_control(self) -> None:
+        """The console's /interval and /stop. Never read before, so both were silently
+        dropped while the console said it had asked the run to stop."""
+        for message in self.writer.poll_control():
+            action = message.get("action")
+            if action == stream.CONTROL_SET_INTERVAL:
+                try:
+                    wanted = float(message.get("interval", self.interval))
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(wanted):
+                    self.interval = min(MAX_INTERVAL, max(MIN_INTERVAL, wanted))
+            elif action == stream.CONTROL_STOP:
+                self._request_stop(message.get("reason") or "")
+
+    def _request_stop(self, reason: str) -> None:
+        """What Ctrl-C in its terminal would do: SIGINT, so the run unwinds normally."""
+        if os.name != "posix":
+            # os.kill on Windows is TerminateProcess, not Ctrl-C: refuse rather than kill.
+            self.writer.emit(stream.KIND_EVENT, {"event": "stop_unsupported", "reason": reason,
+                                                 "error": "cannot interrupt another process here"})
+            return
+        if self.pid == os.getpid():
+            self.writer.emit(stream.KIND_EVENT, {"event": "stop_failed", "reason": reason,
+                                                 "error": "that is this process"})
+            return
+        try:
+            os.kill(self.pid, signal.SIGINT)
+        except OSError as exc:
+            self.writer.emit(stream.KIND_EVENT, {"event": "stop_failed", "reason": reason,
+                                                 "error": f"{type(exc).__name__}: {exc}"})
+            return
+        self.writer.emit(stream.KIND_EVENT, {"event": "stop_requested", "reason": reason})
+        self.snapshot({"stop_requested": True})
+
     def _alive(self) -> bool:
         try:
             os.kill(self.pid, 0)
             return True
-        except OSError:
+        except PermissionError:
+            return True             # EPERM: it exists, it belongs to someone else
+        except (OSError, OverflowError):
             return False
 
     def snapshot(self, extra: Optional[Dict[str, Any]] = None) -> None:

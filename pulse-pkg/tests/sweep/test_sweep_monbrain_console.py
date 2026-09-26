@@ -171,6 +171,8 @@ def test_bug_an_oversized_pid_in_any_spool_crashes_pulse(tmp_path, monkeypatch):
     writer = stream.StreamWriter(str(d), flush_seconds=0.01)
     writer.write_session({"session_id": "bad", "pid": 2 ** 80, "started": time.time()})
     writer.emit(stream.KIND_SCALARS, {"step": 1, "values": {"loss": 1.0}})
+    # discover() hides a run that ended without a state snapshot showing any step.
+    writer.write_state({"step": 1, "scalars": {"loss": 1.0}})
     writer.close()
     monkeypatch.chdir(str(tmp_path))
     runs = console.discover()
@@ -451,3 +453,18 @@ def test_ok_world_writable_detects_a_writable_directory(tmp_path):
 def test_ok_launcher_quotes_a_path_with_spaces():
     text = console.launcher_text("/home/a b/.local/bin/pulse")
     assert "PULSE='/home/a b/.local/bin/pulse'" in text
+
+
+def test_ok_attached_step_zero_is_a_step(tmp_path, monkeypatch):
+    frames = [{"frames": [{"filename": "/home/u/proj/train.py", "name": "train",
+                           "locals": [{"name": "loss", "repr": "0.5"},
+                                      {"name": "step", "repr": "0"},
+                                      {"name": "i", "repr": "7"}]}]}]
+    monkeypatch.setattr(attach, "read_frames", lambda *a, **k: (frames, ""))
+    monkeypatch.setattr(attach, "pyspy_path", lambda: "/usr/bin/py-spy")
+    monkeypatch.setattr(attach, "needs_root", lambda: False)
+    monitor = attach.AttachedMonitor(os.getpid(), directory=str(tmp_path / "att"))
+    monitor._step = 41
+    monitor.sample_once()
+    monitor.stop()
+    assert monitor._step == 0
