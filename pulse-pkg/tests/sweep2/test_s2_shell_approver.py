@@ -146,3 +146,84 @@ def test_ok_other_provider_does_not_get_the_agent_key():
 ])
 def test_ok_parse_plain_forms(answer, ok):
     assert ap.parse(answer).approved is ok
+
+
+# ------------------------------------------------ fixes for the r:1 ("by reading") entries
+
+def test_fix_checkin_tells_the_approver_it_is_a_checkin_not_an_old_problem(monkeypatch, tmp_path):
+    """During a periodic check-in, `purpose` fell back to _last_problem_description -- the
+    last investigation's question, never cleared -- so the approver judged the command
+    against a problem that was already over."""
+    cli, _seen, _asked = _cli(monkeypatch, tmp_path, "DENY: x")
+    cli._last_problem_description = "OLD PROBLEM: loss was NaN at step 10"
+    calls = []
+    monkeypatch.setattr(cli, "_run_terminal", lambda arg, **kw: calls.append((arg, kw)) or "ran",
+                        raising=False)
+    cli._checkin_service_tools("TERMINAL: rm -f stale.cache")
+    assert calls and calls[0][1].get("purpose") == PulseCLI._CHECKIN_APPROVER_PURPOSE
+    cli2, seen, _asked = _cli(monkeypatch, tmp_path, "DENY: x")
+    cli2._last_problem_description = "OLD PROBLEM: loss was NaN at step 10"
+    cli2._confirm_terminal_command("rm x", {"deletes_files": True},
+                                   purpose=PulseCLI._CHECKIN_APPROVER_PURPOSE)
+    prompt = seen[0]["messages"][1]["content"]
+    assert "OLD PROBLEM" not in prompt and "periodic check-in" in prompt
+
+
+def test_fix_denial_reason_is_per_thread(monkeypatch, tmp_path):
+    """_last_terminal_denial was one attribute shared by the check-in worker and the
+    training thread: one could overwrite the other's reason before it was read."""
+    import threading
+    cli, _seen, _asked = _cli(monkeypatch, tmp_path, "DENY: that is the user's raw data")
+    assert cli._confirm_terminal_command("rm -rf data/raw", {"deletes_files": True}) is False
+    other = []
+    monkeypatch.setattr(pc.litellm, "completion", lambda **kw: reply("APPROVE: cache only"))
+    t = threading.Thread(target=lambda: other.append(
+        (cli._confirm_terminal_command("rm -rf cache", {"deletes_files": True}),
+         PulseCLI._terminal_denial_reason())))
+    t.start()
+    t.join(30)
+    assert other and other[0][0] is True
+    assert "denied it: that is the user's raw data" in PulseCLI._terminal_denial_reason()
+
+
+def test_fix_missing_user_is_not_reported_as_a_decline_and_approver_not_reasked(monkeypatch, tmp_path):
+    """Approver can't answer + nobody to ask: the agent was told 'the user declined', and
+    the approver was asked again every round for the same command."""
+    cli, seen, asked = _cli(monkeypatch, tmp_path, ConnectionError("down"))
+    cli.non_interactive = True
+    cli._terminal_needs_confirmation = lambda command: {"deletes_files": True}
+    out = cli._run_terminal("rm -f stale.cache")
+    assert "user declined" not in out and "no user to ask" in out
+    assert asked == [] and len(seen) == 1
+    out2 = cli._run_terminal("rm -f stale.cache")
+    assert "no user to ask" in out2 and len(seen) == 1       # not asked again
+
+
+def test_fix_no_input_is_not_reported_as_the_user_declining(monkeypatch, tmp_path):
+    cli, _seen, _asked = _cli(monkeypatch, tmp_path, "APPROVE: x")
+    monkeypatch.delenv(ap.APPROVER_ENV)
+
+    def eof(*a, **k):
+        raise EOFError
+    monkeypatch.setattr(pc, "_prompt_text", eof)
+    cli._terminal_needs_confirmation = lambda command: {"deletes_files": True}
+    out = cli._run_terminal("rm -f x")
+    assert "user declined" not in out and "no user to ask" in out
+
+
+def test_fix_bad_agent_log_path_warns_once(monkeypatch, tmp_path, capsys):
+    """PULSE_AGENT_LOG pointing at a directory logged nothing and said nothing."""
+    monkeypatch.setenv("PULSE_AGENT_LOG", str(tmp_path))
+    pc._agent_log_write("one\n")
+    pc._agent_log_write("two\n")
+    err = capsys.readouterr().err
+    assert err.count("can't write the agent log") == 1 and str(tmp_path) in err
+
+
+def test_fix_approver_key_from_config_is_scrubbed():
+    """The approver's own api_key was never registered with the scrubber, so a key in a
+    custom format leaked wherever it appeared outside the `"api_key": ...` form."""
+    from pulse import pulse_supabase
+    key = "zz-custom-approver-key-" + "7" * 12
+    ap.settings_from({"model": "openrouter/judge/model", "api_key": key})
+    assert key not in pulse_supabase.scrub_secrets(f"calling with {key} now")

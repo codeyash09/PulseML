@@ -493,6 +493,10 @@ _agent_log_lock = threading.Lock()
 _agent_log_seen: Dict[str, int] = {}     # message hash -> the number it was logged under
 _agent_log_call_no = 0
 _agent_log_resolved: Dict[str, str] = {}  # setting -> absolute path, fixed at first write
+_agent_log_warned: set = set()             # paths already reported as unwritable
+# Why the last flagged TERMINAL command was declined -- per thread, because a check-in
+# worker and the training thread can both be confirming a command at the same time.
+_terminal_denial = threading.local()
 
 
 def _agent_log_path() -> Optional[str]:
@@ -518,8 +522,17 @@ def _agent_log_write(text: str) -> None:
         text = cloud.scrub_secrets(text)
         with _agent_log_lock, open(path, "a", encoding="utf-8") as f:
             f.write(text)
-    except Exception:
-        pass
+    except Exception as exc:
+        # Never break the run over the log -- but say once that nothing is being logged
+        # (a PULSE_AGENT_LOG pointing at a directory or an unwritable file).
+        if path not in _agent_log_warned:
+            _agent_log_warned.add(path)
+            try:
+                sys.stderr.write(f"[Pulse] Warning: can't write the agent log {path} "
+                                 f"({type(exc).__name__}: {exc}) -- nothing will be logged there.\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
 
 
 def _agent_log_event(title: str, body: str = "") -> None:
@@ -1310,9 +1323,9 @@ SYSTEM_PROMPT = (
     "check the file, run the specific failing test or a small repro script, and only report success once "
     "you've actually seen it pass. If a command you ran fails, investigate the real output (another GREP/ "
     "VIEW/TERMINAL) and try again rather than guessing at a second fix blind. A command that deletes "
-    "files, rewrites git history, reaches outside the project, or starts a background process will ask "
-    "the user to confirm before it runs -- expect that pause for those specific cases, not for ordinary "
-    "commands like running a test or reading a file. Large output is truncated (head and tail kept, with "
+    "files, rewrites git history, reaches outside the project, starts a background process, or "
+    "overwrites a file via a shell redirect will ask the user to confirm before it runs -- expect that "
+    "pause for those specific cases, not for ordinary commands like running a test or reading a file. Large output is truncated (head and tail kept, with "
     "a note); narrow the command (grep/head/tail, a single test) if you need something you can't see. Add "
     "' --timeout=<seconds>' at the end of the line to override the default timeout for a long-running "
     f"command (default {int(_terminal.DEFAULT_TIMEOUT_SECONDS)}s, capped at {int(_terminal.MAX_TIMEOUT_SECONDS)}s).\n"
@@ -8419,7 +8432,8 @@ class PulseCLI:
         agent_model = getattr(self, "agent_model_string", None) or (
             PROVIDERS.get(provider, {}).get("model") if provider else None)
         return _approver.settings_from(value, agent_model=agent_model,
-                                       agent_key=getattr(self, "agent_key", None))
+                                       agent_key=getattr(self, "agent_key", None),
+                                       agent_base=getattr(self, "agent_api_base", None))
 
     def _approver_setup(self) -> None:
         """At startup: say whether auto mode is on, and in an interactive session with an
@@ -8447,21 +8461,47 @@ class PulseCLI:
             cprint(f"[Pulse] Auto mode on: {choice} will answer for flagged shell commands.",
                    color=_YELLOW)
 
-    def _confirm_terminal_command(self, command: str, flags: Dict[str, bool]) -> bool:
+    # What the approver is told a periodic check-in is doing (never a stale investigation's
+    # problem: _last_problem_description is not cleared after the investigation ends).
+    _CHECKIN_APPROVER_PURPOSE = ("A periodic check-in: reviewing the still-running training for bugs "
+                                 "and instability. No problem has been found yet.")
+
+    def _confirm_terminal_command(self, command: str, flags: Dict[str, bool],
+                                  purpose: Optional[str] = None) -> bool:
+        """y/N for a flagged command: the auto-mode approver when there is one, else the
+        person. Why a command was declined is kept per thread (a check-in worker and the
+        training thread can both be here) -- see _terminal_denial_reason."""
         why = _terminal.describe_classification(flags)
         cprint(f"[Pulse] ⚠ This command {why}: {command}", color=_YELLOW)
-        self._last_terminal_denial = None
+        _terminal_denial.reason = None
         settings = self._approver_settings()
         if settings:
-            purpose = (getattr(self, "_pending_agent_problem", None)
-                       or getattr(self, "_last_problem_description", None) or "")
+            unanswered = self.__dict__.setdefault("_approver_unanswered", {})
+            if command in unanswered:
+                # Nobody to ask, and the approver already failed on this exact command:
+                # don't ask it again every round.
+                _terminal_denial.reason = unanswered[command]
+                return False
+            if purpose is None:
+                purpose = (getattr(self, "_pending_agent_problem", None)
+                           or getattr(self, "_last_problem_description", None) or "")
             cwd = getattr(self._get_terminal_executor(), "default_cwd", None) or os.getcwd()
             try:
                 decision = _approver.ask(settings, command, why, cwd, str(purpose))
             except _approver.ApproverUnavailable as exc:
+                _agent_log_event("AUTO MODE: approver unavailable", f"{command}\n{exc}")
+                if getattr(self, "non_interactive", False):
+                    # Unattended: a y/N prompt here would wait forever on a terminal nobody
+                    # is at. Fail closed.
+                    cprint(f"[Pulse] Auto mode: the approver ({settings.model}) could not answer ({exc}) "
+                           "-- declined (non-interactive, nobody to ask).", color=_YELLOW)
+                    reason = (f"not run -- the auto-mode approver ({settings.model}) could not answer "
+                              "and there is no user to ask (non-interactive run)")
+                    unanswered[command] = reason
+                    _terminal_denial.reason = reason
+                    return False
                 cprint(f"[Pulse] Auto mode: the approver ({settings.model}) could not answer ({exc}) "
                        "-- falling back to asking.", color=_YELLOW)
-                _agent_log_event("AUTO MODE: approver unavailable, falling back", f"{command}\n{exc}")
             else:
                 verdict = "APPROVED" if decision.approved else "DENIED"
                 cprint(f"[Pulse] Auto mode: {settings.model} {verdict} -- {decision.reason}",
@@ -8469,35 +8509,44 @@ class PulseCLI:
                 _agent_log_event(f"AUTO MODE: {verdict} by {settings.model}",
                                  f"{command}\nflagged because it {why}\nreason: {decision.reason}")
                 if not decision.approved:
-                    self._last_terminal_denial = f"the auto-mode approver ({settings.model}) denied it: {decision.reason}"
+                    _terminal_denial.reason = f"the auto-mode approver ({settings.model}) denied it: {decision.reason}"
                 return decision.approved
         try:
             _flush_stdin()
             resp = _prompt_text(f"Run it anyway? (y/N) > ", label="Run it anyway? (y/N)").strip().lower()
-        except (EOFError, KeyboardInterrupt):
+        except (EOFError, KeyboardInterrupt) as exc:
+            if isinstance(exc, EOFError):
+                _terminal_denial.reason = "not run -- it needs the user's OK and there is no user to ask (no input)"
             return False
         return resp in ("y", "yes")
 
-    def _run_terminal(self, arg: str, *, is_verification: bool = False) -> str:
+    @staticmethod
+    def _terminal_denial_reason() -> str:
+        """Why this thread's last flagged command was not run."""
+        return getattr(_terminal_denial, "reason", None) or "the user declined to run this command"
+
+    def _run_terminal(self, arg: str, *, is_verification: bool = False,
+                      purpose: Optional[str] = None) -> str:
         """TERMINAL: <command> -- run a real shell command via the shared TerminalExecutor
         and hand back a structured result the model can actually reason about (never just
         a 'done' -- see pulse_terminal.TerminalResult.render). Destructive-looking commands
         (delete files, rewrite git state, reach outside the workspace, start a background
-        process) pause for a y/n first, exactly like applying a code fix already does;
-        everything else -- reading files, grepping, running tests/linters, git status,
-        launching a script -- runs immediately."""
+        process, overwrite a file via redirect) pause for a y/n first, exactly like applying
+        a code fix already does; everything else -- reading files, grepping, running
+        tests/linters, git status, launching a script -- runs immediately. `purpose` is what
+        the auto-mode approver is told the agent is doing (default: the current problem)."""
         command, inline_timeout = _terminal.parse_inline_timeout(arg.strip())
         if not command:
             return "TERMINAL: empty command -- nothing to run."
-        if re.search(r"(?:^|\s)<<-?\s*['\"]?[A-Za-z_]\w*", command):
+        if _terminal.has_heredoc(command):
             # A heredoc's body is on the following lines, which never reach us (the
             # directive is one line): bash would run it with an empty stdin and exit 0.
             return (f"TERMINAL '{command}': not run -- a heredoc (<<) needs its body on later lines, "
                     "but TERMINAL takes one line only. Put the script in one line instead "
                     "(e.g. python3 -c \"stmt1; stmt2\").")
         flags = self._terminal_needs_confirmation(command)
-        if flags and not self._confirm_terminal_command(command, flags):
-            who = getattr(self, "_last_terminal_denial", None) or "the user declined to run this command"
+        if flags and not self._confirm_terminal_command(command, flags, purpose):
+            who = self._terminal_denial_reason()
             return f"TERMINAL '{command}': {who} -- try a different " \
                    "approach, or ask a read-only tool (GREP/VIEW) instead if you were only trying to " \
                    "inspect something."
@@ -9870,7 +9919,8 @@ class PulseCLI:
             return f"{key.upper()} {', '.join(names)}: noted -- applied when you give your verdict."
 
         runners = {
-            "terminal": self._run_terminal, "trace": self._run_trace,
+            "terminal": lambda arg: self._run_terminal(arg, purpose=self._CHECKIN_APPROVER_PURPOSE),
+            "trace": self._run_trace,
             "corr": self._run_corr, "outlier": self._run_outlier,
             "diffstats": self._run_diffstats, "histogram": self._run_histogram,
             "mllint": lambda _arg: self._run_mllint(),

@@ -439,7 +439,7 @@ def test_bug_terminal_heredoc_check_refuses_bit_shift(tmp_path):
     was already one line. Correct: it runs and prints 8."""
     cli = make_cli(tmp_path)
     out = cli._run_terminal('python3 -c "n = 3; print(1 << n)"')
-    assert "heredoc" not in out and "8" in out, out
+    assert "heredoc (<<)" not in out and "8" in out, out   # (tmp_path itself contains "heredoc")
 
 
 def test_ok_terminal_heredoc_without_space_refused(tmp_path):
