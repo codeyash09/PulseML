@@ -1386,7 +1386,7 @@ SYSTEM_PROMPT = (
     "a swapped function call, or a few adjacent lines is almost always the right size for a bug fix. "
     "Do not rewrite a function, restructure a class, reformat unrelated code, or 'clean up' anything "
     "you weren't asked to touch, even if you notice something else that could be improved -- mention "
-    "that separately in explanation/PASS 5 instead of folding it into this fix. Prefer one small old/"
+    "that separately in the explanation instead of folding it into this fix. Prefer one small old/"
     "new pair over one large one; only use several old/new pairs, or a large replacement block, when "
     "the root cause genuinely cannot be fixed with a smaller change (e.g. a bug that requires touching "
     "several call sites, or a block where the broken logic is inherently multi-line and can't be "
@@ -1566,6 +1566,8 @@ _CALC_BINOPS = {
 }
 _CALC_UNARY = {ast.USub: lambda a: -a, ast.UAdd: lambda a: +a}
 _CALC_BUILTINS = {"abs": abs, "min": min, "max": max, "round": round, "sum": sum}
+_CALC_NUMBER = (int, float, complex)
+_CALC_MAX_NDIGITS = 1000
 
 
 def _calc_check_size(value):
@@ -1608,10 +1610,23 @@ def _calc_eval_node(node):
         if not callable(func):
             raise TypeError("not a function")
         args = [_calc_eval_node(a) for a in node.args]
-        if getattr(func, "__name__", "") in _CALC_BIG_ARG_FUNCS and any(
+        # Only numbers, or flat lists of numbers (sum/prod/min/max/fsum), go
+        # into a call: math.prod([[0], 10**9]) would build [0] * 10**9 in C.
+        for a in args:
+            items = a if isinstance(a, list) else [a]
+            if not all(isinstance(v, _CALC_NUMBER) for v in items):
+                raise TypeError("functions only take numbers or lists of numbers")
+        name = getattr(func, "__name__", "")
+        if name in _CALC_BIG_ARG_FUNCS and any(
                 isinstance(a, (int, float)) and abs(a) > 5000 for a in args):
             raise ValueError("argument too large")
-        return _calc_check_size(func(*args))
+        if name == "round" and len(args) > 1 and isinstance(args[1], int) and abs(args[1]) > _CALC_MAX_NDIGITS:
+            # int.__round__(n, -k) computes 10 ** k internally, holding the GIL.
+            raise ValueError("ndigits too large")
+        result = func(*args)
+        if not isinstance(result, _CALC_NUMBER):
+            raise TypeError("result is not a number")
+        return _calc_check_size(result)
     raise ValueError(f"unsupported expression ({type(node).__name__})")
 
 
@@ -1725,9 +1740,9 @@ class _BackgroundModelCall:
 #                        code change was actually asked for).
 #   Pass 4 -- VERIFY:   check the math/logic of the fix. Pass -> hand it to
 #                        the user. Fail -> revise and re-check (bounded).
-#   Pass 5 -- SWEEP:    re-read the whole thing again for OTHER, unrelated
-#                        errors; if any turn up, ask the user whether to fix
-#                        those too.
+#   Pass 5 -- SWEEP:    (off unless "sweep": true / PULSE_SWEEP=1) re-read the
+#                        whole thing again for OTHER, unrelated errors; if any
+#                        turn up, ask the user whether to fix those too.
 #   Pass 6:             if the user says yes, recurse through the same
 #                        format (passes 1-5) for the newly-found issue(s).
 # Each call prints to the terminal as soon as it's ready, same spirit as the
@@ -1794,14 +1809,6 @@ _PASS4_VERIFY_TMPL = (
     '"one sentence"}}. passes=true only if the fix is logically/numerically correct, actually '
     "addresses the diagnosed root cause, AND is no larger than necessary to do so."
 )
-_PASS4_REVISE_TMPL = (
-    "Your analysis:\n{diagnosis}\n\n"
-    "The fix you proposed:\n{fix_desc}\n\n"
-    "Your proposed fix did not pass verification: {reason}\n\n"
-    "Revise it -- if the issue was scope (too large a change), narrow it down to the smallest edit "
-    "that still fixes the root cause. Respond with ONLY the corrected code-fix JSON object (old/new/"
-    "explanation) -- no prose, no markdown fences."
-)
 _PASS6_CONFIRM_TMPL = (
     "The fix below was applied and the program was then re-run from the start.\n\n"
     "The fix:\n{fix_desc}\n\n"
@@ -1846,6 +1853,11 @@ _PASS3_NO_TOOLS_NOTE = (
     "JSON object (old/new/files/explanation), fixing the bug and nothing else -- or, if nothing "
     'in the code needs to change, ONLY {"no_change": true, "reason": "one sentence"}.'
 )
+_PASS3_CONFIRM_NO_CHANGE_NOTE = (
+    "Your reply reads as 'no code change needed', but it was not the JSON answer. If nothing "
+    'in the code needs to change, respond with ONLY {"no_change": true, "reason": "one sentence"}. '
+    "If a change IS needed, respond with ONLY the code-fix JSON object (old/new/files/explanation)."
+)
 _PASS4_RECHECK_TMPL = (
     "Your analysis:\n{diagnosis}\n\n"
     "The fix you proposed:\n{fix_desc}\n\n"
@@ -1856,7 +1868,7 @@ _PASS4_RECHECK_TMPL = (
     "Respond with ONLY one of:\n"
     '- {{"decision": "keep", "reason": "one sentence"}} if the fix should be applied as it is\n'
     '- {{"decision": "revise", "old": [...], "new": [...], "files": [...], "explanation": "..."}} '
-    "with a corrected fix\n"
+    "with a corrected fix (keep \"resume\": false in it if your fix asked for a fresh start)\n"
     '- {{"decision": "drop", "reason": "one sentence"}} if it should not be applied at all\n'
     "Fix only the bug; a revision must stay as small as the bug requires."
 )
@@ -1996,6 +2008,32 @@ def _reindent_like(new: str, old: str, actual_old: str) -> str:
             line = actual + line[len(quoted):]
         out.append(line)
     return "\n".join(out)
+
+
+def _reindent_partial_line_match(content: str, start: int, old: str, new: str, path: str) -> str:
+    """`old` was quoted without its indentation ('x = 1' for '    x = 1') and matched
+    exactly, part-way into its line. A multi-line `new` written the same way would put
+    its extra lines at column 0 -- code at the end of a block silently becomes
+    module-level -- so indent them like the matched line. Only for a one-line `old`
+    (a multi-line exact match already quotes its later lines at their real indent), and
+    the unshifted text is kept when only it parses."""
+    if "\n" in old.strip("\n") or "\n" not in new:
+        return new
+    prefix = content[content.rfind("\n", 0, start) + 1:start]
+    if not prefix or prefix.strip():
+        return new
+    lines = new.split("\n")
+    shifted = "\n".join([lines[0]] + [prefix + line if line.strip() else line for line in lines[1:]])
+    if path.endswith(".py"):
+        def _parses(text):
+            try:
+                ast.parse(content[:start] + text + content[start + len(old):])
+                return True
+            except (SyntaxError, ValueError):
+                return False
+        if not _parses(shifted) and _parses(new):
+            return new
+    return shifted
 
 
 def _banner_wrap_fix(old: str, new: str, path: str) -> str:
@@ -2150,11 +2188,15 @@ def _read_all_rank_status(session_key: str) -> List[Dict[str, Any]]:
             continue
         try:
             with open(os.path.join(_rank_status_dir(session_key), name), "r", encoding="utf-8") as f:
-                out.append(json.load(f))
+                payload = json.load(f)
         except (OSError, json.JSONDecodeError):
             continue
-    out.sort(key=lambda p: p.get("rank", 0))
-    return out
+        if isinstance(payload, dict):
+            out.append(payload)
+    # The directory outlives jobs: keep only this job's ranks (same filter as the
+    # dashboard), or GPUSTATUS/RANKDIVERGE report and compare against dead ranks.
+    from pulse import pulse as _core
+    return _core._current_job_rank_status(out)
 
 
 def _format_multi_rank_gpu_status(session_key: str, this_rank: int) -> str:
@@ -2315,6 +2357,8 @@ _MLLINT_FIT_CALL_NAMES = {"fit", "fit_transform"}
 _MLLINT_LOGITS_LOSS_CLASSES = {
     "CategoricalCrossentropy", "SparseCategoricalCrossentropy", "BinaryCrossentropy",
 }
+_MLLINT_EVAL_NAME_PARTS = {"eval", "evaluate", "evaluation", "evaluating", "valid", "validate",
+                           "validation", "validating", "test", "testing"}
 _MLLINT_TEST_NAME_RE = re.compile(r"(?:^|_)test(?:$|_)", re.IGNORECASE)
 _MLLINT_TRAIN_NAME_RE = re.compile(r"(?:^|_)train(?:$|_)", re.IGNORECASE)
 _MLLINT_LOSSY_ACCUM_TARGET_RE = re.compile(r"(?:^|_)(loss|total|running|epoch)(?:$|_)", re.IGNORECASE)
@@ -2600,7 +2644,9 @@ def _mllint_flagged_span(src: str, lineno: int) -> tuple:
     """(start, end) char offsets of the source a lint finding at `lineno`
     points at: the outermost call starting on that line (a whole multi-line
     compile(...)), else just that line."""
-    lines = src.splitlines(keepends=True)
+    # Lines as `ast` counts them (\n, \r\n, \r) -- str.splitlines also splits on form
+    # feeds and other separators, which shifted the patched region.
+    lines = re.findall(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z", src)
     if not 1 <= lineno <= len(lines):
         return 0, 0
 
@@ -3162,8 +3208,10 @@ def _mllint_scan(trees) -> List[tuple]:
         for node in (ast.walk(tree) if uses_torch else ()):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            lname = node.name.lower()
-            if not any(k in lname for k in ("eval", "valid", "test")):
+            # Whole name parts, not substrings: load_latest ('test'), build_retrieval_index
+            # ('eval') and invalidate_cache ('valid') are not evaluation functions.
+            name_parts = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", node.name).lower().split("_")
+            if not any(part in _MLLINT_EVAL_NAME_PARTS for part in name_parts):
                 continue
             has_no_grad = any(
                 isinstance(inner, ast.withitem) and isinstance(inner.context_expr, ast.Call)
@@ -7382,13 +7430,13 @@ class PulseCLI:
             return None
         crash_line = location[1]
         hits = []
-        start = content.find(snippet)
-        while start != -1:
+        # Same occurrences the count used: a hit inside a longer token ('a = 1' in
+        # 'b = a = 10') is never the one to replace.
+        for start in _token_boundary_occurrences(content, snippet):
             first_line = content.count("\n", 0, start) + 1
             last_line = first_line + snippet.count("\n")
             if first_line <= crash_line <= last_line:
                 hits.append(start)
-            start = content.find(snippet, start + 1)
         return hits[0] if len(hits) == 1 else None
 
     def _resolve_fix_path(self, file_label: Optional[str]) -> Optional[str]:
@@ -7982,8 +8030,9 @@ class PulseCLI:
             if len(matches) == 1:
                 name, hist = matches[0], self.scalar_histories[matches[0]]
         # A step where the variable was unreadable is recorded as None; the statistics tools
-        # work on the readings that exist.
-        values = [v for v in (hist or []) if isinstance(v, (int, float)) and math.isfinite(v)]
+        # work on the readings that exist. NaN/inf ARE readings (a diverged loss): they are
+        # kept so OUTLIER/HISTOGRAM can report them; CORR/DIFFSTATS filter them themselves.
+        values = [v for v in (hist or []) if isinstance(v, (int, float))]
         return name, (values or None)
 
     @staticmethod
@@ -8111,9 +8160,10 @@ class PulseCLI:
                 + "\n".join(lines) + bad_note)
 
     def _is_project_module(self, name: str) -> bool:
-        """Does the top-level module `name` resolve to a file of this project
-        (a tracked file, or anything under the project root) rather than an
-        installed library?"""
+        """Does the module `name` (top-level, or dotted once its parent is
+        imported) resolve to a file of this project (a tracked file, or anything
+        under the project root -- including a folder without __init__.py, a
+        namespace package) rather than an installed library?"""
         tracked = {os.path.splitext(os.path.basename(p))[0]
                    for p in [self.script_path] + list(self.extra_files) if p}
         if name in tracked:
@@ -8122,18 +8172,25 @@ class PulseCLI:
             spec = importlib.util.find_spec(name)
         except Exception:
             return False
-        origin = getattr(spec, "origin", None) if spec else None
         root = getattr(self, "_project_root", None) or (
             os.path.dirname(os.path.abspath(self.script_path)) if self.script_path else None)
-        if not origin or not root or not os.path.isfile(origin):
+        if not spec or not root:
             return False
-        origin, root = os.path.realpath(origin), os.path.realpath(root)
-        if "site-packages" in origin or "dist-packages" in origin:
-            return False
-        try:
-            return os.path.commonpath([origin, root]) == root
-        except ValueError:
-            return False
+        root = os.path.realpath(root)
+        origin = getattr(spec, "origin", None)
+        places = [origin] if origin and os.path.isfile(origin) else []
+        # A namespace package has no origin file, only the directories it spans.
+        places += [p for p in (getattr(spec, "submodule_search_locations", None) or []) if isinstance(p, str)]
+        for place in places:
+            place = os.path.realpath(place)
+            if "site-packages" in place or "dist-packages" in place:
+                continue
+            try:
+                if os.path.commonpath([place, root]) == root:
+                    return True
+            except ValueError:
+                continue
+        return False
 
     def _run_doclookup(self, arg: str) -> str:
         """DOCLOOKUP: <library>.<symbol> -- real signature/docstring for an
@@ -8157,8 +8214,14 @@ class PulseCLI:
             try:
                 obj = getattr(obj, attr)
             except AttributeError:
+                sub = ".".join(resolved + [attr])
+                if sub not in sys.modules and self._is_project_module(sub):
+                    # Same refusal for a submodule: an already-imported project package's
+                    # not-yet-imported train_loop.py would run on import too.
+                    return (f"DOCLOOKUP '{arg}': '{sub}' is one of this project's own files -- importing "
+                            "it would execute it. Use DEFOF:/VIEW: to read its code instead.")
                 try:
-                    obj = importlib.import_module(".".join(resolved + [attr]))
+                    obj = importlib.import_module(sub)
                 except Exception:
                     return f"DOCLOOKUP '{arg}': '{'.'.join(resolved)}' has no attribute '{attr}'."
             resolved.append(attr)
@@ -8577,15 +8640,17 @@ class PulseCLI:
         for name, module in model.named_modules():
             if name:
                 hooks.append(module.register_forward_hook(_make_hook(name)))
+        was_training = model.training
         try:
-            was_training = model.training
             model.eval()
             with torch.no_grad():
                 model(sample.clone())
-            model.train(was_training)
         except Exception:
             return f"SHAPETRACE: forward pass raised\n{_format_exc_short(traceback.format_exc())}"
         finally:
+            # Whatever the forward did: a raise must not leave the live model in eval
+            # mode (dropout off, BatchNorm frozen) for the rest of training.
+            model.train(was_training)
             for h in hooks:
                 h.remove()
         if not records:
@@ -8640,12 +8705,18 @@ class PulseCLI:
         try:
             with torch.no_grad():
                 for idx in idxs:
-                    orig = flat[idx].item()
-                    flat[idx] = orig + eps
-                    loss_plus = float(loss_fn())
-                    flat[idx] = orig - eps
-                    loss_minus = float(loss_fn())
-                    flat[idx] = orig
+                    # Keep the exact original element (a tensor copy, not a rounded
+                    # .item()) and restore it whatever loss_fn() does -- a raise used
+                    # to leave the live weight shifted by eps for the rest of training.
+                    orig_t = flat[idx].clone()
+                    orig = orig_t.item()
+                    try:
+                        flat[idx] = orig + eps
+                        loss_plus = float(loss_fn())
+                        flat[idx] = orig - eps
+                        loss_minus = float(loss_fn())
+                    finally:
+                        flat[idx] = orig_t
                     numeric = (loss_plus - loss_minus) / (2 * eps)
                     analytic = grad_flat[idx].item()
                     denom = max(abs(numeric), abs(analytic), 1e-8)
@@ -8663,16 +8734,32 @@ class PulseCLI:
             import torch
         except ImportError:
             return
+        # Same limits as the dashboard's copy (pulse._replay_maybe_checkpoint): a byte
+        # budget (PULSE_REPLAY_MAX_MB), one snapshot per object however many names it is
+        # bound to, and in CPU-only mode accelerator state is left alone.
+        from pulse import pulse as _core
         ns = self._exec_namespace()
         snap = {}
+        seen_ids = set()
+        max_bytes = _core._REPLAY_MAX_BYTES
+        budget = max_bytes
         for name, v in ns.items():
             state_dict_fn = getattr(v, "state_dict", None)
-            if not callable(state_dict_fn):
+            if not callable(state_dict_fn) or isinstance(v, type) or id(v) in seen_ids:
                 continue
+            seen_ids.add(id(v))
             try:
+                state = v.state_dict()
+                tensors = list(_core._state_tensors(state))
+                if _core.PULSE_CPU_ONLY and any(not _core._cpu_resident(t) for t in tensors):
+                    continue
+                size = sum(int(t.numel()) * int(t.element_size()) for t in tensors)
+                if size > budget:
+                    continue
                 buf = io.BytesIO()
-                torch.save(v.state_dict(), buf)
+                torch.save(state, buf)
                 snap[name] = buf.getvalue()
+                budget -= len(snap[name])
             except Exception:
                 continue
         if snap:
@@ -8683,7 +8770,11 @@ class PulseCLI:
             step = next(getattr(self, "_replay_step_counter", itertools.count()))
             self._replay_step_counter = getattr(self, "_replay_step_counter", itertools.count(step + 1))
             checkpoints.append((step, snap))
-            del checkpoints[:-20]
+            del checkpoints[:-_core._REPLAY_MAX_CHECKPOINTS]
+            total = sum(len(b) for _, sn in checkpoints for b in sn.values())
+            while len(checkpoints) > 1 and total > max_bytes:
+                _, dropped = checkpoints.pop(0)
+                total -= sum(len(b) for b in dropped.values())
 
     def _run_exec_replay(self, arg: str) -> str:
         """REPLAY: <n_steps> -- from the last checkpoint at least n_steps
@@ -10119,6 +10210,8 @@ class PulseCLI:
             parts.append(f"--- change {i + 1} ---\nOLD:\n{old}\nNEW:\n{new}")
         if fix.get("explanation"):
             parts.append(f"Explanation: {fix['explanation']}")
+        if fix.get("resume") is False or str(fix.get("resume", "")).strip().lower() == "false":
+            parts.append('"resume": false (the run restarts fresh, not from its last checkpoint)')
         return "\n\n".join(parts)
 
     def _verify_fix_with_retries(self, fix: Dict[str, Any], diagnosis: str):
@@ -10200,7 +10293,7 @@ class PulseCLI:
                 return fix, True, f"kept by the agent after re-examination: {note or '(no reason given)'}"
             if decision == "drop":
                 return fix, False, f"dropped by the agent after re-examination: {note or '(no reason given)'}"
-            revised = self._parse_code_fix(recheck_answer)
+            revised = self._carry_resume(fix, self._parse_code_fix(recheck_answer))
             if revised is None:
                 # No usable decision: treat the check as unconfirmed rather
                 # than applying a fix nobody stood behind.
@@ -10448,7 +10541,7 @@ class PulseCLI:
                     _PASS3_IMPLEMENT_TMPL.format(diagnosis=full_answer), max_tokens=_AGENT_MAX_TOKENS
                 )
             fix = self._parse_code_fix(fix_answer)
-            no_change = self._parse_no_change(fix_answer) if fix is None else None
+            no_change = self._parse_no_change(fix_answer, json_only=True) if fix is None else None
 
             # Wanting to see more code is not a failed fix. Pass 2 already
             # services GREP:/VIEW:/REPL: and friends; this pass used to
@@ -10459,6 +10552,23 @@ class PulseCLI:
             for _round in range(_MAX_FIX_TOOL_ROUNDS):
                 if fix is not None or no_change is not None:
                     break
+                if self._parse_no_change(fix_answer) is not None:
+                    # A decline in prose. Only the JSON ends the pipeline without a fix,
+                    # so ask for it once -- without re-sending the implement prompt, which
+                    # would push the model to change a program it found healthy.
+                    print(f"[3] Fix (not final)\n{fix_answer}\n")
+                    self.agent_history.append({"role": "assistant", "content": fix_answer})
+                    try:
+                        with _Spinner("Developing & implementing fix"):
+                            fix_answer = self._call_model(_PASS3_CONFIRM_NO_CHANGE_NOTE,
+                                                          max_tokens=_AGENT_MAX_TOKENS)
+                    except AgentRequestFailed:
+                        break
+                    fix = self._parse_code_fix(fix_answer)
+                    no_change = self._parse_no_change(fix_answer, json_only=True) if fix is None else None
+                    if fix is None and no_change is None and self._parse_no_change(fix_answer) is not None:
+                        break      # declined twice: reported below as the answer, nothing written
+                    continue
                 print(f"[3] Fix (not final)\n{fix_answer}\n")
                 self.agent_history.append({"role": "assistant", "content": fix_answer})
                 note = self._service_tool_requests(fix_answer)
@@ -10476,7 +10586,7 @@ class PulseCLI:
                 except AgentRequestFailed:
                     break
                 fix = self._parse_code_fix(fix_answer)
-                no_change = self._parse_no_change(fix_answer) if fix is None else None
+                no_change = self._parse_no_change(fix_answer, json_only=True) if fix is None else None
 
             if no_change is not None:
                 # The analysis found nothing in the code to change, and the model said so.
@@ -10515,30 +10625,43 @@ class PulseCLI:
             # miss -- see the matching logic in pulse.py's _ask.
             first_applied_fix = self._last_applied_fix if first_pass_landed else None
             lint_failed = dict(getattr(self, "_last_apply_lint_messages", None) or {})
-            retry_fix = None
-            if self._last_apply_skipped:
-                retry_fix = self._request_corrected_snippets(fix, self._last_apply_skipped)
-            elif lint_failed and not first_pass_landed:
-                # Every snippet matched but the edited file failed the lint gate:
-                # show the model the lint output and let it correct the fix once.
-                retry_fix = self._request_lint_corrected_fix(fix, lint_failed)
-            if retry_fix is not None:
+            skipped_first = list(self._last_apply_skipped or [])
+            retry_fixes = []
+            if skipped_first:
+                retry_fixes.append(lambda: self._request_corrected_snippets(fix, skipped_first))
+            if lint_failed:
+                # A file's edit matched but failed the lint gate: show the model the lint
+                # output and let it correct that part once -- also when another file's
+                # part already landed, or the run restarts with half a fix on disk.
+                retry_fixes.append(lambda: self._request_lint_corrected_fix(
+                    self._fix_part_for_paths(fix, lint_failed), lint_failed))
+            landed_fix = first_applied_fix
+            any_landed = first_pass_landed
+            for request_retry in retry_fixes:
+                retry_fix = request_retry()
+                if retry_fix is None:
+                    continue
                 self._fix_applied_this_turn = False
                 retry_result = self._apply_code_fix(retry_fix)
                 retry_landed = self._fix_applied_this_turn
-                self._fix_applied_this_turn = first_pass_landed or retry_landed
-                if retry_landed:
-                    note = "additional" if first_pass_landed else "retry after correcting the fix --"
-                    apply_result = apply_result + f"\n\n({note} change applied)\n" + retry_result
-                    if first_applied_fix is not None:
-                        # Record the whole fix that landed, not only the partial retry --
-                        # the known-fix index and the post-restart check describe it.
-                        self._last_applied_fix = {
-                            **first_applied_fix,
-                            "old": list(first_applied_fix["old"]) + list(retry_fix["old"]),
-                            "new": list(first_applied_fix["new"]) + list(retry_fix["new"]),
-                            "files": list(first_applied_fix["files"]) + list(retry_fix["files"]),
-                        }
+                self._fix_applied_this_turn = any_landed or retry_landed
+                if not retry_landed:
+                    continue
+                note = "additional" if any_landed else "retry after correcting the fix --"
+                apply_result = apply_result + f"\n\n({note} change applied)\n" + retry_result
+                if landed_fix is not None:
+                    # Record the whole fix that landed, not only the partial retry --
+                    # the known-fix index and the post-restart check describe it.
+                    landed_fix = {
+                        **landed_fix,
+                        "old": list(landed_fix["old"]) + list(retry_fix["old"]),
+                        "new": list(landed_fix["new"]) + list(retry_fix["new"]),
+                        "files": list(landed_fix["files"]) + list(retry_fix["files"]),
+                    }
+                    self._last_applied_fix = landed_fix
+                else:
+                    landed_fix = self._last_applied_fix
+                any_landed = True
 
             result = f"{full_answer}\n\n{apply_result}"
 
@@ -10589,19 +10712,27 @@ class PulseCLI:
     _NO_CHANGE_PROSE_RE = re.compile(
         r"\bno (?:code )?(?:change|fix|edit|modification)s? (?:is |are )?(?:needed|required|necessary)\b"
         r"|\bnothing (?:in the code )?(?:needs|to) (?:to be )?(?:change|fix)", re.IGNORECASE)
+    # Prose that still describes a change ("no changes are required BEYOND lowering lr",
+    # "change `lr = 10.0` to ...; no changes needed ELSEWHERE") is not a decline.
+    _NO_CHANGE_PROSE_FIX_RE = re.compile(
+        r"[`=]|\b(?:beyond|except|other than|besides|apart from|elsewhere|itself|instead|"
+        r"must become|should become|change \S+ to)\b", re.IGNORECASE)
 
     @classmethod
-    def _parse_no_change(cls, answer: str) -> Optional[str]:
-        """PASS 3's way to decline: {"no_change": true, "reason": ...} (or the
-        same said in plain prose with no directive and no fix in it). Returns
-        the reason, or None if the reply isn't a decline."""
+    def _parse_no_change(cls, answer: str, json_only: bool = False) -> Optional[str]:
+        """PASS 3's way to decline: {"no_change": true, "reason": ...} (or, unless
+        json_only, the same said in plain prose with no directive and no fix in
+        it). Returns the reason, or None if the reply isn't a decline. The
+        pipeline passes json_only=True: a prose "no change" is re-asked for the
+        JSON rather than trusted, since prose that mentions "no changes needed"
+        often goes on to describe the fix."""
         text = (answer or "").strip()
         for obj in cls._iter_json_objs(text):
             if "no_change" in obj:
                 if not cls._as_bool(obj.get("no_change")):
                     return None
                 return str(obj.get("reason", "") or obj.get("explanation", "")).strip() or "(no reason given)"
-        if "{" in text:
+        if json_only or "{" in text or cls._NO_CHANGE_PROSE_FIX_RE.search(text):
             return None
         cleaned, *lists = cls._extract_directives(text)
         _c, new_requests = cls._extract_new_directives(cleaned)
@@ -10912,7 +11043,8 @@ class PulseCLI:
         created, deleted = set(), set()
         for fpath in all_paths:
             try:
-                with open(fpath, "r", encoding="utf-8") as f:
+                # newline="" on both sides: the log holds the exact bytes' text, CRLF included.
+                with open(fpath, "r", encoding="utf-8", newline="") as f:
                     current = f.read()
             except OSError:
                 current = None  # file has since been deleted/moved -- still try to restore it
@@ -10928,7 +11060,7 @@ class PulseCLI:
                 if content is None:
                     os.remove(fpath)
                 else:
-                    with open(fpath, "w", encoding="utf-8") as f:
+                    with open(fpath, "w", encoding="utf-8", newline="") as f:
                         f.write(content)
             except OSError as exc:
                 failed.append((fpath, str(exc)))
@@ -10942,12 +11074,13 @@ class PulseCLI:
             if content is None:
                 deleted.add(fpath)
             restored.append(fpath)
+            text = (content or "").replace("\r\n", "\n")   # the in-memory copies are LF
             if fpath == self.script_path:
-                self.code_text = content if content is not None else ""
+                self.code_text = text
             elif content is None:
                 self.extra_files.pop(fpath, None)
             elif fpath in self.extra_files:
-                self.extra_files[fpath] = content
+                self.extra_files[fpath] = text
 
         new_commit = None
         if restored:
@@ -11110,7 +11243,9 @@ class PulseCLI:
 
         for path, pairs in by_path.items():
             try:
-                with open(path, "r", encoding="utf-8") as f:
+                # newline="": keep '\r\n' as it is on disk, or the CRLF check below never
+                # fires and a one-line fix rewrites every line ending in the file.
+                with open(path, "r", encoding="utf-8", newline="") as f:
                     original_content = f.read()
             except OSError as exc:
                 for old, _new in pairs:
@@ -11128,6 +11263,7 @@ class PulseCLI:
                 count = len(hits)
                 if count == 1:
                     start = hits[0]
+                    new = _reindent_partial_line_match(content, start, old, new, path)
                     content = content[:start] + _banner_wrap_fix(old, new, path) + content[start + len(old):]
                     applied.append((old, new))
                     continue
@@ -11168,7 +11304,8 @@ class PulseCLI:
             # plus a real lint pass (pyflakes, if importable) on the FULL
             # proposed file content, before anything touches disk.
             cprint(f"  -> /lint {os.path.basename(path)}", color=_YELLOW)
-            lint_ok, lint_messages = self._lint_check(content, path, original=original_content)
+            lint_ok, lint_messages = self._lint_check(
+                content, path, original=original_content.replace("\r\n", "\n") if crlf else original_content)
             if not lint_ok:
                 self._last_apply_lint_failed.append(path)
                 self._last_apply_lint_messages[path] = lint_messages
@@ -11180,6 +11317,7 @@ class PulseCLI:
                 continue
             cprint("     lint passed", color=_YELLOW)
 
+            lf_content = content
             if crlf:
                 content = content.replace("\n", "\r\n")
             try:
@@ -11200,9 +11338,9 @@ class PulseCLI:
             for old, new in applied:
                 self._append_fixlog(path, old, new, fix.get("explanation", ""))
             if path == self.script_path:
-                self.code_text = content
+                self.code_text = lf_content
             elif path in self.extra_files:
-                self.extra_files[path] = content
+                self.extra_files[path] = lf_content
 
         # New files (Pulse Code). A fix from the debugger never has a "create" key.
         created_paths: set = set()
@@ -11283,7 +11421,14 @@ class PulseCLI:
         root = os.path.abspath(getattr(self, "_project_root", None) or self._repo_cwd or os.getcwd())
         target = os.path.abspath(os.path.join(root, spec["path"]))
         shown = spec["path"]
-        if os.path.commonpath([root, target]) != root:
+        # realpath, not abspath: an in-project symlink (data -> /mnt/...) must not let the
+        # new file land outside the project (the same check as pulse_code's preview).
+        real_root = os.path.realpath(root)
+        try:
+            inside = os.path.commonpath([real_root, os.path.realpath(target)]) == real_root
+        except ValueError:
+            inside = False
+        if not inside:
             skipped.append((f"create {shown}", shown, "outside the project root -- refused"))
             return None
         parts = os.path.relpath(target, root).split(os.sep)
@@ -11355,11 +11500,12 @@ class PulseCLI:
             "the 'old' text EXACTLY as it appears in the file content shown below.\n\n"
             + "\n\n".join(file_blocks)
             + f"\n\nSnippets that didn't match:\n{mismatch_lines}\n\n"
-            "Respond with ONLY a corrected code-fix JSON object (old/new/files/explanation) covering "
+            "Respond with ONLY a corrected code-fix JSON object (old/new/files/explanation, plus "
+            "\"resume\": false if your fix asked for a fresh start) covering "
             "just these snippets -- no prose, no markdown fences."
         )
         answer = self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS)
-        corrected = self._parse_code_fix(answer)
+        corrected = self._carry_resume(fix, self._parse_code_fix(answer))
         if corrected is not None:
             # A reply without "files" must not default to the main script: each
             # corrected entry belongs to the file its miss came from.
@@ -11389,17 +11535,38 @@ class PulseCLI:
             "Your fix was:\n" + self._describe_fix(fix) + "\n\n"
             "Correct it so the edited file is valid (unbalanced brackets, a wrong indent, a name "
             "used before it is defined or imported) without changing what the fix does. Respond "
-            "with ONLY the corrected code-fix JSON object (old/new/files/explanation), quoting "
+            "with ONLY the corrected code-fix JSON object (old/new/files/explanation, plus "
+            "\"resume\": false if your fix asked for a fresh start), quoting "
             "'old' from the file as it is now -- no prose, no markdown fences."
         )
         try:
             answer = self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS)
         except AgentRequestFailed:
             return None
-        corrected = self._parse_code_fix(answer)
+        corrected = self._carry_resume(fix, self._parse_code_fix(answer))
         if corrected is not None and len(corrected["files"]) == len(fix["files"]):
             corrected["files"] = [f or fix["files"][i] for i, f in enumerate(corrected["files"])]
         return corrected
+
+    def _fix_part_for_paths(self, fix: Dict[str, Any], paths) -> Dict[str, Any]:
+        """The entries of `fix` that target one of `paths` (for a correction retry that
+        must not re-send the parts already written); the whole fix if none resolve."""
+        keep = [i for i, label in enumerate(fix["files"]) if self._resolve_fix_path(label) in paths]
+        if not keep:
+            return fix
+        part = {k: v for k, v in fix.items() if k != "create"}
+        for key in ("old", "new", "files"):
+            part[key] = [fix[key][i] for i in keep]
+        return part
+
+    @staticmethod
+    def _carry_resume(original: Dict[str, Any], replacement: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """A revised or corrected fix replaces the original wholesale; unless it says
+        otherwise, it keeps the original's "resume" -- a fix that asked for a fresh start
+        (weights already damaged) must not restart from the checkpoint that carries the bug."""
+        if replacement is not None and "resume" not in replacement and "resume" in original:
+            replacement["resume"] = original["resume"]
+        return replacement
 
     def _cmd_code(self, arg: str) -> None:
         """Toggle whether questions include the training code (and any
@@ -12461,10 +12628,14 @@ class PulseCLI:
         that asks the model to 'confirm and propose' something.
         """
         patched_any = False
+        # path -> [(line in the scanned file, lines added/removed there)]: findings carry
+        # the line numbers of the file as scanned, and a patch that deleted a line would
+        # otherwise point every later finding in that file one line off.
+        shifts: Dict[str, List[tuple]] = {}
 
         # Group findings by the type of pattern so we know which
         # deterministic paths are safe to apply.
-        for label, lineno, msg in findings:
+        for label, scanned_lineno, msg in findings:
             # Find the actual file path this label corresponds to.
             path = None
             for lbl, fpath, _text, _tree in self._iter_ast_trees():
@@ -12473,9 +12644,14 @@ class PulseCLI:
                     break
             if path is None:
                 continue
+            path_shifts = shifts.setdefault(path, [])
+            if any(at == scanned_lineno and delta < 0 for at, delta in path_shifts):
+                continue      # that line was removed by an earlier patch
+            lineno = scanned_lineno + sum(delta for at, delta in path_shifts if at < scanned_lineno)
 
             try:
-                with open(path, "r", encoding="utf-8") as f:
+                # newline="": keep the file's CRLF line endings on a one-token patch.
+                with open(path, "r", encoding="utf-8", newline="") as f:
                     src = f.read()
             except OSError:
                 continue
@@ -12547,8 +12723,9 @@ class PulseCLI:
             if not patched_this:
                 continue
 
-            # Run lint gate before writing -- same check as _apply_code_fix.
-            lint_ok, lint_msgs = self._lint_check(new_src, path)
+            # Run lint gate before writing -- same check as _apply_code_fix: only
+            # problems the patch introduces block it (a notebook's display() doesn't).
+            lint_ok, lint_msgs = self._lint_check(new_src, path, original=src)
             if not lint_ok:
                 cprint(
                     f"[Pulse] MLLINT auto-fix for '{label}' failed lint check "
@@ -12557,11 +12734,14 @@ class PulseCLI:
                 continue
 
             try:
-                with open(path, "w", encoding="utf-8") as f:
+                with open(path, "w", encoding="utf-8", newline="") as f:
                     f.write(new_src)
             except OSError as exc:
                 cprint(f"[Pulse] MLLINT auto-fix couldn't write '{path}': {exc}", color=_YELLOW)
                 continue
+            line_delta = new_src.count("\n") - src.count("\n")
+            if line_delta:
+                path_shifts.append((scanned_lineno, line_delta))
 
             self._append_fixlog(
                 path, src, new_src,
@@ -12573,10 +12753,11 @@ class PulseCLI:
                 {path: (src, new_src)}, f"Automatic MLLINT fix (start-of-run): {msg[:200]}")
             if commit_id:
                 self._last_commit_id = commit_id
+            lf_src = new_src.replace("\r\n", "\n")      # the in-memory copies are LF
             if path == self.script_path:
-                self.code_text = new_src
+                self.code_text = lf_src
             elif path in self.extra_files:
-                self.extra_files[path] = new_src
+                self.extra_files[path] = lf_src
             _agent_log_event(f"START-OF-RUN LINT FIX written to {os.path.basename(path)}", msg[:300])
             cprint(
                 f"[Pulse] ✓ Auto-fixed '{label}' at line {lineno}: {msg[:120]}",
