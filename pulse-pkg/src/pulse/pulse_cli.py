@@ -12,6 +12,7 @@ import io
 import ast
 import copy
 import codecs
+import collections
 import json
 import time
 import math
