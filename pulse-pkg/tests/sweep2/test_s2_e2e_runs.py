@@ -631,8 +631,10 @@ KERAS_FIX = {"old": ["BAD_EPOCH = 3"], "new": ["BAD_EPOCH = -1"], "explanation":
 
 def test_ok_keras_crash_fix_resume_continues_with_the_crash_weights():
     """Crash in epoch 3 -> checkpoint -> scripted fix -> restart: the re-run starts from the
-    weights the crashed run had (BEGIN_WSUM == the crash-time WSUM), at epoch 3 (the one that
-    had not completed from Pulse's point of view), and trains to epoch 7."""
+    weights the crashed run had (BEGIN_WSUM == the crash-time WSUM), at epoch 4, and trains to
+    epoch 7. (Epoch 3 finished training -- the crash-time weights include it -- before the
+    probe raised in its on_epoch_end; resuming AT epoch 3 trained it twice. Fix round 2: the
+    ledger's "An epoch can be trained twice after a resume".)"""
     pytest.importorskip("keras")
     r = h.run(KERAS_CRASH, llm_rules=fix_rules(KERAS_FIX), timeout=400, installed=True)
     assert r.returncode == 0 and not r.timed_out, r.show()
@@ -641,8 +643,8 @@ def test_ok_keras_crash_fix_resume_continues_with_the_crash_weights():
     begins = re.findall(r"BEGIN_WSUM ([0-9.]+)", r.stdout)
     assert len(begins) == 2 and begins[1] == crash_wsum, (begins, crash_wsum)
     rerun = r.stdout.split("Resuming from the checkpoint", 1)[1]
-    assert re.findall(r"EPOCH_BEGIN (\d+)", rerun) == ["3", "4", "5", "6", "7"], rerun[:1500]
-    assert "DONE epochs_run 5" in rerun
+    assert re.findall(r"EPOCH_BEGIN (\d+)", rerun) == ["4", "5", "6", "7"], rerun[:1500]
+    assert "DONE epochs_run 4" in rerun
 
 
 def test_ok_keras_fix_with_resume_false_starts_fresh():
