@@ -3487,6 +3487,8 @@ class PulseCLI:
         # before it's taken more than a couple of real steps. self.step (see update() and
         # _detect_loop_step_delta) is the ground truth this is measured against.
         self._last_checkin_step: int = 0
+        # The step the latest check-in started at (the prompt's "N steps after the last one").
+        self._last_checkin_start_step: int = 0
         self.checkin_interval_steps: int = self._DEFAULT_CHECKIN_STEPS
 
         # Auto-intervention: watch tracked values for signs training is
@@ -9522,18 +9524,59 @@ class PulseCLI:
     _CHECKIN_MIN_STEPS = 20
     _CHECKIN_MAX_STEPS = 20_000
     _DEFAULT_CHECKIN_STEPS = 500
+    # Whole verdicts (their leading clause, before any '--', ';', '(' explanation) that mean
+    # "nothing wrong". Matched as whole phrases, never by first word: 'no problems found' is
+    # ok, 'no clear improvement' is not.
     _CHECKIN_OK_STATUSES = {
         "ok", "ok.", "okay", "fine", "healthy", "looks good", "looks fine",
         "looks healthy", "nominal", "good", "none", "no issues", "no problems",
+        "no issue", "no problem", "no issues found", "no problems found", "no issue found",
+        "no problem found", "no issues detected", "no problems detected", "nothing wrong",
+        "nothing wrong found", "nothing found", "nothing to report", "all good", "all ok",
     }
+    _CHECKIN_OK_FIRST_WORDS = ("ok", "okay", "healthy", "fine", "good", "none", "nominal")
+    # Every field of a check-in / start-of-run answer. A field's text runs until the next
+    # line that starts one of these (or a tool line), so a later field is never swallowed.
+    _CHECKIN_FIELD_NAMES = ("VERDICT", "PROBLEM", "NEXTCHECK", "CHECKNOTE", "STATUS", "GPUTRACK",
+                            "GPUUNTRACK", "SENSITIVITY", "NORMAL_START", "PROMOTE", "CALC", "GREP",
+                            "VIEW", "TERMINAL", "TRACE", "CORR", "OUTLIER", "DIFFSTATS", "HISTOGRAM",
+                            "MLLINT")
+    _CHECKIN_FIELD_ALT = "|".join(_CHECKIN_FIELD_NAMES)
+    # Markdown decoration around a field name: '**VERDICT:** ok', '**NEXTCHECK**: 50',
+    # '- CHECKNOTE: ...', '`PROBLEM:` ...'. Only the decoration of the name is touched.
+    _CHECKIN_FIELD_MD_RE = re.compile(
+        r"^(?P<indent>[ \t]*)(?:[-+\u2022][ \t]+|\*[ \t]+)?(?P<open>[*_`]*)[ \t]*"
+        r"(?P<name>" + _CHECKIN_FIELD_ALT + r")(?P<mid>[*_`]*)[ \t]*:(?P<close>[*_`]*)",
+        re.MULTILINE)
     _STATUS_RE = re.compile(r"^\s*STATUS:\s*(.+)$", re.MULTILINE)
     _VERDICT_RE = re.compile(r"^\s*VERDICT:\s*(.+)$", re.MULTILINE)
-    _PROBLEM_RE = re.compile(r"^\s*PROBLEM:\s*(.+?)(?=^\s*(?:NEXTCHECK|CHECKNOTE|VERDICT|GPUTRACK|GPUUNTRACK):|\Z)",
+    _PROBLEM_RE = re.compile(r"^\s*PROBLEM:\s*(.+?)(?=^\s*(?:" + _CHECKIN_FIELD_ALT + r"):|\Z)",
                              re.MULTILINE | re.DOTALL)
-    _CHECKNOTE_RE = re.compile(r"^\s*CHECKNOTE:\s*(.+?)(?=^\s*(?:NEXTCHECK|VERDICT|PROBLEM|GPUTRACK|GPUUNTRACK):|\Z)",
+    _CHECKNOTE_RE = re.compile(r"^\s*CHECKNOTE:\s*(.+?)(?=^\s*(?:" + _CHECKIN_FIELD_ALT + r"):|\Z)",
                                re.MULTILINE | re.DOTALL)
     # "1,000" and "2_000" are one number, not 1 and 2.
-    _NEXTCHECK_RE = re.compile(r"^\s*NEXTCHECK:\s*([0-9]{1,3}(?:[,_][0-9]{3})+|[0-9]+)", re.MULTILINE)
+    _NEXTCHECK_RE = re.compile(r"^\s*NEXTCHECK:\s*[*_`]*\s*([0-9]{1,3}(?:[,_][0-9]{3})+|[0-9]+)", re.MULTILINE)
+
+    @classmethod
+    def _normalize_checkin_fields(cls, text: Optional[str]) -> str:
+        """The answer with markdown around its field NAMES removed ('**NEXTCHECK:** 2000' ->
+        'NEXTCHECK: 2000', '- CHECKNOTE: x' -> 'CHECKNOTE: x'), so every field parser sees the
+        plain format. The field values are left alone: a PROBLEM like 'y * scale ** 2' or a
+        `code span` keeps its asterisks and backticks."""
+        def fix(m):
+            # A marker opened before the name and closed after the colon ('**NAME:**') is
+            # decoration; with no opener, what follows the colon belongs to the value.
+            close = m.group("close") if m.group("open") and not m.group("mid") else ""
+            rest = m.group("close")[len(close):]
+            return f"{m.group('indent')}{m.group('name')}:{rest}"
+        return cls._CHECKIN_FIELD_MD_RE.sub(fix, text or "")
+
+    @classmethod
+    def _parse_checknote(cls, text: Optional[str]) -> str:
+        """The CHECKNOTE: text of an answer ('' when absent or 'none')."""
+        m = cls._CHECKNOTE_RE.search(cls._normalize_checkin_fields(text))
+        note = m.group(1).strip() if m else ""
+        return "" if note.lower().strip("*`_ ").rstrip(".") in ("", "none", "n/a") else note
 
     @classmethod
     def _parse_nextcheck_steps(cls, text: Optional[str]) -> Optional[int]:
@@ -9542,7 +9585,7 @@ class PulseCLI:
         _CHECKIN_MAX_STEPS] so a malformed or extreme reply can't set an unreasonable cadence.
         Returns None if there's no parseable NEXTCHECK: line at all, in which case the caller
         should leave the existing interval alone rather than guess."""
-        m = cls._NEXTCHECK_RE.search(text or "")
+        m = cls._NEXTCHECK_RE.search(cls._normalize_checkin_fields(text))
         if not m:
             return None
         try:
@@ -9775,7 +9818,13 @@ class PulseCLI:
             return
         if self.step - self._last_checkin_step < self.checkin_interval_steps:
             return
-        self._last_checkin_step = self.step
+        # What the prompt reports is the real gap since the previous check-in STARTED -- the
+        # interval is counted from when that one's answer was applied (_finish_periodic_checkin),
+        # and the answer can land many steps after it started.
+        previous = getattr(self, "_last_checkin_start_step", 0)
+        steps_since = self.step - previous if self.step >= previous else self.step - self._last_checkin_step
+        steps_since = max(0, steps_since)
+        self._last_checkin_step = self._last_checkin_start_step = self.step
 
         # Everything the check-in reads from live state is captured here, on the training thread.
         tracked = ", ".join(sorted(self.gpu_tracked_vars)) if self.gpu_tracked_vars else "(none)"
@@ -9789,7 +9838,7 @@ class PulseCLI:
             history = f"(unable to summarise metric history: {exc})"
         time_per_step = self._format_time_per_step()
         prompt = self._PERIODIC_CHECKIN_PROMPT.format(
-            steps=self.checkin_interval_steps, time_per_step=time_per_step, tracked=tracked,
+            steps=steps_since, time_per_step=time_per_step, tracked=tracked,
             snapshot=snapshot, history=history, note=(getattr(self, "_checkin_note", "") or "(none)"),
         )
         cprint(
@@ -9799,14 +9848,14 @@ class PulseCLI:
             color=_YELLOW,
         )
         _agent_log_event(f"PERIODIC CHECK-IN started at step {self.step} "
-                         f"({self.checkin_interval_steps} steps after the last, {time_per_step}/step)")
+                         f"({steps_since} steps after the last, {time_per_step}/step)")
         if _async_model_calls_enabled():
             self._warm_model_imports()
             self._checkin_call = _BackgroundModelCall(lambda: self._run_checkin(prompt), prompt=prompt)
             return
         try:
             (answer, transcript), error = self._run_checkin(prompt), None
-        except AgentRequestFailed as exc:
+        except Exception as exc:          # same handling as a background check-in's error
             answer, transcript, error = None, [], exc
         self._finish_periodic_checkin(answer, error, prompt, transcript)
 
@@ -9936,31 +9985,47 @@ class PulseCLI:
         answer in that shape is not lost. Either way only the verdict's first word decides --
         'ok -- everything finite, scaler fitted on train' is ok. Matching the whole line against
         a list of exact phrases used to turn every explained 'ok' into an escalation."""
-        # Markdown around the fields ('VERDICT: **ok**', '**VERDICT:** ok', '`ok`') is decoration.
-        text = re.sub(r"[*`]", "", answer or "")
+        # Markdown around the field names ('**VERDICT:** ok') and the verdict itself
+        # ('VERDICT: **ok**', '`ok`') is decoration; inside PROBLEM it is content ('lr * 10').
+        text = cls._normalize_checkin_fields(answer)
         m = cls._VERDICT_RE.search(text)
         if m:
-            first = re.split(r"[\s.,;:!\-—–(]+", m.group(1).strip().lower(), maxsplit=1)[0].strip("_")
+            verdict = re.sub(r"[*`]", "", m.group(1)).strip()
             problem_m = cls._PROBLEM_RE.search(text)
             problem = problem_m.group(1).strip() if problem_m else ""
-            if first in ("ok", "okay", "healthy", "fine", "good", "none"):
+            if cls._is_ok_verdict(verdict):
                 return False, ""
-            return True, problem or m.group(1).strip()
+            return True, problem or verdict
         m = cls._STATUS_RE.search(text)
         if m:
-            status = m.group(1).strip()
-            first = re.split(r"[\s.,;:!\-—–(]+", status.lower(), maxsplit=1)[0]
-            if first in ("ok", "okay", "healthy", "fine", "good", "none", "nominal"):
-                return False, ""
-            if status.lower().rstrip(".") in cls._CHECKIN_OK_STATUSES:
+            status = re.sub(r"[*`]", "", m.group(1)).strip()
+            if cls._is_ok_verdict(status):
                 return False, ""
             return True, status
         return None, ""
+
+    @classmethod
+    def _is_ok_verdict(cls, verdict: str) -> bool:
+        """'ok', 'ok -- all finite', 'no problems found', 'nothing wrong (checked the split)'.
+        Decided by the first word when that is an ok word, else by the verdict's leading clause
+        matched as a WHOLE phrase -- so 'no issues' is ok while 'no clear improvement' and
+        'problem: no issues with the data, but ...' are problems."""
+        low = verdict.strip().lower()
+        first = re.split(r"[\s.,;:!\-\u2014\u2013(]+", low, maxsplit=1)[0].strip("_")
+        if first in cls._CHECKIN_OK_FIRST_WORDS:
+            return True
+        clause = re.split(r"\s+[-\u2014\u2013]+\s+|--|[\u2014\u2013;:,(]|\.(?:\s|$)", low, maxsplit=1)[0]
+        clause = re.sub(r"\s+", " ", clause).strip().rstrip(".!").strip("_ ")
+        return clause in cls._CHECKIN_OK_STATUSES
 
     def _finish_periodic_checkin(self, answer, error, prompt, transcript=None) -> None:
         """Everything a check-in does with the agent's answer. Runs on the training thread."""
         queued_gpu = getattr(self, "_checkin_gpu_requests", None) or {}
         self._checkin_gpu_requests = None
+        # The next interval (NEXTCHECK: 'N steps from now') counts from here, when the answer is
+        # applied -- not from when the check-in started, which may be thousands of steps back
+        # on a fast loop and would start the next paid check-in immediately.
+        self._last_checkin_step = getattr(self, "step", 0)
         if error is not None:
             # A periodic, low-stakes background check -- never worth interrupting training
             # over, whatever went wrong in it (a Pulse bug included: it is logged, not raised
@@ -9978,7 +10043,8 @@ class PulseCLI:
             cprint(f"[Pulse] Check-in investigated with {len(transcript)} tool call(s): "
                    + "; ".join(t.split(': ', 1)[1][:80] for t in transcript), color=_YELLOW)
 
-        _, _calc, _promote, gputrack_names, gpuuntrack_names, _sens, _norm, _grep, _view = self._extract_directives(answer)
+        _, _calc, _promote, gputrack_names, gpuuntrack_names, _sens, _norm, _grep, _view = \
+            self._extract_directives(self._normalize_checkin_fields(answer))
         # Plus any sent as tool lines during the investigation (see _checkin_service_tools).
         gputrack_names = list(dict.fromkeys(queued_gpu.get("gputrack", []) + gputrack_names))
         gpuuntrack_names = list(dict.fromkeys(queued_gpu.get("gpuuntrack", []) + gpuuntrack_names))
@@ -9986,9 +10052,7 @@ class PulseCLI:
         if summary:
             cprint(f"[Pulse] {summary}", color=_YELLOW)
 
-        note_m = self._CHECKNOTE_RE.search(answer)
-        note = note_m.group(1).strip() if note_m else ""
-        self._checkin_note = "" if note.lower().rstrip(".") in ("", "none", "n/a") else note
+        self._checkin_note = self._parse_checknote(answer)
 
         is_problem, problem = self._checkin_verdict(answer)
         _agent_log_event(
@@ -12408,7 +12472,7 @@ class PulseCLI:
     _START_PRIME_PROMPT = (
         "[Automatic start-of-run check -- sent once, automatically, before the first training step, "
         "so this is your only chance to set these from the code alone, before any real data exists] "
-        "Look at the training code and the tracked variables above. Four things:\n"
+        "Look at the training code and the tracked variables above. Five things:\n"
         "1. Judge how noisy this run's loss/metric curves are likely to be, given the model type, "
         "batch size, learning rate, and loss function, and set an appropriate sensitivity for "
         "spike/plateau/oscillation detection.\n"
@@ -12704,7 +12768,9 @@ class PulseCLI:
         _finish_start_prime, on the training thread, the next time update() runs after it lands."""
         try:
             context = self._build_agent_context(include_code=True)
-        except AgentRequestFailed:
+        except Exception as exc:
+            if not isinstance(exc, AgentRequestFailed):
+                _pulse_log(f"START PRIME ERROR {type(exc).__name__}: {exc}")
             return
         prompt = f"{context}\n\n{self._START_PRIME_PROMPT}"
         if _async_model_calls_enabled():
@@ -12716,8 +12782,8 @@ class PulseCLI:
             return
         try:
             answer, error = self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS, purpose="start-of-run check"), None
-        except AgentRequestFailed as exc:
-            answer, error = None, exc
+        except Exception as exc:          # handled like the background call's error: never raised
+            answer, error = None, exc     # into the training loop (see _finish_start_prime)
         self._finish_start_prime(answer, error, deferred)
 
     def _poll_start_prime(self) -> None:
@@ -12745,14 +12811,14 @@ class PulseCLI:
                 _pulse_log(f"START PRIME ERROR {type(error).__name__}: {error}")
             return
         self._start_prime_answered = True
-        _, _calc, _promote, gputrack_names, _gpuu, sensitivity_args, normal_start_args, _grep, _view = self._extract_directives(answer)
+        _, _calc, _promote, gputrack_names, _gpuu, sensitivity_args, normal_start_args, _grep, _view = \
+            self._extract_directives(self._normalize_checkin_fields(answer))
         summary = self._apply_directives([], [], gputrack_names, None, sensitivity_args, normal_start_args)
         if summary:
             label = "Start-of-run check (deferred, agent now available)" if deferred else "Start-of-run check"
             cprint(f"[Pulse] {label}: {summary}", color=_YELLOW)
-        note_m = self._CHECKNOTE_RE.search(answer or "")
-        note = note_m.group(1).strip() if note_m else ""
-        if note and note.lower().rstrip(".") not in ("none", "n/a"):
+        note = self._parse_checknote(answer)
+        if note:
             self._checkin_note = note
             cprint(f"[Pulse] Note for the first check-in: {note}", color=_YELLOW)
             _agent_log_event("NOTE FOR THE FIRST CHECK-IN", note)
@@ -12818,6 +12884,9 @@ class PulseCLI:
         if (not mllint_findings and self.code_text
                 and not self._start_prime_answered
                 and self._start_prime_call is None
+                # _prime_at_start already asked and, on failure, asked once more: a start check
+                # that failed twice is not asked a third time.
+                and not self._start_prime_retried
                 and not self._resumed_from_restart()):
             self._start_start_prime(deferred=True)
 
