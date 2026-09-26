@@ -762,9 +762,9 @@ def test_bug_implement_keyword_substring_match(chat_cls):
     'applying' all match, so a pure question edits the user's files. Correct: a
     question like 'what does the prefix argument do?' does not trigger a code edit."""
     q = "what does the prefix argument do?"
-    wants = any(kw in q.lower() for kw in core._IMPLEMENT_KEYWORDS)
-    # mirror of the exact expression in ChatPanel._ask (include_code=True)
-    assert wants is False
+    # the decision ChatPanel._ask makes (include_code=True)
+    assert core._wants_implementation(q) is False
+    assert core._wants_implementation("Please fix the loss computation") is True
 
 
 def test_bug_discover_project_files_misses_package_submodules(tmp_path, monkeypatch):
@@ -843,6 +843,45 @@ def test_bug_auto_track_docstring_default_mode_mismatch():
     doc = core.auto_track.__doc__
     documented = "auto" if '"auto" (default' in doc else default
     assert default == documented
+
+
+def test_bug_doclookup_runs_the_users_own_module(chat_cls, tmp_path, monkeypatch):
+    """DOCLOOKUP: <module>.<symbol> imported <module> to read its docstring -- for the
+    user's own train.py that means running the training script inside the agent call.
+    Correct: a project module is refused (VIEW/DEFOF read its code instead)."""
+    marker = tmp_path / "ran.txt"
+    (tmp_path / "sweep_local_trainmod.py").write_text(
+        f"open({str(marker)!r}, 'w').write('ran')\ndef build():\n    return 1\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    p = make_panel(chat_cls)
+    out = p._run_doclookup("sweep_local_trainmod.build")
+    assert not marker.exists(), out
+    assert "sweep_local_trainmod" not in sys.modules
+    assert "json.dumps" in p._run_doclookup("json.dumps")
+
+
+def test_bug_replay_snapshots_are_unbounded(monkeypatch):
+    """REPLAY kept up to 20 full serialized copies of every model/optimizer in scope,
+    whatever their size. Correct: snapshots stay within the memory budget (a state too
+    big for it is not copied at all) and one object reachable under two names is
+    copied once."""
+    torch = pytest.importorskip("torch")
+    model = torch.nn.Linear(64, 64)                     # ~16.6 KB of parameters
+    frame = types.SimpleNamespace(f_globals={"net": model}, f_locals={"model": model})
+    old = list(core._REPLAY_CHECKPOINTS)
+    core._REPLAY_CHECKPOINTS.clear()
+    try:
+        monkeypatch.setattr(core, "_REPLAY_MAX_BYTES", 4096)
+        core._replay_maybe_checkpoint(frame, 0)
+        assert core._REPLAY_CHECKPOINTS == []
+        monkeypatch.setattr(core, "_REPLAY_MAX_BYTES", 60_000)
+        for step in range(5):
+            core._replay_maybe_checkpoint(frame, step)
+        total = sum(len(b) for _, snap in core._REPLAY_CHECKPOINTS for b in snap.values())
+        assert core._REPLAY_CHECKPOINTS and total <= 60_000, total
+        assert all(len(snap) == 1 for _, snap in core._REPLAY_CHECKPOINTS)
+    finally:
+        core._REPLAY_CHECKPOINTS[:] = old
 
 
 # ===========================================================================
