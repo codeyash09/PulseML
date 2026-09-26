@@ -1121,3 +1121,35 @@ def test_ok_auto_track_inside_main_keeps_observing_loop():
     line = [l for l in r.stdout.splitlines() if l.startswith("LATE")]
     assert line, r.stdout + r.stderr
     assert int(line[0].split()[1]) >= 2, line[0]
+
+
+def test_ok_auto_track_inside_a_spawned_worker_function_still_runs(tmp_path):
+    """A DDP rank started with torch.multiprocessing.spawn calls auto_track() inside
+    its worker function; only the module-level re-import of the script is skipped."""
+    import subprocess, sys, textwrap, os
+    script = tmp_path / "ddp_like.py"
+    script.write_text(textwrap.dedent('''
+        import multiprocessing as mp, sys
+        import pulse.pulse as core
+        calls = []
+        def fake_start(*a, **k):
+            calls.append(1)
+            raise SystemExit(0)
+        def worker(q):
+            core._AUTO_TRACK_STARTED = False
+            core._determine_mode = lambda m: (_ for _ in ()).throw(RuntimeError("reached setup"))
+            try:
+                core.auto_track()
+                q.put("skipped")
+            except RuntimeError as exc:
+                q.put(str(exc))
+        if __name__ == "__main__":
+            ctx = mp.get_context("spawn")
+            q = ctx.Queue()
+            p = ctx.Process(target=worker, args=(q,))
+            p.start(); p.join(60)
+            print("RESULT", q.get(timeout=5))
+    '''))
+    env = dict(os.environ, PYTHONPATH=os.environ.get("PULSE_SRC", "") + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    out = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=180, env=env)
+    assert "RESULT reached setup" in out.stdout, out.stdout + out.stderr

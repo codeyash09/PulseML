@@ -7091,10 +7091,15 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
 
     # A 'spawn'/'forkserver' child re-imports the main module under the name
     # __mp_main__ -- before parent_process() is set, which only happens once
-    # the child starts its target -- so check both.
+    # the child starts its target -- so check both. Only a module-level call is
+    # that re-import; auto_track() called inside the worker's own function is a
+    # deliberate one (a DDP rank started with torch.multiprocessing.spawn) and
+    # goes ahead, so each rank still gets its Pulse.
     try:
-        in_child = (mp.parent_process() is not None
-                    or sys._getframe(1).f_globals.get("__name__") == "__mp_main__")
+        caller = sys._getframe(1)
+        in_child = (caller.f_code.co_name == "<module>"
+                    and (mp.parent_process() is not None
+                         or caller.f_globals.get("__name__") == "__mp_main__"))
     except Exception:
         in_child = False
     if in_child:
