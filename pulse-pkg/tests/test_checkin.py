@@ -246,45 +246,46 @@ def test_a_late_start_answer_does_not_push_the_first_checkin_back():
     assert cli._last_checkin_step == 0          # due now, not 50 steps after the answer arrived
 
 
-def reviewing_cli(printed, step=0):
-    import pulse.pulse_cli as pc
+def exiting_cli(step=0):
     cli = finished_cli()
     cli.agent_provider, cli.agent_key, cli.code_text = "p", "k", "print(1)"
     cli.step, cli.epoch_scalar_histories = step, {}
-    pc._RECENT_OUTPUT.clear()
-    for line in printed:
-        pc._RECENT_OUTPUT.append(line)
     return cli
 
 
-def test_a_run_that_trained_nothing_is_escalated_at_exit():
-    cli = reviewing_cli(["[Pulse] ✓ Start-of-run ML anti-pattern check: no issues found in the code.",
-                         "Found input variables with inconsistent numbers of samples: [1000, 12]"])
-    cli._end_of_run_review()
-    assert len(cli.escalated) == 1
-    assert "without training a single step" in cli.escalated[0]
-    assert "inconsistent numbers of samples" in cli.escalated[0]
-    assert "anti-pattern" not in cli.escalated[0]        # Pulse's own lines are left out
+# The end-of-run review ("finished without training a single step") was removed: it flagged
+# healthy fast runs, eval-only and sklearn scripts, and its model calls could not complete at
+# exit. These keep it from coming back -- nothing at exit escalates the run itself.
+
+def test_a_run_that_trained_nothing_is_not_escalated_at_exit():
+    import pulse.pulse_cli as pc
+    assert not hasattr(pc, "_RECENT_OUTPUT")
+    cli = exiting_cli()
+    cli._finish_background_calls_at_exit()
+    assert cli.escalated == []
 
 
 def test_a_run_that_trained_is_not_reviewed_at_exit():
-    cli = reviewing_cli(["Epoch 1/10"], step=120)
-    cli._end_of_run_review()
+    cli = exiting_cli(step=120)
+    cli._finish_background_calls_at_exit()
     assert cli.escalated == []
 
 
 def test_a_crash_pulse_already_handled_is_not_reviewed_again():
-    cli = reviewing_cli(["Traceback ..."])
-    cli._crash_seen = True
-    cli._end_of_run_review()
+    cli = exiting_cli()
+    cli._finish_background_calls_at_exit()
     assert cli.escalated == []
 
 
-def test_the_exit_review_runs_once():
-    cli = reviewing_cli(["oops"])
-    cli._end_of_run_review()
-    cli._end_of_run_review()
-    assert len(cli.escalated) == 1
+def test_the_exit_handler_runs_once():
+    import types
+    cli = exiting_cli(step=300)
+    answer = "VERDICT: problem\nPROBLEM: labels shuffled apart from features (train.py:9)"
+    cli._checkin_call = types.SimpleNamespace(done=True, error=None, prompt="p", result=(answer, []))
+    cli._finish_background_calls_at_exit()
+    cli._checkin_call = types.SimpleNamespace(done=True, error=None, prompt="p", result=(answer, []))
+    cli._finish_background_calls_at_exit()
+    assert cli.escalated == ["[periodic check-in] labels shuffled apart from features (train.py:9)"]
 
 
 def test_terminal_python_is_the_runs_own_interpreter(tmp_path):

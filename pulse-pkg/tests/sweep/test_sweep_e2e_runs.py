@@ -181,36 +181,35 @@ print("FINAL", loss.item())
     assert flagged(r), "a NaN torch loss was never flagged:\n" + r.show(3000)
 
 
-def test_bug_end_review_escalates_a_healthy_fast_numpy_run():
-    """The new end-of-run review escalates a run that trained perfectly well.
+def test_ok_healthy_fast_numpy_run_is_not_escalated_at_exit():
+    """Regression for the removed end-of-run review, which escalated a run that trained
+    perfectly well.
 
     300 real gradient steps that finish in well under a second leave PulseCLI.step at 0
     (update() is throttled to once per throttle_interval, and the step counter only moves
-    inside update()), so _end_of_run_review (pulse_cli.py ~5504) decides "The script
-    finished without training a single step ... an error may have been caught" and runs the
-    full diagnose-and-fix pipeline (6 more model calls, 'Fix the bug' prompts) on a correct
-    script. Correct: a run whose loss was observed going down / whose loop ran is not
-    escalated -- "no training" needs positive evidence (no loop iterations, no loss ever
-    assigned), not step==0.
+    inside update()), so the review decided "The script finished without training a single
+    step ... an error may have been caught" and ran the full diagnose-and-fix pipeline
+    (6 more model calls, 'Fix the bug' prompts) on a correct script. The review is gone:
+    nothing escalates at exit.
     """
     r = h.run(AT + np_loop(300, 0), installed=True)
     assert r.returncode == 0, r.show()
     assert not escalated_at_exit(r), "healthy run escalated as 'trained nothing':\n" + r.show(3000)
 
 
-def test_bug_end_review_escalates_a_healthy_fast_run_under_pulse_run():
-    """Same false positive through `pulse run` (no auto_track in the file): the healthy run
-    gets the 'crashed invisibly' escalation and 6 extra agent calls asking to fix it."""
+def test_ok_healthy_fast_run_under_pulse_run_is_not_escalated_at_exit():
+    """Same removed false positive through `pulse run` (no auto_track in the file): the
+    healthy run got the 'crashed invisibly' escalation and 6 extra agent calls."""
     r = h.run(np_loop(300, 0), mode="run", installed=True)
     assert r.returncode == 0, r.show()
     assert not escalated_at_exit(r), r.show(3000)
     assert len(r.llm_calls) <= 1, f"{len(r.llm_calls)} agent calls for a healthy run"
 
 
-def test_bug_end_review_escalates_an_evaluation_only_script():
+def test_ok_evaluation_only_script_is_not_escalated_at_exit():
     """An evaluation/inference script (model.eval(), no_grad, computes a test loss) is a
-    legitimate script that trains nothing by design; the end-of-run review treats it as a
-    failed training run and asks the agent to find and fix 'the bug'. Correct: not
+    legitimate script that trains nothing by design; the removed end-of-run review treated
+    it as a failed training run and asked the agent to find and fix 'the bug'. Not
     escalated (with auto-fix on, a confident fake 'fix' would be written into the file)."""
     pytest.importorskip("torch")
     src = TORCH_PRE + AT + """
@@ -228,10 +227,10 @@ print("EVAL", total / 8)
     assert not escalated_at_exit(r), r.show(3000)
 
 
-def test_bug_end_review_escalates_a_sklearn_script_that_reports_a_loss():
-    """A scikit-learn fit that reports its test loss (`loss = mean_squared_error(...)`) is
-    escalated at exit as 'trained nothing, maybe a swallowed error'. Correct: no escalation
-    -- a non-iterative fit is still training."""
+def test_ok_sklearn_script_that_reports_a_loss_is_not_escalated_at_exit():
+    """A scikit-learn fit that reports its test loss (`loss = mean_squared_error(...)`) was
+    escalated at exit by the removed review as 'trained nothing, maybe a swallowed error'.
+    No escalation -- a non-iterative fit is still training."""
     pytest.importorskip("sklearn")
     src = """
 import numpy as np
@@ -249,10 +248,10 @@ print("TEST LOSS", loss)
     assert not escalated_at_exit(r), r.show(3000)
 
 
-def test_bug_end_review_escalates_healthy_torch_dataloader_training():
-    """8 epochs of a normal DataLoader loop (loss 2.57 -> 0.015, ~1 s of training) end with
-    the 'finished without training a single step' escalation and 6 extra agent calls.
-    Correct: not escalated."""
+def test_ok_healthy_torch_dataloader_training_is_not_escalated_at_exit():
+    """8 epochs of a normal DataLoader loop (loss 2.57 -> 0.015, ~1 s of training) ended with
+    the removed review's 'finished without training a single step' escalation and 6 extra
+    agent calls. Not escalated."""
     pytest.importorskip("torch")
     src = TORCH_PRE + AT + """
 from torch.utils.data import TensorDataset, DataLoader
@@ -273,17 +272,13 @@ for epoch in range(8):
     assert not escalated_at_exit(r), r.show(3000)
 
 
-def test_bug_end_review_crashes_when_pulse_is_not_in_site_packages():
-    """Run from a checkout / editable install (PYTHONPATH=src, `pip install -e .`), Pulse's
-    own line tracer is still installed when the atexit review runs, and it traces Pulse's
-    own code: the review's locals ('self', 'call', 'deadline') are added as tracked
-    variables and cli.update() runs inside the review, mutating epoch_scalar_histories
-    while the review iterates it. pulse.log: "END-OF-RUN REVIEW failed: RuntimeError:
-    dictionary changed size during iteration" -- the review silently does nothing.
-    _is_library_frame (pulse.py:6549) only skips site-packages/stdlib, never Pulse itself;
-    direct `python train.py` never calls sys.settrace(None) before atexit (pulse run does,
-    in cli._execute). Correct: the tracer never traces Pulse's own frames, and is removed
-    before the exit review runs."""
+def test_ok_exit_work_is_not_traced_when_pulse_is_not_in_site_packages():
+    """Regression for the removed end-of-run review. Run from a checkout / editable install
+    (PYTHONPATH=src, `pip install -e .`), Pulse's own line tracer was still installed when
+    the atexit review ran, and traced Pulse's own code: the review's locals ('self', 'call',
+    'deadline') became tracked variables and cli.update() ran inside the review ("END-OF-RUN
+    REVIEW failed: RuntimeError: dictionary changed size during iteration"). The review is
+    gone, and Pulse's remaining exit work removes the tracer first."""
     r = h.run(AT + np_loop(300, 0), installed=False)
     assert r.returncode == 0, r.show()
     log = pulse_log(r)
@@ -430,22 +425,12 @@ def test_ok_stream_mode_crash_keeps_exit_code_and_traceback():
     assert "ValueError: boom" in r.stderr
 
 
-def test_bug_end_review_can_never_reach_the_model():
-    """The case the end-of-run review exists for -- training raises, the script catches
-    and prints the error, exits 0 -- is detected, but the agent is never actually asked.
-
-    The review runs from atexit (pulse_cli.py ~3051 atexit.register(_end_of_run_review)),
-    and by then concurrent.futures has shut down (threading._shutdown runs before atexit
-    handlers). litellm.completion submits its success-logging to a ThreadPoolExecutor after
-    the provider has answered (litellm/utils.py ~1757 `executor.submit(...)`), so EVERY
-    model call from the review raises "RuntimeError: cannot schedule new futures after
-    interpreter shutdown" -- after the request was sent and billed. Pulse prints "AI agent
-    request failed ... will retry this request again in ~60s" and exits. (Verified
-    standalone: litellm.completion(mock_response=...) inside any atexit handler raises the
-    same.) The fake model here goes through litellm's real completion() with mock_response.
-    Correct: the review happens before interpreter shutdown (e.g. from the excepthook /
-    a main-thread hook at the end of the script, or a threading._register_atexit hook), so
-    the model's answer is received and used."""
+def test_ok_caught_and_printed_error_makes_no_model_call_at_exit():
+    """Regression for the removed end-of-run review. It escalated a script that catches and
+    prints its training error and exits 0 -- from atexit, after concurrent.futures had shut
+    down, so every model call it made failed with "cannot schedule new futures after
+    interpreter shutdown" after the request was sent and billed. The review is gone: no
+    escalation, and no model call at exit that could fail that way."""
     pytest.importorskip("torch")
     src = TORCH_PRE + AT + """
 model = nn.Linear(10, 1)
@@ -460,14 +445,14 @@ except Exception as exc:
 """
     r = h.run(src, installed=True)
     assert r.returncode == 0
-    assert NO_TRAINING in r.stdout, "precondition: the review escalated\n" + r.show()
-    assert "cannot schedule new futures" not in r.stdout, (
-        "every model call from the exit review fails:\n" + r.stdout[-1500:])
+    assert "training failed:" in r.stdout, r.show()
+    assert not escalated_at_exit(r), "escalated at exit:\n" + r.show()
+    assert "cannot schedule new futures" not in r.stdout, r.stdout[-1500:]
 
 
-def test_ok_end_review_escalation_carries_the_printed_error():
+def test_ok_caught_and_printed_error_is_not_handed_to_the_agent_at_exit():
     """With the model call short-circuited (FAKE_LLM_SHORTCUT=1, no litellm executor), the
-    review hands the caught-and-printed error to the agent as intended."""
+    removed review used to hand the caught-and-printed error to the agent. Nothing is."""
     pytest.importorskip("torch")
     src = TORCH_PRE + AT + """
 model = nn.Linear(10, 1)
@@ -479,8 +464,8 @@ except Exception as exc:
 """
     r = h.run(src, installed=True, env={"FAKE_LLM_SHORTCUT": "1"})
     assert r.returncode == 0
-    calls = r.calls_about(NO_TRAINING)
-    assert calls and "mat1 and mat2 shapes cannot be multiplied" in calls[0]["all"], r.show()
+    assert not escalated_at_exit(r), r.show()
+    assert not r.calls_about("mat1 and mat2 shapes cannot be multiplied"), r.show()
 
 
 def test_ok_healthy_longer_numpy_run_is_left_alone():

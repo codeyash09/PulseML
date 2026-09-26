@@ -11,7 +11,7 @@ import sys
 import io
 import ast
 import copy
-import collections
+import codecs
 import json
 import time
 import math
@@ -153,9 +153,11 @@ def _build_keras_tracker_class(callback_base):
 
             # The epoch boundary is the correct point to run diagnosis.
             # We do NOT run the expensive detector on every batch.
+            # Always, whether or not auto-fix is on: the tracer cannot call update() while fit()
+            # runs, so this is the run's only step count, check-in and Ctrl+C pause point.
+            # update() itself only escalates when auto_intervene is on.
             try:
-                if getattr(self.pulse, "auto_intervene", False):
-                    self.pulse.update(step=getattr(self.pulse, "_keras_steps", None) or None)
+                self.pulse.update(step=getattr(self.pulse, "_keras_steps", None) or None)
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
@@ -304,8 +306,19 @@ def _install_keras_fit_hook():
     original_fit = model_cls.fit
 
     def pulse_fit(self, *args, **kwargs):
+        # Which fit() of the run this is (1, 2, ...): a fix checkpoint records it, so a
+        # pretrain + fine-tune script resumes into the fit() the checkpoint was taken in.
+        instance = _PULSE_ACTIVE_INSTANCE
+        fit_index = getattr(instance, "_keras_fit_count", 0) + 1
+        try:
+            instance._keras_fit_count = fit_index
+        except Exception:
+            pass
         _resume_from_fix_checkpoint(self, args, kwargs)
-        callbacks = kwargs.get("callbacks")
+        # callbacks is fit()'s 6th positional parameter: fit(x, y, batch_size, epochs,
+        # verbose, callbacks, ...). Merged where it was given, never passed twice.
+        positional = len(args) > 5
+        callbacks = args[5] if positional else kwargs.get("callbacks")
 
         if callbacks is None:
             callbacks = []
@@ -313,10 +326,13 @@ def _install_keras_fit_hook():
             callbacks = list(callbacks)
 
         callbacks.append(
-            tracker_cls(_PULSE_ACTIVE_INSTANCE)
+            tracker_cls(instance)
         )
 
-        kwargs["callbacks"] = callbacks
+        if positional:
+            args = args[:5] + (callbacks,) + args[6:]
+        else:
+            kwargs["callbacks"] = callbacks
 
         return original_fit(self, *args, **kwargs)
 
@@ -333,8 +349,9 @@ def _install_keras_fit_hook():
 # Checkpoint-and-resume around a fix. When Pulse starts fixing a running Keras job it saves
 # the model's weights (PulseCLI._save_fix_checkpoint); after the fix is written, the
 # restarted script continues from that point instead of retraining from scratch:
-# _resume_from_fix_checkpoint loads the weights into the first model.fit() and starts it
-# at the next epoch. A fresh start is used instead when the fix asked for one ("resume":
+# _resume_from_fix_checkpoint loads the weights into the model.fit() the checkpoint was
+# taken in (its "fit" index: the 2nd fit() of a pretrain + fine-tune script, say) and starts
+# it at the next epoch. A fresh start is used instead when the fix asked for one ("resume":
 # false -- e.g. an initializer, architecture, data or label fix, where the saved weights
 # carry the bug), when the saved weights were not finite, or when they do not fit the fixed
 # model. Keras only; other frameworks restart from the beginning as before.
@@ -349,13 +366,24 @@ def _fit_epochs(args, kwargs) -> Optional[int]:
     return args[3] if len(args) > 3 else 1
 
 
+# fit() calls seen so far per checkpoint being resumed, to find the one it was taken in.
+_RESUME_FITS_SEEN: Dict[str, int] = {}
+
+
 def _resume_from_fix_checkpoint(model, args, kwargs) -> None:
-    meta_path = os.environ.pop(_RESUME_ENV, "")      # once: the first fit() of the restarted run
+    meta_path = os.environ.get(_RESUME_ENV, "")
     if not meta_path:
         return
     try:
         with open(meta_path, encoding="utf-8") as f:
             meta = json.load(f)
+        # The fit() the checkpoint was taken in: earlier fits of the restarted run (a
+        # pretraining stage, say) run untouched. Older checkpoints carry no index: first fit().
+        seen = _RESUME_FITS_SEEN.get(meta_path, 0) + 1
+        _RESUME_FITS_SEEN[meta_path] = seen
+        if seen < int(meta.get("fit") or 1):
+            return
+        os.environ.pop(_RESUME_ENV, None)            # once
         if not getattr(model, "built", False):
             _agent_log_event("RESUME SKIPPED -- the model is not built before fit(), starting fresh")
             return
@@ -404,6 +432,7 @@ def _install_keras_pulse_hook(pulse_instance):
     global _PULSE_KERAS_IMPORT_WATCHER
 
     _PULSE_ACTIVE_INSTANCE = pulse_instance
+    _register_exit_hook()
 
     if _PULSE_KERAS_HOOK_INSTALLED:
         return
@@ -414,6 +443,37 @@ def _install_keras_pulse_hook(pulse_instance):
     watcher = _KerasImportWatcher()
     sys.meta_path.insert(0, watcher)
     _PULSE_KERAS_IMPORT_WATCHER = watcher
+
+
+_PULSE_EXIT_HOOK_REGISTERED = False
+
+
+def _at_interpreter_exit() -> None:
+    """The live session's exit work -- see PulseCLI._finish_background_calls_at_exit."""
+    cli = _PULSE_ACTIVE_INSTANCE
+    if cli is None:
+        return
+    try:
+        sys.settrace(None)          # Pulse's line tracer must not trace Pulse's own exit work
+    except Exception:
+        pass
+    cli._finish_background_calls_at_exit()
+
+
+def _register_exit_hook() -> None:
+    """Once per process, for the live session. threading._register_atexit hooks run at the
+    start of interpreter shutdown -- worker threads still running, concurrent.futures (which
+    litellm needs to finish a call) still taking work -- where atexit handlers run after both."""
+    global _PULSE_EXIT_HOOK_REGISTERED
+    if _PULSE_EXIT_HOOK_REGISTERED:
+        return
+    _PULSE_EXIT_HOOK_REGISTERED = True
+    try:
+        threading._register_atexit(_at_interpreter_exit)
+    except Exception:
+        atexit.register(_at_interpreter_exit)
+
+
 # Agent log: what Pulse's AI was shown, what it answered, and what Pulse did about it --
 # every model call (system prompt, conversation, reply, timing, failures) plus the actions
 # that follow (check-in verdicts, escalations, applied fixes, restarts). Plain
@@ -526,6 +586,7 @@ def _pulse_log(message: str, *, console: bool = False) -> None:
 import builtins
 
 _io_lock = threading.Lock()
+_token_usage_lock = threading.Lock()     # PulseCLI._token_usage, updated from worker threads too
 _original_print = builtins.print
 _original_input = builtins.input
 
@@ -538,18 +599,7 @@ def _stdout_is_tty() -> bool:
         return False
 
 
-# The last lines a script printed, for the end-of-run review (PulseCLI._end_of_run_review):
-# a script that catches its own exception and prints it ends "normally", and what it printed
-# is the only trace of what went wrong.
-_RECENT_OUTPUT: "collections.deque[str]" = collections.deque(maxlen=40)
-
-
 def safe_print(*args, **kwargs):
-    if kwargs.get("file") in (None, sys.stdout, sys.stderr):
-        try:
-            _RECENT_OUTPUT.append(kwargs.get("sep", " ").join(str(a) for a in args))
-        except Exception:
-            pass
     with _io_lock:
         # Move cursor to column 0 and clear line before printing background text -- but only
         # when this print is going to a terminal. Into a pipe, a log file or a notebook cell
@@ -576,14 +626,17 @@ def safe_print(*args, **kwargs):
             _original_print(*safe_args, **kwargs)
 
 def safe_input(prompt=""):
-    # Clear formatting and force prompt to a clean new line. Off a terminal keep the new line
-    # (it is what keeps each prompt on its own line in a log) and drop only the escape codes.
-    sys.stdout.write("\033[0m\n\r\033[K" if _stdout_is_tty() else "\n")
-    sys.stdout.flush()
-    
-    # Hold the lock while waiting for user input
-    with _io_lock:
-        return _original_input(prompt)
+    # input() replaces the builtin for the whole process, the script's own reads included, so
+    # it writes nothing of its own to stdout (Pulse's prompts carry their own spacing). On a
+    # terminal only, reset any colour a background print left behind.
+    if _stdout_is_tty():
+        with _io_lock:
+            sys.stdout.write("\033[0m")
+            sys.stdout.flush()
+    # Not under _io_lock while waiting: a prompt nobody answers (a check-in's TERMINAL
+    # confirmation on its worker thread, in an unattended run) must not block every print()
+    # in the process -- the training script's included.
+    return _original_input(prompt)
 
 # Global overrides
 builtins.print = safe_print
@@ -594,6 +647,22 @@ builtins.input = safe_input
 # and same purpose as pulse.py's LOSS_NAME_HINTS/_looks_like_loss, kept as a
 # local copy so this module has no dependency on pulse.py (which pulls in
 # tkinter and isn't safe to import in a headless CLI/Colab/SSH session).
+
+
+def _pulse_host_copy(value: Any):
+    """A host (CPU) copy of an accelerator tensor, for a variable the user or the agent asked
+    to GPU-track -- this forces a device-to-host sync, which is why only GPU tracking does it,
+    and only on its slow cadence. None when the value cannot be copied."""
+    try:
+        detach = getattr(value, "detach", None)
+        if callable(detach):                       # torch
+            return detach().cpu()
+        to_numpy = getattr(value, "numpy", None)
+        if callable(to_numpy):                     # TensorFlow / JAX-like
+            return to_numpy()
+        return np.asarray(value)
+    except Exception:
+        return None
 
 
 def _pulse_is_accelerator_value(value: Any) -> bool:
@@ -1280,7 +1349,15 @@ class AgentRequestFailed(Exception):
     disguised as a real model answer -- see _ask_agent_impl's try/except,
     the one chokepoint that catches this for the whole multi-pass
     pipeline, and the GPU check-in's own try/except for the other call
-    site outside that pipeline."""
+    site outside that pipeline.
+
+    `transient` says whether asking again later can succeed (a rate limit,
+    a timeout, a provider outage) or not (a bad key, an unknown model, a
+    context too long): only transient failures are queued for retry."""
+
+    def __init__(self, message: str = "", transient: bool = True):
+        super().__init__(message)
+        self.transient = transient
 
 
 PROVIDERS = {
@@ -2805,92 +2882,94 @@ def _mllint_scan(trees) -> List[tuple]:
 
     return findings
 
-class PulseCLI:
-    def _try_keras_history(var_name: str, watch_locals: Dict[str, Any]) -> Optional[float]:
-        """When a tracked variable is None in the outer frame (typically because
-        it's set inside a Keras callback from `logs.get(...)` and that metric
-        doesn't exist in logs for this task), try to read the latest value from
-        the Keras model's own `.history.history` dict, which IS accessible in
-        the outer frame via the tracked `model` variable and is always
-        up-to-date after each epoch. This handles the extremely common case of
-        a user tracking `train_acc`, `val_acc`, `train_mape`, etc. that are
-        assigned inside callbacks but whose real values live in model.history.
 
-        Name mapping: strips 'train_' / 'val_' prefix, then tries both with and
-        without 'val_' prefix in model.history. E.g.:
-            train_acc   -> history['accuracy'][-1]  or history['acc'][-1]
-            val_acc     -> history['val_accuracy'][-1]
-            train_loss  -> history['loss'][-1]
-            val_mape    -> history['val_mean_absolute_percentage_error'][-1] etc.
-        """
-        # Find any Keras model in scope
-        model = None
-        for candidate_name in ("model", "clf", "net", "network", "estimator"):
-            candidate = watch_locals.get(candidate_name)
-            if candidate is not None and hasattr(candidate, "history") and hasattr(candidate.history, "history"):
-                model = candidate
+def _try_keras_history(var_name: str, watch_locals: Dict[str, Any]) -> Optional[float]:
+    """When a tracked variable is None in the outer frame (typically because
+    it's set inside a Keras callback from `logs.get(...)` and that metric
+    doesn't exist in logs for this task), try to read the latest value from
+    the Keras model's own `.history.history` dict, which IS accessible in
+    the outer frame via the tracked `model` variable and is always
+    up-to-date after each epoch. This handles the extremely common case of
+    a user tracking `train_acc`, `val_acc`, `train_mape`, etc. that are
+    assigned inside callbacks but whose real values live in model.history.
+
+    Name mapping: strips 'train_' / 'val_' prefix, then tries both with and
+    without 'val_' prefix in model.history. E.g.:
+        train_acc   -> history['accuracy'][-1]  or history['acc'][-1]
+        val_acc     -> history['val_accuracy'][-1]
+        train_loss  -> history['loss'][-1]
+        val_mape    -> history['val_mean_absolute_percentage_error'][-1] etc.
+    """
+    # Find any Keras model in scope
+    model = None
+    for candidate_name in ("model", "clf", "net", "network", "estimator"):
+        candidate = watch_locals.get(candidate_name)
+        if candidate is not None and hasattr(candidate, "history") and hasattr(candidate.history, "history"):
+            model = candidate
+            break
+    if model is None:
+        # Also scan for any object with a .history.history attribute
+        for val in watch_locals.values():
+            if val is not None and hasattr(val, "history") and hasattr(val.history, "history"):
+                model = val
                 break
-        if model is None:
-            # Also scan for any object with a .history.history attribute
-            for val in watch_locals.values():
-                if val is not None and hasattr(val, "history") and hasattr(val.history, "history"):
-                    model = val
-                    break
-        if model is None:
-            return None
-
-        hist = model.history.history
-        if not hist:
-            return None
-
-        name_lower = var_name.lower()
-        is_val = name_lower.startswith("val_")
-        # Strip known prefixes to get the bare metric name
-        bare = name_lower
-        for prefix in ("train_", "val_", "tr_", "training_"):
-            if bare.startswith(prefix):
-                bare = bare[len(prefix):]
-                break
-
-        # Build candidate keys to try in model.history.history
-        candidates = []
-        if is_val:
-            candidates += [f"val_{bare}", f"val_{bare.replace('_', '')}"]
-            # Common Keras metric name expansions
-            expansions = {
-                "acc": ["val_accuracy", "val_acc"],
-                "accuracy": ["val_accuracy", "val_acc"],
-                "mse": ["val_mean_squared_error", "val_mse"],
-                "mae": ["val_mean_absolute_error", "val_mae"],
-                "mape": ["val_mean_absolute_percentage_error", "val_mape"],
-                "rmse": ["val_root_mean_squared_error", "val_rmse"],
-                "loss": ["val_loss"],
-            }
-            candidates += expansions.get(bare, [])
-        else:
-            candidates += [bare, bare.replace("_", "")]
-            expansions = {
-                "acc": ["accuracy", "acc"],
-                "accuracy": ["accuracy", "acc"],
-                "mse": ["mean_squared_error", "mse"],
-                "mae": ["mean_absolute_error", "mae"],
-                "mape": ["mean_absolute_percentage_error", "mape"],
-                "rmse": ["root_mean_squared_error", "rmse"],
-                "loss": ["loss"],
-            }
-            candidates += expansions.get(bare, [])
-
-        for key in candidates:
-            values = hist.get(key)
-            if values:
-                try:
-                    v = float(values[-1])
-                    if math.isfinite(v):
-                        return v
-                except (TypeError, ValueError):
-                    continue
+    if model is None:
         return None
 
+    hist = model.history.history
+    if not hist:
+        return None
+
+    name_lower = var_name.lower()
+    is_val = name_lower.startswith("val_")
+    # Strip known prefixes to get the bare metric name
+    bare = name_lower
+    for prefix in ("train_", "val_", "tr_", "training_"):
+        if bare.startswith(prefix):
+            bare = bare[len(prefix):]
+            break
+
+    # Build candidate keys to try in model.history.history
+    candidates = []
+    if is_val:
+        candidates += [f"val_{bare}", f"val_{bare.replace('_', '')}"]
+        # Common Keras metric name expansions
+        expansions = {
+            "acc": ["val_accuracy", "val_acc"],
+            "accuracy": ["val_accuracy", "val_acc"],
+            "mse": ["val_mean_squared_error", "val_mse"],
+            "mae": ["val_mean_absolute_error", "val_mae"],
+            "mape": ["val_mean_absolute_percentage_error", "val_mape"],
+            "rmse": ["val_root_mean_squared_error", "val_rmse"],
+            "loss": ["val_loss"],
+        }
+        candidates += expansions.get(bare, [])
+    else:
+        candidates += [bare, bare.replace("_", "")]
+        expansions = {
+            "acc": ["accuracy", "acc"],
+            "accuracy": ["accuracy", "acc"],
+            "mse": ["mean_squared_error", "mse"],
+            "mae": ["mean_absolute_error", "mae"],
+            "mape": ["mean_absolute_percentage_error", "mape"],
+            "rmse": ["root_mean_squared_error", "rmse"],
+            "loss": ["loss"],
+        }
+        candidates += expansions.get(bare, [])
+
+    for key in candidates:
+        values = hist.get(key)
+        if values:
+            try:
+                v = float(values[-1])
+                if math.isfinite(v):
+                    return v
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+class PulseCLI:
     @property
     def agent_key(self) -> Optional[str]:
         return self.__dict__.get("_agent_key_value")
@@ -3020,6 +3099,9 @@ class PulseCLI:
         # the retry loop already in flight relaunches the re-patched
         # script directly instead.
         self._suppress_auto_restart: bool = False
+        # Where the run was launched from: a restart runs the fixed script from
+        # here, not from wherever it has os.chdir()'d to since.
+        self._launch_cwd: str = os.getcwd()
 
         # Matrix/tensor probing is intentionally decoupled from the training loop.
         # statistics() on GPU arrays can force a device->host synchronization, so
@@ -3062,8 +3144,6 @@ class PulseCLI:
         self._checkin_call: Optional[_BackgroundModelCall] = None
         # What the agent that scheduled the next check-in wants it to look at (CHECKNOTE:).
         self._checkin_note: str = ""
-        # A run that ends without training, and without a visible crash, is reviewed at exit.
-        atexit.register(self._end_of_run_review)
         self._start_prime_call: Optional[_BackgroundModelCall] = None
         self._start_prime_answered: bool = False
         self._start_prime_retried: bool = False
@@ -3129,9 +3209,14 @@ class PulseCLI:
         # legitimately change `continuous` while a SIGINT is being delivered.
         # The latch guarantees Ctrl+C survives until the next safe boundary.
         self._stop_requested = False
+        self._interrupted = False        # any Ctrl+C this run: never handed to the agent at exit
+        self._update_count = 0           # update() calls so far -- see _sigint_handler
+        self._update_running = False
         self.original_sigint = signal.getsignal(signal.SIGINT)
         try:
-            signal.signal(signal.SIGINT, self._sigint_handler)
+            # Ctrl+C ignored at startup (nohup, a background job): leave it ignored.
+            if self.original_sigint is not signal.SIG_IGN:
+                signal.signal(signal.SIGINT, self._sigint_handler)
         except ValueError:
             # signal.signal only works from the main thread on every
             # platform (raises ValueError elsewhere) -- some training
@@ -3310,11 +3395,23 @@ class PulseCLI:
         press: the user's training code may be between Python instructions
         (for example inside a long GPU/framework call). We latch the request
         and let update() consume it at a safe point.
+
+        Only while a training step can still come to consume it: outside the
+        loop (a long evaluation, a download, a sleep after training) no update()
+        follows, so if none starts within _SIGINT_GRACE_SECONDS the interrupt is
+        delivered as a normal KeyboardInterrupt. Non-interactive runs have nobody
+        to answer the pause prompt: Ctrl+C interrupts straight away there.
         """
-        if not self._stop_requested:
+        self._interrupted = True
+        if not self._stop_requested and not getattr(self, "non_interactive", False):
             self._stop_requested = True
             self.continuous = False
             cprint("\n[Pulse] Ctrl+C received. Pausing after the current training step...")
+            updates_seen = self._update_count
+            timer = threading.Timer(self._SIGINT_GRACE_SECONDS, self._interrupt_if_no_step_followed,
+                                    args=(updates_seen,))
+            timer.daemon = True
+            timer.start()
             return
 
         # A second Ctrl+C while already paused keeps the old hard-exit
@@ -3322,6 +3419,25 @@ class PulseCLI:
         if self.original_sigint:
             signal.signal(signal.SIGINT, self.original_sigint)
         raise KeyboardInterrupt
+
+    _SIGINT_GRACE_SECONDS = 5.0
+
+    def _interrupt_if_no_step_followed(self, updates_seen: int) -> None:
+        """Timer thread: a Ctrl+C that no update() has picked up since is re-delivered to the
+        main thread, where _sigint_handler (the latch already set) raises KeyboardInterrupt."""
+        if not self._stop_requested or self._update_count != updates_seen or self._update_running:
+            return                           # a step came (or is running) to pause at
+        try:
+            if signal.getsignal(signal.SIGINT) != self._sigint_handler:
+                return                       # no longer Pulse's to handle
+            if hasattr(signal, "pthread_kill"):
+                # A real signal to the main thread wakes a blocking call (time.sleep, a read).
+                signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+            else:
+                import _thread
+                _thread.interrupt_main()
+        except Exception:
+            pass
 
     def print_banner(self) -> None:
         pass  # minimal UI: no banner -- setup only asks for a provider/API key below
@@ -3342,6 +3458,11 @@ class PulseCLI:
         interactive sign-in, workspace, and provider UI remains active."""
         configured_path = os.environ.get("PULSE_CONFIG", "").strip()
         candidates = [configured_path] if configured_path else []
+        if configured_path and not os.path.isfile(configured_path):
+            # Named explicitly, so an unattended job is counting on it: say so, instead of
+            # quietly falling back to interactive setup (or to some other config).
+            cprint(f"[Pulse] ⚠ PULSE_CONFIG names '{configured_path}', which does not exist -- "
+                   "ignoring it.", color=_RED)
         if self.script_path:
             directory = os.path.dirname(os.path.abspath(self.script_path))
             candidates.extend((os.path.join(directory, "pulse_config.json"), os.path.join(directory, "pulse_config")))
@@ -3385,6 +3506,8 @@ class PulseCLI:
 
     def _config_bool(self, *names: str, default: bool = False) -> bool:
         value = self._config_value(*names, default=default)
+        if value is None:
+            return default          # JSON null: "unset", not "off"
         if isinstance(value, bool):
             return value
         if isinstance(value, (int, float)):
@@ -3450,7 +3573,8 @@ class PulseCLI:
         self.gpu_tracked_vars.add(var_name)
         if var_name not in self.tracked_vars:
             self.tracked_vars.append(var_name)
-        self.var_states[var_name] = "lotrack"
+        if self.var_states.get(var_name) != "track":
+            self.var_states[var_name] = "lotrack"    # never demotes a fully tracked variable
 
         if not quiet:
             print(f"✓ '{var_name}' flagged for GPU tracking. It will probe every {self.gpu_probe_interval / 60:g} min.")
@@ -5543,50 +5667,50 @@ class PulseCLI:
         """A stable-ish fingerprint for 'is this the same bug' -- the
         exception type/message plus the last couple of frames, so the
         same bug re-raising every training step (or across separate runs)
-        is recognized as one incident instead of N.
+        is recognized as one incident instead of N. Object addresses
+        ('<Batch object at 0x7f3a...>') differ on every run, so they are
+        left out of it.
         """
         lines = [l for l in tb_text.strip().splitlines() if l.strip()]
-        tail = "\n".join(lines[-4:])
+        tail = re.sub(r"0x[0-9a-fA-F]+", "0x?", "\n".join(lines[-4:]))
         return hashlib.sha1(tail.encode("utf-8")).hexdigest()[:12]
 
-    def _end_of_run_review(self) -> None:
-        """At exit: a run that trained nothing, and whose script did not crash visibly, is
-        escalated like any other problem, with the last lines the script printed.
+    # How long interpreter exit waits for model calls still running on worker threads.
+    _EXIT_WAIT_SECONDS = 10.0
 
-        That is what a script looks like when it wraps training in try/except and prints the
-        error: it exits normally after a few seconds, the crash handler never sees anything,
-        and any start-of-run check still in flight used to die with the process. Waits briefly
-        for that check, so its reading of the code is not lost, then hands the agent the
-        output. Registered with atexit, which runs while background threads are still alive.
+    def _finish_background_calls_at_exit(self) -> None:
+        """At interpreter exit: wait (bounded) for model calls still running on worker threads,
+        then apply a periodic check-in whose answer landed after the last training step.
+
+        Registered with threading._register_atexit (see _install_keras_pulse_hook), which runs
+        before Python tears the interpreter down and before concurrent.futures stops taking
+        work, so a problem the check-in found can still go to the agent. A worker thread cut
+        off in the middle of a model call can hold an import lock (litellm imports lazily) that
+        the main thread then waits on forever -- a short script (`train.py --help`) hung at
+        exit. Nothing new is asked here: there is no review of the run itself at exit.
         """
-        if getattr(self, "_end_review_done", False):
+        if getattr(self, "_exit_calls_finished", False):
             return
-        self._end_review_done = True
+        self._exit_calls_finished = True
+        calls = [c for c in (getattr(self, "_start_prime_call", None), getattr(self, "_checkin_call", None))
+                 if c is not None]
+        give_up_at = time.monotonic() + self._EXIT_WAIT_SECONDS
+        while any(not c.done for c in calls) and time.monotonic() < give_up_at:
+            time.sleep(0.05)
+        call = getattr(self, "_checkin_call", None)
+        if call is None or not call.done:
+            return
+        # Ctrl+C, or a crash the crash handler already owns: nothing is handed to the agent.
+        if getattr(self, "_interrupted", False) or getattr(sys, "last_value", None) is not None:
+            return
+        self._checkin_call = None
+        answer, transcript = call.result if call.result else (None, [])
         try:
-            if not (self.auto_intervene and self.agent_provider and self.agent_key and self.code_text):
-                return
-            if getattr(self, "_crash_seen", False):
-                return
-            histories = getattr(self, "epoch_scalar_histories", {}) or {}
-            if self.step > 0 or any(histories.values()):
-                return
-            call = getattr(self, "_start_prime_call", None)
-            if call is not None:
-                deadline = time.monotonic() + 90
-                while not call.done and time.monotonic() < deadline:
-                    time.sleep(0.5)
-                self._poll_start_prime()
-            own = ("[Pulse]", "  ", "─", "Pulse is ready", "Type /help")
-            tail = [l for l in list(_RECENT_OUTPUT) if l.strip() and not l.startswith(own)][-15:]
-            problem = ("The script finished without training a single step, and nothing crashed "
-                       "visibly -- an error may have been caught and printed instead of raised. "
-                       "Its last output:\n" + ("\n".join(tail) or "(nothing)"))
-            _agent_log_event("END OF RUN WITHOUT TRAINING -- escalating", "\n".join(tail))
-            self._escalate_training_problem(problem)
+            self._finish_periodic_checkin(answer, call.error, call.prompt, transcript)
         except SystemExit:
             pass        # a fix restarted the script, and the restarted run finished
         except Exception as exc:
-            _pulse_log(f"END-OF-RUN REVIEW failed: {type(exc).__name__}: {exc}")
+            _pulse_log(f"EXIT CHECK-IN failed: {type(exc).__name__}: {exc}")
 
     def handle_crash(self, tb_text: str) -> Optional[str]:
         """Called from pulse.py's excepthook for every uncaught exception.
@@ -5597,8 +5721,11 @@ class PulseCLI:
         deciding what to do next (offer a known fix, ask the agent, or
         just note it's the same one as before).
         """
-        self._crash_seen = True
         self.log_traceback(tb_text)
+        if self.agent_provider and self.agent_key:
+            # A fix may follow, and restart the script: a Keras run resumes from where this
+            # crash left it, never from an older escalation's checkpoint.
+            self._save_fix_checkpoint()
         sig = self._traceback_signature(tb_text)
         self._traceback_signatures_seen[sig] = self._traceback_signatures_seen.get(sig, 0) + 1
         frame_info = self._last_user_frame(tb_text)
@@ -5650,7 +5777,13 @@ class PulseCLI:
         if resp not in ("y", "yes"):
             return False
 
+        # Only what this re-apply writes counts: a flag left over from an earlier fix this run
+        # must not restart the script, nor report a fix that no longer matches the code.
+        self._fix_applied_this_turn = False
         self._apply_code_fix(fix)
+        if not self._fix_applied_this_turn:
+            cprint("[Pulse] That fix no longer matches the code -- asking the agent instead.", color=_YELLOW)
+            return False
         self._last_applied_fix = fix
         self._resolved_signatures.add(signature)
         self._sync_agent_turn(
@@ -5659,8 +5792,7 @@ class PulseCLI:
             traceback_signature=signature,
             fix_applied=fix,
         )
-        if self._fix_applied_this_turn:
-            self._restart_process()  # does not return
+        self._restart_process()  # does not return
         return True
 
     def _select_agent_provider_and_key(self, initial: bool = False) -> bool:
@@ -6001,6 +6133,10 @@ class PulseCLI:
             else:
                 env_var = info.get("env_key")
                 key = os.environ.get(env_var, "").strip() if env_var else "local"
+                if not env_var and self._config_text("api_key"):
+                    # A custom agent whose key is in pulse_config.json ("api_key") -- the
+                    # restarted run reads the same config, so the key comes from there.
+                    key = self._config_text("api_key")
                 if key:
                     self.agent_provider = auto_provider
                     self.agent_key = key
@@ -6130,19 +6266,24 @@ class PulseCLI:
             self._log_incident("restart_skipped", f"restart depth cap ({_MAX_RESTART_DEPTH}) reached")
             return
 
+        # Everything below goes into the CHILD's environment only: if every
+        # launch fails and this process keeps running, anything it starts
+        # later (DataLoader workers re-importing the script, a TERMINAL
+        # check, the user's own subprocesses) must not inherit unattended mode.
+        unattended: Dict[str, str] = {}
         # Mark the replacement process as an unattended auto-fix resume.
         # __init__ consumes this flag before workspace/provider setup so the
         # restarted run never stops for interactive input.
-        os.environ["PULSE_AUTO_RESTART"] = "1"
+        unattended["PULSE_AUTO_RESTART"] = "1"
 
         if self.agent_provider:
-            os.environ["PULSE_AUTO_PROVIDER"] = self.agent_provider
+            unattended["PULSE_AUTO_PROVIDER"] = self.agent_provider
             if self.agent_api_base:
-                os.environ["PULSE_AUTO_API_BASE"] = self.agent_api_base
+                unattended["PULSE_AUTO_API_BASE"] = self.agent_api_base
             if self.agent_model_string:
                 # Strip the litellm prefix back off -- _set_local_agent adds
                 # it back on the other side of the restart.
-                os.environ["PULSE_AUTO_MODEL"] = self.agent_model_string.split("/", 1)[-1]
+                unattended["PULSE_AUTO_MODEL"] = self.agent_model_string.split("/", 1)[-1]
             # A dynamically-registered "Custom: ..." provider only exists in
             # THIS process's PROVIDERS dict -- carry its model string/env var
             # separately so _agent_setup can re-register it in the fresh
@@ -6151,9 +6292,9 @@ class PulseCLI:
             # has a static entry the fresh process can look up on its own.
             provider_info = PROVIDERS.get(self.agent_provider, {})
             if "model" in provider_info and not provider_info.get("local"):
-                os.environ["PULSE_AUTO_CUSTOM_MODEL"] = provider_info["model"]
+                unattended["PULSE_AUTO_CUSTOM_MODEL"] = provider_info["model"]
                 if provider_info.get("env_key"):
-                    os.environ["PULSE_AUTO_CUSTOM_ENV_KEY"] = provider_info["env_key"]
+                    unattended["PULSE_AUTO_CUSTOM_ENV_KEY"] = provider_info["env_key"]
 
         if self.debug_session_id:
             # Carry the SAME Debug_Sessions row (and where its counters
@@ -6163,16 +6304,16 @@ class PulseCLI:
             # which is what made uptime/downtime look like they "weren't
             # logging": every auto-fix fragmented one continuous run into
             # a new, mostly-empty session.
-            os.environ["PULSE_AUTO_SESSION_ID"] = self.debug_session_id
-            os.environ["PULSE_AUTO_UPTIME"] = str(self._uptime_seconds)
-            os.environ["PULSE_AUTO_DOWNTIME"] = str(self._downtime_seconds)
+            unattended["PULSE_AUTO_SESSION_ID"] = self.debug_session_id
+            unattended["PULSE_AUTO_UPTIME"] = str(self._uptime_seconds)
+            unattended["PULSE_AUTO_DOWNTIME"] = str(self._downtime_seconds)
             # Carry the EXACT sha this run was already using too -- see
             # _cloud_setup's "ask at the start, not after a restart"
             # ordering. Not re-detecting it here (only forwarding
             # whatever's already recorded) is what keeps an unrelated
             # commit/push elsewhere on the machine from ever being able
             # to change what a resumed run is attributed to.
-            os.environ["PULSE_AUTO_COMMIT_SHA"] = self._last_synced_commit_sha or ""
+            unattended["PULSE_AUTO_COMMIT_SHA"] = self._last_synced_commit_sha or ""
             # Explicitly dirty regardless of whether something else already
             # marked them -- we're about to snapshot+carry these exact
             # values, so the server-side row should reflect them too.
@@ -6218,12 +6359,30 @@ class PulseCLI:
         # which may be the stale path this whole resolution step exists
         # to route around.
         argv = [python_exe, script_path] + sys.argv[1:]
+        # `python -m pkg.train`: restarted the same way, or its relative imports fail.
+        # Only when that module IS the script (not a launcher's own __main__).
+        main_spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+        main_module = getattr(main_spec, "name", None)
+        main_origin = getattr(main_spec, "origin", None)
+        if (main_module and main_module != "__main__"
+                and (not main_origin or os.path.abspath(main_origin) == script_path)):
+            argv = [python_exe, "-m", main_module] + sys.argv[1:]
         if _RESTART_ARGV_HOOK is not None:
             argv = _RESTART_ARGV_HOOK(python_exe, script_path, sys.argv[1:]) or argv
         # Only the child gets the marker (not this process's os.environ):
         # if every retry fails and this process keeps running the old code,
         # its own later crashes must still go through the agent as normal.
-        child_env = self._restart_env(depth)
+        # Rebuilt after every fix applied inside the loop below: a later fix
+        # may ask for a fresh start instead of resuming ("resume": false).
+        def _child_env() -> Dict[str, str]:
+            return dict(self._restart_env(depth), **unattended)
+
+        child_env = _child_env()
+        # The directory the run was launched from, not wherever the script
+        # has os.chdir()'d to since: its relative paths are relative to that.
+        launch_cwd = getattr(self, "_launch_cwd", None)
+        if launch_cwd and not os.path.isdir(launch_cwd):
+            launch_cwd = None
 
         # Retry the restart itself instead of ever falling back to "keep
         # running the old, already-in-memory process" on a bad exit code.
@@ -6248,10 +6407,9 @@ class PulseCLI:
         while True:
             attempt += 1
             try:
-                # capture_output=True so a failure's stdout/stderr can be
-                # fed back to the agent below -- printed after the fact
-                # either way, so nothing is hidden, just no longer live.
-                result = subprocess.run(argv, capture_output=True, text=True, env=child_env)
+                # Streamed live to this process's stdout/stderr, and kept, so
+                # a failure's output can be fed back to the agent below.
+                result, streamed = self._run_restart_child(argv, child_env, launch_cwd)
             except Exception as exc:
                 cprint(f"[Pulse] ⚠ Restart attempt {attempt}/{MAX_RESTART_ATTEMPTS} failed to launch ({exc}).", color=_RED)
                 if attempt >= MAX_RESTART_ATTEMPTS:
@@ -6266,12 +6424,17 @@ class PulseCLI:
                 time.sleep(min(RETRY_BACKOFF_SECONDS * attempt, 30))
                 continue
 
-            if result.returncode == 0:
+            # A nonzero exit without a traceback or a signal is the script's own
+            # exit status (sys.exit(3) at the end of a run), not a crash.
+            crashed = result.returncode != 0 and (
+                result.returncode < 0 or "Traceback" in (result.stderr or ""))
+            if not crashed:
                 resolved, reason = self._confirm_fix_did_its_job(result)
                 if resolved:
-                    sys.exit(0)
-                sys.stdout.write(result.stdout or "")
-                sys.stderr.write(result.stderr or "")
+                    sys.exit(result.returncode)
+                if not streamed:
+                    sys.stdout.write(result.stdout or "")
+                    sys.stderr.write(result.stderr or "")
                 message = (f"The re-run finished, but the fix does not appear to have done its job "
                            f"(attempt {attempt}/{MAX_RESTART_ATTEMPTS}): {reason}")
                 if child_env.get(_RESUME_ENV):
@@ -6279,11 +6442,12 @@ class PulseCLI:
                     # weights may carry the damage (e.g. a learning rate that wrecked them while
                     # leaving them finite). Every later attempt in this chain starts fresh.
                     self._resume_after_fix = False
-                    child_env = self._restart_env(depth)
+                    child_env = _child_env()
                     _agent_log_event("RESUMED RUN DID NOT WORK -- later attempts start from scratch", reason)
             else:
-                sys.stdout.write(result.stdout or "")
-                sys.stderr.write(result.stderr or "")
+                if not streamed:
+                    sys.stdout.write(result.stdout or "")
+                    sys.stderr.write(result.stderr or "")
                 message = f"Replacement training process exited with code {result.returncode} (attempt {attempt}/{MAX_RESTART_ATTEMPTS})"
 
             if attempt >= MAX_RESTART_ATTEMPTS:
@@ -6340,9 +6504,59 @@ class PulseCLI:
                     self._ask_agent_impl(failure_question, include_code=True, _depth=0)
                 finally:
                     self._suppress_auto_restart = False
+                if not crashed and not self._fix_applied_this_turn:
+                    # The re-run already finished cleanly; running the byte-identical
+                    # script again (a full training run) cannot change the verdict.
+                    cprint(f"[Pulse] ⚠ {message}. The agent made no further change -- not re-running "
+                           "the same script.", color=_RED)
+                    self._log_incident("restart_failed", message + " -- no further fix")
+                    self._auto_rollback_after_failed_restarts(chain_start_commit_id)
+                    return
+                child_env = _child_env()
             else:
                 cprint(f"[Pulse] ⚠ {message}. Retrying restart...", color=_YELLOW)
                 time.sleep(min(RETRY_BACKOFF_SECONDS * attempt, 30))
+
+    def _run_restart_child(self, argv: List[str], env: Dict[str, str], cwd: Optional[str]):
+        """Run the restarted script to the end with its output shown live -- a fixed re-run is
+        often the rest of a long training job, and its log, metrics and 'saved model' lines
+        belong on the user's screen -- while keeping a copy for the post-fix check and for the
+        agent if it fails. Returns (CompletedProcess with text stdout/stderr, whether the
+        output was already shown)."""
+        pipes = (os.pipe(), os.pipe())
+        copies: Tuple[List[str], List[str]] = ([], [])
+
+        def pump(fd: int, stream, kept: List[str]) -> None:
+            decoder = codecs.getincrementaldecoder("utf-8")("replace")
+            with os.fdopen(fd, "rb", buffering=0) as source:
+                while True:
+                    chunk = source.read(65536)
+                    text = decoder.decode(chunk, final=not chunk)
+                    if text:
+                        kept.append(text)
+                        try:
+                            with _io_lock:
+                                stream.write(text)
+                                stream.flush()
+                        except Exception:
+                            pass
+                    if not chunk:
+                        return
+
+        readers = [threading.Thread(target=pump, args=(read_fd, stream, kept), daemon=True)
+                   for (read_fd, _w), stream, kept in zip(pipes, (sys.stdout, sys.stderr), copies)]
+        for reader in readers:
+            reader.start()
+        try:
+            result = subprocess.run(argv, stdout=pipes[0][1], stderr=pipes[1][1], env=env, cwd=cwd)
+        finally:
+            for _r, write_fd in pipes:
+                os.close(write_fd)
+            for reader in readers:
+                reader.join(5)      # a worker the child left behind may hold the pipe open
+        if result.stdout is not None or result.stderr is not None:
+            return result, False    # a stand-in for subprocess.run that captured on its own
+        return subprocess.CompletedProcess(argv, result.returncode, "".join(copies[0]), "".join(copies[1])), True
 
     def _confirm_fix_did_its_job(self, result) -> tuple:
         """One small question after a re-run that finished cleanly: did the fix
@@ -6812,7 +7026,8 @@ class PulseCLI:
                     time.sleep(backoff)
                     continue
                 _agent_log_event("AGENT REQUEST FAILED", f"{label}: {self._classify_model_error(exc)}")
-                raise AgentRequestFailed(self._classify_model_error(exc)) from exc
+                transient = isinstance(exc, _EmptyModelResponse) or self._is_retryable_model_error(exc)
+                raise AgentRequestFailed(self._classify_model_error(exc), transient=transient) from exc
         # Unreachable in practice (the loop above always returns or raises),
         # but keeps type-checkers happy and fails safe if that ever changes.
         raise AgentRequestFailed(self._classify_model_error(last_exc) if last_exc else "unknown error")
@@ -7129,7 +7344,10 @@ class PulseCLI:
             matches = [k for k in self.scalar_histories if name.lower() in k.lower()]
             if len(matches) == 1:
                 name, hist = matches[0], self.scalar_histories[matches[0]]
-        return name, (list(hist) if hist else None)
+        # A step where the variable was unreadable is recorded as None; the statistics tools
+        # work on the readings that exist.
+        values = [v for v in (hist or []) if isinstance(v, (int, float)) and math.isfinite(v)]
+        return name, (values or None)
 
     def _run_corr(self, arg: str) -> str:
         """CORR: <var1> <var2> -- real correlation coefficient between two
@@ -8028,16 +8246,19 @@ class PulseCLI:
         response. Cost is litellm's own estimate where it has pricing
         data for the model; otherwise only token counts are available."""
         try:
-            usage = getattr(response, "usage", None)
-            if usage:
-                self._token_usage["prompt_tokens"] += getattr(usage, "prompt_tokens", 0) or 0
-                self._token_usage["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
-                self._token_usage["total_tokens"] += getattr(usage, "total_tokens", 0) or 0
-            self._token_usage["calls"] += 1
             try:
-                self._token_usage["cost_usd"] += float(litellm.completion_cost(completion_response=response) or 0.0)
+                cost = float(litellm.completion_cost(completion_response=response) or 0.0)
             except Exception:
-                pass
+                cost = 0.0
+            usage = getattr(response, "usage", None)
+            # Check-ins and the start-of-run check call the model from worker threads.
+            with _token_usage_lock:
+                if usage:
+                    self._token_usage["prompt_tokens"] += getattr(usage, "prompt_tokens", 0) or 0
+                    self._token_usage["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
+                    self._token_usage["total_tokens"] += getattr(usage, "total_tokens", 0) or 0
+                self._token_usage["calls"] += 1
+                self._token_usage["cost_usd"] += cost
         except Exception:
             pass
 
@@ -8078,11 +8299,26 @@ class PulseCLI:
                             pass  # _ask_agent_impl already handles/re-queues its own failures
                     pending_restart = self._pending_restart_retry
                     if pending_restart and time.time() >= pending_restart["next_attempt"]:
+                        # Once per queue entry: a failed attempt re-queues itself (with a
+                        # longer backoff); one that returns without doing so is not retried.
+                        self._pending_restart_retry = None
+                        self._last_restart_retry = pending_restart
                         cprint("\n[Pulse] retrying an earlier restart that failed to launch...", color=_YELLOW)
                         try:
                             self._restart_process()  # does not return on success
                         except Exception:
                             pass
+                except SystemExit as exc:
+                    # A restart (queued, or after a retried fix) whose fixed run has finished.
+                    # sys.exit on this thread would end only the thread, and the old process
+                    # would train on with the old code: end the process itself.
+                    code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+                    for stream in (sys.stdout, sys.stderr):
+                        try:
+                            stream.flush()
+                        except Exception:
+                            pass
+                    os._exit(code)
                 finally:
                     self._retry_ticker_lock.release()
 
@@ -8120,7 +8356,7 @@ class PulseCLI:
         retrying a demonstrably-broken fix forever isn't safe). A launch
         failure has nothing to do with whether the fix is good, so it's
         legitimately worth trying again later."""
-        existing = self._pending_restart_retry
+        existing = self._pending_restart_retry or getattr(self, "_last_restart_retry", None)
         backoff = 60.0
         if existing:
             backoff = min(existing.get("backoff", 60.0) * 2, 600.0)
@@ -8454,7 +8690,8 @@ class PulseCLI:
     # Rounds of tool use a check-in may take before it must answer. Each round is one model
     # call, so this caps a check-in's cost at MAX_ROUNDS + 1 calls.
     _CHECKIN_MAX_ROUNDS = int(os.environ.get("PULSE_CHECKIN_ROUNDS", "6") or 6)
-    _CHECKIN_TOOL_NAMES = ("terminal", "trace", "corr", "outlier", "diffstats", "histogram", "mllint")
+    _CHECKIN_TOOL_NAMES = ("terminal", "trace", "corr", "outlier", "diffstats", "histogram", "mllint",
+                           "gputrack", "gpuuntrack")
 
     # Bounds on the agent-negotiated NEXTCHECK: interval -- keeps the cadence genuinely dynamic
     # (see _maybe_periodic_checkin and the NEXTCHECK: line added to _START_PRIME_PROMPT) without
@@ -8474,7 +8711,8 @@ class PulseCLI:
                              re.MULTILINE | re.DOTALL)
     _CHECKNOTE_RE = re.compile(r"^\s*CHECKNOTE:\s*(.+?)(?=^\s*(?:NEXTCHECK|VERDICT|PROBLEM|GPUTRACK|GPUUNTRACK):|\Z)",
                                re.MULTILINE | re.DOTALL)
-    _NEXTCHECK_RE = re.compile(r"^\s*NEXTCHECK:\s*([0-9]+)", re.MULTILINE)
+    # "1,000" and "2_000" are one number, not 1 and 2.
+    _NEXTCHECK_RE = re.compile(r"^\s*NEXTCHECK:\s*([0-9]{1,3}(?:[,_][0-9]{3})+|[0-9]+)", re.MULTILINE)
 
     @classmethod
     def _parse_nextcheck_steps(cls, text: Optional[str]) -> Optional[int]:
@@ -8487,12 +8725,27 @@ class PulseCLI:
         if not m:
             return None
         try:
-            steps = int(m.group(1))
+            steps = int(re.sub(r"[,_]", "", m.group(1)))
         except ValueError:
             return None
         if steps <= 0:
             return None
         return max(cls._CHECKIN_MIN_STEPS, min(cls._CHECKIN_MAX_STEPS, steps))
+
+    def _warm_model_imports(self) -> None:
+        """litellm imports parts of itself on first use (provider resolution in
+        get_model_info, for one). Done once on the training thread, before a worker thread
+        makes a model call: a worker cut off by interpreter exit while it holds an import lock
+        leaves the main thread waiting on that lock forever (see
+        _finish_background_calls_at_exit)."""
+        if getattr(self, "_model_imports_warm", False):
+            return
+        self._model_imports_warm = True
+        try:
+            _clamp_output_tokens(self.agent_model_string or PROVIDERS[self.agent_provider]["model"],
+                                 _AGENT_MAX_TOKENS)
+        except Exception:
+            pass
 
     def _restart_env(self, depth: int) -> Dict[str, str]:
         """The environment for the restarted, fixed script: marked as a restart, and told
@@ -8520,7 +8773,9 @@ class PulseCLI:
         """Save the Keras model's weights as they are right now -- the point a fix starts --
         so the restarted, fixed script can resume from here (see _resume_from_fix_checkpoint).
         Nothing to save for non-Keras runs or before the first epoch; failures only mean the
-        restart trains from the beginning, as it always did."""
+        restart trains from the beginning, as it always did. Each checkpoint is a full copy of
+        the weights, so the one it replaces is deleted and only the newest few are kept."""
+        previous = getattr(self, "_fix_checkpoint", None)
         self._fix_checkpoint = None
         self._resume_after_fix = True
         model = getattr(self, "_keras_model", None)
@@ -8529,30 +8784,51 @@ class PulseCLI:
         try:
             folder = os.path.join(os.path.dirname(os.path.abspath(self.script_path)), ".pulse_checkpoints")
             os.makedirs(folder, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             weights = os.path.join(folder, f"fix-{stamp}.weights.h5")
             model.save_weights(weights)
             finite = all(bool(np.all(np.isfinite(w))) for w in model.get_weights())
             meta = {"weights": weights, "epoch": getattr(self, "_keras_epoch", -1),
-                    "epochs": getattr(self, "_keras_epochs", None), "finite": finite}
+                    "epochs": getattr(self, "_keras_epochs", None), "finite": finite,
+                    # Which fit() of the run it was taken in -- see _resume_from_fix_checkpoint.
+                    "fit": getattr(self, "_keras_fit_count", 0) or 1}
             meta_path = os.path.join(folder, f"fix-{stamp}.json")
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(meta, f)
             self._fix_checkpoint = meta_path
+            self._prune_fix_checkpoints(folder, previous)
             _agent_log_event(f"CHECKPOINT SAVED before fixing (after epoch {meta['epoch'] + 1})",
                              f"{weights}\nweights finite: {finite}")
         except Exception as exc:
             _agent_log_event("CHECKPOINT FAILED -- a restart will train from the beginning",
                              f"{type(exc).__name__}: {exc}")
 
+    _FIX_CHECKPOINTS_KEPT = 3
+
+    def _prune_fix_checkpoints(self, folder: str, previous: Optional[str]) -> None:
+        """Delete the checkpoint this process's new one replaces, and all but the newest
+        _FIX_CHECKPOINTS_KEPT in the folder (a long run escalates many times)."""
+        try:
+            metas = sorted(n for n in os.listdir(folder) if n.startswith("fix-") and n.endswith(".json"))
+            stale = metas[:-self._FIX_CHECKPOINTS_KEPT]
+            if previous and os.path.abspath(previous) != os.path.abspath(self._fix_checkpoint or ""):
+                stale.append(os.path.basename(previous))
+            for name in set(stale):
+                stem = os.path.join(folder, name[:-len(".json")])
+                for path in (stem + ".json", stem + ".weights.h5"):
+                    if os.path.exists(path):
+                        os.remove(path)
+        except OSError:
+            pass
+
     def _escalate_training_problem(self, problem: Optional[str]) -> None:
         """Shared escalation path for anything that decides training
         looks like it's going wrong -- either _check_for_trouble's
         deterministic, every-step signal-based detector, or the agent's
         own free-text STATUS: read from a periodic check-in (see
-        _maybe_periodic_checkin). Either way: pause (even out of
-        continuous mode), hand the problem to the agent to diagnose and,
-        if possible, fix, then resume automatically. Deduplicated
+        _maybe_periodic_checkin). Either way: hand the problem to the
+        agent to diagnose and, if possible, fix, while the run carries on
+        in continuous mode (no interactive pause). Deduplicated
         against the last-escalated problem so a standing issue that's
         already being worked doesn't re-trigger on every single
         step/check-in it's still present for.
@@ -8561,7 +8837,9 @@ class PulseCLI:
             return
         self._last_intervention_signature = problem
         _agent_log_event("ESCALATED -- pausing to investigate and fix", problem)
-        self._save_fix_checkpoint()
+        if self.agent_provider and self.agent_key:
+            # Only when a fix (and a restart that resumes from it) can follow.
+            self._save_fix_checkpoint()
         self.continuous = True
 
         ui = _ui.enabled()
@@ -8702,6 +8980,7 @@ class PulseCLI:
         _agent_log_event(f"PERIODIC CHECK-IN started at step {self.step} "
                          f"({self.checkin_interval_steps} steps after the last, {time_per_step}/step)")
         if _async_model_calls_enabled():
+            self._warm_model_imports()
             self._checkin_call = _BackgroundModelCall(lambda: self._run_checkin(prompt), prompt=prompt)
             return
         try:
@@ -8754,11 +9033,28 @@ class PulseCLI:
                 results.append(self._run_view(arg))
                 summary.append(f"VIEW {arg}")
         _clean, requests = self._extract_new_directives(answer)
+        # GPUTRACK:/GPUUNTRACK: change what the training thread probes, so they are only
+        # queued here and applied with the verdict (_finish_periodic_checkin), on that thread.
+        _, _calc, _promote, gpu_track, gpu_untrack, _sens, _norm, _grep, _view = self._extract_directives(answer)
+        if gpu_track:
+            requests["gputrack"] = [", ".join(gpu_track)]
+        if gpu_untrack:
+            requests["gpuuntrack"] = [", ".join(gpu_untrack)]
+
+        def queue_gpu(key: str, names: List[str]) -> str:
+            queued = getattr(self, "_checkin_gpu_requests", None)
+            if queued is None:
+                queued = self._checkin_gpu_requests = {"gputrack": [], "gpuuntrack": []}
+            queued[key].extend(n for n in names if n not in queued[key])
+            return f"{key.upper()} {', '.join(names)}: noted -- applied when you give your verdict."
+
         runners = {
             "terminal": self._run_terminal, "trace": self._run_trace,
             "corr": self._run_corr, "outlier": self._run_outlier,
             "diffstats": self._run_diffstats, "histogram": self._run_histogram,
             "mllint": lambda _arg: self._run_mllint(),
+            "gputrack": lambda _arg: queue_gpu("gputrack", gpu_track),
+            "gpuuntrack": lambda _arg: queue_gpu("gpuuntrack", gpu_untrack),
         }
         for name in self._CHECKIN_TOOL_NAMES:
             for arg in requests.get(name, []):
@@ -8819,10 +9115,11 @@ class PulseCLI:
         answer in that shape is not lost. Either way only the verdict's first word decides --
         'ok -- everything finite, scaler fitted on train' is ok. Matching the whole line against
         a list of exact phrases used to turn every explained 'ok' into an escalation."""
-        text = answer or ""
+        # Markdown around the fields ('VERDICT: **ok**', '**VERDICT:** ok', '`ok`') is decoration.
+        text = re.sub(r"[*`]", "", answer or "")
         m = cls._VERDICT_RE.search(text)
         if m:
-            first = re.split(r"[\s.,;:!\-—–(]+", m.group(1).strip().lower(), maxsplit=1)[0]
+            first = re.split(r"[\s.,;:!\-—–(]+", m.group(1).strip().lower(), maxsplit=1)[0].strip("_")
             problem_m = cls._PROBLEM_RE.search(text)
             problem = problem_m.group(1).strip() if problem_m else ""
             if first in ("ok", "okay", "healthy", "fine", "good", "none"):
@@ -8841,13 +9138,19 @@ class PulseCLI:
 
     def _finish_periodic_checkin(self, answer, error, prompt, transcript=None) -> None:
         """Everything a check-in does with the agent's answer. Runs on the training thread."""
+        queued_gpu = getattr(self, "_checkin_gpu_requests", None) or {}
+        self._checkin_gpu_requests = None
         if error is not None:
-            if not isinstance(error, AgentRequestFailed):
-                raise error
             # A periodic, low-stakes background check -- never worth interrupting training
-            # over. Skip this round and try again at the next interval.
-            cprint(f"[Pulse] ⚠ Check-in skipped (agent request failed: {error})", color=_RED)
-            _agent_log_event("CHECK-IN SKIPPED: agent request failed", str(error))
+            # over, whatever went wrong in it (a Pulse bug included: it is logged, not raised
+            # into the training loop). Skip this round and try again at the next interval.
+            if isinstance(error, AgentRequestFailed):
+                cprint(f"[Pulse] ⚠ Check-in skipped (agent request failed: {error})", color=_RED)
+                _agent_log_event("CHECK-IN SKIPPED: agent request failed", str(error))
+            else:
+                cprint(f"[Pulse] ⚠ Check-in skipped (internal error: {type(error).__name__}: {error})", color=_RED)
+                _agent_log_event("CHECK-IN SKIPPED: internal error", f"{type(error).__name__}: {error}")
+                _pulse_log(f"CHECK-IN ERROR {type(error).__name__}: {error}")
             return
         answer = answer or ""
         if transcript:
@@ -8855,6 +9158,9 @@ class PulseCLI:
                    + "; ".join(t.split(': ', 1)[1][:80] for t in transcript), color=_YELLOW)
 
         _, _calc, _promote, gputrack_names, gpuuntrack_names, _sens, _norm, _grep, _view = self._extract_directives(answer)
+        # Plus any sent as tool lines during the investigation (see _checkin_service_tools).
+        gputrack_names = list(dict.fromkeys(queued_gpu.get("gputrack", []) + gputrack_names))
+        gpuuntrack_names = list(dict.fromkeys(queued_gpu.get("gpuuntrack", []) + gpuuntrack_names))
         summary = self._apply_directives([], [], gputrack_names, gpuuntrack_names)
         if summary:
             cprint(f"[Pulse] {summary}", color=_YELLOW)
@@ -9381,7 +9687,9 @@ class PulseCLI:
             self.agent_history.append({"role": "assistant", "content": msg})
             if not (_depth == 0 and self._fix_applied_this_turn):
                 if _depth == 0:
-                    self._last_call_failed_transiently = True
+                    # Only a failure that can clear on its own is worth queueing a retry for
+                    # (or, in the crash hook, waiting to re-ask): a bad key never will.
+                    self._last_call_failed_transiently = getattr(exc, "transient", True)
                 return msg
             # A fix already landed on disk before this later request failed
             # -- still restart so it actually gets run and tested.
@@ -10258,6 +10566,8 @@ class PulseCLI:
             else:
                 try:
                     val = float(val_str)
+                    if not math.isfinite(val):
+                        raise ValueError(val_str)     # int(inf) would raise OverflowError
                     setattr(self, field, int(val) if field == "oscillation_flip_threshold" else val)
                     msg = f"✓ '{sub}' sensitivity pinned to {val_str}."
                 except ValueError:
@@ -10281,7 +10591,10 @@ class PulseCLI:
             self.sensitivity = self._SENSITIVITY_PRESETS[sub]
         else:
             try:
-                self.sensitivity = max(0.0, min(1.0, float(sub)))
+                dial = float(sub)
+                if math.isnan(dial):
+                    raise ValueError(sub)
+                self.sensitivity = max(0.0, min(1.0, dial))
             except ValueError:
                 msg = (
                     f"Usage: /sensitivity <0.0-1.0|{'|'.join(self._SENSITIVITY_PRESETS)}> or "
@@ -11313,6 +11626,10 @@ class PulseCLI:
                     "Please fix it manually before continuing.",
                     color=_RED,
                 )
+        if self.agent_provider and self.agent_key:
+            # The agent has had its look at the MLLINT findings (if any):
+            # _prime_with_agent_if_needed must not scan and ask it again.
+            self._mllint_primed_with_agent = True
 
         # Sensitivity / baseline / GPU-track priming (independent of MLLINT).
         if not self.agent_provider or not self.agent_key or not self.code_text:
@@ -11337,6 +11654,7 @@ class PulseCLI:
             return
         prompt = f"{context}\n\n{self._START_PRIME_PROMPT}"
         if _async_model_calls_enabled():
+            self._warm_model_imports()
             self._start_prime_call = _BackgroundModelCall(
                 lambda: self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS, purpose="start-of-run check",
                                          timeout=_BACKGROUND_CALL_TIMEOUT_SECONDS),
@@ -11367,7 +11685,10 @@ class PulseCLI:
                     self._start_prime_retried = True
                     self._start_start_prime(deferred=True)
             if not expected:
-                raise error          # a bug, not an outage: surface it as it always was
+                # A bug, not an outage -- logged, never raised into the training loop.
+                cprint(f"[Pulse] ⚠ Start-of-run check failed (internal error: {type(error).__name__}: {error})",
+                       color=_YELLOW)
+                _pulse_log(f"START PRIME ERROR {type(error).__name__}: {error}")
             return
         self._start_prime_answered = True
         _, _calc, _promote, gputrack_names, _gpuu, sensitivity_args, normal_start_args, _grep, _view = self._extract_directives(answer)
@@ -11409,9 +11730,10 @@ class PulseCLI:
         # Re-run MLLINT now that we have an agent. We already ran it in
         # _prime_at_start (without an agent), applied any deterministic
         # fixes, and printed the findings -- but couldn't kick off the
-        # agent fix pipeline then. Do it now.
+        # agent fix pipeline then. Do it now -- unless the agent was already
+        # there for that first pass (the normal case, and every restarted run).
         mllint_findings = []
-        if self.code_text:
+        if self.code_text and not getattr(self, "_mllint_primed_with_agent", False):
             try:
                 mllint_findings = _mllint_scan(self._iter_ast_trees())
             except Exception:
@@ -11631,6 +11953,10 @@ class PulseCLI:
     # real steps happening between two ticks -- capped so a false match can't silently
     # fast-forward the step count.
     _LOOP_VAR_MAX_STEP_JUMP = 200
+    # Counters that advance once per many steps. Standing still between ticks is no evidence
+    # that no step happened (`for epoch: for batch in loader:` has only `epoch` in scope), so
+    # these never answer a confident 0: the loss-change fallback decides instead.
+    _COARSE_LOOP_VARS = frozenset({"epoch"})
 
     def _detect_loop_step_delta(self) -> Optional[int]:
         """Look for a plain integer loop counter in the code Pulse is watching
@@ -11644,9 +11970,10 @@ class PulseCLI:
         A candidate only counts if:
           - it's a plain int (not a tensor, not a float, not a bool) -- a real Python loop
             counter, not something that merely looks like one;
-          - it did not decrease since last seen -- a decrease means a new loop/run started
-            (or this name isn't the counter we think it is), so it's re-baselined instead of
-            reported as a step;
+          - a decrease means the counter wrapped (an inner loop starting its next pass, e.g.
+            batch 4 -> batch 0 of the next epoch): the new value + 1 iterations ran since;
+          - a coarse counter (epoch) that did not move says nothing about steps -- None, so
+            the caller's loss-change fallback decides;
           - the increase is within _LOOP_VAR_MAX_STEP_JUMP, so a variable that happens to
             jump by a huge amount (it's actually a sample count, not a step count) doesn't
             get reported as hundreds of steps in one tick.
@@ -11671,9 +11998,11 @@ class PulseCLI:
                 continue  # first sighting -- nothing to diff against yet, try the next candidate
             delta = raw - prev
             if delta < 0:
-                return 0  # the loop/run restarted -- confidently "no step this tick," not a guess
+                delta = raw + 1  # wrapped: iterations 0..raw of the loop's next pass ran
             if delta > self._LOOP_VAR_MAX_STEP_JUMP:
                 continue  # implausible jump for one tick -- probably not a step counter after all
+            if delta == 0 and name in self._COARSE_LOOP_VARS:
+                return None  # an epoch counter standing still is no evidence either way
             return delta  # first (finest-grained) match wins, including a confident 0
         return None
 
@@ -11684,6 +12013,8 @@ class PulseCLI:
         # ------------------------------------------------------------
         # SIGINT / CTRL-C
         # ------------------------------------------------------------
+        self._update_count = getattr(self, "_update_count", 0) + 1   # a step is here to pause at
+        self._update_running = True
         if self._stop_requested:
             self.continuous = False
 
@@ -11813,7 +12144,17 @@ class PulseCLI:
         loop_step_delta = self._detect_loop_step_delta()
         prev_step = self.step
         if step is not None:
-            self.step = step
+            # self.step stays a monotonic count of the whole run: an explicit step that goes
+            # back (a per-epoch batch index restarting at 0) starts a new segment and counts
+            # as one step, instead of freezing the step-scheduled check-ins.
+            last_explicit = getattr(self, "_last_explicit_step", None)
+            self._last_explicit_step = step
+            if last_explicit is None:
+                self.step = max(self.step, step)
+            elif step > last_explicit:
+                self.step += step - last_explicit
+            elif step < last_explicit:
+                self.step += 1
 
         elif loop_step_delta is not None:
             self.step += loop_step_delta
@@ -11844,26 +12185,16 @@ class PulseCLI:
 
         now = time.monotonic()
 
-        gpu_ready = (
-            now - getattr(
-                self,
-                "_last_gpu_probe",
-                0.0,
-            )
-        ) >= getattr(
-            self,
-            "gpu_probe_interval",
-            1.0,
-        )
+        # Each cadence on its own clock: 'track' matrices every matrix_probe_interval,
+        # 'lotrack' every lotrack_probe_interval, and only GPU-tracked variables (a forced
+        # device-to-host copy each time) on the slow gpu_probe_interval.
+        gpu_vars = getattr(self, "gpu_tracked_vars", set())
 
         probe_track = (
             not self._matrix_cache
             or (
-                gpu_ready
-                and (
-                    now - self._last_matrix_probe
-                ) >= self.matrix_probe_interval
-            )
+                now - self._last_matrix_probe
+            ) >= self.matrix_probe_interval
             or any(
                 v not in self._matrix_cached_vars
                 for v in self.tracked_vars
@@ -11873,11 +12204,8 @@ class PulseCLI:
 
         probe_lotrack = (
             (
-                gpu_ready
-                and (
-                    now - self._last_lotrack_probe
-                ) >= self.lotrack_probe_interval
-            )
+                now - self._last_lotrack_probe
+            ) >= self.lotrack_probe_interval
             or any(
                 v not in self._matrix_cached_vars
                 for v in self.tracked_vars
@@ -11885,9 +12213,20 @@ class PulseCLI:
             )
         )
 
-        probe_matrices = probe_track or probe_lotrack
+        gpu_probed = self.__dict__.setdefault("_gpu_probed_vars", set())
+        probe_gpu = bool(gpu_vars) and (
+            (
+                now - getattr(self, "_last_gpu_probe", 0.0)
+            ) >= getattr(self, "gpu_probe_interval", 600.0)
+            or any(
+                v not in gpu_probed
+                for v in gpu_vars
+            )
+        )
 
-        if probe_matrices and self._matrix_cache:
+        probe_matrices = probe_track or probe_lotrack or probe_gpu
+
+        if probe_gpu:
             self._last_gpu_probe = now
 
         scalar_lines: List[
@@ -11916,6 +12255,21 @@ class PulseCLI:
             )
 
             var_state = self._state_of(var_name)
+            gpu_copy = False
+
+            if (
+                var_name in gpu_vars
+                and orig_val is None
+                and raw_local is not None
+                and _pulse_is_accelerator_value(raw_local)
+            ):
+                # /gputrack (or the agent's GPUTRACK:): the one place Pulse copies an
+                # accelerator value to the host itself -- on the slow GPU cadence only.
+                if not probe_gpu:
+                    continue
+                orig_val = _pulse_host_copy(raw_local)
+                gpu_copy = orig_val is not None
+                gpu_probed.add(var_name)
 
             if (
                 orig_val is None
@@ -11936,7 +12290,9 @@ class PulseCLI:
                 continue
 
             due_this_var = (
-                probe_track
+                probe_gpu
+                if gpu_copy
+                else probe_track
                 if var_state == "track"
                 else probe_lotrack
             )
@@ -12216,10 +12572,13 @@ class PulseCLI:
         )
 
         if should_redraw:
-            sys.stdout.write(
-                "\033[2J\033[H"
-            )
-            sys.stdout.flush()
+            # Clear the screen only on a terminal: into a log file or a pipe the codes are
+            # just junk in the program's output.
+            if _stdout_is_tty():
+                sys.stdout.write(
+                    "\033[2J\033[H"
+                )
+                sys.stdout.flush()
 
             cprint(
                 f"--- Pulse Live Debugger | Step {self.step} ---"
@@ -12382,6 +12741,7 @@ class PulseCLI:
         # UPDATE FINISHED
         # ------------------------------------------------------------
         self._last_update_end_ts = time.monotonic()
+        self._update_running = False
 
         if self._stop_requested:
             self.continuous = False
