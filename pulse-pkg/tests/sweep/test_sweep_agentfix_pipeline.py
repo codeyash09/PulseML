@@ -483,6 +483,79 @@ def test_bug_rollback_error_advertises_nonexistent_log_directive(tmp_path):
     assert "LOG" not in out or req
 
 
+def test_bug_rollback_ambiguous_id_picks_first_match(tmp_path):
+    """ROLLBACK/revert matched an id prefix to the FIRST commit that starts with
+    it, silently reverting to the wrong state when two ids share the prefix.
+    Correct: an ambiguous prefix is refused."""
+    cli = make_cli(tmp_path, "lr = 10.0\n")
+    cli._apply_code_fix({"old": ["lr = 10.0"], "new": ["lr = 0.01"], "files": [None], "explanation": "a"})
+    entries = cli._load_fix_log()
+    entries.append(dict(entries[0], id=entries[0]["id"][:2] + "zzzzzz"))
+    idx, problem = PulseCLI._match_commit_id(entries, entries[0]["id"][:2])
+    assert idx is None and "ambiguous" in problem
+
+
+def test_bug_revert_of_file_deletion_is_not_recorded(tmp_path):
+    """Reverting past a file's creation deletes it; reverting THAT revert must
+    bring the file back -- so the deletion has to be recorded in the log."""
+    cli = make_cli(tmp_path, "x = 1\n")
+    cli._apply_code_fix({"old": [], "new": [], "files": [], "explanation": "add helper",
+                         "create": [{"path": "helper.py", "content": "HELP = 1\n"}]})
+    cli._cmd_revert("")
+    assert not (tmp_path / "helper.py").exists()
+    cli._cmd_revert("")          # undo the revert
+    assert (tmp_path / "helper.py").read_text() == "HELP = 1\n"
+
+
+def test_bug_doclookup_runs_the_users_script(tmp_path):
+    """DOCLOOKUP: train.build imported (and so ran) the user's training script."""
+    cli = make_cli(tmp_path, "open(%r, 'w').write('ran')\ndef build():\n    pass\n" % str(tmp_path / "ran.txt"))
+    sys.path.insert(0, str(tmp_path))
+    try:
+        out = cli._run_doclookup("train.build")
+    finally:
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("train", None)
+    assert not (tmp_path / "ran.txt").exists(), out
+
+
+def test_bug_sweep_fix_overwrites_the_reported_fix(tmp_path):
+    """PASS 5's recursive fix replaced _last_applied_fix, so the known-fix index
+    and the post-restart check described the sweep's fix, not the crash fix."""
+    cli = make_cli(tmp_path, "x = 1\n")
+    reported = {"old": ["a"], "new": ["b"], "files": [None], "explanation": "crash fix"}
+    cli._last_applied_fix = reported
+    cli.auto_intervene = True
+    cli._call_model = lambda *a, **k: '{"other_errors_found": true, "summary": "also y"}'
+
+    def fake_ask(q, include_code=False, _depth=0, **kw):
+        cli._last_applied_fix = {"old": ["c"], "new": ["d"], "files": [None], "explanation": "sweep"}
+        return ""
+    cli.ask_agent = fake_ask
+    cli._run_sweep_and_maybe_recurse(True, 0)
+    assert cli._last_applied_fix is reported
+
+
+def test_bug_calc_result_missing_from_final_diagnosis(tmp_path):
+    """A CALC: in the final PASS 2 answer came back after the diagnosis was
+    printed and passed on; the fix pass never saw Pulse's exact value."""
+    replies = ["- train.py:1", "Diagnosis: lr too high.\nCALC: 10*0.1", "Lower lr to 0.01."]
+    cli = make_cli(tmp_path, "lr = 10.0\n", replies=replies)
+    stub_context(cli)
+    cli._ask_agent_impl("why is the loss exploding?", include_code=True)
+    assert "10*0.1 = 1.0" in cli.calls[-1]
+
+
+def test_ok_pass3_no_change_json_writes_nothing(tmp_path):
+    replies = ["- train.py:1", "Diagnosis: healthy run.",
+               '{"no_change": true, "reason": "the code is correct"}']
+    cli = make_cli(tmp_path, "lr = 0.01\n", replies=replies)
+    stub_context(cli)
+    out = cli._ask_agent_impl("please fix the plateau", include_code=True)
+    assert "No code change needed" in out and cli._fix_applied_this_turn is False
+    assert (tmp_path / "train.py").read_text() == "lr = 0.01\n"
+
+
 # ---- MLLINT and its auto-fix ------------------------------------------------
 
 HEALTHY_TORCH = textwrap.dedent("""\

@@ -287,7 +287,8 @@ def _default_var_state(name, shape):
     return "lotrack"
 
 
-import math as _math_module
+# CALC: one AST-whitelisted evaluator, shared with the CLI.
+from pulse.pulse_cli import _safe_eval_math  # noqa: E402
 
 
 def _flush_stdin() -> None:
@@ -310,20 +311,6 @@ def _flush_stdin() -> None:
             termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
     except Exception:
         pass  # not a real terminal (piped input, some IDEs, etc.) -- nothing to flush
-
-
-def _safe_eval_math(expr: str):
-    """Evaluate a plain arithmetic/math expression deterministically -- LLMs
-    are unreliable at exact arithmetic, so the agent can hand off anything
-    like update magnitudes or ratios here instead of eyeballing it. Only
-    numbers, operators, and `math` module names are reachable; no builtins,
-    so this is safe to eval() directly.
-    """
-    allowed_names = {k: v for k, v in vars(_math_module).items() if not k.startswith("_")}
-    try:
-        return eval(expr, {"__builtins__": {}}, allowed_names)  # noqa: S307 -- restricted namespace above
-    except Exception as exc:
-        return f"(calc error: {exc})"
 
 
 def _values_equal(a, b) -> bool:
