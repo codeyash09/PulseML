@@ -607,3 +607,84 @@ def test_ok_keras_logs_nan_reaches_cli_detector():
     cli._record_keras_logs({"loss": float("nan"), "val_loss": float("nan")}, epoch=5)
     problem = cli._check_for_trouble()
     assert problem and "NaN" in problem
+
+
+# ============================================================================ DET ledger items
+# confirmed by reading (no test in the sweep); each one below asserts the fixed behaviour.
+
+def test_bug_keras_loss_finding_reported_twice_via_train_loss_alias():
+    """_record_keras_logs stores "train_loss" as an alias of Keras's "loss" (for the legacy
+    detector); the engine saw two copies of one series and every loss finding came twice.
+    Correct: the detector gets the loss once."""
+    cli = make_cli()
+    for epoch in range(3):
+        cli._record_keras_logs({"loss": 1.0 / (epoch + 1)}, epoch=epoch)
+    histories = cli._detector_histories()
+    assert "loss" in histories and "train_loss" not in histories, sorted(histories)
+    cli._record_keras_logs({"loss": float("nan")}, epoch=3)
+    problem = cli._check_for_trouble()
+    assert problem and problem.count("NaN") == 1, problem
+
+
+def test_bug_finding_step_freezes_at_history_cap():
+    """_check_for_trouble passed step=max(len(history)), which stops at the 2,000-reading
+    cap. Correct: the run's own step."""
+    cli = make_cli()
+    cli.step = 5000
+    cli._detector_scalar_histories = {"loss": [0.5] * 1999 + [float("nan")]}
+    cli.scalar_histories = {"loss": [0.5, float("nan")]}
+    cli._check_for_trouble()
+    assert [f.step for f in cli._detection_engine().current()] == [5000]
+
+
+def test_bug_logit_scale_collapse_message_is_backwards():
+    """logit_scale multiplies the logits (an inverse temperature): shrinking flattens the
+    softmax towards uniform, not towards a hard argmax."""
+    values = [4.6 * math.exp(-i / 5) for i in range(20)]
+    engine = DetectionEngine(confirmations=1)
+    found = [f for f in engine.update({"logit_scale": values})["raised"]
+             if f.check == "temperature_collapse"]
+    assert found and "uniform" in found[0].message and "argmax" not in found[0].message
+
+
+def test_bug_throughput_hint_matches_unrelated_names():
+    """THROUGHPUT hint `it_s` matched init_std, split_size and logit_scale."""
+    for name in ("init_std", "split_size", "logit_scale", "clips"):
+        assert not D.looks_like_throughput(name), name
+    for name in ("it_s", "train_it_s", "samples_per_sec", "fps"):
+        assert D.looks_like_throughput(name), name
+
+
+def test_bug_numpy_array_histories_raise():
+    """`if not history` on a numpy array raises ValueError out of update()."""
+    np = pytest.importorskip("numpy")
+    out = DetectionEngine().update({"loss": np.array([1.0, 0.9, np.nan])})
+    assert [f.check for f in out["raised"]] == ["nonfinite"]
+    DetectionEngine().update({"loss": np.array([])})
+
+
+def test_bug_cpu_data_batch_called_a_layer_left_on_cpu():
+    """A data tensor seen first on the CPU (before .to(device)) while weights are on the
+    GPU was reported as a layer on the wrong device. Only parameters count."""
+    engine = DetectionEngine()
+    engine.update({}, tensor_stats={"w": {"device": "cuda:0", "dtype": "float32"}})
+    out = engine.update({}, tensor_stats={"x": {"device": "cpu", "dtype": "float32"}})
+    assert "tensor_device_change" not in {f.check for f in out["raised"]}
+    out = engine.update({}, tensor_stats={"b": {"device": "cpu", "dtype": "float32",
+                                                "requires_grad": True}})
+    assert "tensor_device_change" in {f.check for f in out["raised"]}
+
+
+def test_ok_epoch_level_local_is_not_frozen_by_repeated_sampling():
+    """The per-sample detector history must not turn an epoch-level local that is simply
+    not reassigned between samples into a 'frozen' series."""
+    cli = make_cli()
+    cli.continuous = True
+    cli.auto_intervene = False
+    cli.tracked_vars = ["val_loss"]
+    val_loss = 0.8
+    with contextlib.redirect_stdout(io.StringIO()):
+        for i in range(20):
+            cli.watch_locals = {"val_loss": val_loss}      # the same object every sample
+            cli.update()
+    assert len(cli._detector_histories().get("val_loss", [])) == 1
