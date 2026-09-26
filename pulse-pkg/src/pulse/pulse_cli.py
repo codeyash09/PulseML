@@ -5912,38 +5912,77 @@ class PulseCLI:
 
     _CLOUD_ARRAY_FIELDS = ("agent_logs", "error_tracebacks", "telemetry", "incidents")
 
-    def _preload_cloud_history(self) -> bool:
+    # Serialises merging the saved history in (a retry on its own thread and a
+    # final flush may race); class-level so a bare PulseCLI.__new__ has it too.
+    _cloud_history_lock = threading.Lock()
+    _cloud_history_retrying = False
+
+    def _preload_cloud_history(self, only_if_unloaded: bool = False) -> bool:
         """Load the resumed session's saved arrays and put this process's entries after
         them. False (and _cloud_history_unloaded set) if the fetch failed; a missing row
-        counts as loaded -- there is nothing to overwrite."""
+        counts as loaded -- there is nothing to overwrite. `only_if_unloaded` (retries)
+        makes it a no-op once another caller has loaded it.
+
+        The saved entries are inserted IN PLACE at the front of each list, under a lock,
+        so an entry appended by another thread while the fetch was in flight is kept."""
         try:
             existing = cloud.fetch_debug_session(self.debug_session_id)
         except cloud.SupabaseError:
-            self._cloud_history_unloaded = True
-            self._cloud_history_retry_at = time.monotonic() + 60.0
+            with self._cloud_history_lock:
+                if not (only_if_unloaded and not self._cloud_history_unloaded):
+                    self._cloud_history_unloaded = True
+                    self._cloud_history_retry_at = time.monotonic() + 60.0
             return False
-        self._cloud_history_unloaded = False
-        if existing:
-            self._agent_logs = cloud.decode_entries(existing.get("agent_logs")) + list(self._agent_logs)
-            self._error_tracebacks = (cloud.decode_entries(existing.get("error_tracebacks"))
-                                      + list(self._error_tracebacks))
-            self._telemetry = cloud.decode_entries(existing.get("telemetry")) + list(self._telemetry)
-            self._incidents = cloud.decode_entries(existing.get("incidents")) + list(self._incidents)
+        with self._cloud_history_lock:
+            if only_if_unloaded and not self._cloud_history_unloaded:
+                return True
+            if existing:
+                for field, attr in (("agent_logs", "_agent_logs"), ("error_tracebacks", "_error_tracebacks"),
+                                    ("telemetry", "_telemetry"), ("incidents", "_incidents")):
+                    getattr(self, attr)[:0] = cloud.decode_entries(existing.get(field))
+            self._cloud_history_unloaded = False
         return True
 
-    def _build_cloud_patch_body(self) -> Dict[str, Any]:
+    def _retry_cloud_history_async(self) -> None:
+        """Retry the history preload off the calling (training) thread -- offline, the
+        fetch takes the whole request timeout -- and flush whatever was held once it
+        has loaded."""
+        with self._cloud_history_lock:
+            if self._cloud_history_retrying:
+                return
+            self._cloud_history_retrying = True
+            self._cloud_history_retry_at = time.monotonic() + 60.0
+
+        def _retry() -> None:
+            try:
+                if self._preload_cloud_history(only_if_unloaded=True):
+                    self._maybe_flush_cloud(force=True)
+            except Exception:
+                pass
+            finally:
+                self._cloud_history_retrying = False
+
+        threading.Thread(target=_retry, name="pulse-cloud-history", daemon=True).start()
+
+    def _build_cloud_patch_body(self, retry_history_now: bool = False) -> Dict[str, Any]:
         """Compress and package every dirty field into ONE PATCH body,
         clearing the dirty set. Each array entry is individually
         compressed (see pulse_supabase.encode_entry) -- the array itself
         still has to be resent in full each flush (PostgREST has no array
         "append" verb), but batching flushes infrequently plus compressing
         each entry keeps that resend cheap instead of the dominant cost.
+
+        While a resumed session's history is unloaded, the array fields are held
+        back and the load is retried at most every 60 s -- or regardless of that
+        timer when `retry_history_now` (the final flushes). _maybe_flush_cloud,
+        which runs on the training thread, starts that retry in the background
+        instead, so it never gets here due.
         """
         body: Dict[str, Any] = {}
         held: set = set()
         if getattr(self, "_cloud_history_unloaded", False):
-            if time.monotonic() >= self._cloud_history_retry_at:
-                self._preload_cloud_history()
+            if retry_history_now or time.monotonic() >= self._cloud_history_retry_at:
+                self._preload_cloud_history(only_if_unloaded=True)
             if self._cloud_history_unloaded:
                 # Still unknown what is saved: sending the arrays now would replace it.
                 held = self._cloud_dirty_fields & set(self._CLOUD_ARRAY_FIELDS)
@@ -5986,6 +6025,10 @@ class PulseCLI:
         if not force and (now - self._last_cloud_flush) < self.cloud_flush_interval:
             return
         self._last_cloud_flush = now
+        if getattr(self, "_cloud_history_unloaded", False) and now >= self._cloud_history_retry_at:
+            # Offline, the fetch blocks for the whole request timeout: never on the
+            # training thread. The retry flushes the held arrays itself once loaded.
+            self._retry_cloud_history_async()
         self._cloud_sync.submit(self.debug_session_id, self._build_cloud_patch_body())
 
     def _flush_cloud_now(self) -> None:
@@ -5995,7 +6038,7 @@ class PulseCLI:
         `atexit` for normal/Ctrl-C shutdown."""
         if not self.debug_session_id:
             return
-        body = self._build_cloud_patch_body() if self._cloud_dirty_fields else {}
+        body = self._build_cloud_patch_body(retry_history_now=True) if self._cloud_dirty_fields else {}
         # Queue this behind every earlier snapshot instead of making a direct
         # PATCH. A direct PATCH can complete before an older background PATCH
         # and let that stale array overwrite newer issues/fixes.

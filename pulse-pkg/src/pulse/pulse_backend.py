@@ -225,14 +225,42 @@ def has_shape(x):
     something weirder) returns False so discovery doesn't sweep them up."""
     if isinstance(x, (int, float, bool)) and not isinstance(x, complex):
         return True
-    if hasattr(x, "shape"):
-        return True
-    return False
+    try:
+        # getattr, not hasattr: a torch nested tensor's `.shape` raises
+        # RuntimeError, which hasattr lets through.
+        getattr(x, "shape")
+    except Exception:
+        return _is_torch_nested(x)
+    return True
+
+
+def _is_torch_nested(x):
+    torch = _torch()
+    try:
+        return torch is not None and isinstance(x, torch.Tensor) and bool(x.is_nested)
+    except Exception:
+        return False
+
+
+def _ragged_bounding_shape(x):
+    """The bounding shape of a tf.RaggedTensor (its longest row in each ragged
+    dimension), or None for anything else."""
+    tf = _tf()
+    ragged = getattr(tf, "RaggedTensor", None) if tf is not None else None
+    if ragged is None or not isinstance(x, ragged):
+        return None
+    try:
+        return tuple(int(d) for d in x.bounding_shape().numpy())
+    except Exception:
+        return None
 
 
 def shape_of(x):
     if isinstance(x, (int, float, bool)) and not isinstance(x, complex):
         return ()
+    ragged = _ragged_bounding_shape(x)
+    if ragged is not None:
+        return ragged
     try:
         return tuple(x.shape)
     except Exception:
@@ -371,9 +399,18 @@ def _torch_to_numpy(x):
     the host, after the copy, so no kernel runs on the accelerator."""
     torch = _torch()
     t = x.detach()
+    if getattr(t, "is_nested", False):
+        # The stored values of every component (like a RaggedTensor's
+        # flat_values); padding would invent zeros.
+        parts = [c.reshape(-1) for c in t.unbind()]
+        t = torch.cat(parts) if parts else torch.empty(0, dtype=t.dtype)
     if t.layout != torch.strided:
         t = t.to_dense()
     t = t.cpu()
+    # A lazy conjugate (`z.conj()`) or negative (`z.conj().imag`) view:
+    # .numpy() refuses it until the bit is resolved.
+    if hasattr(t, "resolve_conj"):
+        t = t.resolve_conj().resolve_neg()
     try:
         return t.numpy()
     except TypeError:
@@ -417,15 +454,20 @@ def _metadata_dtype(x, backend):
         return x.dtype.name
     if backend in ("CuPy", "JAX"):
         return str(x.dtype)
+    if backend == "SciPy Sparse":
+        # Densifying a large sparse matrix (a TF-IDF matrix) just to read its
+        # shape can need hundreds of GB.
+        return str(x.dtype)
     return None
 
 
 def describe_tensor(x):
     backend = detect_backend(x)
     dtype = None
+    shape = None
     try:
         dtype = _metadata_dtype(x, backend)
-        shape = tuple(x.shape) if dtype is not None else None
+        shape = (_ragged_bounding_shape(x) or tuple(x.shape)) if dtype is not None else None
     except Exception:
         dtype = None
     if dtype is not None and shape is not None and None not in shape:
@@ -504,8 +546,8 @@ def statistics(x):
 
     finite = work[np.isfinite(work)] if work.size else work
 
-    return {
-        "shape": tuple(arr.shape),
+    stats = {
+        "shape": _ragged_bounding_shape(x) or tuple(arr.shape),
         "dtype": str(arr.dtype),
         "backend": detect_backend(x),
         "kind": tensor_kind(x),
@@ -519,6 +561,11 @@ def statistics(x):
         "nan": int(np.isnan(work).sum()) if work.size else 0,
         "inf": int(np.isinf(work).sum()) if work.size else 0,
     }
+    torch = _torch()
+    if torch is not None and isinstance(x, torch.Tensor):
+        # Tells a parameter (or anything being trained) from a data tensor.
+        stats["requires_grad"] = bool(x.requires_grad)
+    return stats
 
 
 # ----------------------------------------------------------------------

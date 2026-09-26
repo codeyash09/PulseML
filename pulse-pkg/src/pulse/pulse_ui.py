@@ -142,7 +142,9 @@ def _visible_len(text):
 
 def _width():
     try:
-        return max(40, min(shutil.get_terminal_size((80, 24)).columns, 100))
+        # Never wider than the real terminal: a line clipped to more columns
+        # than it has wraps and breaks the in-place redraw.
+        return max(1, min(shutil.get_terminal_size((80, 24)).columns, 100))
     except Exception:
         return 80
 

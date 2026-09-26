@@ -63,6 +63,8 @@ from .pulse_cli import (
     _Spinner,
     _YELLOW,
     _find_fuzzy_snippet_span,
+    _reindent_like,
+    _token_boundary_occurrences,
     _flush_stdin,
     _prompt_text,
     cprint,
@@ -283,6 +285,9 @@ class _CodeAgentCLI(PulseCLI):
             paths[label] = path
         self._label_for_path = labels
         self._path_for_label = paths
+        # As the base class does: CHANGELOG's baseline is the code as the session
+        # first loaded it, not whatever it is at the first CHANGELOG call.
+        self._snapshot_changelog_baseline()
 
     # -- files ---------------------------------------------------------------------------
     def setup_code(self, root, focus, known):
@@ -529,14 +534,18 @@ def simulate(cli, fix):
             problems.append((old, label, "not a file loaded in this session"))
             continue
         content = after.get(path, cli.texts[path])
-        count = content.count(old)
+        # The applier's own matching: token boundaries ('lr = 0.1' is not inside
+        # 'lr = 0.15'), then the whitespace-tolerant fallback, re-indented.
+        hits = _token_boundary_occurrences(content, old)
+        count = len(hits)
         if count == 1:
-            content = content.replace(old, new, 1)
+            content = content[:hits[0]] + new + content[hits[0] + len(old):]
         elif count == 0:
             span = _find_fuzzy_snippet_span(content, old)
             if span is None:
                 problems.append((old, label, "no exact match found in the file"))
                 continue
+            new = _reindent_like(new, old, content[span[0]:span[1]])
             content = content[:span[0]] + new + content[span[1]:]
         else:
             problems.append((old, label, f"matched {count} times (ambiguous), skipped for safety"))
@@ -545,7 +554,8 @@ def simulate(cli, fix):
 
     changes = {}
     for path, content in after.items():
-        ok, messages = cli._lint_check(content, path)
+        # Like the applier: only problems the change introduces block it.
+        ok, messages = cli._lint_check(content, path, original=cli.texts[path])
         if not ok:
             problems.append(("(lint)", cli._label_for_path.get(path, path), "; ".join(messages)))
             continue

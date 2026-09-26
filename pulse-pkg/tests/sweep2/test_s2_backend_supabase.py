@@ -171,6 +171,11 @@ def test_bug_cloud_history_retry_runs_on_the_training_thread(monkeypatch):
     obj._maybe_flush_cloud(force=True)
     elapsed = time.monotonic() - t0
     assert elapsed < 0.5, f"flush blocked the caller for {elapsed:.1f}s"
+    # Let the background retry finish while fetch_debug_session is still mocked, so it
+    # can never reach the real network after this test's patches are undone.
+    for t in threading.enumerate():
+        if t.name == "pulse-cloud-history":
+            t.join(10)
 
 
 def test_bug_final_flush_drops_entries_held_while_history_unloaded(monkeypatch):
@@ -251,6 +256,54 @@ def test_bug_scrubber_redacts_non_secret_env_values_named_token(monkeypatch):
     monkeypatch.setenv("TOKENIZER_NAME", "bert-base-uncased")
     out = cloud.scrub_secrets("OSError: bert-base-uncased is not a local folder")
     assert "bert-base-uncased" in out, out
+
+
+def test_bug_preloading_cloud_history_loses_a_concurrent_append(monkeypatch):
+    """(Found by reading.) _preload_cloud_history rebuilt each array as saved +
+    list(current) AFTER the (up to 8 s) fetch: an entry another thread appended while
+    the fetch was in flight went into the old list object and was dropped when the
+    attribute was replaced. Correct: merge in place, under a lock."""
+    obj = _cli_obj()
+    obj._agent_logs = [{"q": "before"}]
+
+    def fetch(sid):
+        obj._agent_logs.append({"q": "during"})      # another thread's append mid-fetch
+        return {"agent_logs": [cloud.encode_entry({"q": "saved"})]}
+
+    monkeypatch.setattr(cloud, "fetch_debug_session", fetch)
+    assert obj._preload_cloud_history() is True
+    assert obj._agent_logs == [{"q": "saved"}, {"q": "before"}, {"q": "during"}]
+    # A retry after it has loaded (a final flush racing the background retry) is a no-op.
+    monkeypatch.setattr(cloud, "fetch_debug_session",
+                        lambda sid: {"agent_logs": [cloud.encode_entry({"q": "saved"})]})
+    assert obj._preload_cloud_history(only_if_unloaded=True) is True
+    assert obj._agent_logs == [{"q": "saved"}, {"q": "before"}, {"q": "during"}]
+
+
+def test_ok_expired_token_is_refreshed_once_not_in_a_loop(monkeypatch):
+    """A refresh that still gets 401 is reported, not retried forever."""
+    cloud.set_session("expired-access-token", "refresh-1")
+    calls = []
+
+    def urlopen(req, timeout=None):
+        calls.append(req.full_url)
+        if "/auth/v1/token" in req.full_url:
+            return _Resp({"access_token": "still-bad", "refresh_token": "refresh-2"})
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, io.BytesIO(b"JWT expired"))
+
+    monkeypatch.setattr(cloud.urllib.request, "urlopen", urlopen)
+    with pytest.raises(cloud.SupabaseError):
+        cloud.patch_debug_session("sid", {"uptime_seconds": 1})
+    assert len(calls) == 3, calls        # request, refresh, one retry
+
+
+def test_ok_scrubber_keeps_ordinary_ml_text(monkeypatch):
+    for text in ('tokenizer.eos_token = "<|endoftext|>"', "max_tokens=40960000",
+                 "is_secret: False", "http://localhost:8080/x@y",
+                 "model = AutoModel.from_pretrained('bert-base-uncased')"):
+        assert cloud.scrub_secrets(text) == text, text
+    monkeypatch.setenv("PWD", "/home/someone/project")
+    assert cloud.scrub_secrets("cd /home/someone/project") == "cd /home/someone/project"
 
 
 # ============================================================================ ok

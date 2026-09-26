@@ -297,13 +297,32 @@ class Index:
         if scope.is_module:
             return []
         simple = _simple_name(scope.name)
+        if simple == "__init__" and scope.class_name:
+            # A constructor is called by the class's name (`Opt(0.1)`), or from a subclass
+            # through `super().__init__(...)` -- not by every `__init__` call anywhere.
+            return [c for c in self.calls if c.scope is not scope
+                    and (c.callee == scope.class_name or self._super_init_of(c, scope))]
         return [c for c in self.calls if c.callee == simple and c.scope is not scope]
+
+    def _super_init_of(self, call_site: CallSite, init: Scope) -> bool:
+        """`super().__init__(...)` in a class whose bases include init's class."""
+        func = call_site.call.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "__init__"
+                and isinstance(func.value, ast.Call) and isinstance(func.value.func, ast.Name)
+                and func.value.func.id == "super"):
+            return False
+        caller_class = call_site.scope.class_name
+        if not caller_class:
+            return False
+        return init.class_name in self.class_bases.get((call_site.scope.label, caller_class), [])
 
 
 # ---------------------------------------------------------------------------------------
 # AST helpers
 # ---------------------------------------------------------------------------------------
 _DEF_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+_TRY_NODES = (ast.Try,) + ((ast.TryStar,) if hasattr(ast, "TryStar") else ())   # except* (3.11+)
+_MATCH = getattr(ast, "Match", None)                                            # 3.10+
 
 
 def _own_statements(body: Sequence[ast.stmt]) -> List[ast.stmt]:
@@ -321,6 +340,8 @@ def _own_statements(body: Sequence[ast.stmt]) -> List[ast.stmt]:
         for handler in getattr(stmt, "handlers", None) or []:
             if isinstance(handler, ast.ExceptHandler):
                 flat.extend(_own_statements(handler.body))
+        for case in getattr(stmt, "cases", None) or []:     # match / case
+            flat.extend(_own_statements(case.body))
     return flat
 
 
@@ -337,6 +358,8 @@ def _nested_definitions(body: Sequence[ast.stmt]) -> List[ast.stmt]:
         for handler in getattr(stmt, "handlers", None) or []:
             if isinstance(handler, ast.ExceptHandler):
                 found.extend(_nested_definitions(handler.body))
+        for case in getattr(stmt, "cases", None) or []:
+            found.extend(_nested_definitions(case.body))
     return found
 
 
@@ -349,6 +372,17 @@ def _parameters(func: ast.AST) -> List[str]:
     if args.kwarg:
         names.append(args.kwarg.arg)
     return names
+
+
+def _positional_params(func: Optional[ast.AST]) -> Tuple[List[str], Optional[str]]:
+    """The parameters a positional argument can fill, in order, and the *args name. Past
+    those, a positional argument goes into *args; keyword-only parameters and **kwargs are
+    never filled positionally."""
+    if func is None:
+        return [], None
+    args = func.args
+    positional = [a.arg for a in list(getattr(args, "posonlyargs", []) or []) + list(args.args)]
+    return positional, (args.vararg.arg if args.vararg else None)
 
 
 def _import_aliases(tree: ast.AST) -> Set[str]:
@@ -414,6 +448,14 @@ def targets_of(stmt: ast.stmt) -> List[str]:
         targets = [stmt.target]
     elif isinstance(stmt, (ast.With, ast.AsyncWith)):
         targets = [i.optional_vars for i in stmt.items if i.optional_vars is not None]
+    elif _MATCH is not None and isinstance(stmt, _MATCH):
+        # `case Point(x=px)` / `case [first, *rest]` / `case {"k": v, **extra}` bind names.
+        for case in stmt.cases:
+            for node in ast.walk(case.pattern):
+                for attr in ("name", "rest"):
+                    bound = getattr(node, attr, None)
+                    if isinstance(bound, str):
+                        targets.append(ast.Name(id=bound, ctx=ast.Store()))
     # `(batch := next(it))` assigns batch in the enclosing scope, wherever it appears.
     if not isinstance(stmt, _DEF_NODES):
         for part in read_parts(stmt):
@@ -440,8 +482,10 @@ def read_parts(stmt: ast.stmt) -> List[ast.AST]:
         return [stmt.iter]
     if isinstance(stmt, (ast.With, ast.AsyncWith)):
         return [i.context_expr for i in stmt.items]
-    if isinstance(stmt, ast.Try):
-        return []
+    if isinstance(stmt, _TRY_NODES):
+        return []                      # try / except*: every block is in the statement list
+    if _MATCH is not None and isinstance(stmt, _MATCH):
+        return [stmt.subject] + [c.guard for c in stmt.cases if c.guard is not None]
     if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
         defaults = [d for d in stmt.args.defaults if d is not None]
         defaults += [d for d in stmt.args.kw_defaults if d is not None]
@@ -684,6 +728,16 @@ def find_origin(index: Index, symbol: str, file_hint: Optional[str] = None,
                 if symbol not in scope.nonlocals and (symbol in scope.assigned or symbol in scope.params):
                     return scope, line_hint
                 scope = scope.parent
+        # No function around the line binds it, so the line reads the module's variable:
+        # prefer a module-level assignment (closest above) over some function's local.
+        module_assigns = [(s, lines) for s, lines in assigns if s.is_module]
+        module_best: Optional[Tuple[int, Scope]] = None
+        for scope, lines in module_assigns:
+            earlier = [ln for ln in lines if ln <= line_hint]
+            if earlier and (module_best is None or line_hint - earlier[-1] < module_best[0]):
+                module_best = (line_hint - earlier[-1], scope)
+        if module_best is not None:
+            return module_best[1], line_hint
         # Otherwise the scope that assigns it closest above the hinted line is the one being asked about.
         best: Optional[Tuple[int, Scope, int]] = None
         for scope, lines in assigns:
@@ -875,7 +929,7 @@ def _parameter_site(index: Index, graph: Graph, scope: Scope, name: str, depth: 
         site.note += " -- no call site found in the traced code"
         return site
     for caller in callers[:MAX_CALLERS]:
-        argument = _argument_for(caller.call, name, position, _takes_self(caller.call, scope))
+        argument = _argument_for(caller.call, name, position, _takes_self(caller.call, scope), scope)
         if argument is None:
             continue
         for read in _reads([argument], caller.scope, index)[:MAX_PARENTS]:
@@ -896,19 +950,36 @@ def _parameter_site(index: Index, graph: Graph, scope: Scope, name: str, depth: 
 def _takes_self(call: ast.Call, target: Scope) -> bool:
     """obj.method(a) passes `self` implicitly; utils.helper(a) -- a plain function reached
     through a module -- does not."""
-    return (isinstance(call.func, ast.Attribute) and target.class_name is not None
-            and target.params[:1] in (["self"], ["cls"]))
+    if target.class_name is None or target.params[:1] not in (["self"], ["cls"]):
+        return False
+    if isinstance(call.func, ast.Attribute):
+        return True
+    # `Opt(0.1)` constructs the object and passes it to __init__ as self.
+    return _simple_name(target.name) == "__init__" and _called_name(call) == target.class_name
 
 
 def _argument_for(call: ast.Call, name: str, position: int,
-                  implicit_self: bool = False) -> Optional[ast.expr]:
+                  implicit_self: bool = False, target: Optional[Scope] = None) -> Optional[ast.expr]:
     """The expression a call passes for parameter `name`. Keyword first (it is explicit),
-    then the positional slot -- offset by one for a method call, whose `self` is implicit."""
+    then the positional slot -- offset by one for a method call, whose `self` is implicit.
+    With the callee's scope known, a keyword-only parameter is never taken from a
+    positional slot, and *args gets every positional argument past the named ones."""
     for keyword in call.keywords:
         if keyword.arg == name:
             return keyword.value
     if position < 0:
         return None
+    if target is not None and target.func is not None:
+        positional, vararg = _positional_params(target.func)
+        offset = 1 if implicit_self else 0
+        if name in positional:
+            position = positional.index(name)
+        elif name == vararg:
+            extra = [a for a in call.args[max(len(positional) - offset, 0):]
+                     if not isinstance(a, ast.Starred)]
+            return ast.Tuple(elts=extra, ctx=ast.Load()) if extra else None
+        else:
+            return None                        # keyword-only / **kwargs: never positional
     index = position
     if implicit_self:
         index -= 1                             # obj.method(a): `a` is parameter 1, not 0
@@ -998,9 +1069,13 @@ def _forward_into_calls(index: Index, graph: Graph, scope: Scope, stmt: ast.stmt
                 slot = position
                 if _takes_self(node, target_scope):
                     slot += 1                  # skip the implicit self
-                if slot >= len(target_scope.params):
+                positional, vararg = _positional_params(target_scope.func)
+                if slot < len(positional):
+                    param = positional[slot]
+                elif vararg:
+                    param = vararg             # past the named ones: it lands in *args
+                else:
                     continue
-                param = target_scope.params[slot]
                 param_key = (target_scope.label, target_scope.key_scope, param)
                 if _node(graph, param_key) is None:
                     continue

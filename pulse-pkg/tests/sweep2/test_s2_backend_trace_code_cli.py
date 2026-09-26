@@ -111,6 +111,24 @@ def test_bug_assignments_inside_match_case_are_invisible():
     assert len(graph.nodes[graph.root].sites) == 2
 
 
+def test_bug_except_star_block_is_credited_to_the_try_line():
+    """(Found by reading.) read_parts() treats ast.Try as a compound statement but not
+    ast.TryStar (`except*`), so a whole try/except* block was walked as one simple
+    statement: every read inside it was credited to the `try:` line."""
+    if not hasattr(ast, "TryStar"):
+        pytest.skip("except* needs Python 3.11+")
+    files = [F("t.py", """
+        lr = 0.1
+        try:
+            opt = SGD(lr)
+        except* ValueError:
+            pass
+    """)]
+    graph = PT.build(files, "lr")
+    lines = sorted(e.lineno for e in graph.nodes[graph.root].out)
+    assert 2 not in lines and 3 in lines, lines
+
+
 # ======================================================================== TRACE ok
 
 def test_ok_trace_scoping():
@@ -252,6 +270,20 @@ def test_bug_launch_option_hint_drops_the_approver_model(capsys):
     out = capsys.readouterr().out
     assert rc == 1
     assert "pulse run --approver openrouter/anthropic/claude-sonnet-5 train.py" in out, out
+
+
+def test_bug_restart_makes_argv0_absolute(monkeypatch, tmp_path):
+    """(Found by reading.) `pulse run train.py` sets sys.argv[0] to 'train.py' as typed,
+    but the fix-triggered restart passed the absolute path, so after the first fix the
+    script saw an absolute sys.argv[0]. Correct: the restart passes it as typed."""
+    from pulse import cli
+    script = tmp_path / "train.py"
+    script.write_text("x = 1\n")
+    monkeypatch.setattr(cli, "_RUN_ARGV0", ("train.py", str(tmp_path)))
+    argv = cli._restart_argv(sys.executable, str(script), ["--lr", "1"])
+    assert argv[-3:] == ["train.py", "--lr", "1"], argv
+    monkeypatch.setattr(cli, "_RUN_ARGV0", ("other.py", str(tmp_path)))
+    assert cli._restart_argv(sys.executable, str(script), [])[-1] == str(script)
 
 
 def _injected_index(source):

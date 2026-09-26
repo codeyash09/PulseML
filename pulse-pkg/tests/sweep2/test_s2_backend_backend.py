@@ -74,6 +74,46 @@ def test_bug_torch_conjugate_view_crashes_statistics():
     assert neg["min"] == pytest.approx(-4.0) and neg["max"] == pytest.approx(1.0)
 
 
+def test_bug_torch_nested_tensor_crashes_has_shape():
+    """(Found by reading.) A nested tensor's `.shape` raises RuntimeError, which
+    hasattr() does not catch: discovery crashed on the first nested tensor in scope."""
+    torch = pytest.importorskip("torch")
+    try:
+        nt = torch.nested.nested_tensor([torch.ones(2), torch.full((3,), 2.0)])
+    except Exception:
+        pytest.skip("no nested tensors in this torch")
+    assert B.has_shape(nt) in (True, False)
+    if B.is_trackable(nt):
+        s = B.statistics(nt)
+        assert s["min"] == 1.0 and s["max"] == 2.0, s
+
+
+def test_bug_parameter_on_cpu_check_never_gets_requires_grad():
+    """(Found by reading.) pulse_detect's 'parameter left on the CPU' check reads
+    stats["requires_grad"], which statistics() never set -- the check was dead code."""
+    torch = pytest.importorskip("torch")
+    assert B.statistics(torch.ones(2, requires_grad=True))["requires_grad"] is True
+    assert B.statistics(torch.ones(2))["requires_grad"] is False
+    assert "requires_grad" not in B.statistics(np.ones(2))
+
+
+def test_bug_ragged_tensor_shape_is_reported_from_its_flat_values(tmp_path):
+    """(Found by reading.) A tf.RaggedTensor [[1, 2, 3], [4]] was described with the shape
+    of its flat values, (4,) -- a vector -- instead of its (bounding) shape (2, 3)."""
+    pytest.importorskip("tensorflow")
+    r = _run_isolated("""
+        import tensorflow as tf
+        from pulse import pulse_backend as B
+        rt = tf.ragged.constant([[1.0, 2.0, 3.0], [4.0]])
+        info = B.describe_tensor(rt)
+        assert info.shape == (2, 3) and info.kind == "matrix", info
+        s = B.statistics(rt)
+        assert s["shape"] == (2, 3) and s["max"] == 4.0, s
+        print("OK")
+    """, tmp_path=tmp_path)
+    assert r.returncode == 0 and "OK" in r.stdout, r.stdout + r.stderr
+
+
 # ---------------------------------------------------------------------------------------
 # verified working
 # ---------------------------------------------------------------------------------------

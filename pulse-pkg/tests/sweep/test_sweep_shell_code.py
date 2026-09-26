@@ -34,7 +34,7 @@ def fake_cli(root, files):
         _project_root=root, texts=texts, _label_for_path=labels, _path_for_label=paths,
         focus=list(texts), known=list(texts),
     )
-    cli._lint_check = lambda content, path: PulseCLI._lint_check(None, content, path)
+    cli._lint_check = lambda content, path, original=None: PulseCLI._lint_check(None, content, path, original)
     return cli
 
 
