@@ -60,6 +60,11 @@ options for `pulse run` (before the script; everything after it is the script's)
   --again                        start it even though a copy is already running
   --cwd DIR                      run the script in DIR (default: the directory you ran
                                  `pulse` from, as with `python path/to/script.py`)
+  --approver MODEL               auto mode: MODEL (a litellm id, e.g.
+                                 openrouter/anthropic/claude-sonnet-5) answers the y/N for
+                                 shell commands the agent wants to run that need permission,
+                                 so an unattended run never stops to ask. Same as
+                                 PULSE_APPROVER=MODEL or "approver" in pulse_config.json.
   --agent-log[=PATH]             record what Pulse's AI was shown, what it answered and what
                                  Pulse did (fixes, restarts...) to PATH (default:
                                  pulse_agent.log). Off unless given: it holds every prompt in
@@ -370,6 +375,16 @@ def _parse_run_args(args):
             stream = True
         elif arg == "--again":
             again = True
+        elif arg == "--approver":
+            if i + 1 >= len(args):
+                raise _UsageError("--approver needs a model id")
+            os.environ["PULSE_APPROVER"] = args[i + 1]
+            i += 1
+        elif arg.startswith("--approver="):
+            model = arg.split("=", 1)[1].strip()
+            if not model:
+                raise _UsageError("--approver= needs a model id")
+            os.environ["PULSE_APPROVER"] = model
         elif arg == "--agent-log":
             # Applied to the environment, where Pulse reads it -- which also carries it
             # into a fix-triggered restart.
@@ -617,7 +632,7 @@ def main(argv=None):
         return 0
 
     console_commands = ("watch", "attach", "console", "sessions", "install-sudo")
-    launch_options = ("--stream", "--cwd", "--again", "--agent-log")
+    launch_options = ("--stream", "--cwd", "--again", "--agent-log", "--approver")
 
     # `run` starts a run. Without it, a script name means "the run of this script that is
     # already going" -- so `pulse train.py` watches, and only `pulse run train.py` starts

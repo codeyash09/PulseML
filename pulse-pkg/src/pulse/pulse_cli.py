@@ -49,6 +49,7 @@ from pulse import pulse_detect as _pulse_detect
 from pulse import pulse_supabase as cloud
 from pulse import pulse_ui as _ui
 from pulse import pulse_terminal as _terminal
+from pulse import pulse_approver as _approver
 from pulse import pulse_trace as _pulse_trace
 try:
     import litellm
@@ -3797,6 +3798,7 @@ class PulseCLI:
 
         self._cloud_setup()
         self._agent_setup()
+        self._approver_setup()
         self._print_ready_summary()
         self._print_run_header()
 
@@ -7405,9 +7407,68 @@ class PulseCLI:
         flags = _terminal.classify_command(command)
         return flags if any(flags.values()) else None
 
+    def _approver_settings(self) -> Optional["_approver.ApproverSettings"]:
+        """Auto mode's approver, or None when a person answers (see pulse_approver)."""
+        config = getattr(self, "config", None) or {}
+        value = config.get(self._config_key("approver")) if config else None
+        if value is None and config:
+            value = config.get(self._config_key("approver_model"))
+        provider = getattr(self, "agent_provider", None)
+        agent_model = getattr(self, "agent_model_string", None) or (
+            PROVIDERS.get(provider, {}).get("model") if provider else None)
+        return _approver.settings_from(value, agent_model=agent_model,
+                                       agent_key=getattr(self, "agent_key", None))
+
+    def _approver_setup(self) -> None:
+        """At startup: say whether auto mode is on, and in an interactive session with an
+        agent but no approver chosen yet, offer to choose one. A choice is stored in the
+        environment, so a fix-triggered restart keeps it."""
+        settings = self._approver_settings()
+        if settings:
+            cprint(f"[Pulse] Auto mode: {settings.model} answers the y/N for flagged shell "
+                   "commands, so the run never waits on you.", color=_YELLOW)
+            return
+        if (getattr(self, "non_interactive", False) or getattr(self, "_code_mode", False)
+                or not getattr(self, "agent_provider", None)):
+            return
+        try:
+            _flush_stdin()
+            choice = _prompt_text(
+                "Auto mode -- a model to approve risky shell commands instead of you, so a long run "
+                "never stops to ask (a model id like openrouter/anthropic/claude-sonnet-5; Enter to "
+                "keep asking me) > ",
+                label="Auto-mode approver model (Enter = ask me)").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if choice:
+            os.environ[_approver.APPROVER_ENV] = choice
+            cprint(f"[Pulse] Auto mode on: {choice} will answer for flagged shell commands.",
+                   color=_YELLOW)
+
     def _confirm_terminal_command(self, command: str, flags: Dict[str, bool]) -> bool:
         why = _terminal.describe_classification(flags)
         cprint(f"[Pulse] ⚠ This command {why}: {command}", color=_YELLOW)
+        self._last_terminal_denial = None
+        settings = self._approver_settings()
+        if settings:
+            purpose = (getattr(self, "_pending_agent_problem", None)
+                       or getattr(self, "_last_problem_description", None) or "")
+            cwd = getattr(self._get_terminal_executor(), "default_cwd", None) or os.getcwd()
+            try:
+                decision = _approver.ask(settings, command, why, cwd, str(purpose))
+            except _approver.ApproverUnavailable as exc:
+                cprint(f"[Pulse] Auto mode: the approver ({settings.model}) could not answer ({exc}) "
+                       "-- falling back to asking.", color=_YELLOW)
+                _agent_log_event("AUTO MODE: approver unavailable, falling back", f"{command}\n{exc}")
+            else:
+                verdict = "APPROVED" if decision.approved else "DENIED"
+                cprint(f"[Pulse] Auto mode: {settings.model} {verdict} -- {decision.reason}",
+                       color=(_GREEN if decision.approved else _YELLOW))
+                _agent_log_event(f"AUTO MODE: {verdict} by {settings.model}",
+                                 f"{command}\nflagged because it {why}\nreason: {decision.reason}")
+                if not decision.approved:
+                    self._last_terminal_denial = f"the auto-mode approver ({settings.model}) denied it: {decision.reason}"
+                return decision.approved
         try:
             _flush_stdin()
             resp = _prompt_text(f"Run it anyway? (y/N) > ", label="Run it anyway? (y/N)").strip().lower()
@@ -7428,7 +7489,8 @@ class PulseCLI:
             return "TERMINAL: empty command -- nothing to run."
         flags = self._terminal_needs_confirmation(command)
         if flags and not self._confirm_terminal_command(command, flags):
-            return f"TERMINAL '{command}': the user declined to run this command -- try a different " \
+            who = getattr(self, "_last_terminal_denial", None) or "the user declined to run this command"
+            return f"TERMINAL '{command}': {who} -- try a different " \
                    "approach, or ask a read-only tool (GREP/VIEW) instead if you were only trying to " \
                    "inspect something."
         executor = self._get_terminal_executor()
