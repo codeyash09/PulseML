@@ -40,15 +40,12 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import pulse_stream as stream
+from .pulse_monitor import is_library_path
 
 DEFAULT_INTERVAL = 1.0
 MIN_INTERVAL = 0.2
 MAX_INTERVAL = 60.0
 _SAMPLE_TIMEOUT = 20.0
-
-# Frames from these do not belong to the user's training loop.
-_NOT_USER_CODE = (os.sep + "site-packages" + os.sep, os.sep + "lib" + os.sep + "python",
-                  "<frozen", "<string>")
 
 # Pulse's own package. Not "any directory called pulse": that skipped ~/pulse/train.py,
 # and attach reported a loop plainly inside a function as unreadable module globals. The
@@ -142,7 +139,9 @@ def _is_pulse_file(filename: str) -> bool:
 
 def _is_user_frame(frame: Dict[str, Any]) -> bool:
     filename = frame.get("filename") or ""
-    return (bool(filename) and not any(marker in filename for marker in _NOT_USER_CODE)
+    # Not this interpreter's paths alone: the target may run another Python, so the
+    # judgement is made from the path's own components.
+    return (bool(filename) and not is_library_path(filename)
             and not _is_pulse_file(filename))
 
 
@@ -251,9 +250,21 @@ class AttachedMonitor:
         self._thread: Optional[threading.Thread] = None
         self._last: Dict[str, float] = {}
         self._step = 0
+        # Once `finished` is written it stays: a sample still in flight when stop() gave
+        # up waiting for it rewrote the state without it, and the abandoned spool of a
+        # still-running target then looked like a live run.
+        self._finished = False
+        self._state_lock = threading.Lock()
 
+        # The target's identity (start ticks, pid namespace) and the SAMPLER's: the pid
+        # says whether the target runs, but only this process writes the spool, and a
+        # spool whose sampler died without cleaning up is nobody's live run.
+        sampler = stream.process_start_ticks(os.getpid())
         info = {"session_id": self.session_id, "script": self.script, "pid": self.pid,
-                "started": time.time(), "attached": True, "sampler": "py-spy"}
+                "started": time.time(), "attached": True, "sampler": "py-spy",
+                "sampler_pid": os.getpid(),
+                **({"sampler_start_ticks": sampler} if sampler is not None else {}),
+                **stream.process_identity(self.pid)}
         self._info = info
         self._registered = False
         self.writer.write_session(info)
@@ -310,6 +321,8 @@ class AttachedMonitor:
             except Exception as exc:                 # sampling must never take the console down
                 self.errors += 1
                 self.last_error = f"{type(exc).__name__}: {exc}"
+            if self._stop.is_set():
+                return                      # stop() has written the final state
             if self.samples and self.samples % 5 == 0:
                 self.snapshot()
 
@@ -358,11 +371,18 @@ class AttachedMonitor:
             return False
 
     def snapshot(self, extra: Optional[Dict[str, Any]] = None) -> None:
-        self.writer.write_state({
-            "session_id": self.session_id, "script": self.script, "step": self._step,
-            "updated": time.time(), "scalars": dict(self._last), "attached": True,
-            "samples": self.samples, "sample_errors": self.errors,
-            **(extra or {})})
+        with self._state_lock:
+            extra = dict(extra or {})
+            if extra.get("finished"):
+                self._finished = True
+            elif self._finished:
+                extra["finished"] = True
+            self.writer.write_state({
+                "session_id": self.session_id, "script": self.script, "step": self._step,
+                "updated": time.time(), "scalars": dict(self._last), "attached": True,
+                "samples": self.samples, "sample_errors": self.errors,
+                "interval": self.interval,
+                **extra})
 
     # ------------------------------------------------------------------ lifecycle
 
