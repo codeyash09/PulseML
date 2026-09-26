@@ -436,6 +436,26 @@ With:
 
 Pulse can pause training when configured detection logic identifies serious numerical or training problems, allowing the debugging agent to investigate before additional compute is wasted.
 
+### Auto mode: no stopping to ask
+
+Some shell commands the agent wants to run need your OK first: ones that delete files,
+rewrite git state, reach outside the project, start a background process or overwrite a
+file. In an unattended run nobody is there to answer, so the run waits or the command is
+declined. Auto mode hands that y/N to a second model you choose at startup:
+
+```bash
+pulse run --approver openrouter/anthropic/claude-sonnet-5 train.py
+```
+
+(or `PULSE_APPROVER=<model>`, or `"approver": "<model>"` in `pulse_config.json`; an
+interactive session also offers to pick one). The same commands are flagged as before;
+only who answers changes. The approver sees the command, why it was flagged, the project
+folder and what the agent was working on, and answers APPROVE or DENY with a reason that
+goes back to the agent. It is told to deny anything that could destroy work that can't be
+regenerated, touch files outside the project, handle credentials or use sudo, and to deny
+when unsure. If it can't be reached, Pulse falls back to asking you. Every decision is
+printed, and recorded with `--agent-log`.
+
 ---
 
 ## The `pulse` command
