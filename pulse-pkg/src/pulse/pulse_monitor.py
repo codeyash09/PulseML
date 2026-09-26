@@ -120,7 +120,10 @@ def _scalar_of(value: Any, local_vars: Optional[Dict[str, Any]] = None, name: Op
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        result = float(value)
+        try:
+            result = float(value)
+        except OverflowError:
+            return None         # an int beyond float range (a seed, a hash): not a metric
         return result if not isinstance(value, complex) else None
     shape = getattr(value, "shape", None)
     if shape is None:
@@ -134,6 +137,12 @@ def _scalar_of(value: Any, local_vars: Optional[Dict[str, Any]] = None, name: Op
     if size > _SMALL_ELEMENT_LIMIT:
         return None
     item = getattr(value, "item", None)
+    if item is None:
+        # TensorFlow eager tensors and Keras variables have no .item(); their .numpy()
+        # is the same host read. Without this a TF custom loop's loss was never sampled.
+        to_numpy = getattr(value, "numpy", None)
+        if callable(to_numpy):
+            item = lambda: to_numpy().item()      # noqa: E731
     if item is None or size != 1:
         return None
     if local_vars is not None and not _GPU_READS and _on_accelerator(value):
@@ -141,7 +150,7 @@ def _scalar_of(value: Any, local_vars: Optional[Dict[str, Any]] = None, name: Op
         return _scalar_of(mirror) if mirror is not None else None
     try:
         return float(item())
-    except (TypeError, ValueError, RuntimeError):
+    except (TypeError, ValueError, RuntimeError, AttributeError, OverflowError):
         return None
 
 
@@ -203,6 +212,11 @@ class Monitor:
         self.script_path = script_path
         self.directory = directory or stream.session_dir_for(script_path, self.session_id)
         self.interval = float(interval)
+        # Set by attach(): the sampler thread's own pace. When there is one, /interval
+        # changes that -- `interval` above is 0 there, so changing it did nothing.
+        self.sampler_interval: Optional[float] = None
+        # The thread a stop request should interrupt; None means the main thread.
+        self.training_thread: Optional[int] = None
         self.tensor_interval = float(tensor_interval)
         self.writer = stream.StreamWriter(self.directory)
         self.step = 0
@@ -235,6 +249,9 @@ class Monitor:
             "session_id": self.session_id,
             "script": os.path.abspath(script_path) if script_path else None,
             "pid": os.getpid(),
+            # A brain that started before session.json existed learns the start time
+            # only from here; without it the run read "0.0s elapsed" forever.
+            "started": self._started,
         })
         # Tell the machine this run exists, so `pulse` typed anywhere can find it.
         stream.register_session(self.session_id, self.directory, {
@@ -261,7 +278,7 @@ class Monitor:
             self._last_control_poll = now
             self._handle_control()
 
-        if now - self._last_sample < self.interval:
+        if self._paused or now - self._last_sample < self.interval:
             return
         self._last_sample = now
         started = time.perf_counter()
@@ -316,9 +333,11 @@ class Monitor:
         # After sampling, so the snapshot describes this sample rather than the state
         # before it: taken first, the very first snapshot said step 0 with no values,
         # and a live run read as "no steps" until the next one was due.
+        # Written by the writer thread: this is the training thread, and a snapshot is a
+        # temp file, a write and a rename, on a disk that may be slow or networked.
         if now - self._last_snapshot >= self.snapshot_interval:
             self._last_snapshot = now
-            self.snapshot_state()
+            self.snapshot_state(background=True)
 
         self._samples += 1
         self._observe_seconds += time.perf_counter() - started
@@ -400,7 +419,11 @@ class Monitor:
                     continue
                 # Bounded on both sides. Unbounded, one `/interval 1e9` (or inf) put the
                 # monitor beyond reach of the next control message for the rest of the run.
-                self.interval = min(MAX_INTERVAL, max(MIN_INTERVAL, wanted))
+                wanted = min(MAX_INTERVAL, max(MIN_INTERVAL, wanted))
+                if self.sampler_interval is not None:
+                    self.sampler_interval = wanted
+                else:
+                    self.interval = wanted
             elif action == stream.CONTROL_PAUSE:
                 self._paused = True
                 self.event("paused", reason=message.get("reason") or "")
@@ -420,9 +443,29 @@ class Monitor:
                 # in the training thread, which is what Ctrl-C does: the loop unwinds,
                 # finally blocks run, and the excepthook still records the ending.
                 try:
-                    _thread.interrupt_main()
+                    self._interrupt_training()
                 except Exception as exc:
                     self.event("stop_failed", error=f"{type(exc).__name__}: {exc}")
+
+    def _interrupt_training(self) -> None:
+        """KeyboardInterrupt in the training thread -- which is not always the main one.
+
+        attach(thread_id=...) watches some other thread; interrupt_main() then stopped the
+        main thread and left the training loop running.
+        """
+        target = self.training_thread
+        main = threading.main_thread().ident
+        if target is None or target == main:
+            _thread.interrupt_main()
+            return
+        import ctypes
+
+        hit = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+            ctypes.c_ulong(target), ctypes.py_object(KeyboardInterrupt))
+        if hit > 1:                                   # never happens; undo it if it does
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(target), None)
+        if hit != 1:
+            raise RuntimeError(f"training thread {target} is gone")
 
     @property
     def stop_requested(self) -> bool:
@@ -434,7 +477,7 @@ class Monitor:
 
     # ------------------------------------------------------------------ bookkeeping
 
-    def snapshot_state(self, extra: Optional[Dict[str, Any]] = None) -> None:
+    def snapshot_state(self, extra: Optional[Dict[str, Any]] = None, background: bool = False) -> None:
         """Replace state.json so a brain attaching late starts from something real.
 
         Flags like `crashed` stick: the crash hook records one and then closes the
@@ -443,7 +486,8 @@ class Monitor:
         run that died of a CUDA OOM was listed as having finished normally.
         """
         self._sticky.update(extra or {})
-        self.writer.write_state({
+        write = self.writer.queue_state if background else self.writer.write_state
+        write({
             "session_id": self.session_id,
             "script": os.path.abspath(self.script_path) if self.script_path else None,
             "step": self.step,
@@ -481,13 +525,19 @@ _ACTIVE: Optional["Monitor"] = None
 _SAMPLER: Optional[threading.Thread] = None
 _STOP = threading.Event()
 
-_SKIP_PATH_MARKERS = (os.sep + "pulse" + os.sep, os.sep + "site-packages" + os.sep,
+_SKIP_PATH_MARKERS = (os.sep + "site-packages" + os.sep,
                       os.sep + "lib" + os.sep + "python", "<frozen", "<string>")
+
+# Pulse's own package directory. Not any directory called "pulse": that marker also
+# matched ~/pulse/train.py, and a project living there streamed nothing at all.
+_PULSE_DIR = os.path.dirname(os.path.abspath(__file__)) + os.sep
 
 
 def _is_user_frame(frame: Any) -> bool:
     """True for a frame in the user's own code, rather than in Pulse, a library or the stdlib."""
     filename = getattr(getattr(frame, "f_code", None), "co_filename", "") or ""
+    if filename.startswith(_PULSE_DIR):
+        return False
     return not any(marker in filename for marker in _SKIP_PATH_MARKERS)
 
 
@@ -516,7 +566,7 @@ def _sample_loop(monitor: "Monitor", thread_id: int, depth: int, interval: float
     it is never called back into, and the only interaction is this thread briefly
     holding the GIL a few times a second.
     """
-    while not _STOP.wait(interval):
+    while not _STOP.wait(monitor.sampler_interval or interval):
         frames = sys._current_frames()
         frame = frames.get(thread_id)
         if frame is None:
@@ -551,6 +601,8 @@ def attach(
     monitor = Monitor(script_path=script_path, session_id=session_id, directory=directory,
                       interval=0.0,            # the sampler thread sets the pace
                       tensor_interval=tensor_interval)
+    monitor.sampler_interval = max(0.01, interval)
+    monitor.training_thread = thread_id or threading.get_ident()
     _STOP.clear()
     _ACTIVE = monitor
     _SAMPLER = threading.Thread(

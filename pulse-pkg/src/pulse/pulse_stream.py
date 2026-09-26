@@ -60,6 +60,9 @@ KIND_BYE = "bye"            # clean shutdown
 # Not a frame: a marker put on the writer's queue by flush(), asking the writer thread to
 # put what it is holding on disk now and say when it has.
 _FLUSH = object()
+# Not a frame either: a state snapshot for the writer thread to put on disk, so that the
+# thread that asked (the training thread) never does the file IO itself.
+_STATE = object()
 
 # Control messages (brain -> monitor).
 CONTROL_PAUSE = "pause"
@@ -86,7 +89,9 @@ def registry_dir() -> str:
     """
     base = os.environ.get("PULSE_HOME", "").strip()
     if not base:
-        home = os.path.expanduser("~")
+        # Under sudo, the invoking user's home, not root's: the user's next plain `pulse`
+        # looks in their own ~/.pulse, and a pointer left in /root is one it never sees.
+        home = invoking_user_home() or os.path.expanduser("~")
         if home == "~" or not os.path.isabs(home):
             # No HOME and no passwd entry: the usual shape of a container run started
             # with --user 1234:1234. expanduser hands back the literal "~", and joining
@@ -312,6 +317,10 @@ class StreamWriter:
         self._on_error = on_error
         self._closed = False
         self._control_offset = 0
+        # A queued snapshot must not land on top of a newer one written directly (close()
+        # writes `finished` while an older snapshot may still be in the queue).
+        self._state_lock = threading.RLock()
+        self._state_generation = 0
 
         _makedirs(self.directory)
         self._handle = _open_append(self.events_path)
@@ -340,6 +349,8 @@ class StreamWriter:
                     # Not a frame, and somebody is waiting on it: release them rather
                     # than leaving flush() to sit out its whole timeout.
                     oldest[1].set()
+                elif isinstance(oldest, tuple) and oldest and oldest[0] is _STATE:
+                    pass                # a snapshot, not a frame; the next one replaces it
                 else:
                     self._dropped += 1
             except queue.Empty:
@@ -356,10 +367,22 @@ class StreamWriter:
 
     def write_state(self, state: Dict[str, Any]) -> None:
         """Replace the snapshot a late-attaching brain reads before tailing the log."""
+        with self._state_lock:
+            self._state_generation += 1
+            try:
+                _atomic_write_json(self.state_path, state)
+            except OSError as exc:
+                self._report(exc)
+
+    def queue_state(self, state: Dict[str, Any]) -> bool:
+        """write_state, done by the writer thread. Never blocks; False if it was skipped."""
+        if self._closed:
+            return False
         try:
-            _atomic_write_json(self.state_path, state)
-        except OSError as exc:
-            self._report(exc)
+            self._queue.put_nowait((_STATE, state, self._state_generation))
+            return True
+        except queue.Full:
+            return False                # the next snapshot will say the same, only newer
 
     # ---------------------------------------------------------------- control channel
 
@@ -405,7 +428,9 @@ class StreamWriter:
         while True:
             timeout = max(0.0, self.flush_seconds - (time.monotonic() - last_flush))
             try:
-                item = self._queue.get(timeout=timeout or self.flush_seconds)
+                # Never a zero timeout: flush_seconds=0 made that a busy loop, one core
+                # spinning at 100% for the life of the run.
+                item = self._queue.get(timeout=max(0.01, timeout or self.flush_seconds))
             except queue.Empty:
                 item = None
             else:
@@ -416,6 +441,11 @@ class StreamWriter:
                     except OSError:
                         pass
                     return
+                if isinstance(item, tuple) and item and item[0] is _STATE:
+                    with self._state_lock:
+                        if item[2] == self._state_generation:   # nothing newer written since
+                            self.write_state(item[1])
+                    continue
                 if isinstance(item, tuple) and item and item[0] is _FLUSH:
                     # Somebody is waiting to read what has been emitted so far.
                     self._flush(pending)
@@ -461,7 +491,9 @@ class StreamWriter:
                 return
             self._handle.close()
             os.replace(self.events_path, self.events_path + ".prev")
-            self._handle = open(self.events_path, "a", encoding="utf-8")
+            # The same way as the first open: under sudo a plain open() here made the new
+            # file root's, and followed a symlink planted in the rotation window as root.
+            self._handle = _open_append(self.events_path)
         except OSError as exc:
             self._report(exc)
 
@@ -505,7 +537,13 @@ class StreamWriter:
             self._queue.put_nowait(None)
         except queue.Full:
             try:
-                self._queue.get_nowait()
+                evicted = self._queue.get_nowait()
+                if isinstance(evicted, tuple) and evicted and evicted[0] is _FLUSH:
+                    evicted[1].set()
+                elif isinstance(evicted, tuple) and evicted and evicted[0] is _STATE:
+                    pass
+                elif evicted is not None:
+                    self._dropped += 1          # it never reaches the file: say so
                 self._queue.put_nowait(None)
             except (queue.Empty, queue.Full):
                 pass
@@ -527,8 +565,10 @@ class StreamReader:
         self.session_path = os.path.join(self.directory, "session.json")
         self.control_path = os.path.join(self.directory, "control.jsonl")
         self._offset = 0
+        self._inode: Optional[int] = None
+        self._from_start = False
         self._last_seq = 0
-        self.gaps = 0               # frames the writer told us it dropped
+        self.gaps = 0               # frames missing from the sequence: dropped or lost
         self.rotations = 0
         self._lock = threading.Lock()
 
@@ -559,44 +599,84 @@ class StreamReader:
             return self._poll()
 
     def _poll(self) -> List[Dict[str, Any]]:
+        # Binary, with offsets in real bytes. Text mode got both of these wrong: a line
+        # cut in the middle of a multi-byte character raised UnicodeDecodeError out of
+        # here (losing the frames already read), and on Windows '\r\n' came back as one
+        # character, so the offset fell a byte behind per line and frames came back twice.
         try:
-            size = os.path.getsize(self.events_path)
+            handle = open(self.events_path, "rb")
         except OSError:
-            return []
-        if size < self._offset:
-            # The writer rotated (or the file was replaced): re-read from the top.
-            self._offset = 0
-            self.rotations += 1
-        if size == self._offset:
             return []
         frames: List[Dict[str, Any]] = []
+        with handle:
+            try:
+                info = os.fstat(handle.fileno())
+            except OSError:
+                return []
+            inode = info.st_ino or None
+            if self._inode is not None and inode is not None and inode != self._inode:
+                # The writer rotated: events.jsonl is a new file. What was appended to the
+                # old one since the last poll is now in .prev -- read that first, or it is
+                # lost, and then the new file from its top.
+                frames.extend(self._drain_previous())
+                self._offset = 0
+                self.rotations += 1
+            elif info.st_size < self._offset:
+                # Truncated or replaced in place: re-read from the top.
+                self._offset = 0
+                self.rotations += 1
+            self._inode = inode
+            if self._last_seq == 0 and self._offset == 0 and self.rotations == 0:
+                # The very start of the spool, so numbering starts at 1 and frames dropped
+                # before the first one that made it are holes too -- unless an earlier file
+                # was rotated away, when a high first number means nothing.
+                self._from_start = not os.path.exists(self.events_path + ".prev")
+            if info.st_size > self._offset:
+                try:
+                    frames.extend(self._read_lines(handle))
+                except OSError:
+                    pass
+        return frames
+
+    def _drain_previous(self) -> List[Dict[str, Any]]:
+        """The tail of the file we were reading, after the writer renamed it to .prev."""
         try:
-            with open(self.events_path, "r", encoding="utf-8") as handle:
-                handle.seek(self._offset)
-                for line in handle:
-                    if not line.endswith("\n"):
-                        break
-                    self._offset += len(line.encode("utf-8"))
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        frame = json.loads(line)
-                    except ValueError:
-                        continue
-                    if not isinstance(frame, dict):
-                        continue
-                    if frame.get("kind") == KIND_DROP:
-                        self.gaps += int(frame.get("dropped") or 0)
-                    else:
-                        seq = frame.get("seq")
-                        if isinstance(seq, int) and seq > 0:
-                            if self._last_seq and seq > self._last_seq + 1:
-                                self.gaps += seq - self._last_seq - 1
-                            self._last_seq = max(self._last_seq, seq)
-                    frames.append(frame)
+            with open(self.events_path + ".prev", "rb") as handle:
+                if os.fstat(handle.fileno()).st_ino != self._inode:
+                    return []           # rotated more than once since: that part is gone
+                return self._read_lines(handle)
         except OSError:
-            return frames
+            return []
+
+    def _read_lines(self, handle: Any) -> List[Dict[str, Any]]:
+        """Complete lines from self._offset on; a partial final line is left for next time."""
+        frames: List[Dict[str, Any]] = []
+        handle.seek(self._offset)
+        for raw in handle:
+            if not raw.endswith(b"\n"):
+                break
+            self._offset += len(raw)
+            try:
+                line = raw.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                continue
+            if not line:
+                continue
+            try:
+                frame = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(frame, dict):
+                continue
+            # Holes are counted from the sequence numbers alone. The writer also appends
+            # a KIND_DROP record for what it dropped, and adding both counted every lost
+            # frame twice.
+            seq = frame.get("seq")
+            if frame.get("kind") != KIND_DROP and isinstance(seq, int) and seq > 0:
+                if (self._last_seq or self._from_start) and seq > self._last_seq + 1:
+                    self.gaps += seq - self._last_seq - 1
+                self._last_seq = max(self._last_seq, seq)
+            frames.append(frame)
         return frames
 
     def follow(self, interval: float = 0.25, stop: Optional[Callable[[], bool]] = None) -> Iterator[Dict[str, Any]]:

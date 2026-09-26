@@ -67,6 +67,7 @@ class Schedule:
         self.risk = "unknown"
         self.next_at = time.time() + self.interval
         self.history: List[Dict[str, Any]] = []
+        self.loaded = False             # True when a persisted schedule was picked up
         self._load()
 
     @staticmethod
@@ -139,6 +140,7 @@ class Schedule:
         self.reason = str(saved.get("reason") or self.reason)
         self.risk = str(saved.get("risk") or self.risk)
         self.history = list(saved.get("history") or [])
+        self.loaded = True
         # A brain that was down while training continued should look promptly, but not
         # immediately-and-repeatedly if it is being restarted in a loop.
         self.next_at = min(float(saved.get("next_at") or 0.0) or time.time(),
@@ -241,11 +243,32 @@ class Brain:
         # the main one, so two audits can start at once: two model calls billed, both
         # writing the schedule, and the later answer silently winning.
         self._audit_lock = threading.Lock()
+        # Guards the history and findings. Held for ingesting and for gathering evidence,
+        # never across a model call: the console's views take it too, and an audit that
+        # held it froze every one of them for as long as the model took to answer.
+        self.state_lock = threading.RLock()
+        self._last_activity = time.monotonic()
 
     # ------------------------------------------------------------------ ingest
 
     def ingest(self, frames: Sequence[Dict[str, Any]]) -> List[detect.Finding]:
         """Fold new frames into the history and run the detectors over the result."""
+        with self.state_lock:
+            urgent, raised = self._fold(frames)
+        if urgent:
+            # Something the monitor itself flagged as not-worth-waiting-for.
+            self.schedule.bring_forward(MIN_INTERVAL_SECONDS,
+                                        f"monitor reported {urgent[0].get('event')}")
+        if raised:
+            if any(f.severity == detect.CRITICAL for f in raised):
+                self.schedule.bring_forward(MIN_INTERVAL_SECONDS, "a critical check fired")
+            if self.on_finding is not None:
+                self.on_finding(raised)
+            if self.escalate is not None:
+                self.escalate(raised, self.evidence())
+        return raised
+
+    def _fold(self, frames: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[detect.Finding]]:
         urgent: List[Dict[str, Any]] = []
         for frame in frames:
             kind = frame.get("kind")
@@ -280,28 +303,22 @@ class Brain:
                 self.finished = True
 
         result = self.engine.update(self.histories, step=self.step, tensor_stats=self.tensor_stats)
-        raised = result["raised"]
-        if urgent:
-            # Something the monitor itself flagged as not-worth-waiting-for.
-            self.schedule.bring_forward(MIN_INTERVAL_SECONDS,
-                                        f"monitor reported {urgent[0].get('event')}")
-        if raised:
-            if any(f.severity == detect.CRITICAL for f in raised):
-                self.schedule.bring_forward(MIN_INTERVAL_SECONDS, "a critical check fired")
-            if self.on_finding is not None:
-                self.on_finding(raised)
-            if self.escalate is not None:
-                self.escalate(raised, self.evidence())
-        return raised
+        return urgent, result["raised"]
 
     # ------------------------------------------------------------------ evidence
 
     def evidence(self, include_code: bool = False) -> Dict[str, Any]:
         """Everything known about this run, small enough to put in a prompt."""
+        with self.state_lock:
+            return self._evidence(include_code)
+
+    def _evidence(self, include_code: bool) -> Dict[str, Any]:
         findings = [f.to_dict() for f in self.engine.current()]
         curves = {}
         for name, history in self.histories.items():
-            if len(history) < 2:
+            # One reading is still a reading: the first val_loss after an epoch, a final
+            # test score. Leaving it out hid it from the audit while /vars showed it.
+            if not history:
                 continue
             curves[name] = {
                 "points": len(history),
@@ -316,8 +333,8 @@ class Brain:
             "step": self.step,
             "elapsed_seconds": round(time.time() - float(self.session.get("started") or time.time()), 1),
             "scalars": curves,
-            "tensors": self.tensors,
-            "tensor_stats": self.tensor_stats,
+            "tensors": {k: dict(v) for k, v in self.tensors.items()},
+            "tensor_stats": {k: dict(v) for k, v in self.tensor_stats.items()},
             "findings": findings,
             "recent_events": self.events[-20:],
             "fixes_applied": self.fixes[-5:],
@@ -376,14 +393,17 @@ class Brain:
                 shape = "x".join(str(d) for d in (meta.get("shape") or []))
                 line = f"  {name}: shape {shape} {meta.get('dtype', '')} on {meta.get('device', 'cpu')}"
                 if stats:
-                    line += ("  min %.4g max %.4g mean %.4g nan %s inf %s" %
-                             (stats.get("min", float("nan")), stats.get("max", float("nan")),
-                              stats.get("mean", float("nan")), stats.get("nan", 0), stats.get("inf", 0)))
+                    # An all-NaN tensor has no min/max/mean (None): exactly the failure
+                    # Pulse exists for, and '%.4g' % None crashed every audit over it.
+                    line += (f"  min {_num(stats.get('min'))} max {_num(stats.get('max'))} "
+                             f"mean {_num(stats.get('mean'))} nan {stats.get('nan', 0)} "
+                             f"inf {stats.get('inf', 0)}")
                 out.append(line)
         events = pack.get("recent_events") or []
         if events:
-            out.append("\nRecent events: " + ", ".join(
-                f"{e.get('event')}@{e.get('step')}" for e in events[-10:]))
+            out.append("\nRecent events:")
+            for e in events[-10:]:
+                out.extend(_describe_event(e))
         fixes = pack.get("fixes_applied") or []
         if fixes:
             out.append("\nFixes already applied this run:")
@@ -424,11 +444,21 @@ class Brain:
                               f"audit failed: {type(exc).__name__}", "unknown")
             return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
         decision = parse_decision(answer)
-        record = dict(decision, t=time.time(), step=self.step, text=answer)
-        self.audits.append(record)
-        del self.audits[:-20]
-        self.last_status = str(decision.get("status") or "unknown")
+        with self.state_lock:
+            record = dict(decision, t=time.time(), step=self.step, text=answer)
+            self.audits.append(record)
+            del self.audits[:-20]
+            self.last_status = str(decision.get("status") or "unknown")
         self.schedule.apply_decision(decision)
+        if self.last_status == "problem" and self.escalate is not None:
+            # The audit found something the checks did not: that is a problem to act on,
+            # not just a line of text. It used to go nowhere.
+            with self.state_lock:
+                current = list(self.engine.current())
+            try:
+                self.escalate(current, dict(pack, audit=record))
+            except Exception:
+                pass
         return record
 
     def note_fix(self, summary: str, **fields: Any) -> None:
@@ -457,9 +487,61 @@ class Brain:
         while not self.finished:
             if stop is not None and stop():
                 return
-            self.poll_once()
+            if self.poll_once()["frames"]:
+                self._last_activity = time.monotonic()
+            elif self._training_process_gone():
+                # Killed without a word (SIGKILL, the OOM killer, pre-emption): no
+                # 'finished' and no BYE will ever come, and audits would be billed forever.
+                self.events.append({"kind": stream.KIND_EVENT, "event": "process_gone",
+                                    "step": self.step})
+                self.finished = True
+                break
             time.sleep(self.poll_interval)
         self.poll_once()        # drain whatever arrived with the closing frames
+
+    def _training_process_gone(self, quiet_seconds: float = 2.0) -> bool:
+        """The run's process no longer exists, and nothing has arrived for a while."""
+        if time.monotonic() - self._last_activity < quiet_seconds:
+            return False
+        if not self.session.get("pid"):
+            self.session.update({k: v for k, v in self.reader.session().items()
+                                 if k not in self.session})
+        pid = self.session.get("pid")
+        if not pid:
+            return False
+        from .pulse_console import session_process_alive
+
+        return not session_process_alive(pid, self.session.get("started"))
+
+
+def _num(value: Any) -> str:
+    """A statistic for a prompt; a missing one (an all-NaN tensor has none) as n/a."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{value:.4g}"
+    return "n/a"
+
+
+def _describe_event(event: Dict[str, Any]) -> List[str]:
+    """One event for a prompt, with what it says rather than just its name.
+
+    'crash@41' told the agent a crash happened and nothing about it; the exception and the
+    end of the traceback are the evidence. The same for which value went non-finite.
+    """
+    line = f"  {event.get('event')}@{event.get('step')}"
+    details = []
+    if event.get("name") is not None:
+        details.append(str(event["name"]) + (f" = {event['value']}" if "value" in event else ""))
+    for key in ("exception", "error", "reason", "message"):
+        if event.get(key):
+            details.append(str(event[key])[:500])
+    if details:
+        line += ": " + "; ".join(details)
+    out = [line]
+    traceback = event.get("traceback")
+    if traceback:
+        tail = str(traceback).rstrip().splitlines()[-8:]
+        out.extend("      " + text for text in tail)
+    return out
 
 
 def parse_decision(answer: str) -> Dict[str, Any]:
@@ -516,8 +598,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--model", default=os.environ.get("PULSE_BRAIN_MODEL", ""),
                         help="litellm model id for the audit pass; omit to run detection only")
     parser.add_argument("--sensitivity", type=float, default=0.3)
-    parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_SECONDS,
-                        help="seconds until the first audit (the agent chooses after that)")
+    parser.add_argument("--interval", type=float, default=None,
+                        help="seconds until the first audit (the agent chooses after that; "
+                             f"default: the saved schedule, else {DEFAULT_INTERVAL_SECONDS:g})")
     parser.add_argument("--once", action="store_true", help="one pass over what exists, then exit")
     args = parser.parse_args(argv)
 
@@ -532,7 +615,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     agent = build_litellm_agent(args.model) if args.model else None
     brain = Brain(directory, agent=agent, sensitivity=args.sensitivity)
-    brain.schedule.set(args.interval, "startup", brain.schedule.risk)
+    # Only when asked, or when there is nothing saved: the schedule is persisted precisely
+    # so a restarted brain keeps the cadence the agent chose (2 minutes after a fix, say).
+    if args.interval is not None:
+        brain.schedule.set(args.interval, "startup", brain.schedule.risk)
+    elif not brain.schedule.loaded:
+        brain.schedule.set(DEFAULT_INTERVAL_SECONDS, "startup", brain.schedule.risk)
 
     def report(findings: List[detect.Finding]) -> None:
         for finding in findings:

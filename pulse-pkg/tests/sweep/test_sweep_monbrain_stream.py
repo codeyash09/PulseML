@@ -549,3 +549,76 @@ def test_bug_a_value_with_one_reading_is_silently_left_out_of_the_evidence(tmp_p
                  + [{"kind": "scalars", "step": 20, "values": {"val_accuracy": 0.12}}])
     text = Brain.render_evidence(brain.evidence())
     assert "val_accuracy" in text
+
+
+# =====================================================================================
+# ledger items confirmed by reading (r:1), covered after the fix
+# =====================================================================================
+
+def test_ok_pause_stops_sampling_until_resume(tmp_path):
+    monitor = Monitor(directory=str(tmp_path), session_id="p", interval=0.0, tensor_interval=0.0)
+    reader = stream.StreamReader(str(tmp_path))
+    reader.send_control(stream.CONTROL_PAUSE, reason="test")
+    monitor._last_control_poll = -1e9
+    monitor.observe_locals({"loss": 1.0}, step=1)
+    reader.send_control(stream.CONTROL_RESUME)
+    monitor._last_control_poll = -1e9
+    monitor.observe_locals({"loss": 0.5}, step=2)
+    monitor.close()
+    assert _steps(stream.StreamReader(str(tmp_path)).poll()) == [2]
+
+
+def test_ok_stop_interrupts_the_attached_thread_not_the_main_one(tmp_path):
+    outcome = {}
+    ready = threading.Event()
+
+    def training():
+        ready.set()
+        try:
+            while True:
+                time.sleep(0.01)
+        except KeyboardInterrupt:
+            outcome["interrupted"] = True
+
+    t = threading.Thread(target=training, daemon=True)
+    t.start()
+    ready.wait(2)
+    monitor = pulse_monitor.attach(directory=str(tmp_path), session_id="stop", interval=0.05,
+                                   depth=1, thread_id=t.ident)
+    try:
+        stream.StreamReader(str(tmp_path)).send_control(stream.CONTROL_STOP, reason="test")
+        t.join(5)
+    finally:
+        pulse_monitor.detach()
+    assert outcome.get("interrupted"), "the watched thread was never interrupted"
+    assert monitor.stop_requested
+
+
+def test_ok_writer_with_zero_flush_seconds_does_not_spin(tmp_path):
+    writer = stream.StreamWriter(str(tmp_path), flush_seconds=0.0)
+    cpu0 = time.process_time()
+    time.sleep(1.0)
+    used = time.process_time() - cpu0
+    writer.emit(stream.KIND_SCALARS, {"step": 1, "values": {"loss": 1.0}})
+    writer.close()
+    assert _steps(stream.StreamReader(str(tmp_path)).poll()) == [1]
+    assert used < 0.5, f"idle writer used {used:.2f}s of CPU in 1s"
+
+
+def test_ok_brain_started_before_session_json_learns_the_start_time(tmp_path):
+    brain = Brain(str(tmp_path))                      # no session.json yet
+    assert not brain.session.get("started")
+    monitor = Monitor(directory=str(tmp_path), session_id="late", interval=0.0)
+    monitor.close()
+    brain.ingest(brain.reader.poll())
+    assert brain.session.get("started") == monitor._started
+
+
+def test_ok_problem_audit_is_escalated(tmp_path):
+    escalated = []
+    brain = Brain(str(tmp_path), agent=lambda p: '{"status": "problem", "findings": ["lr"], '
+                                                 '"next_check_minutes": 5}',
+                  escalate=lambda findings, pack: escalated.append(pack))
+    brain.ingest([{"kind": "scalars", "step": 1, "values": {"loss": 1.0}}])
+    brain.audit()
+    assert escalated and escalated[0]["audit"]["status"] == "problem"
