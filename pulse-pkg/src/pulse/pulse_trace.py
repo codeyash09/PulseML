@@ -156,6 +156,9 @@ class Scope:
     params: List[str]
     stmts: List[ast.stmt]
     assigned: Set[str] = field(default_factory=set)
+    parent: Optional["Scope"] = None           # the enclosing function/module (a class is not a scope)
+    globals: Set[str] = field(default_factory=set)      # `global x`: x is the module's
+    nonlocals: Set[str] = field(default_factory=set)    # `nonlocal x`: x is an enclosing function's
 
     @property
     def is_module(self) -> bool:
@@ -181,18 +184,28 @@ class Index:
         self.funcs_by_name: Dict[str, List[Scope]] = {}
         self.classes: Dict[Tuple[str, str], List[Scope]] = {}
         self.import_aliases: Dict[str, Set[str]] = {}
+        self.class_bases: Dict[Tuple[str, str], List[str]] = {}
+        self.attr_owner: Dict[Tuple[str, str, str], Tuple[str, str]] = {}
         self.calls: List[CallSite] = []
         self.parsed = 0
 
         for label, path, text in files:
             try:
                 tree = ast.parse(text, filename=path or label)
-            except (SyntaxError, ValueError):
-                continue                       # a file mid-edit is not a reason to fail the trace
+            except (SyntaxError, ValueError, RecursionError, MemoryError):
+                # A file mid-edit -- or a generated one too deeply nested for the parser --
+                # is not a reason to fail the trace.
+                continue
+            try:
+                aliases = _import_aliases(tree)
+                first = len(self.scopes)
+                self._index_scope(label, path, tree, name=MODULE_SCOPE, class_name=None)
+            except (RecursionError, MemoryError):
+                del self.scopes[first:]
+                continue
             self.parsed += 1
             self.lines[label] = text.splitlines()
-            self.import_aliases[label] = _import_aliases(tree)
-            self._index_scope(label, path, tree, name=MODULE_SCOPE, class_name=None)
+            self.import_aliases[label] = aliases
 
         for scope in self.scopes:
             self.by_key.setdefault((scope.label, scope.key_scope), []).append(scope)
@@ -207,7 +220,7 @@ class Index:
     # -- construction -------------------------------------------------------------------
 
     def _index_scope(self, label: str, path: str, node: ast.AST, name: str,
-                     class_name: Optional[str]) -> None:
+                     class_name: Optional[str], parent: Optional[Scope] = None) -> None:
         """Register `node` as a scope and recurse into the functions and classes it holds."""
         body = list(getattr(node, "body", []))
         stmts = _own_statements(body)
@@ -218,10 +231,14 @@ class Index:
             label=label, path=path, name=name,
             key_scope=name,
             func=node if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else None,
-            class_name=class_name, params=params, stmts=stmts,
+            class_name=class_name, params=params, stmts=stmts, parent=parent,
         )
         for stmt in stmts:
             scope.assigned.update(targets_of(stmt))
+            if isinstance(stmt, ast.Global):
+                scope.globals.update(stmt.names)
+            elif isinstance(stmt, ast.Nonlocal):
+                scope.nonlocals.update(stmt.names)
         self.scopes.append(scope)
 
         # Nested definitions get their own scope. A class contributes no scope of its own
@@ -229,15 +246,19 @@ class Index:
         # across all of them.
         for child in _nested_definitions(body):
             if isinstance(child, ast.ClassDef):
+                self.class_bases.setdefault((label, child.name), []).extend(
+                    b.id if isinstance(b, ast.Name) else b.attr
+                    for b in child.bases if isinstance(b, (ast.Name, ast.Attribute)))
                 for grandchild in _nested_definitions(child.body):
                     if isinstance(grandchild, ast.ClassDef):
                         continue               # a class inside a class: rare, not worth the depth
                     self._index_scope(label, path, grandchild,
                                       name=f"{child.name}.{grandchild.name}",
-                                      class_name=child.name)
+                                      class_name=child.name, parent=scope)
             else:
                 qualified = child.name if name == MODULE_SCOPE else f"{name}.{child.name}"
-                self._index_scope(label, path, child, name=qualified, class_name=class_name)
+                self._index_scope(label, path, child, name=qualified, class_name=class_name,
+                                  parent=scope)
 
     def _index_calls(self) -> None:
         for scope in self.scopes:
@@ -374,7 +395,8 @@ def _target_names(node: ast.expr) -> List[str]:
             if node.value.id in ("self", "cls"):
                 return [f"{node.value.id}.{node.attr}"]
             return [node.value.id]
-        return []
+        # `cfg.optim.lr = x` writes through cfg.optim, i.e. into cfg.
+        return _target_names(node.value) if isinstance(node.value, (ast.Attribute, ast.Subscript)) else []
     if isinstance(node, ast.Subscript):
         return _target_names(node.value)
     return []
@@ -392,8 +414,12 @@ def targets_of(stmt: ast.stmt) -> List[str]:
         targets = [stmt.target]
     elif isinstance(stmt, (ast.With, ast.AsyncWith)):
         targets = [i.optional_vars for i in stmt.items if i.optional_vars is not None]
-    elif isinstance(stmt, ast.NamedExpr):            # pragma: no cover -- walrus at statement level
-        targets = [stmt.target]
+    # `(batch := next(it))` assigns batch in the enclosing scope, wherever it appears.
+    if not isinstance(stmt, _DEF_NODES):
+        for part in read_parts(stmt):
+            for node in ast.walk(part):
+                if isinstance(node, ast.NamedExpr):
+                    targets.append(node.target)
     names: List[str] = []
     for target in targets:
         for name in _target_names(target):
@@ -453,6 +479,7 @@ def _reads(parts: Sequence[ast.AST], scope: Scope, index: Index) -> List[str]:
     called: Set[int] = set()
     for root in parts:
         for node in ast.walk(root):
+            _mark_inner_bindings(node, consumed)
             if (isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)
                     and isinstance(node.value, ast.Name) and node.value.id in ("self", "cls")):
                 # ctx must be Load: `self.w = x` does not *read* self.w, it writes it -- without
@@ -493,6 +520,30 @@ def _reads(parts: Sequence[ast.AST], scope: Scope, index: Index) -> List[str]:
     return ordered
 
 
+def _mark_inner_bindings(node: ast.AST, consumed: Set[int]) -> None:
+    """A comprehension's loop variable and a lambda's parameters are that expression's
+    own names, not reads of a variable with the same name outside it: mark every Name
+    node that refers to one of them as consumed."""
+    inner: List[ast.AST] = []
+    bound: Set[str] = set()
+    if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+        for i, gen in enumerate(node.generators):
+            bound.update(n.id for n in ast.walk(gen.target) if isinstance(n, ast.Name))
+            inner.extend(gen.ifs)
+            if i:
+                inner.append(gen.iter)         # the first iterable is evaluated outside
+        inner.extend([node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt])
+    elif isinstance(node, ast.Lambda):
+        bound.update(_parameters(node))
+        inner.append(node.body)
+    if not bound:
+        return
+    for part in inner:
+        for sub in ast.walk(part):
+            if isinstance(sub, ast.Name) and sub.id in bound:
+                consumed.add(id(sub))
+
+
 def _site_kind(stmt: ast.stmt) -> str:
     if isinstance(stmt, ast.AugAssign):
         return "aug"
@@ -514,13 +565,68 @@ def _home_key(index: Index, scope: Scope, name: str) -> Key:
     neither assigns nor takes as a parameter, but the module does, belongs to the module --
     otherwise a global read from three functions would look like three variables."""
     if name.startswith(("self.", "cls.")) and scope.class_name:
-        return (scope.label, f"<class {scope.class_name}>", name)
-    if name in scope.assigned or name in scope.params:
-        return (scope.label, scope.key_scope, name)
+        owner_label, owner_class = _attribute_owner(index, scope.label, scope.class_name, name)
+        return (owner_label, f"<class {owner_class}>", name)
     module = index.module_scope.get(scope.label)
+    if name in scope.globals and module is not None:
+        return (scope.label, MODULE_SCOPE, name)
+    if name not in scope.nonlocals and (name in scope.assigned or name in scope.params):
+        return (scope.label, scope.key_scope, name)
+    # A closure: a nested function reading (or `nonlocal`-writing) its enclosing function's variable.
+    enclosing = scope.parent
+    while enclosing is not None and not enclosing.is_module:
+        if name in enclosing.globals:
+            break
+        if name not in enclosing.nonlocals and (name in enclosing.assigned or name in enclosing.params):
+            return (enclosing.label, enclosing.key_scope, name)
+        enclosing = enclosing.parent
     if module is not None and module is not scope and name in module.assigned:
         return (scope.label, MODULE_SCOPE, name)
     return (scope.label, scope.key_scope, name)
+
+
+def _attribute_owner(index: Index, label: str, class_name: str, name: str) -> Tuple[str, str]:
+    """The class whose methods assign `self.<attr>`: this class, or else the nearest base
+    class that does -- an inherited attribute is one variable of one object."""
+    cache_key = (label, class_name, name)
+    if cache_key in index.attr_owner:
+        return index.attr_owner[cache_key]
+    index.attr_owner[cache_key] = (label, class_name)          # guards a cycle
+    owner = (label, class_name)
+    queue: List[Tuple[str, str]] = [(label, class_name)]
+    seen: Set[Tuple[str, str]] = set()
+    while queue:
+        current = queue.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+        if any(name in method.assigned for method in index.classes.get(current) or []):
+            owner = current
+            break
+        for base in index.class_bases.get(current, []):
+            if (current[0], base) in index.class_bases:
+                queue.append((current[0], base))
+            else:
+                queue.extend(k for k in index.class_bases if k[1] == base)
+    index.attr_owner[cache_key] = owner
+    return owner
+
+
+def _related_scopes(index: Index, key: Key) -> List[Scope]:
+    """Every scope where the name refers to this key's variable: the key's own scopes, plus
+    functions that read a module global, a closure's enclosing variable, a `global`
+    declaration, or an attribute inherited from a base class."""
+    label, _scope_key, name = key
+    scopes = list(index.scopes_for(key))
+    attribute = name.startswith(("self.", "cls."))
+    for scope in index.scopes:
+        if scope in scopes or (not attribute and scope.label != label):
+            continue
+        if attribute and not scope.class_name:
+            continue
+        if _home_key(index, scope, name) == key:
+            scopes.append(scope)
+    return scopes
 
 
 def _class_scope_key(index: Index, label: str, class_name: str) -> str:
@@ -549,8 +655,11 @@ def find_origin(index: Index, symbol: str, file_hint: Optional[str] = None,
     def _matches_file(scope: Scope) -> bool:
         if not file_hint:
             return True
-        return (scope.label == file_hint or scope.path.endswith(file_hint)
-                or os.path.basename(scope.path) == file_hint)
+        hint = file_hint.replace(os.sep, "/")
+        path = (scope.path or "").replace(os.sep, "/")
+        label = scope.label.replace(os.sep, "/")
+        return (label == hint or path == hint or label.endswith("/" + hint)
+                or path.endswith("/" + hint) or os.path.basename(path) == hint)
 
     assigns: List[Tuple[Scope, List[int]]] = []
     params: List[Scope] = []
@@ -564,7 +673,18 @@ def find_origin(index: Index, symbol: str, file_hint: Optional[str] = None,
             params.append(scope)
 
     if line_hint is not None:
-        # The scope that assigns it closest above the hinted line is the one being asked about.
+        # The function the hinted line is in, if it (or a function around it) binds the name.
+        enclosing = [s for s in index.scopes if not s.is_module and _matches_file(s)
+                     and s.func.lineno <= line_hint <= (getattr(s.func, "end_lineno", None) or s.func.lineno)]
+        if enclosing:
+            scope: Optional[Scope] = max(enclosing, key=lambda s: s.func.lineno)
+            while scope is not None and not scope.is_module:
+                if symbol in scope.globals:
+                    break
+                if symbol not in scope.nonlocals and (symbol in scope.assigned or symbol in scope.params):
+                    return scope, line_hint
+                scope = scope.parent
+        # Otherwise the scope that assigns it closest above the hinted line is the one being asked about.
         best: Optional[Tuple[int, Scope, int]] = None
         for scope, lines in assigns:
             earlier = [ln for ln in lines if ln <= line_hint]
@@ -661,7 +781,8 @@ def _expand_upstream(index: Index, graph: Graph, root: Key, root_ref: Optional[i
 
         label, _scope_key, name = key
         scopes = index.scopes_for(key)
-        defs = [(s, stmt) for s in scopes for stmt in s.stmts if name in targets_of(stmt)]
+        defs = [(s, stmt) for s in _related_scopes(index, key) for stmt in s.stmts
+                if name in targets_of(stmt) and _home_key(index, s, name) == key]
         defs.sort(key=lambda item: item[1].lineno)
 
         if not defs:
@@ -754,7 +875,7 @@ def _parameter_site(index: Index, graph: Graph, scope: Scope, name: str, depth: 
         site.note += " -- no call site found in the traced code"
         return site
     for caller in callers[:MAX_CALLERS]:
-        argument = _argument_for(caller.call, name, position)
+        argument = _argument_for(caller.call, name, position, _takes_self(caller.call, scope))
         if argument is None:
             continue
         for read in _reads([argument], caller.scope, index)[:MAX_PARENTS]:
@@ -772,7 +893,15 @@ def _parameter_site(index: Index, graph: Graph, scope: Scope, name: str, depth: 
     return site
 
 
-def _argument_for(call: ast.Call, name: str, position: int) -> Optional[ast.expr]:
+def _takes_self(call: ast.Call, target: Scope) -> bool:
+    """obj.method(a) passes `self` implicitly; utils.helper(a) -- a plain function reached
+    through a module -- does not."""
+    return (isinstance(call.func, ast.Attribute) and target.class_name is not None
+            and target.params[:1] in (["self"], ["cls"]))
+
+
+def _argument_for(call: ast.Call, name: str, position: int,
+                  implicit_self: bool = False) -> Optional[ast.expr]:
     """The expression a call passes for parameter `name`. Keyword first (it is explicit),
     then the positional slot -- offset by one for a method call, whose `self` is implicit."""
     for keyword in call.keywords:
@@ -781,7 +910,7 @@ def _argument_for(call: ast.Call, name: str, position: int) -> Optional[ast.expr
     if position < 0:
         return None
     index = position
-    if isinstance(call.func, ast.Attribute) and index > 0:
+    if implicit_self:
         index -= 1                             # obj.method(a): `a` is parameter 1, not 0
     if 0 <= index < len(call.args):
         argument = call.args[index]
@@ -810,7 +939,7 @@ def _expand_downstream(index: Index, graph: Graph, root: Key, root_ref: Optional
         label, _scope_key, name = key
         edges: List[Edge] = []
         effects = 0
-        for scope in index.scopes_for(key):
+        for scope in _related_scopes(index, key):
             for stmt in scope.stmts:
                 if name not in _reads(read_parts(stmt), scope, index):
                     continue
@@ -831,6 +960,7 @@ def _expand_downstream(index: Index, graph: Graph, root: Key, root_ref: Optional
                         effects += 1
                     else:
                         node.more_out += 1
+                        graph.truncated = True
                 _forward_into_calls(index, graph, scope, stmt, name, depth, edges, frontier)
                 if isinstance(stmt, ast.Return):
                     _forward_through_return(index, graph, scope, stmt, depth, edges, frontier)
@@ -866,7 +996,7 @@ def _forward_into_calls(index: Index, graph: Graph, scope: Scope, stmt: ast.stmt
                 if name not in _reads([argument], scope, index):
                     continue
                 slot = position
-                if isinstance(node.func, ast.Attribute):
+                if _takes_self(node, target_scope):
                     slot += 1                  # skip the implicit self
                 if slot >= len(target_scope.params):
                     continue

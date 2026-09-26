@@ -85,9 +85,10 @@ _MAX_VERIFY_FIX_CYCLES = 2      # additional change->verify loops if verificatio
 _TEXT_EXTS = {
     ".py", ".pyi", ".md", ".rst", ".txt", ".toml", ".yaml", ".yml", ".json", ".cfg", ".ini",
     ".sh", ".bash", ".js", ".jsx", ".ts", ".tsx", ".html", ".css", ".sql", ".c", ".h", ".cc",
-    ".cpp", ".hpp", ".cu", ".cuh", ".java", ".go", ".rs", ".rb", ".lua", ".r", ".env.example",
+    ".cpp", ".hpp", ".cu", ".cuh", ".java", ".go", ".rs", ".rb", ".lua", ".r",
 }
-_TEXT_NAMES = {"Makefile", "Dockerfile", "Procfile", "README", "LICENSE", ".gitignore"}
+# Matched on the whole file name (splitext(".env.example") is ".example", never an entry above).
+_TEXT_NAMES = {"Makefile", "Dockerfile", "Procfile", "README", "LICENSE", ".gitignore", ".env.example"}
 _SKIP_DIRS = {
     ".git", ".hg", ".svn", "__pycache__", "node_modules", ".venv", "venv", "env", ".mypy_cache",
     ".pytest_cache", ".ruff_cache", ".tox", "dist", "build", ".idea", ".vscode", ".pulse_history",
@@ -144,9 +145,10 @@ CODE_SYSTEM_PROMPT = (
     "repro.py'. This is a general terminal, not a fixed set of commands -- compose whatever command "
     "actually answers your question. Prefer it over guessing: to see whether a file parses, to "
     "reproduce a bug before proposing a fix, to run a project's existing tests/linters, or to check "
-    "git state. A command that deletes files, rewrites git history, reaches outside the project, or "
-    "starts a background process pauses for the user's confirmation first -- expect that only for "
-    "those cases, not for ordinary read/run/test commands. Large output comes back truncated (head "
+    "git state. A command that deletes files, rewrites git history, reaches outside the project, "
+    "starts a background process, or overwrites a file via a shell redirect (`> file`, `>> file`, "
+    "tee) pauses for the user's confirmation first -- expect that only for those cases, not for "
+    "ordinary read/run/test commands (`2>&1` and `2>/dev/null` are fine). Large output comes back truncated (head "
     "and tail kept); narrow the command if you need a different slice.\n"
 )
 
@@ -201,6 +203,14 @@ _REVISE = (
     "Your change has a problem:\n{problem}\n\n"
     "Revise it. Respond with ONLY the corrected, complete JSON object from step 2 -- every change, "
     "not just the fixed one -- no prose, no fences."
+)
+
+_REVISE_APPLIED = (
+    "Your change has ALREADY been applied to the files, but it has a problem:\n{problem}\n\n"
+    "Respond with ONLY a JSON object in the step 2 format holding just the ADDITIONAL edits needed "
+    "on top of the files as they are now: every old[i] must match the current, already-changed "
+    "text; do not repeat an edit (or an insertion) that is already in place, and do not create a "
+    "file that now exists. No prose, no fences."
 )
 
 _VERIFY_TERMINAL = (
@@ -371,7 +381,7 @@ def expand_paths(root, args):
         pattern = os.path.expanduser(arg)
         if not os.path.isabs(pattern):
             pattern = os.path.join(root, pattern)
-        matches = sorted(glob.glob(pattern)) if any(c in pattern for c in "*?[") else [pattern]
+        matches = sorted(glob.glob(pattern, recursive=True)) if any(c in pattern for c in "*?[") else [pattern]
         if not matches:
             problems.append(f"no match for '{arg}'")
         for match in matches:
@@ -392,8 +402,11 @@ def expand_paths(root, args):
 
 
 def _inside(root, path):
+    # realpath, not abspath: a symlink inside the project (data -> /mnt/...) must not let a
+    # write land outside it.
     try:
-        return os.path.commonpath([root, os.path.abspath(path)]) == root
+        real_root = os.path.realpath(root)
+        return os.path.commonpath([real_root, os.path.realpath(path)]) == real_root
     except ValueError:
         return False
 
@@ -713,11 +726,14 @@ def _run_turn_passes(cli, request):
             break
         cprint(f"[Pulse Code] Verification failed -- attempting a fix "
                f"({_cycle + 1}/{_MAX_VERIFY_FIX_CYCLES})", color=_YELLOW)
-        revised = _revise(cli, _IMPLEMENT.format(plan=plan), f"Verification found: {verify_note or 'verification failed'}")
+        # The change is on disk now: ask only for what goes on top of it, or an insertion
+        # the model re-sends as part of "the complete change" is applied a second time.
+        revised = _revise(cli, implement, f"Verification found: {verify_note or 'verification failed'}",
+                          applied=True)
         if revised is None:
             cprint("[Pulse Code] ⚠ Could not produce a fix for the verification failure; stopping here.", color=_RED)
             break
-        new_changes, new_fix = _settle(cli, request, plan, revised, _IMPLEMENT.format(plan=plan))
+        new_changes, new_fix = _settle(cli, request, plan, revised, implement, applied=True)
         if new_fix is None:
             break
         outcome, apply_summary = _confirm_and_apply(cli, request, plan, new_fix, new_changes)
@@ -775,13 +791,16 @@ def _run_verification_pass(cli, fix, changes):
         cli._in_verification_pass = False
 
 
-def _revise(cli, implement, problem):
+def _revise(cli, implement, problem, applied=False):
+    prompt = (_REVISE_APPLIED if applied else _REVISE).format(problem=problem)
+    if implement:
+        prompt += "\n\nThe step 2 instructions, for reference:\n" + implement
     with _Spinner("Revising"):
-        raw = cli._call_model(_REVISE.format(problem=problem), max_tokens=_AGENT_MAX_TOKENS)
+        raw = cli._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS)
     return parse_change(cli, raw)
 
 
-def _settle(cli, request, plan, fix, implement):
+def _settle(cli, request, plan, fix, implement, applied=False):
     """Get `fix` to the point where every part of it will go through, or give up. Returns
     (changes, fix) or (None, None) after saying why. All-or-nothing starts here: a change
     with any unresolved part is never applied."""
@@ -813,7 +832,7 @@ def _settle(cli, request, plan, fix, implement):
         if revised is None:
             text = "\n".join(f"- [{label}] {reason}: {str(snippet).splitlines()[0][:100] if str(snippet).strip() else ''}"
                              for snippet, label, reason in problems)
-            revised = _revise(cli, implement, text)
+            revised = _revise(cli, implement, text, applied=applied)
         if revised is None:
             break
         fix = revised
