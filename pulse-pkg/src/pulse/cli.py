@@ -104,7 +104,9 @@ class PulseASTInjector(ast.NodeTransformer):
     other line number in the script moves.
 
     Where it goes: first thing inside the script's own top-level `if __name__ ==
-    "__main__":` block if it has one, otherwise right after the last top-level import.
+    "__main__":` block if it has one, otherwise right after the script's leading block of
+    imports -- never after code that already runs (a late `import json` after the
+    training loop must not pull it past the loop).
     """
 
     def __init__(self, mode="cli"):
@@ -131,13 +133,24 @@ class PulseASTInjector(ast.NodeTransformer):
         return call
 
     @staticmethod
+    def _is_import_only(stmt):
+        """An import, or a `try:`/`if` that only imports (an optional-dependency shim)."""
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            return True
+        if isinstance(stmt, (ast.Try, ast.If)):
+            parts = list(stmt.body) + list(stmt.orelse) + list(getattr(stmt, "finalbody", []))
+            for handler in getattr(stmt, "handlers", []):
+                parts.extend(handler.body)
+            return bool(parts) and all(
+                isinstance(p, ast.Pass) or PulseASTInjector._is_import_only(p) for p in parts)
+        return False
+
+    @staticmethod
     def _find_import_insert_idx(body):
-        """After the last top-level import; failing that, after a module docstring."""
+        """After the leading block of imports (and a module docstring before it), i.e.
+        before the first statement that runs the script's own code."""
         idx = 0
-        for i, child in enumerate(body):
-            if isinstance(child, (ast.Import, ast.ImportFrom)):
-                idx = i + 1
-        if idx == 0 and body:
+        if body:
             first = body[0]
             if (
                 isinstance(first, ast.Expr)
@@ -145,6 +158,8 @@ class PulseASTInjector(ast.NodeTransformer):
                 and isinstance(first.value.value, str)
             ):
                 idx = 1
+        while idx < len(body) and PulseASTInjector._is_import_only(body[idx]):
+            idx += 1
         return idx
 
     @staticmethod
@@ -205,7 +220,7 @@ def _already_uses_pulse(tree):
 # Becoming `python script.py`
 # ---------------------------------------------------------------------------------------
 
-def _set_process_view(script_path, script_args):
+def _set_process_view(script_path, script_args, argv0=None):
     """Make this process look like `python script.py args...` to anything that asks.
 
     Pulse asks: a restart re-runs `[python, script_path] + sys.argv[1:]`. The script
@@ -215,7 +230,7 @@ def _set_process_view(script_path, script_args):
     # not the directory of the link, so the script's sibling modules are found beside the
     # real file. (`__file__` and sys.argv[0] stay as typed, also as under python.)
     script_dir = os.path.dirname(os.path.realpath(script_path))
-    sys.argv = [script_path] + list(script_args)
+    sys.argv = [argv0 or script_path] + list(script_args)
     if not sys.path or sys.path[0] != script_dir:
         sys.path.insert(0, script_dir)
 
@@ -570,9 +585,15 @@ def run_script(script, script_args, stream=False, cwd=None, again=False):
     except (SyntaxError, UnicodeDecodeError, LookupError) as exc:
         print(f"Error: cannot decode '{script_path}': {exc}")
         return 1
+    except OSError as exc:                              # e.g. no read permission
+        print(f"Error: cannot read '{script_path}': {exc.strerror or exc}")
+        return 1
 
     pulse_cli._RESTART_ARGV_HOOK = _restart_argv
-    _set_process_view(script_path, script_args)
+    # sys.argv[0] as typed, like `python train.py` -- unless --cwd moved us away from
+    # where a relative path was typed.
+    argv0 = script if (cwd is None or os.path.isabs(script)) else script_path
+    _set_process_view(script_path, script_args, argv0=argv0)
 
     # A run that Pulse itself restarted reports back to the process that restarted it,
     # which owns the retry loop and feeds the output to the agent. It must not start a
@@ -643,9 +664,16 @@ def main(argv=None):
         for argument in argv)
     if (argv and argv[0] not in console_commands and argv[0] not in ("run", "code")
             and names_a_script):
-        offered = [a for a in argv if a.split("=", 1)[0] in launch_options]
+        offered, values = [], set()
+        for i, a in enumerate(argv):
+            if a.split("=", 1)[0] in launch_options:
+                offered.append(a)
+                if a == "--cwd" and i + 1 < len(argv):      # --cwd takes the next argument
+                    offered.append(argv[i + 1])
+                    values.add(i + 1)
         if offered:
-            script = next((a for a in argv if not a.startswith("-")), "train.py")
+            script = next((a for i, a in enumerate(argv) if not a.startswith("-") and i not in values),
+                          "train.py")
             print(f"pulse: {' '.join(offered)} is an option for starting a run.\n")
             print(f"  to start one:            pulse run {' '.join(offered)} {script}")
             print(f"  to watch one already going:  pulse {script}\n")
