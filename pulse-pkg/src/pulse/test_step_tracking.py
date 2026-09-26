@@ -48,14 +48,17 @@ cli.watch_locals = {"step": 4, "loss": 0.9}
 cli.update()
 assert cli.step == 5, f"step should not advance when the real loop var hasn't moved, got {cli.step}"
 
-# Tick 5: loop var went DOWN (a new epoch/run reset it) -- must not decrement or misread this
-# as a step; it should just re-baseline.
+# Tick 5: loop var went DOWN (a new epoch reset it) -- must not decrement. The value it
+# wrapped to is itself a real iteration (batch 0 of the next epoch), so it counts as
+# raw+1 = 1 step; re-baselining without counting it lost one step per epoch (15 iterations
+# over 3 epochs read as 13 -- see tests/sweep/test_sweep_cli_loop_integration.py
+# test_bug_inner_loop_counter_wrap_drops_a_step_each_epoch).
 cli.watch_locals = {"step": 0, "loss": 0.9}
 cli.update()
-assert cli.step == 5, f"a loop-var reset should not move the step counter at all, got {cli.step}"
+assert cli.step == 6, f"a loop-var reset to 0 is one real iteration, expected 6, got {cli.step}"
 cli.watch_locals = {"step": 1, "loss": 0.9}
 cli.update()
-assert cli.step == 6, f"after re-baselining, the next real advance should count normally, got {cli.step}"
+assert cli.step == 7, f"after re-baselining, the next real advance should count normally, got {cli.step}"
 
 print("PASS -- step count tracks the real loop variable's actual advances: not too fast "
       "(no double counting, no counting a reset), not too slow (multi-step jumps and "
