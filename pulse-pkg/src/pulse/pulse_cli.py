@@ -1146,6 +1146,9 @@ SYSTEM_PROMPT = (
     "    TERMINAL: <shell command> -- run a REAL command in the project's working directory and get "
     "back its actual stdout, stderr, exit code and duration -- e.g. 'TERMINAL: pytest tests/test_model.py', "
     "'TERMINAL: python -m py_compile model.py', 'TERMINAL: git status', 'TERMINAL: grep -R \"loss_val\" .'. "
+    "The command is ONE line -- only the text after 'TERMINAL:' on that line runs, so a heredoc or a "
+    "script spread over several lines arrives cut off; for Python, join statements with ';' in one "
+    "python3 -c \"...\" line. "
     "This is not one of the narrow tools above with a fixed shape -- you compose the command yourself, the "
     "way you would at a real shell. Use it to inspect files, search code, run linters/tests, check git "
     "state, reproduce a bug, or run a small diagnostic script. NEVER assume a command succeeded because "
@@ -1263,7 +1266,12 @@ SYSTEM_PROMPT = (
     "project's model.py), fix it there via files[i] rather than working around it in the main "
     "script.\n"
     "  - If you were not shown the code, or the user has not asked for a fix, do not emit this JSON "
-    "format -- answer normally per RESPONSE FORMAT above."
+    "format -- answer normally per RESPONSE FORMAT above.\n"
+    "NO CHANGE NEEDED: being asked to fix something is not proof that the code is wrong. If your "
+    "diagnosis finds no bug in the code (the run is healthy, the alarm was noise, or the cause is "
+    "outside the code), respond instead with ONLY {\"no_change\": true, \"reason\": \"one sentence\"} "
+    "-- nothing is written, and that is a valid, complete answer. Never change a working program "
+    "just to have made a change."
 )
 
 class AgentRequestFailed(Exception):
@@ -1387,17 +1395,80 @@ def register_openrouter_model(slug: str) -> str:
 import math as _math_module
 
 
+_CALC_MAX_INT_BITS = 4096        # ~1200 digits: plenty for any ratio / magnitude check
+_CALC_BIG_ARG_FUNCS = {"factorial", "comb", "perm"}
+_CALC_BINOPS = {
+    ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b,
+    ast.Mult: lambda a, b: a * b, ast.Div: lambda a, b: a / b,
+    ast.FloorDiv: lambda a, b: a // b, ast.Mod: lambda a, b: a % b,
+    ast.Pow: lambda a, b: a ** b,
+}
+_CALC_UNARY = {ast.USub: lambda a: -a, ast.UAdd: lambda a: +a}
+_CALC_BUILTINS = {"abs": abs, "min": min, "max": max, "round": round, "sum": sum}
+
+
+def _calc_check_size(value):
+    if isinstance(value, int) and not isinstance(value, bool) and value.bit_length() > _CALC_MAX_INT_BITS:
+        raise ValueError("result too large")
+    return value
+
+
+def _calc_eval_node(node):
+    if isinstance(node, ast.Expression):
+        return _calc_eval_node(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return _calc_check_size(node.value)
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return [_calc_eval_node(e) for e in node.elts]
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _CALC_UNARY:
+        return _CALC_UNARY[type(node.op)](_calc_eval_node(node.operand))
+    if isinstance(node, ast.BinOp) and type(node.op) in _CALC_BINOPS:
+        left, right = _calc_eval_node(node.left), _calc_eval_node(node.right)
+        if not all(isinstance(v, (int, float, complex)) for v in (left, right)):
+            raise TypeError("arithmetic is only allowed on numbers")   # e.g. [0] * 10**9
+        if isinstance(node.op, ast.Pow) and isinstance(left, int) and isinstance(right, int):
+            # Estimate the result size BEFORE computing it: big-int pow holds
+            # the GIL for minutes (9**9**9 is 370M digits).
+            if right > 0 and abs(left) > 1 and right * _math_module.log2(abs(left)) > _CALC_MAX_INT_BITS:
+                raise ValueError("result too large")
+        return _calc_check_size(_CALC_BINOPS[type(node.op)](left, right))
+    if isinstance(node, ast.Name):
+        if node.id in _CALC_BUILTINS:
+            return _CALC_BUILTINS[node.id]
+        if not node.id.startswith("_") and hasattr(_math_module, node.id):
+            return getattr(_math_module, node.id)
+        raise NameError(f"name '{node.id}' is not defined")
+    if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+            and node.value.id == "math" and not node.attr.startswith("_")
+            and hasattr(_math_module, node.attr)):
+        return getattr(_math_module, node.attr)
+    if isinstance(node, ast.Call) and not node.keywords:
+        func = _calc_eval_node(node.func)
+        if not callable(func):
+            raise TypeError("not a function")
+        args = [_calc_eval_node(a) for a in node.args]
+        if getattr(func, "__name__", "") in _CALC_BIG_ARG_FUNCS and any(
+                isinstance(a, (int, float)) and abs(a) > 5000 for a in args):
+            raise ValueError("argument too large")
+        return _calc_check_size(func(*args))
+    raise ValueError(f"unsupported expression ({type(node).__name__})")
+
+
 def _safe_eval_math(expr: str):
     """Evaluate a plain arithmetic/math expression deterministically -- LLMs
     are unreliable at exact arithmetic, so the agent can hand off anything
-    like update magnitudes or ratios here instead of eyeballing it. Only
-    numbers, operators, and `math` module names are reachable; no builtins,
-    no attribute access beyond that, so this is safe to eval() directly.
+    like update magnitudes or ratios here instead of eyeballing it. The
+    expression is parsed and walked as an AST: only numbers, arithmetic
+    operators, lists/tuples, `math` functions/constants (bare or as math.x)
+    and abs/min/max/round/sum are allowed -- no other names, no attribute
+    access, no eval(). Integer results are capped in size so a CALC like
+    9**9**9 returns an error at once instead of freezing the caller (the
+    training thread or the check-in worker). Shared with pulse.py.
     """
-    allowed_names = {k: v for k, v in vars(_math_module).items() if not k.startswith("_")}
-    allowed_names["math"] = _math_module
     try:
-        return eval(expr, {"__builtins__": {}}, allowed_names)  # noqa: S307 -- restricted namespace above
+        if len(expr) > 2000:
+            raise ValueError("expression too long")
+        return _calc_eval_node(ast.parse(expr.strip(), mode="eval"))
     except Exception as exc:
         return f"(calc error: {exc})"
 
@@ -1543,7 +1614,10 @@ _PASS3_IMPLEMENT_TMPL = (
     "smallest possible change -- a single line or a few adjacent lines -- and only widen the edit if "
     "the root cause genuinely can't be fixed that narrowly. Do not refactor, restructure, or rewrite "
     "code beyond what's needed to fix the diagnosed root cause. Respond with ONLY the code-fix JSON "
-    "object described in your instructions (old/new/explanation) -- no prose, no markdown fences."
+    "object described in your instructions (old/new/explanation) -- no prose, no markdown fences. "
+    "If the analysis found no bug -- the run is behaving correctly, or the problem is not in the "
+    "code -- do not invent a change: respond with ONLY "
+    '{{"no_change": true, "reason": "one sentence"}} and nothing will be written.'
 )
 _PASS4_VERIFY_TMPL = (
     "Your analysis:\n{diagnosis}\n\n"
@@ -1587,6 +1661,12 @@ _PASS5_SWEEP = (
     'if none"}.'
 )
 _IMPLEMENT_KEYWORDS = ("fix", "edit", "patch", "change the code", "apply", "implement")
+# Whole words only: a substring test sent "what does the prefix layer do?" or a question
+# about credit/application data down the code-editing path. Inflections (fixes, fixed,
+# fixing, applied, ...) still count.
+_IMPLEMENT_RE = re.compile(
+    r"\b(?:fix(?:es|ed|ing)?|edit(?:s|ed|ing)?|patch(?:es|ed|ing)?|change the code|"
+    r"appl(?:y|ies|ied|ying)|implement(?:s|ed|ing)?)\b", re.IGNORECASE)
 _MAX_VERIFY_ATTEMPTS = 3
 
 # How many times the fix pass may ask to see more code before giving up.
@@ -1602,7 +1682,8 @@ _PASS3_NO_TOOLS_NOTE = (
     "You did not return the code-fix JSON. Everything you were given is above. If you need to "
     "see more code, ask for it with a directive line -- e.g. 'VIEW: <file>:<start>-<end>' or "
     "'GREP: <pattern>' -- and it will be answered. Otherwise respond with ONLY the code-fix "
-    "JSON object (old/new/files/explanation), fixing the bug and nothing else."
+    "JSON object (old/new/files/explanation), fixing the bug and nothing else -- or, if nothing "
+    'in the code needs to change, ONLY {"no_change": true, "reason": "one sentence"}.'
 )
 _PASS4_RECHECK_TMPL = (
     "Your analysis:\n{diagnosis}\n\n"
@@ -1710,15 +1791,57 @@ def _find_fuzzy_snippet_span(content: str, old: str):
     first_line_idx, last_line_idx = matches[0]
     start_offset = sum(len(l) for l in content_lines[:first_line_idx])
     end_offset = sum(len(l) for l in content_lines[:last_line_idx + 1])
+    # Stop before the last line's line break: the replacement has none of its own,
+    # so including it glued the following line onto the fix ("b = 3    return a").
+    last_line = content_lines[last_line_idx]
+    end_offset -= len(last_line) - len(last_line.rstrip("\r\n"))
     return start_offset, end_offset
 
 
+def _token_boundary_occurrences(content: str, old: str) -> List[int]:
+    """Start offsets of every occurrence of `old` in `content` that does not
+    begin or end in the middle of a token: 'lr = 0.1' must not match inside
+    'lr = 0.15' (which the replacement would turn into 'lr = 0.015'). A
+    snippet may still be part of a line ('lr=0.1' inside 'SGD(lr=0.1)')."""
+    def _word(ch):
+        return ch.isalnum() or ch == "_"
+    hits = []
+    start = content.find(old)
+    while start != -1 and old:
+        end = start + len(old)
+        ok_start = start == 0 or not (_word(old[0]) and _word(content[start - 1]))
+        ok_end = end == len(content) or not (_word(old[-1]) and _word(content[end]))
+        if ok_start and ok_end:
+            hits.append(start)
+        start = content.find(old, start + 1)
+    return hits
+
+
+def _reindent_like(new: str, old: str, actual_old: str) -> str:
+    """Re-indent a replacement matched only whitespace-insensitively: when
+    `new` was written at the same indentation as the (mis-indented) `old`,
+    shift it to where the matched code actually sits."""
+    def _indent(text):
+        for line in text.splitlines():
+            if line.strip():
+                return line[:len(line) - len(line.lstrip())]
+        return ""
+    have, quoted, actual = _indent(new), _indent(old), _indent(actual_old)
+    if have == actual or have != quoted:
+        return new
+    out = []
+    for line in new.split("\n"):
+        if line.strip() and line.startswith(quoted):
+            line = actual + line[len(quoted):]
+        out.append(line)
+    return "\n".join(out)
+
+
 def _banner_wrap_fix(old: str, new: str, path: str) -> str:
-    """Wrap a code-fix replacement so the OLD code stays visible, commented
-    out, directly above the NEW (live) code -- instead of silently
-    swapping one for the other with no trace in the file itself. Written
-    directly into the file content saved to disk, so it shows up the next
-    time the file is opened, not just in Pulse's own console output.
+    """The text written in place of `old`. It used to keep the OLD code as a
+    commented-out banner above the new code; it now returns `new` unchanged
+    -- a banner broke indentation-sensitive blocks and cluttered the user's
+    file, and the old code is kept in .pulse_history (/log, /revert) instead.
     """
     return new
 
@@ -2230,6 +2353,116 @@ def _mllint_find_calls_in_loops(tree, names):
     return found
 
 
+def _mllint_imported_modules(tree) -> set:
+    """Top-level names of every module a file imports ('torch' for
+    `import torch.nn as nn` and `from torch import nn`)."""
+    mods = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            mods.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            mods.add(node.module.split(".")[0])
+    return mods
+
+
+def _mllint_seed_from_loop_var(tree, call_node) -> bool:
+    """True when a seed call's argument uses the target of a loop enclosing it
+    (`for seed in seeds: np.random.seed(seed)`): a multi-seed sweep, where
+    each iteration is its own experiment -- not a per-step reseed."""
+    arg_names = {n.id for a in list(call_node.args) + [k.value for k in call_node.keywords]
+                 for n in ast.walk(a) if isinstance(n, ast.Name)}
+    if not arg_names:
+        return False
+    for loop in ast.walk(tree):
+        if not isinstance(loop, (ast.For, ast.AsyncFor)):
+            continue
+        targets = {n.id for n in ast.walk(loop.target) if isinstance(n, ast.Name)}
+        if targets & arg_names and any(inner is call_node for stmt in loop.body for inner in ast.walk(stmt)):
+            return True
+    return False
+
+
+_MLLINT_SOFTMAX_FUNCS = ("softmax", "log_softmax")
+
+
+def _mllint_softmax_call_line(node) -> Optional[int]:
+    for inner in ast.walk(node):
+        if isinstance(inner, ast.Call) and _mllint_fname(inner) in _MLLINT_SOFTMAX_FUNCS:
+            return inner.lineno
+    return None
+
+
+def _mllint_softmax_into_loss(tree) -> Optional[int]:
+    """Line of a functional softmax whose output actually reaches a
+    cross-entropy loss in this file -- as the loss call's input (directly, or
+    through a variable assigned from it), or as what a forward()/call()
+    returns (the model's output, which is then fed to the loss). A softmax
+    used only on the side (accuracy, logging probabilities) is not flagged."""
+    softmaxed: Dict[str, int] = {}
+    criteria = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            line = _mllint_softmax_call_line(node.value)
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    if line:
+                        softmaxed[t.id] = line
+                    if isinstance(node.value, ast.Call) and _mllint_fname(node.value) == "CrossEntropyLoss":
+                        criteria.add(t.id)
+                elif (isinstance(t, ast.Attribute) and isinstance(node.value, ast.Call)
+                        and _mllint_fname(node.value) == "CrossEntropyLoss"):
+                    criteria.add(t.attr)
+
+    def _reaches(expr) -> Optional[int]:
+        line = _mllint_softmax_call_line(expr)
+        if line:
+            return line
+        return next((softmaxed[n.id] for n in ast.walk(expr)
+                     if isinstance(n, ast.Name) and n.id in softmaxed), None)
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in ("forward", "call", "__call__"):
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Return) and inner.value is not None:
+                    line = _reaches(inner.value)
+                    if line:
+                        return line
+        if isinstance(node, ast.Call) and node.args and (
+                _mllint_fname(node) == "cross_entropy" or _mllint_fname(node) in criteria):
+            line = _reaches(node.args[0])
+            if line:
+                return line
+    return None
+
+
+def _mllint_flagged_span(src: str, lineno: int) -> tuple:
+    """(start, end) char offsets of the source a lint finding at `lineno`
+    points at: the outermost call starting on that line (a whole multi-line
+    compile(...)), else just that line."""
+    lines = src.splitlines(keepends=True)
+    if not 1 <= lineno <= len(lines):
+        return 0, 0
+
+    def _offset(line, col):
+        text = lines[line - 1]
+        return sum(len(l) for l in lines[:line - 1]) + len(text.encode("utf-8")[:col].decode("utf-8", "ignore"))
+
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        tree = None
+    best = None
+    for node in (ast.walk(tree) if tree is not None else ()):
+        if isinstance(node, ast.Call) and node.lineno == lineno and getattr(node, "end_lineno", None):
+            span = (_offset(node.lineno, node.col_offset), _offset(node.end_lineno, node.end_col_offset))
+            if best is None or span[1] - span[0] > best[1] - best[0]:
+                best = span
+    if best is not None:
+        return best
+    start = sum(len(l) for l in lines[:lineno - 1])
+    return start, start + len(lines[lineno - 1])
+
+
 def _mllint_scan(trees) -> List[tuple]:
     """trees: iterable of (label, path, text, tree). Returns a list of
     (label, lineno, message) findings."""
@@ -2237,6 +2470,11 @@ def _mllint_scan(trees) -> List[tuple]:
     softmax_loc = crossentropy_loc = sigmoid_loc = bce_logits_loc = None
     softmax_module_loc = nllloss_loc = None
     trees = list(trees)
+    imported = set()
+    for _label, _path, _text, _tree in trees:
+        imported |= _mllint_imported_modules(_tree)
+    uses_torch = "torch" in imported
+    uses_autodiff = bool(imported & {"torch", "tensorflow", "keras", "jax"})
 
     for label, _path, _text, tree in trees:
         # Per-file accumulators used by the cross-check passes below.
@@ -2311,7 +2549,9 @@ def _mllint_scan(trees) -> List[tuple]:
                             "compare continuous values and are typically meaningless against class labels -- "
                             "worth double-checking accuracy or similar is what's actually meant to be watched."))
 
-            if fname in ("Softmax", "LogSoftmax", "softmax", "log_softmax") and softmax_loc is None:
+            # A Softmax/LogSoftmax *module* is almost always a model's last layer; a
+            # functional softmax only counts when its output reaches the loss (below).
+            if fname in ("Softmax", "LogSoftmax") and softmax_loc is None:
                 softmax_loc = (label, node.lineno)
             if fname in ("CrossEntropyLoss", "cross_entropy") and crossentropy_loc is None:
                 crossentropy_loc = (label, node.lineno)
@@ -2642,8 +2882,15 @@ def _mllint_scan(trees) -> List[tuple]:
         # Pass 4: per-file, non-function-scoped checks.
         # --------------------------------------------------------------
 
+        if softmax_loc is None:
+            fed_line = _mllint_softmax_into_loss(tree)
+            if fed_line:
+                softmax_loc = (label, fed_line)
+
         # ---- GENERAL: PRNG reseeded on every iteration of a loop ----
         for call_node in _mllint_find_calls_in_loops(tree, _MLLINT_SEED_FUNC_NAMES):
+            if _mllint_seed_from_loop_var(tree, call_node):
+                continue
             findings.append((label, call_node.lineno,
                 f"a {_mllint_fname(call_node)}(...) call sits inside a loop here -- reseeding a PRNG on "
                 "every iteration forces every epoch/step to draw the exact same sequence of 'random' "
@@ -2671,7 +2918,8 @@ def _mllint_scan(trees) -> List[tuple]:
 
         # ---- GENERAL: loss accumulated into a running total without
         # detaching it from the autodiff graph first (torch/tf tensors) ----
-        for node in ast.walk(tree):
+        # Only where an autodiff framework is in use: a numpy loss holds no graph.
+        for node in (ast.walk(tree) if uses_autodiff else ()):
             if not (isinstance(node, ast.AugAssign) and isinstance(node.op, ast.Add)):
                 continue
             target = node.target
@@ -2749,7 +2997,8 @@ def _mllint_scan(trees) -> List[tuple]:
                             "if the mismatched path only runs during eval/inference this can be silent."))
 
         # ---- Evaluation-looking function without no_grad()/eval() ----
-        for node in ast.walk(tree):
+        # torch-only advice: Keras/numpy code (model.evaluate) has neither.
+        for node in (ast.walk(tree) if uses_torch else ()):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             lname = node.name.lower()
@@ -3310,6 +3559,7 @@ class PulseCLI:
         self.code_text = code_text
         if script_path is not None:
             self.script_path = script_path
+        self._snapshot_changelog_baseline()
         self._load_config()
 
     @staticmethod
@@ -6331,7 +6581,7 @@ class PulseCLI:
         if not verdict or "resolved" not in verdict:
             return True, ""
         reason = str(verdict.get("reason", "")).strip() or "(no reason given)"
-        if bool(verdict["resolved"]):
+        if self._as_bool(verdict["resolved"]):
             cprint(f"[Pulse] ✓ Re-run checked: the fix did its job -- {reason}", color=_YELLOW)
             return True, reason
         cprint(f"[Pulse] ⚠ Re-run checked: the fix did NOT do its job -- {reason}", color=_RED)
@@ -6496,6 +6746,7 @@ class PulseCLI:
 
         self._label_for_path = label_for_path
         self._path_for_label = path_for_label
+        self._snapshot_changelog_baseline()
 
     def _occurrence_at_crash(self, content: str, snippet: str, path: str) -> Optional[int]:
         """Offset of the occurrence of `snippet` containing the crash line in
@@ -6715,9 +6966,18 @@ class PulseCLI:
         conversation -- the periodic check-in runs its own conversation on a
         worker thread and must neither read nor grow agent_history.
         """
+        if history is None:
+            recent = self.agent_history[-10:]
+            # The turn's question + code/traceback message must survive the window:
+            # each tool round adds two messages, so after a few rounds a pass would
+            # otherwise be asked to diagnose or write a fix without seeing the code.
+            question_msg = getattr(self, "_turn_question_msg", None)
+            if (question_msg is not None and not any(m is question_msg for m in recent)
+                    and any(m is question_msg for m in self.agent_history)):
+                recent = [question_msg] + recent
         messages = (
             [{"role": "system", "content": system or getattr(self, "_system_prompt_override", None) or SYSTEM_PROMPT}]
-            + (self.agent_history[-10:] if history is None else list(history))
+            + (recent if history is None else list(history))
             + [{"role": "user", "content": instruction}]
         )
         model = self.agent_model_string or PROVIDERS[self.agent_provider]["model"]
@@ -6769,14 +7029,14 @@ class PulseCLI:
         # but keeps type-checkers happy and fails safe if that ever changes.
         raise AgentRequestFailed(self._classify_model_error(last_exc) if last_exc else "unknown error")
 
-    _CALC_RE = re.compile(r"^\s*CALC:\s*(.+)$", re.MULTILINE)
-    _PROMOTE_RE = re.compile(r"^\s*PROMOTE:\s*(.+)$", re.MULTILINE)
-    _GPUTRACK_RE = re.compile(r"^\s*GPUTRACK:\s*(.+)$", re.MULTILINE)
-    _GPUUNTRACK_RE = re.compile(r"^\s*GPUUNTRACK:\s*(.+)$", re.MULTILINE)
-    _SENSITIVITY_RE = re.compile(r"^\s*SENSITIVITY:\s*(.+)$", re.MULTILINE)
-    _NORMAL_START_RE = re.compile(r"^\s*NORMAL_START:\s*(.+)$", re.MULTILINE)
-    _GREP_RE = re.compile(r"^\s*GREP:\s*(.+)$", re.MULTILINE)
-    _VIEW_RE = re.compile(r"^\s*VIEW:\s*(.+)$", re.MULTILINE)
+    _CALC_RE = re.compile(r"^\s*CALC:[ \t]*(.+)$", re.MULTILINE)
+    _PROMOTE_RE = re.compile(r"^\s*PROMOTE:[ \t]*(.+)$", re.MULTILINE)
+    _GPUTRACK_RE = re.compile(r"^\s*GPUTRACK:[ \t]*(.+)$", re.MULTILINE)
+    _GPUUNTRACK_RE = re.compile(r"^\s*GPUUNTRACK:[ \t]*(.+)$", re.MULTILINE)
+    _SENSITIVITY_RE = re.compile(r"^\s*SENSITIVITY:[ \t]*(.+)$", re.MULTILINE)
+    _NORMAL_START_RE = re.compile(r"^\s*NORMAL_START:[ \t]*(.+)$", re.MULTILINE)
+    _GREP_RE = re.compile(r"^\s*GREP:[ \t]*(.+)$", re.MULTILINE)
+    _VIEW_RE = re.compile(r"^\s*VIEW:[ \t]*(.+)$", re.MULTILINE)
 
     @classmethod
     def _extract_directives(cls, text: str):
@@ -6934,33 +7194,33 @@ class PulseCLI:
     # above need to change shape.
     # ------------------------------------------------------------------
     _NEW_DIRECTIVE_RES = {
-        "defof": re.compile(r"^\s*DEFOF:\s*(.+)$", re.MULTILINE),
-        "callers": re.compile(r"^\s*CALLERS:\s*(.+)$", re.MULTILINE),
-        "depgraph": re.compile(r"^\s*DEPGRAPH:\s*(.*)$", re.MULTILINE),
-        "trace": re.compile(r"^\s*TRACE:\s*(.+)$", re.MULTILINE),
-        "corr": re.compile(r"^\s*CORR:\s*(.+)$", re.MULTILINE),
-        "outlier": re.compile(r"^\s*OUTLIER:\s*(.+)$", re.MULTILINE),
-        "diffstats": re.compile(r"^\s*DIFFSTATS:\s*(.+)$", re.MULTILINE),
-        "histogram": re.compile(r"^\s*HISTOGRAM:\s*(.+)$", re.MULTILINE),
-        "doclookup": re.compile(r"^\s*DOCLOOKUP:\s*(.+)$", re.MULTILINE),
-        "changelog": re.compile(r"^\s*CHANGELOG:\s*(.*)$", re.MULTILINE),
-        "pastfix": re.compile(r"^\s*PASTFIX:\s*(.+)$", re.MULTILINE),
-        "dryrun": re.compile(r"^\s*DRYRUN:\s*(.+)$", re.MULTILINE),
-        "repl": re.compile(r"^\s*REPL:\s*(.+)$", re.MULTILINE),
-        "replay": re.compile(r"^\s*REPLAY:\s*(.+)$", re.MULTILINE),
-        "terminal": re.compile(r"^\s*TERMINAL:\s*(.+)$", re.MULTILINE),
-        "gradcheck": re.compile(r"^\s*GRADCHECK:\s*(.+)$", re.MULTILINE),
-        "shapetrace": re.compile(r"^\s*SHAPETRACE:\s*(.*)$", re.MULTILINE),
-        "gpustatus": re.compile(r"^\s*GPUSTATUS:\s*(.*)$", re.MULTILINE),
-        "rollback": re.compile(r"^\s*ROLLBACK:\s*(.+)$", re.MULTILINE),
-        "mllint": re.compile(r"^\s*MLLINT:\s*(.*)$", re.MULTILINE),
-        "layerstats": re.compile(r"^\s*LAYERSTATS:\s*(.*)$", re.MULTILINE),
-        "hardexamples": re.compile(r"^\s*HARDEXAMPLES:\s*(.*)$", re.MULTILINE),
-        "ampstatus": re.compile(r"^\s*AMPSTATUS:\s*(.*)$", re.MULTILINE),
-        "seedcheck": re.compile(r"^\s*SEEDCHECK:\s*(.*)$", re.MULTILINE),
-        "rankdiverge": re.compile(r"^\s*RANKDIVERGE:\s*(.+)$", re.MULTILINE),
-        "runcompare": re.compile(r"^\s*RUNCOMPARE:\s*(.*)$", re.MULTILINE),
-        "cost": re.compile(r"^\s*COST:\s*(.*)$", re.MULTILINE),
+        "defof": re.compile(r"^\s*DEFOF:[ \t]*(.+)$", re.MULTILINE),
+        "callers": re.compile(r"^\s*CALLERS:[ \t]*(.+)$", re.MULTILINE),
+        "depgraph": re.compile(r"^\s*DEPGRAPH:[ \t]*(.*)$", re.MULTILINE),
+        "trace": re.compile(r"^\s*TRACE:[ \t]*(.+)$", re.MULTILINE),
+        "corr": re.compile(r"^\s*CORR:[ \t]*(.+)$", re.MULTILINE),
+        "outlier": re.compile(r"^\s*OUTLIER:[ \t]*(.+)$", re.MULTILINE),
+        "diffstats": re.compile(r"^\s*DIFFSTATS:[ \t]*(.+)$", re.MULTILINE),
+        "histogram": re.compile(r"^\s*HISTOGRAM:[ \t]*(.+)$", re.MULTILINE),
+        "doclookup": re.compile(r"^\s*DOCLOOKUP:[ \t]*(.+)$", re.MULTILINE),
+        "changelog": re.compile(r"^\s*CHANGELOG:[ \t]*(.*)$", re.MULTILINE),
+        "pastfix": re.compile(r"^\s*PASTFIX:[ \t]*(.+)$", re.MULTILINE),
+        "dryrun": re.compile(r"^\s*DRYRUN:[ \t]*(.+)$", re.MULTILINE),
+        "repl": re.compile(r"^\s*REPL:[ \t]*(.+)$", re.MULTILINE),
+        "replay": re.compile(r"^\s*REPLAY:[ \t]*(.+)$", re.MULTILINE),
+        "terminal": re.compile(r"^\s*TERMINAL:[ \t]*(.+)$", re.MULTILINE),
+        "gradcheck": re.compile(r"^\s*GRADCHECK:[ \t]*(.+)$", re.MULTILINE),
+        "shapetrace": re.compile(r"^\s*SHAPETRACE:[ \t]*(.*)$", re.MULTILINE),
+        "gpustatus": re.compile(r"^\s*GPUSTATUS:[ \t]*(.*)$", re.MULTILINE),
+        "rollback": re.compile(r"^\s*ROLLBACK:[ \t]*(.+)$", re.MULTILINE),
+        "mllint": re.compile(r"^\s*MLLINT:[ \t]*(.*)$", re.MULTILINE),
+        "layerstats": re.compile(r"^\s*LAYERSTATS:[ \t]*(.*)$", re.MULTILINE),
+        "hardexamples": re.compile(r"^\s*HARDEXAMPLES:[ \t]*(.*)$", re.MULTILINE),
+        "ampstatus": re.compile(r"^\s*AMPSTATUS:[ \t]*(.*)$", re.MULTILINE),
+        "seedcheck": re.compile(r"^\s*SEEDCHECK:[ \t]*(.*)$", re.MULTILINE),
+        "rankdiverge": re.compile(r"^\s*RANKDIVERGE:[ \t]*(.+)$", re.MULTILINE),
+        "runcompare": re.compile(r"^\s*RUNCOMPARE:[ \t]*(.*)$", re.MULTILINE),
+        "cost": re.compile(r"^\s*COST:[ \t]*(.*)$", re.MULTILINE),
     }
     _FLAG_STYLE_DIRECTIVES = {"depgraph", "changelog", "shapetrace", "gpustatus", "mllint", "layerstats", "hardexamples", "ampstatus", "seedcheck", "runcompare", "cost"}
 
@@ -7009,11 +7269,24 @@ class PulseCLI:
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == symbol:
                     name = node.name
                     kind = "class" if isinstance(node, ast.ClassDef) else "function"
-                elif isinstance(node, ast.Assign):
-                    for t in node.targets:
-                        if isinstance(t, ast.Name) and t.id == symbol:
-                            name, kind = symbol, "assignment"
-                            break
+                elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    # x = / x: T = / self.x = / a, x = ... -- all define `symbol`
+                    # ("self.x" or plain "x" both find `self.x = ...`).
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    stack = list(targets)
+                    while stack and name is None:
+                        t = stack.pop()
+                        if isinstance(t, (ast.Tuple, ast.List)):
+                            stack.extend(t.elts)
+                        elif isinstance(t, ast.Starred):
+                            stack.append(t.value)
+                        elif isinstance(t, ast.Name) and t.id == symbol:
+                            name = symbol
+                        elif isinstance(t, ast.Attribute) and symbol in (
+                                t.attr, f"{getattr(t.value, 'id', '')}.{t.attr}"):
+                            name = symbol
+                    if name is not None:
+                        kind = "assignment"
                 if name is None:
                     continue
                 start = node.lineno
@@ -7083,6 +7356,29 @@ class PulseCLI:
                 name, hist = matches[0], self.scalar_histories[matches[0]]
         return name, (list(hist) if hist else None)
 
+    @staticmethod
+    def _is_finite_number(v) -> bool:
+        try:
+            return v is not None and not isinstance(v, bool) and math.isfinite(v)
+        except TypeError:
+            return False
+
+    @classmethod
+    def _split_finite(cls, values):
+        """(finite values, [(history idx, value) for every None/NaN/inf]). update()
+        records NaN once the loss diverges and None when a value is unreadable --
+        the statistics tools must neither crash on those nor hide them."""
+        finite, bad = [], []
+        for i, v in enumerate(values):
+            (finite.append(v) if cls._is_finite_number(v) else bad.append((i, v)))
+        return finite, bad
+
+    @staticmethod
+    def _describe_nonfinite(bad) -> str:
+        shown = ", ".join(f"idx {i}: {v}" for i, v in bad[:10])
+        more = f", ... ({len(bad) - 10} more)" if len(bad) > 10 else ""
+        return f"{len(bad)} non-finite/missing point(s) (NaN/inf/None) -- {shown}{more}"
+
     def _run_corr(self, arg: str) -> str:
         """CORR: <var1> <var2> -- real correlation coefficient between two
         tracked scalar histories."""
@@ -7095,9 +7391,14 @@ class PulseCLI:
             missing = parts[0] if not v1 else parts[1]
             return f"CORR '{arg}': no numeric history for '{missing}' -- only scalar-tracked variables have one."
         n = min(len(v1), len(v2))
+        pairs = [(a, b) for a, b in zip(v1[-n:], v2[-n:])
+                 if self._is_finite_number(a) and self._is_finite_number(b)]
+        dropped = n - len(pairs)
+        dropped_note = f" ({dropped} pair(s) with NaN/inf/None skipped)" if dropped else ""
+        n = len(pairs)
         if n < 3:
-            return f"CORR '{name1}' vs '{name2}': not enough overlapping data points yet ({n})."
-        v1, v2 = v1[-n:], v2[-n:]
+            return f"CORR '{name1}' vs '{name2}': not enough overlapping finite data points yet ({n}){dropped_note}."
+        v1, v2 = [a for a, _b in pairs], [b for _a, b in pairs]
         mean1, mean2 = sum(v1) / n, sum(v2) / n
         cov = sum((a - mean1) * (b - mean2) for a, b in zip(v1, v2))
         var1 = sum((a - mean1) ** 2 for a in v1)
@@ -7105,25 +7406,31 @@ class PulseCLI:
         if var1 == 0 or var2 == 0:
             return f"CORR '{name1}' vs '{name2}': one series is constant over these {n} points -- correlation undefined."
         r = cov / math.sqrt(var1 * var2)
-        return f"CORR '{name1}' vs '{name2}' (last {n} points): r = {r:.4f}"
+        return f"CORR '{name1}' vs '{name2}' (last {n} points): r = {r:.4f}{dropped_note}"
 
     def _run_outlier(self, var: str) -> str:
         """OUTLIER: <var> -- deterministic z-score anomaly detection."""
         name, values = self._scalar_history(var)
         if not values:
             return f"OUTLIER '{var}': no numeric history available."
-        if len(values) < 4:
-            return f"OUTLIER '{name}': not enough data points yet ({len(values)})."
-        mean = sum(values) / len(values)
-        variance = sum((v - mean) ** 2 for v in values) / len(values)
+        finite, bad = self._split_finite(values)
+        # A NaN/inf is the most extreme point there is -- report it up front rather
+        # than letting it turn mean/std into NaN and the answer into "no outliers".
+        bad_note = f"OUTLIER '{name}': {self._describe_nonfinite(bad)}\n" if bad else ""
+        idx = [i for i, v in enumerate(values) if self._is_finite_number(v)]
+        if len(finite) < 4:
+            return f"{bad_note}OUTLIER '{name}': not enough finite data points yet ({len(finite)})."
+        mean = sum(finite) / len(finite)
+        variance = sum((v - mean) ** 2 for v in finite) / len(finite)
         std = math.sqrt(variance)
         if std == 0:
-            return f"OUTLIER '{name}': series is constant -- no outliers."
-        flagged = [(i, v, (v - mean) / std) for i, v in enumerate(values) if abs((v - mean) / std) > 3]
+            return f"{bad_note}OUTLIER '{name}': finite series is constant -- no outliers among those."
+        flagged = [(i, v, (v - mean) / std) for i, v in zip(idx, finite) if abs((v - mean) / std) > 3]
         if not flagged:
-            return f"OUTLIER '{name}': no points with |z| > 3 over {len(values)} points (mean={mean:.4g}, std={std:.4g})."
+            return (f"{bad_note}OUTLIER '{name}': no finite points with |z| > 3 over {len(finite)} points "
+                    f"(mean={mean:.4g}, std={std:.4g}).")
         lines = "\n".join(f"  history idx {i}: {v:.6g} (z={z:.2f})" for i, v, z in flagged[-20:])
-        return f"OUTLIER '{name}': {len(flagged)} outlier point(s) (mean={mean:.4g}, std={std:.4g})\n{lines}"
+        return f"{bad_note}OUTLIER '{name}': {len(flagged)} outlier point(s) (mean={mean:.4g}, std={std:.4g})\n{lines}"
 
     _DIFFSTATS_ARG_RE = re.compile(r"^\s*(\S+)\s+(-?\d+)\s+(-?\d+)\s*$")
 
@@ -7142,6 +7449,8 @@ class PulseCLI:
             va, vb = values[int(a_str)], values[int(b_str)]
         except IndexError:
             return f"DIFFSTATS '{name}': index out of range (history has {len(values)} point(s))."
+        if not (self._is_finite_number(va) and self._is_finite_number(vb)):
+            return f"DIFFSTATS '{name}' [{a_str}] -> [{b_str}]: {va} -> {vb} (non-finite/missing -- no delta)."
         delta = vb - va
         pct = f" ({delta / va * 100:+.2f}%)" if va else ""
         return f"DIFFSTATS '{name}' [{a_str}] -> [{b_str}]: {va:.6g} -> {vb:.6g}, delta = {delta:+.6g}{pct}"
@@ -7151,11 +7460,13 @@ class PulseCLI:
         name, values = self._scalar_history(var)
         if not values:
             return f"HISTOGRAM '{var}': no numeric history available."
+        values, bad = self._split_finite(values)
+        bad_note = f"\n  plus {self._describe_nonfinite(bad)}" if bad else ""
         if len(values) < 2:
-            return f"HISTOGRAM '{name}': not enough data points yet ({len(values)})."
+            return f"HISTOGRAM '{name}': not enough finite data points yet ({len(values)}).{bad_note}"
         lo, hi = min(values), max(values)
         if lo == hi:
-            return f"HISTOGRAM '{name}': all {len(values)} point(s) equal {lo:.6g}."
+            return f"HISTOGRAM '{name}': all {len(values)} finite point(s) equal {lo:.6g}.{bad_note}"
         width = (hi - lo) / buckets
         counts = [0] * buckets
         for v in values:
@@ -7166,7 +7477,33 @@ class PulseCLI:
             b_lo, b_hi = lo + i * width, lo + (i + 1) * width
             bar = "#" * max(1, int(40 * c / peak)) if c else ""
             lines.append(f"  [{b_lo:>10.4g}, {b_hi:>10.4g}): {c:>5}  {bar}")
-        return f"HISTOGRAM '{name}' ({len(values)} points, range [{lo:.4g}, {hi:.4g}]):\n" + "\n".join(lines)
+        return (f"HISTOGRAM '{name}' ({len(values)} points, range [{lo:.4g}, {hi:.4g}]):\n"
+                + "\n".join(lines) + bad_note)
+
+    def _is_project_module(self, name: str) -> bool:
+        """Does the top-level module `name` resolve to a file of this project
+        (a tracked file, or anything under the project root) rather than an
+        installed library?"""
+        tracked = {os.path.splitext(os.path.basename(p))[0]
+                   for p in [self.script_path] + list(self.extra_files) if p}
+        if name in tracked:
+            return True
+        try:
+            spec = importlib.util.find_spec(name)
+        except Exception:
+            return False
+        origin = getattr(spec, "origin", None) if spec else None
+        root = getattr(self, "_project_root", None) or (
+            os.path.dirname(os.path.abspath(self.script_path)) if self.script_path else None)
+        if not origin or not root or not os.path.isfile(origin):
+            return False
+        origin, root = os.path.realpath(origin), os.path.realpath(root)
+        if "site-packages" in origin or "dist-packages" in origin:
+            return False
+        try:
+            return os.path.commonpath([origin, root]) == root
+        except ValueError:
+            return False
 
     def _run_doclookup(self, arg: str) -> str:
         """DOCLOOKUP: <library>.<symbol> -- real signature/docstring for an
@@ -7176,6 +7513,11 @@ class PulseCLI:
         if len(parts) < 2:
             return f"DOCLOOKUP '{arg}': expected '<library>.<symbol>', e.g. 'DOCLOOKUP: torch.nn.functional.cross_entropy'."
         root = parts[0]
+        if root not in sys.modules and self._is_project_module(root):
+            # Importing one of the user's own files RUNS it -- a training script
+            # started from inside the agent call. DOCLOOKUP is for installed libraries.
+            return (f"DOCLOOKUP '{arg}': '{root}' is one of this project's own files -- importing it "
+                    "would execute it. Use DEFOF:/VIEW: to read its code instead.")
         try:
             obj = importlib.import_module(root)
         except Exception as exc:
@@ -7199,20 +7541,31 @@ class PulseCLI:
             doc = doc[:1200] + "\n... (truncated)"
         return f"DOCLOOKUP '{arg}': {'.'.join(resolved)}{sig}\n{doc}"
 
+    def _current_code_files(self) -> Dict[str, str]:
+        current = dict(self.extra_files)
+        if self.script_path and self.code_text is not None:
+            current[self.script_path] = self.code_text
+        return current
+
+    def _snapshot_changelog_baseline(self) -> None:
+        """CHANGELOG's first baseline: the code as this session first saw it
+        (taken when the code is set / first labelled), not the code at the
+        first CHANGELOG call -- which, after a fix, would hide that fix."""
+        if getattr(self, "_changelog_baseline", None) is None and self.code_text is not None:
+            self._changelog_baseline = self._current_code_files()
+
     def _run_changelog(self) -> str:
         """CHANGELOG: -- diff of what's changed in tracked files since the
         last checkpoint. Baseline starts at this session's code and
         advances to 'now' every call, so a second CHANGELOG only shows
         what's changed since the first."""
         self._build_file_labels()
-        current = dict(self.extra_files)
-        if self.script_path and self.code_text is not None:
-            current[self.script_path] = self.code_text
+        current = self._current_code_files()
 
         baseline = getattr(self, "_changelog_baseline", None)
         if baseline is None:
             self._changelog_baseline = current
-            return "CHANGELOG: no prior checkpoint yet -- this turn's code is now the baseline for future CHANGELOG calls."
+            return "CHANGELOG: no code loaded before now -- this turn's code is now the baseline for future CHANGELOG calls."
 
         diffs = []
         for path, new_text in current.items():
@@ -7313,10 +7666,15 @@ class PulseCLI:
             lines.append(f"  [team-shared, commit {sha}, {ts}]: {explanation}")
         return f"PASTFIX '{query}': {len(local_hits) + len(shared_hits)} prior fix(es) ({len(local_hits)} local, {len(shared_hits)} team-shared)\n" + "\n".join(lines)
 
-    def _lint_check(self, content: str, path: str):
+    def _lint_check(self, content: str, path: str, original: Optional[str] = None):
         """Automatic, non-model-invoked gate: syntax/AST validation, then
         pyflakes (if importable), run on the FULL proposed file content
-        before it's ever written to disk. Returns (ok, messages)."""
+        before it's ever written to disk. Returns (ok, messages).
+
+        With `original` (the file before the fix), only problems the fix
+        INTRODUCED block it: a notebook export's display() or a name set via
+        globals() was 'undefined' before the fix too, and used to block every
+        fix to that file."""
         if os.path.splitext(path)[1] != ".py":
             return True, []
         try:
@@ -7328,10 +7686,26 @@ class PulseCLI:
             import pyflakes.reporter as _pyflakes_reporter
         except ImportError:
             return True, []
-        out, err = io.StringIO(), io.StringIO()
-        _pyflakes_api.check(content, path, _pyflakes_reporter.Reporter(out, err))
-        messages = [l for l in (out.getvalue() + err.getvalue()).splitlines() if l.strip()]
-        blocking = [m for m in messages if "undefined name" in m.lower() or "syntaxerror" in m.lower()]
+
+        def _blocking(text):
+            out, err = io.StringIO(), io.StringIO()
+            _pyflakes_api.check(text, path, _pyflakes_reporter.Reporter(out, err))
+            msgs = [l for l in (out.getvalue() + err.getvalue()).splitlines() if l.strip()]
+            return msgs, [m for m in msgs if "undefined name" in m.lower() or "syntaxerror" in m.lower()]
+
+        messages, blocking = _blocking(content)
+        if blocking and original is not None:
+            # Compare without the "path:line:col:" prefix -- the fix may shift line numbers.
+            strip = lambda m: re.sub(r"^.*?:\d+:(?:\d+:)?\s*", "", m)   # noqa: E731
+            before = collections.Counter(strip(m) for m in _blocking(original)[1])
+            new_blocking = []
+            for m in blocking:
+                key = strip(m)
+                if before[key] > 0:
+                    before[key] -= 1
+                else:
+                    new_blocking.append(m)
+            blocking = new_blocking
         return (len(blocking) == 0), messages
 
     # ------------------------------------------------------------------
@@ -7426,6 +7800,12 @@ class PulseCLI:
         command, inline_timeout = _terminal.parse_inline_timeout(arg.strip())
         if not command:
             return "TERMINAL: empty command -- nothing to run."
+        if re.search(r"(?:^|\s)<<-?\s*['\"]?[A-Za-z_]\w*", command):
+            # A heredoc's body is on the following lines, which never reach us (the
+            # directive is one line): bash would run it with an empty stdin and exit 0.
+            return (f"TERMINAL '{command}': not run -- a heredoc (<<) needs its body on later lines, "
+                    "but TERMINAL takes one line only. Put the script in one line instead "
+                    "(e.g. python3 -c \"stmt1; stmt2\").")
         flags = self._terminal_needs_confirmation(command)
         if flags and not self._confirm_terminal_command(command, flags):
             return f"TERMINAL '{command}': the user declined to run this command -- try a different " \
@@ -7705,16 +8085,10 @@ class PulseCLI:
             target_idx = len(entries) - 2
             target_label = f"before commit {entries[-1].get('id', '?')} (most recent)"
         else:
-            target_idx = None
-            target_label = ""
-            for i, e in enumerate(entries):
-                eid = e.get("id", "")
-                if eid == arg or eid.startswith(arg):
-                    target_idx = i
-                    target_label = f"commit {eid}"
-                    break
+            target_idx, problem = self._match_commit_id(entries, arg)
             if target_idx is None:
-                return f"ROLLBACK '{arg}': no commit matches that id -- send LOG (or /log interactively) to see recorded commits."
+                return f"ROLLBACK '{arg}': {problem}. Recorded commits (oldest first):\n" + self._describe_commits(entries)
+            target_label = f"commit {entries[target_idx].get('id', '')}"
         restored, failed, new_commit = self._perform_revert(entries, target_idx, target_label)
         if not restored and not failed:
             return f"ROLLBACK '{arg}': workspace already matches that state -- nothing to revert."
@@ -8115,67 +8489,89 @@ class PulseCLI:
                 label = f"/{name} {arg}" if arg else f"/{name}"
                 cprint(f"  -> {label}", color=_YELLOW)
 
+    def _safe_tool(self, name: str, arg: str, fn, *args) -> str:
+        """Run one directive's tool; a failure is returned as its result."""
+        try:
+            return fn(*args)
+        except Exception as exc:
+            _pulse_log(f"TOOL {name} failed: {exc!r}")
+            return f"{name} '{arg}': error -- {type(exc).__name__}: {exc}"
+
+    def _safe_cmd(self, notes: List[str], name: str, arg: str, fn, *args):
+        """Run one PROMOTE/GPUTRACK/... command quietly; a failure becomes an
+        error note (appended to `notes`) and a None result."""
+        try:
+            return fn(*args, quiet=True)
+        except Exception as exc:
+            _pulse_log(f"TOOL {name} failed: {exc!r}")
+            notes.append(f"{name} '{arg}': error -- {type(exc).__name__}: {exc}")
+            return None
+
     def _apply_new_directives(self, requests: Dict[str, List[str]]) -> str:
         """Deterministically service the extended toolset the same way
-        _apply_directives handles CALC/PROMOTE/GREP/VIEW."""
+        _apply_directives handles CALC/PROMOTE/GREP/VIEW. Each tool runs under
+        _safe_tool: one that raises (HISTOGRAM on a NaN history, a DRYRUN that
+        blows up) becomes an error note for the model instead of an exception
+        thrown out of the pipeline -- on an auto-intervention, into the user's
+        training loop."""
         self._echo_directives(requests)
         notes = []
         for symbol in requests.get("defof", []):
-            notes.append(self._run_defof(symbol))
+            notes.append(self._safe_tool("DEFOF", symbol, self._run_defof, symbol))
         for symbol in requests.get("callers", []):
-            notes.append(self._run_callers(symbol))
+            notes.append(self._safe_tool("CALLERS", symbol, self._run_callers, symbol))
         if "depgraph" in requests:
-            notes.append(self._run_depgraph())
+            notes.append(self._safe_tool("DEPGRAPH", "", self._run_depgraph))
         for arg in requests.get("trace", []):
-            notes.append(self._run_trace(arg))
+            notes.append(self._safe_tool("TRACE", arg, self._run_trace, arg))
         for arg in requests.get("corr", []):
-            notes.append(self._run_corr(arg))
+            notes.append(self._safe_tool("CORR", arg, self._run_corr, arg))
         for var in requests.get("outlier", []):
-            notes.append(self._run_outlier(var))
+            notes.append(self._safe_tool("OUTLIER", var, self._run_outlier, var))
         for arg in requests.get("diffstats", []):
-            notes.append(self._run_diffstats(arg))
+            notes.append(self._safe_tool("DIFFSTATS", arg, self._run_diffstats, arg))
         for var in requests.get("histogram", []):
-            notes.append(self._run_histogram(var))
+            notes.append(self._safe_tool("HISTOGRAM", var, self._run_histogram, var))
         for arg in requests.get("doclookup", []):
-            notes.append(self._run_doclookup(arg))
+            notes.append(self._safe_tool("DOCLOOKUP", arg, self._run_doclookup, arg))
         if "changelog" in requests:
-            notes.append(self._run_changelog())
+            notes.append(self._safe_tool("CHANGELOG", "", self._run_changelog))
         if "gpustatus" in requests:
-            notes.append(self._run_gpustatus())
+            notes.append(self._safe_tool("GPUSTATUS", "", self._run_gpustatus))
         for arg in requests.get("rollback", []):
-            notes.append(self._run_rollback(arg))
+            notes.append(self._safe_tool("ROLLBACK", arg, self._run_rollback, arg))
         for query in requests.get("pastfix", []):
-            notes.append(self._run_pastfix(query))
+            notes.append(self._safe_tool("PASTFIX", query, self._run_pastfix, query))
         for arg in requests.get("dryrun", []):
-            notes.append(self._run_exec_dryrun(arg))
+            notes.append(self._safe_tool("DRYRUN", arg, self._run_exec_dryrun, arg))
         for arg in requests.get("repl", []):
-            notes.append(self._run_exec_repl(arg))
+            notes.append(self._safe_tool("REPL", arg, self._run_exec_repl, arg))
         for arg in requests.get("replay", []):
-            notes.append(self._run_exec_replay(arg))
+            notes.append(self._safe_tool("REPLAY", arg, self._run_exec_replay, arg))
         for arg in requests.get("terminal", []):
-            notes.append(self._run_terminal(arg))
+            notes.append(self._safe_tool("TERMINAL", arg, self._run_terminal, arg))
         for arg in requests.get("gradcheck", []):
-            notes.append(self._run_exec_gradcheck(arg))
+            notes.append(self._safe_tool("GRADCHECK", arg, self._run_exec_gradcheck, arg))
         if "shapetrace" in requests:
             for arg in requests["shapetrace"]:
-                notes.append(self._run_exec_shapetrace(arg))
+                notes.append(self._safe_tool("SHAPETRACE", arg, self._run_exec_shapetrace, arg))
         if "mllint" in requests:
-            notes.append(self._run_mllint())
+            notes.append(self._safe_tool("MLLINT", "", self._run_mllint))
         for arg in requests.get("layerstats", []):
-            notes.append(self._run_exec_layerstats(arg))
+            notes.append(self._safe_tool("LAYERSTATS", arg, self._run_exec_layerstats, arg))
         for arg in requests.get("hardexamples", []):
-            notes.append(self._run_exec_hardexamples(arg))
+            notes.append(self._safe_tool("HARDEXAMPLES", arg, self._run_exec_hardexamples, arg))
         for arg in requests.get("ampstatus", []):
-            notes.append(self._run_exec_ampstatus(arg))
+            notes.append(self._safe_tool("AMPSTATUS", arg, self._run_exec_ampstatus, arg))
         if "seedcheck" in requests:
             for arg in requests["seedcheck"]:
-                notes.append(self._run_exec_seedcheck(arg))
+                notes.append(self._safe_tool("SEEDCHECK", arg, self._run_exec_seedcheck, arg))
         for var in requests.get("rankdiverge", []):
-            notes.append(self._run_rankdiverge(var))
+            notes.append(self._safe_tool("RANKDIVERGE", var, self._run_rankdiverge, var))
         if "runcompare" in requests:
-            notes.append(self._run_runcompare())
+            notes.append(self._safe_tool("RUNCOMPARE", "", self._run_runcompare))
         if "cost" in requests:
-            notes.append(self._run_cost())
+            notes.append(self._safe_tool("COST", "", self._run_cost))
         return "\n\n".join(n for n in notes if n)
 
     def _apply_directives(
@@ -8212,7 +8608,7 @@ class PulseCLI:
         if promote_names:
             promoted = []
             for name in promote_names:
-                result = self._cmd_track(name, quiet=True)
+                result = self._safe_cmd(notes, "PROMOTE", name, self._cmd_track, name)
                 if result:
                     promoted.append(result if result != "all" else "all tracked variables")
             if promoted:
@@ -8222,7 +8618,7 @@ class PulseCLI:
         if gputrack_names:
             tracked = []
             for name in gputrack_names:
-                result = self._cmd_gputrack(name, quiet=True)
+                result = self._safe_cmd(notes, "GPUTRACK", name, self._cmd_gputrack, name)
                 if result:
                     tracked.append(result)
             if tracked:
@@ -8236,7 +8632,7 @@ class PulseCLI:
         if gpuuntrack_names:
             untracked = []
             for name in gpuuntrack_names:
-                result = self._cmd_gpuuntrack(name, quiet=True)
+                result = self._safe_cmd(notes, "GPUUNTRACK", name, self._cmd_gpuuntrack, name)
                 if result:
                     untracked.append(result if result != "all" else "all GPU-tracked variables")
             if untracked:
@@ -8247,7 +8643,8 @@ class PulseCLI:
             # Only the last SENSITIVITY: line (if the agent sent more than
             # one, which it shouldn't) is applied -- last-write-wins, same
             # as any other directive would if duplicated.
-            result = self._cmd_sensitivity(sensitivity_args[-1], quiet=True)
+            result = self._safe_cmd(notes, "SENSITIVITY", sensitivity_args[-1], self._cmd_sensitivity,
+                                    sensitivity_args[-1])
             if result:
                 print(f"  🎚 Sensitivity adjusted (agent request): {result}")
                 notes.append(result)
@@ -8281,13 +8678,13 @@ class PulseCLI:
 
         if grep_patterns:
             for pattern in grep_patterns:
-                result = self._run_grep(pattern)
+                result = self._safe_tool("GREP", pattern, self._run_grep, pattern)
                 print(f"  🔎 {result.splitlines()[0]}")
                 notes.append(result)
 
         if view_requests:
             for arg in view_requests:
-                result = self._run_view(arg)
+                result = self._safe_tool("VIEW", arg, self._run_view, arg)
                 print(f"  📄 {result.splitlines()[0]}")
                 notes.append(result)
 
@@ -8862,9 +9259,9 @@ class PulseCLI:
         sentence after it, or a code fence that isn't stripped cleanly is
         enough to make a naive "whole string must be exactly `{...}`"
         check fail, which is why verification used to report "unparsable"
-        on almost every call. Instead, find the first balanced {...} span
+        on almost every call. Instead, take the first balanced {...} span
         anywhere in the text (respecting strings, so braces inside a
-        quoted "reason" don't throw off the count) and parse just that.
+        quoted "reason" don't throw off the count) that parses as an object.
         """
         text = (answer or "").strip()
         if not text:
@@ -8875,41 +9272,67 @@ class PulseCLI:
                 text = text[4:]
             text = text.strip()
 
-        start = text.find("{")
-        if start == -1:
-            return None
+        for payload in PulseCLI._iter_json_objs(text):
+            return payload
+        return None
 
-        depth = 0
-        in_string = False
-        escape = False
-        end = -1
-        for i in range(start, len(text)):
-            ch = text[i]
-            if in_string:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == '"':
-                    in_string = False
+    @staticmethod
+    def _iter_json_objs(text: str):
+        """Yield every JSON object found in `text`, in order: each balanced
+        {...} span (respecting strings) that parses to a dict. Prose before
+        the real object can hold braces of its own (a quoted dict literal,
+        an f-string), so a span that doesn't parse is skipped rather than
+        ending the search."""
+        pos = 0
+        while True:
+            start = text.find("{", pos)
+            if start == -1:
+                return
+            depth = 0
+            in_string = False
+            escape = False
+            end = -1
+            for i in range(start, len(text)):
+                ch = text[i]
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif ch == "\\":
+                        escape = True
+                    elif ch == '"':
+                        in_string = False
+                    continue
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+            if end == -1:
+                # Unbalanced from here (e.g. a stray quote in prose) -- try the next brace.
+                pos = start + 1
                 continue
-            if ch == '"':
-                in_string = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i
-                    break
-        if end == -1:
-            return None
+            try:
+                payload = json.loads(text[start:end + 1])
+            except (ValueError, TypeError):
+                payload = None
+            if isinstance(payload, dict):
+                yield payload
+                pos = end + 1
+            else:
+                pos = start + 1
 
-        try:
-            payload = json.loads(text[start:end + 1])
-        except (ValueError, TypeError):
-            return None
-        return payload if isinstance(payload, dict) else None
+    @staticmethod
+    def _as_bool(value) -> bool:
+        """A model's JSON boolean, read the way it was meant: "false"/"no"/"0"
+        as strings are False (bool("false") is True, which turned rejected
+        fixes into verified ones)."""
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "yes", "y", "1", "pass", "passed", "resolved")
+        return bool(value)
 
     @staticmethod
     def _describe_fix(fix: Dict[str, Any]) -> str:
@@ -8972,10 +9395,10 @@ class PulseCLI:
                     if verdict is not None:
                         break
                 if verdict is None:
-                    # Still nothing usable after giving it a chance to check -- don't
-                    # block the user on a formatting slip; hand off as best effort.
-                    return fix, True, "(verification response was unparsable; proceeding anyway)"
-            passes = bool(verdict.get("passes"))
+                    # Still nothing usable after giving it a chance to check. A verdict
+                    # nobody can read is not a pass -- it may well have been a "false".
+                    return fix, False, "(verification response was unparsable -- the fix was not confirmed)"
+            passes = self._as_bool(verdict.get("passes"))
             reason = str(verdict.get("reason", "")).strip()
             if passes:
                 return fix, True, reason
@@ -9018,7 +9441,8 @@ class PulseCLI:
         try:
             (_clean, calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
              sensitivity_args, normal_start_args, grep_patterns, view_requests) = self._extract_directives(answer)
-            if calc_exprs or promote_names or grep_patterns or view_requests:
+            if (calc_exprs or promote_names or gputrack_names or gpuuntrack_names
+                    or sensitivity_args or normal_start_args or grep_patterns or view_requests):
                 note = self._apply_directives(
                     calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
                     sensitivity_args, normal_start_args, grep_patterns, view_requests,
@@ -9041,7 +9465,7 @@ class PulseCLI:
         with _Spinner("Reading for other errors"):
             sweep_answer = self._call_model(_PASS5_SWEEP, max_tokens=_AGENT_MAX_TOKENS)
         sweep = self._parse_json_obj(sweep_answer)
-        found = bool(sweep.get("other_errors_found")) if sweep else False
+        found = self._as_bool(sweep.get("other_errors_found")) if sweep else False
         summary = str(sweep.get("summary", "")).strip() if sweep else ""
 
         if not found or not summary:
@@ -9061,9 +9485,15 @@ class PulseCLI:
             return
 
         print("\n[6] Following the established format for the additional issue(s)...")
-        self.ask_agent(
-            f"Please also fix this: {summary}", include_code=include_code, _depth=_depth + 1
-        )
+        # The sweep's own fix must not replace the record of the fix for the problem
+        # that was actually asked about (known-fix index, post-restart check).
+        reported_fix = self._last_applied_fix
+        try:
+            self.ask_agent(
+                f"Please also fix this: {summary}", include_code=include_code, _depth=_depth + 1
+            )
+        finally:
+            self._last_applied_fix = reported_fix
 
     def ask_agent(
         self, question: str, include_code: bool = False, _depth: int = 0,
@@ -9151,11 +9581,10 @@ class PulseCLI:
 
         context = self._build_agent_context(include_code=include_code)
         user_content = f"{context}\n\nQuestion: {question}"
-        self.agent_history.append({"role": "user", "content": user_content})
+        self._turn_question_msg = {"role": "user", "content": user_content}
+        self.agent_history.append(self._turn_question_msg)
 
-        wants_implementation = include_code and any(
-            kw in question.lower() for kw in _IMPLEMENT_KEYWORDS
-        )
+        wants_implementation = include_code and bool(_IMPLEMENT_RE.search(question))
 
         try:
             # Pass 1: locate the region(s) of the error. May itself investigate first via
@@ -9209,6 +9638,12 @@ class PulseCLI:
                     continue
                 if combined_note:
                     self.agent_history.append({"role": "user", "content": combined_note})
+                if calc_exprs:
+                    # The diagnosis was written before these came back: carry Pulse's
+                    # exact values with it (printed and handed to the fix pass), so the
+                    # model's own arithmetic isn't the only number on record.
+                    analysis += "\n\nPulse-verified calculations:\n" + "\n".join(
+                        f"  {expr} = {_safe_eval_math(expr)}" for expr in calc_exprs)
                 break
             print(f"[2] Diagnosis & reasoning\n{analysis}\n")
 
@@ -9235,6 +9670,7 @@ class PulseCLI:
                     _PASS3_IMPLEMENT_TMPL.format(diagnosis=full_answer), max_tokens=_AGENT_MAX_TOKENS
                 )
             fix = self._parse_code_fix(fix_answer)
+            no_change = self._parse_no_change(fix_answer) if fix is None else None
 
             # Wanting to see more code is not a failed fix. Pass 2 already
             # services GREP:/VIEW:/REPL: and friends; this pass used to
@@ -9243,7 +9679,7 @@ class PulseCLI:
             # pipeline with the bug undiagnosed. Answer what it asked for
             # and let it try again, a bounded number of times.
             for _round in range(_MAX_FIX_TOOL_ROUNDS):
-                if fix is not None:
+                if fix is not None or no_change is not None:
                     break
                 print(f"[3] Fix (not final)\n{fix_answer}\n")
                 self.agent_history.append({"role": "assistant", "content": fix_answer})
@@ -9262,6 +9698,15 @@ class PulseCLI:
                 except AgentRequestFailed:
                     break
                 fix = self._parse_code_fix(fix_answer)
+                no_change = self._parse_no_change(fix_answer) if fix is None else None
+
+            if no_change is not None:
+                # The analysis found nothing in the code to change, and the model said so.
+                # That is a complete answer: nothing is written, nothing is re-asked.
+                print(f"[3] No code change needed\n{no_change}\n")
+                full_answer += f"\n\nNo code change needed: {no_change}"
+                self.agent_history.append({"role": "assistant", "content": full_answer})
+                return full_answer
 
             if fix is None:
                 print(f"[3] Fix\n{fix_answer}\n")
@@ -9290,16 +9735,32 @@ class PulseCLI:
             # If any snippet failed to match (verbatim or fuzzy), give the
             # model ONE chance to re-quote it exactly before accepting the
             # miss -- see the matching logic in pulse.py's _ask.
+            first_applied_fix = self._last_applied_fix if first_pass_landed else None
+            lint_failed = dict(getattr(self, "_last_apply_lint_messages", None) or {})
+            retry_fix = None
             if self._last_apply_skipped:
                 retry_fix = self._request_corrected_snippets(fix, self._last_apply_skipped)
-                if retry_fix is not None:
-                    self._fix_applied_this_turn = False
-                    retry_result = self._apply_code_fix(retry_fix)
-                    retry_landed = self._fix_applied_this_turn
-                    self._fix_applied_this_turn = first_pass_landed or retry_landed
-                    if retry_landed:
-                        note = "additional" if first_pass_landed else "retry after correcting a snippet mismatch --"
-                        apply_result = apply_result + f"\n\n({note} change applied)\n" + retry_result
+            elif lint_failed and not first_pass_landed:
+                # Every snippet matched but the edited file failed the lint gate:
+                # show the model the lint output and let it correct the fix once.
+                retry_fix = self._request_lint_corrected_fix(fix, lint_failed)
+            if retry_fix is not None:
+                self._fix_applied_this_turn = False
+                retry_result = self._apply_code_fix(retry_fix)
+                retry_landed = self._fix_applied_this_turn
+                self._fix_applied_this_turn = first_pass_landed or retry_landed
+                if retry_landed:
+                    note = "additional" if first_pass_landed else "retry after correcting the fix --"
+                    apply_result = apply_result + f"\n\n({note} change applied)\n" + retry_result
+                    if first_applied_fix is not None:
+                        # Record the whole fix that landed, not only the partial retry --
+                        # the known-fix index and the post-restart check describe it.
+                        self._last_applied_fix = {
+                            **first_applied_fix,
+                            "old": list(first_applied_fix["old"]) + list(retry_fix["old"]),
+                            "new": list(first_applied_fix["new"]) + list(retry_fix["new"]),
+                            "files": list(first_applied_fix["files"]) + list(retry_fix["files"]),
+                        }
 
             result = f"{full_answer}\n\n{apply_result}"
 
@@ -9344,6 +9805,30 @@ class PulseCLI:
 
         return result
 
+    # A reply that declines in prose instead of the {"no_change": true} object.
+    _NO_CHANGE_PROSE_RE = re.compile(
+        r"\bno (?:code )?(?:change|fix|edit|modification)s? (?:is |are )?(?:needed|required|necessary)\b"
+        r"|\bnothing (?:in the code )?(?:needs|to) (?:to be )?(?:change|fix)", re.IGNORECASE)
+
+    @classmethod
+    def _parse_no_change(cls, answer: str) -> Optional[str]:
+        """PASS 3's way to decline: {"no_change": true, "reason": ...} (or the
+        same said in plain prose with no directive and no fix in it). Returns
+        the reason, or None if the reply isn't a decline."""
+        text = (answer or "").strip()
+        for obj in cls._iter_json_objs(text):
+            if "no_change" in obj:
+                if not cls._as_bool(obj.get("no_change")):
+                    return None
+                return str(obj.get("reason", "") or obj.get("explanation", "")).strip() or "(no reason given)"
+        if "{" in text:
+            return None
+        cleaned, *lists = cls._extract_directives(text)
+        _c, new_requests = cls._extract_new_directives(cleaned)
+        if any(lists) or new_requests:
+            return None
+        return text if cls._NO_CHANGE_PROSE_RE.search(text) else None
+
     @staticmethod
     def _parse_code_fix(answer: str) -> Optional[Dict[str, Any]]:
         """If `answer` is a well-formed code-fix JSON payload, return it, else None.
@@ -9373,14 +9858,18 @@ class PulseCLI:
                 text = text[4:]
             text = text.strip()
 
-        if not (text.startswith("{") and text.endswith("}")):
-            return None
-
-        try:
-            payload = json.loads(text)
-        except (ValueError, TypeError):
-            return None
-
+        payload = None
+        if text.startswith("{") and text.endswith("}"):
+            try:
+                payload = json.loads(text)
+            except (ValueError, TypeError):
+                payload = None
+        if not isinstance(payload, dict):
+            # "Here is the fix:\n{...}" -- find the object inside the prose, preferring
+            # one that actually carries old/new over an incidental {...} in the text.
+            candidates = list(PulseCLI._iter_json_objs(text))
+            payload = next((c for c in candidates if "old" in c and "new" in c),
+                           candidates[0] if candidates else None)
         if not isinstance(payload, dict):
             return None
 
@@ -9397,6 +9886,10 @@ class PulseCLI:
         old, new, explanation = payload.get("old"), payload.get("new"), payload.get("explanation")
         files = payload.get("files")
         explanation = explanation if isinstance(explanation, str) else ""
+        extra = {"resume": payload["resume"]} if "resume" in payload else {}
+        if isinstance(files, str):
+            # "files": "model.py" -- one file named for every change.
+            files = [files] * (len(old) if isinstance(old, list) and old else 1)
 
         def _valid_str_list(lst):
             return isinstance(lst, list) and bool(lst) and all(isinstance(x, str) for x in lst)
@@ -9414,7 +9907,7 @@ class PulseCLI:
             else:
                 files = [None] * len(old)
 
-            return {"old": old, "new": new, "files": files, "explanation": explanation}
+            return {"old": old, "new": new, "files": files, "explanation": explanation, **extra}
 
         # Fallback shape: "old"/"new" are flat line arrays for a single
         # change -- join them back into one snippet each.
@@ -9424,14 +9917,12 @@ class PulseCLI:
             return None
 
         file_label = None
-        if isinstance(files, str):
-            file_label = files
-        elif isinstance(files, list) and files and isinstance(files[0], str):
+        if isinstance(files, list) and files and isinstance(files[0], str):
             file_label = files[0]
 
         return {
             "old": [joined_old], "new": [joined_new], "files": [file_label],
-            "explanation": explanation,
+            "explanation": explanation, **extra,
         }
 
     def _fix_log_dir(self) -> Optional[str]:
@@ -9487,7 +9978,7 @@ class PulseCLI:
 
     def _record_fix_commit(
         self, files: Dict[str, tuple], explanation: str, kind: str = "fix",
-        created: Optional[set] = None,
+        created: Optional[set] = None, deleted: Optional[set] = None,
     ) -> Optional[str]:
         """Append one 'commit' to the persistent, git-diff-style change
         log. `files` maps path -> (before, after) full file contents.
@@ -9520,6 +10011,8 @@ class PulseCLI:
             file_entry = {"path": fpath, "before": before, "after": after, "diff": diff}
             if created and fpath in created:
                 file_entry["created"] = True      # `before` is "" because the file did not exist
+            if deleted and fpath in deleted:
+                file_entry["deleted"] = True      # `after` is "" because the file no longer exists
             file_entries.append(file_entry)
 
         entry = {
@@ -9545,31 +10038,58 @@ class PulseCLI:
 
         return commit_id
 
-    def _fix_log_state_asof(self, entries: List[Dict[str, Any]], target_idx: int) -> Dict[str, str]:
+    def _fix_log_state_asof(self, entries: List[Dict[str, Any]], target_idx: int) -> Dict[str, Optional[str]]:
         """{path: content} the workspace would have had right after the
         commit at `target_idx` landed -- built by replaying the log in
         order and keeping the latest 'after' seen per file, up to and
         including that commit. `target_idx == -1` means "before the very
         first commit" (an empty dict; see _fix_log_original for that
-        case's fallback).
+        case's fallback). None means the file did not exist at that point
+        (a commit that deleted it).
         """
-        state: Dict[str, str] = {}
+        state: Dict[str, Optional[str]] = {}
         for i, e in enumerate(entries):
             if i > target_idx:
                 break
             for fc in e.get("files", []):
-                state[fc["path"]] = fc["after"]
+                state[fc["path"]] = None if fc.get("deleted") else fc["after"]
         return state
 
     @staticmethod
     def _fix_log_original(entries: List[Dict[str, Any]], path: str) -> Optional[str]:
         """The very first 'before' recorded for `path` anywhere in the
-        log, i.e. its content before Pulse ever touched it."""
+        log, i.e. its content before Pulse ever touched it -- None if a
+        Pulse commit created it (it did not exist before)."""
         for e in entries:
             for fc in e.get("files", []):
                 if fc["path"] == path:
-                    return fc["before"]
+                    return None if fc.get("created") else fc["before"]
         return None
+
+    @staticmethod
+    def _match_commit_id(entries: List[Dict[str, Any]], arg: str):
+        """(index, "") of the commit whose id is `arg` or starts with it, or
+        (None, why) when none does or the prefix names more than one --
+        picking the first of several would silently revert the wrong one."""
+        exact = [i for i, e in enumerate(entries) if e.get("id", "") == arg]
+        if exact:
+            return exact[-1], ""
+        hits = [i for i, e in enumerate(entries) if arg and e.get("id", "").startswith(arg)]
+        if len(hits) == 1:
+            return hits[0], ""
+        if hits:
+            ids = ", ".join(entries[i].get("id", "?") for i in hits)
+            return None, f"ambiguous -- matches {len(hits)} commits ({ids}); give more of the id"
+        return None, "no commit matches that id"
+
+    @staticmethod
+    def _describe_commits(entries: List[Dict[str, Any]], limit: int = 15) -> str:
+        shown = entries[-limit:]
+        lines = [f"  {e.get('id', '?')}  [{e.get('kind', 'fix')}]  {(e.get('explanation') or '')[:100]}"
+                 for e in shown]
+        if len(entries) > len(shown):
+            lines.insert(0, f"  ... ({len(entries) - len(shown)} older)")
+        return "\n".join(lines)
 
     def _cmd_log(self, arg: str) -> None:
         """/log -- list Pulse's persisted code-fix commits for this
@@ -9609,6 +10129,7 @@ class PulseCLI:
 
         restored, failed = [], []
         revert_files: Dict[str, tuple] = {}
+        created, deleted = set(), set()
         for fpath in all_paths:
             try:
                 with open(fpath, "r", encoding="utf-8") as f:
@@ -9616,31 +10137,43 @@ class PulseCLI:
             except OSError:
                 current = None  # file has since been deleted/moved -- still try to restore it
 
-            content = asof.get(fpath)
-            if content is None:
-                content = self._fix_log_original(entries, fpath)
-            if content is None or content == current:
-                continue  # nothing recorded for this file, or it's already in that state
+            # None = the file must not exist in that state (a fix created it later,
+            # or a commit deleted it): remove it rather than leave an empty module
+            # behind, which still shadows or breaks an import.
+            content = asof[fpath] if fpath in asof else self._fix_log_original(entries, fpath)
+            if content == current:
+                continue  # already in that state
 
             try:
-                with open(fpath, "w", encoding="utf-8") as f:
-                    f.write(content)
+                if content is None:
+                    os.remove(fpath)
+                else:
+                    with open(fpath, "w", encoding="utf-8") as f:
+                        f.write(content)
             except OSError as exc:
                 failed.append((fpath, str(exc)))
                 continue
 
-            if current is not None:
-                revert_files[fpath] = (current, content)
+            # Recorded either way -- restoring a deleted file, or deleting a
+            # created one, is a change the next /revert must be able to undo.
+            revert_files[fpath] = (current or "", content or "")
+            if current is None:
+                created.add(fpath)
+            if content is None:
+                deleted.add(fpath)
             restored.append(fpath)
             if fpath == self.script_path:
-                self.code_text = content
+                self.code_text = content if content is not None else ""
+            elif content is None:
+                self.extra_files.pop(fpath, None)
             elif fpath in self.extra_files:
                 self.extra_files[fpath] = content
 
         new_commit = None
         if restored:
             new_commit = self._record_fix_commit(
-                revert_files, f"Reverted to state {target_label}", kind="revert"
+                revert_files, f"Reverted to state {target_label}", kind="revert",
+                created=created, deleted=deleted,
             )
             if new_commit:
                 self._last_commit_id = new_commit
@@ -9669,17 +10202,11 @@ class PulseCLI:
             target_idx = len(entries) - 2  # state right before the last commit
             target_label = f"before commit {entries[-1].get('id', '?')} (most recent)"
         else:
-            target_idx = None
-            target_label = ""
-            for i, e in enumerate(entries):
-                eid = e.get("id", "")
-                if eid == arg or (arg and eid.startswith(arg)):
-                    target_idx = i
-                    target_label = f"commit {eid}"
-                    break
+            target_idx, problem = self._match_commit_id(entries, arg)
             if target_idx is None:
-                cprint(f"[Pulse CLI] No commit matches '{arg}'. Use /log to see recorded commits.")
+                cprint(f"[Pulse CLI] '{arg}': {problem}. Use /log to see recorded commits.")
                 return
+            target_label = f"commit {entries[target_idx].get('id', '')}"
 
         restored, failed, new_commit = self._perform_revert(entries, target_idx, target_label)
 
@@ -9781,6 +10308,7 @@ class PulseCLI:
         by_path: Dict[str, List[tuple]] = {}
         unresolved = []
         self._last_apply_lint_failed = []
+        self._last_apply_lint_messages: Dict[str, List[str]] = {}
         for old, new, label in zip(fix["old"], fix["new"], fix["files"]):
             path = self._resolve_fix_path(label)
             if not path:
@@ -9809,12 +10337,18 @@ class PulseCLI:
                     skipped.append((old, path, f"couldn't read file: {exc}"))
                 continue
 
-            content = original_content
+            # Windows line endings: the model is shown (and quotes) lines without '\r',
+            # so match against LF text and put the CRLFs back when writing.
+            crlf = "\r\n" in original_content
+            content = original_content.replace("\r\n", "\n") if crlf else original_content
             applied = []
             for old, new in pairs:
-                count = content.count(old)
+                old, new = old.replace("\r\n", "\n"), new.replace("\r\n", "\n")
+                hits = _token_boundary_occurrences(content, old)
+                count = len(hits)
                 if count == 1:
-                    content = content.replace(old, _banner_wrap_fix(old, new, path), 1)
+                    start = hits[0]
+                    content = content[:start] + _banner_wrap_fix(old, new, path) + content[start + len(old):]
                     applied.append((old, new))
                     continue
                 if count == 0:
@@ -9826,6 +10360,7 @@ class PulseCLI:
                     if span is not None:
                         start, end = span
                         actual_old = content[start:end]
+                        new = _reindent_like(new, old, actual_old)
                         content = content[:start] + _banner_wrap_fix(actual_old, new, path) + content[end:]
                         applied.append((actual_old, new))
                     else:
@@ -9853,9 +10388,10 @@ class PulseCLI:
             # plus a real lint pass (pyflakes, if importable) on the FULL
             # proposed file content, before anything touches disk.
             cprint(f"  -> /lint {os.path.basename(path)}", color=_YELLOW)
-            lint_ok, lint_messages = self._lint_check(content, path)
+            lint_ok, lint_messages = self._lint_check(content, path, original=original_content)
             if not lint_ok:
                 self._last_apply_lint_failed.append(path)
+                self._last_apply_lint_messages[path] = lint_messages
                 cprint(f"     lint FAILED -- fix will not be written:\n     " + "\n     ".join(lint_messages), color=_RED)
                 lines.append(
                     f"⚠ Fix for '{path}' failed the automatic syntax/lint gate and was NOT written:\n"
@@ -9864,8 +10400,10 @@ class PulseCLI:
                 continue
             cprint("     lint passed", color=_YELLOW)
 
+            if crlf:
+                content = content.replace("\n", "\r\n")
             try:
-                with open(path, "w", encoding="utf-8") as f:
+                with open(path, "w", encoding="utf-8", newline="") as f:
                     f.write(content)
             except OSError as exc:
                 lines.append(f"⚠ Failed to write changes to '{path}': {exc}")
@@ -9901,7 +10439,15 @@ class PulseCLI:
             skipped.append((old, label or "(unspecified file)", "couldn't determine which file this targets"))
 
         if not applied_by_path:
-            lines.append("\n⚠ No changes were applied -- none of the proposed snippets matched cleanly:")
+            if self._last_apply_lint_failed:
+                # The snippets matched; the edited file failed the lint gate (already
+                # listed above). Saying "didn't match" here hid the real reason.
+                lines.append("\n⚠ No changes were applied -- the edited file(s) failed the automatic "
+                             "syntax/lint check (see above).")
+                if skipped:
+                    lines.append("Also skipped:")
+            else:
+                lines.append("\n⚠ No changes were applied -- none of the proposed snippets matched cleanly:")
             for old, where, reason in skipped:
                 lines.append(f"  - [{os.path.basename(str(where))}] {reason}: {old.splitlines()[0][:80]}...")
             self._last_apply_skipped = skipped
@@ -10033,7 +10579,47 @@ class PulseCLI:
             "just these snippets -- no prose, no markdown fences."
         )
         answer = self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS)
-        return self._parse_code_fix(answer)
+        corrected = self._parse_code_fix(answer)
+        if corrected is not None:
+            # A reply without "files" must not default to the main script: each
+            # corrected entry belongs to the file its miss came from.
+            miss_paths = [self._resolve_fix_path(label) for _old, label in retryable]
+            for i, f in enumerate(corrected["files"]):
+                if f:
+                    continue
+                if len(corrected["files"]) == len(miss_paths):
+                    path = miss_paths[i]
+                elif len(set(miss_paths)) == 1:
+                    path = miss_paths[0]
+                else:
+                    continue
+                if path:
+                    corrected["files"][i] = self._label_for_path.get(path, path)
+        return corrected
+
+    def _request_lint_corrected_fix(self, fix: Dict[str, Any], lint_failed: Dict[str, List[str]]) -> Optional[Dict[str, Any]]:
+        """One bounded retry when a fix matched but the edited file failed the
+        lint gate: show the model the lint output and ask for a corrected fix."""
+        report = "\n".join(
+            f"--- {self._label_for_path.get(p, os.path.basename(p))} ---\n" + "\n".join(msgs)
+            for p, msgs in lint_failed.items())
+        prompt = (
+            "CORRECTION: your fix matched the code, but the edited file failed Pulse's automatic "
+            "syntax/lint check, so NOTHING was written:\n" + report + "\n\n"
+            "Your fix was:\n" + self._describe_fix(fix) + "\n\n"
+            "Correct it so the edited file is valid (unbalanced brackets, a wrong indent, a name "
+            "used before it is defined or imported) without changing what the fix does. Respond "
+            "with ONLY the corrected code-fix JSON object (old/new/files/explanation), quoting "
+            "'old' from the file as it is now -- no prose, no markdown fences."
+        )
+        try:
+            answer = self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS)
+        except AgentRequestFailed:
+            return None
+        corrected = self._parse_code_fix(answer)
+        if corrected is not None and len(corrected["files"]) == len(fix["files"]):
+            corrected["files"] = [f or fix["files"][i] for i, f in enumerate(corrected["files"])]
+        return corrected
 
     def _cmd_code(self, arg: str) -> None:
         """Toggle whether questions include the training code (and any
@@ -11092,6 +11678,10 @@ class PulseCLI:
 
             new_src = src
             patched_this = False
+            # Patch only the flagged call (or line), never every match in the file:
+            # a file-wide regex also "fixed" a correct classifier's metrics.
+            seg_start, seg_end = _mllint_flagged_span(src, lineno)
+            head, region, tail = src[:seg_start], src[seg_start:seg_end], src[seg_end:]
 
             # Pattern 1: regression loss + accuracy metric in
             # model.compile(). Replace accuracy-type metrics with 'mae'
@@ -11109,10 +11699,10 @@ class PulseCLI:
                         )
                     return f"metrics={inner}"
 
-                new_src = re.sub(
+                new_src = head + re.sub(
                     r"metrics=(\[[^\]]*\]|'[^']*'|\"[^\"]*\")",
-                    replace_metric, src
-                )
+                    replace_metric, region
+                ) + tail
                 patched_this = new_src != src
 
             # Pattern 1b: classification loss + regression-only metric --
@@ -11129,10 +11719,10 @@ class PulseCLI:
                         )
                     return f"metrics={inner}"
 
-                new_src = re.sub(
+                new_src = head + re.sub(
                     r"metrics=(\[[^\]]*\]|'[^']*'|\"[^\"]*\")",
-                    replace_metric_inverse, src
-                )
+                    replace_metric_inverse, region
+                ) + tail
                 patched_this = new_src != src
 
             # Pattern 2: double-softmax -- remove Softmax() from the
@@ -11141,10 +11731,13 @@ class PulseCLI:
             elif "double softmax" in msg.lower() or "double-softmax" in msg.lower():
                 import re
                 # Remove Softmax() / nn.Softmax() as a standalone layer
-                new_src = re.sub(
+                line_start = src.rfind("\n", 0, seg_start) + 1
+                line_end = src.find("\n", seg_start)
+                line_end = len(src) if line_end == -1 else line_end + 1
+                new_src = src[:line_start] + re.sub(
                     r"\bmodel\.add\(.*?[Ss]oftmax\s*\(.*?\)\s*\)\s*\n",
-                    "", src
-                )
+                    "", src[line_start:line_end]
+                ) + src[line_end:]
                 patched_this = new_src != src
 
             if not patched_this:
@@ -11170,6 +11763,16 @@ class PulseCLI:
                 path, src, new_src,
                 f"Automatic MLLINT fix (start-of-run): {msg[:200]}"
             )
+            # A real .pulse_history commit too, so /log shows it and /revert undoes it,
+            # and the in-memory code the agent is shown next is the patched file.
+            commit_id = self._record_fix_commit(
+                {path: (src, new_src)}, f"Automatic MLLINT fix (start-of-run): {msg[:200]}")
+            if commit_id:
+                self._last_commit_id = commit_id
+            if path == self.script_path:
+                self.code_text = new_src
+            elif path in self.extra_files:
+                self.extra_files[path] = new_src
             _agent_log_event(f"START-OF-RUN LINT FIX written to {os.path.basename(path)}", msg[:300])
             cprint(
                 f"[Pulse] ✓ Auto-fixed '{label}' at line {lineno}: {msg[:120]}",
@@ -11193,6 +11796,21 @@ class PulseCLI:
         self._mllint_clean_reported = True
         cprint("[Pulse] ✓ Start-of-run ML anti-pattern check: no issues found in the code.", color=_YELLOW)
 
+    @staticmethod
+    def _mllint_agent_question(kind: str, finding_summary: str, fixed_deterministically: bool) -> str:
+        """The question MLLINT findings are handed to the agent with. The checks are
+        heuristics (some say so in their own text), so the agent verifies each one
+        against the code first and changes code only for a finding it confirms --
+        ordering a fix for every finding edited healthy programs."""
+        patched = (" Pulse has already applied a deterministic mechanical fix to the file; verify it "
+                   "is correct." if fixed_deterministically else "")
+        return (
+            f"Pulse's {kind} ML anti-pattern check (a heuristic scan, which can report false "
+            f"positives) found: {finding_summary}.{patched} First verify against the code whether "
+            "each finding is a real problem in this program. Only for one you confirm, fix it with "
+            "the smallest code change; if none is real, make no change and say why."
+        )
+
     def _prime_at_start(self) -> None:
         """Runs once, automatically, before the very first training step.
 
@@ -11200,10 +11818,10 @@ class PulseCLI:
         finding that has a deterministic fix (regression+accuracy mismatch,
         double-softmax, ...) the fix is applied immediately to the file,
         the same as any other Pulse auto-intervention, before training has
-        taken a single step. For findings without a deterministic path,
-        the agent pipeline is triggered with an explicit 'diagnose AND fix'
-        instruction -- not 'confirm and propose'. Either way, a finding
-        always produces an actual fix attempt, not a suggestion.
+        taken a single step. Every finding then goes to the agent pipeline,
+        which verifies it against the code first and fixes only what it
+        confirms -- the checks are heuristics, and a false positive must
+        not turn into an edit of a healthy program.
 
         (1) If an agent is configured: asks it to set sensitivity, seed a
         starting-value baseline (NORMAL_START:) and flag GPU-track
@@ -11227,7 +11845,7 @@ class PulseCLI:
             lines = [f"  {label}:{lineno}: {msg}" for label, lineno, msg in mllint_findings]
             cprint(
                 f"\n[Pulse] ⚠ Start-of-run ML anti-pattern check found "
-                f"{len(mllint_findings)} problem(s) -- auto-fixing before training starts:\n"
+                f"{len(mllint_findings)} possible problem(s) -- checking before training starts:\n"
                 + "\n\n".join(lines) + "\n",
                 color=_RED,
             )
@@ -11243,20 +11861,13 @@ class PulseCLI:
                 finding_summary = "; ".join(
                     f"{label}:{lineno}: {msg}" for label, lineno, msg in mllint_findings[:3]
                 )
-                fix_note = (
-                    " Pulse has already applied a deterministic mechanical fix to the file; "
-                    "verify it is correct and fix anything remaining."
-                    if fixed_deterministically else
-                    " Pulse could not apply a deterministic fix -- diagnose AND fix this now."
-                )
                 cprint(
-                    "[Pulse] Auto-intervention: agent fixing "
+                    "[Pulse] Auto-intervention: agent checking the findings "
                     f"({'verifying deterministic patch' if fixed_deterministically else 'no deterministic fix available'})...",
                     color=_RED,
                 )
                 self.ask_agent(
-                    f"Pulse's automatic start-of-run ML anti-pattern check found: {finding_summary}."
-                    f"{fix_note} Use the full fix pipeline (diagnose, write a code fix, apply it).",
+                    self._mllint_agent_question("automatic start-of-run", finding_summary, fixed_deterministically),
                     include_code=True,
                 )
             elif not fixed_deterministically:
@@ -11376,19 +11987,13 @@ class PulseCLI:
             finding_summary = "; ".join(
                 f"{label}:{lineno}: {msg}" for label, lineno, msg in mllint_findings[:3]
             )
-            fix_note = (
-                " Pulse has already applied a deterministic mechanical fix; verify it and fix anything remaining."
-                if fixed_deterministically else
-                " Pulse could not apply a deterministic fix -- diagnose AND fix this now."
-            )
             cprint(
-                f"\n[Pulse] ⚠ Re-running ML anti-pattern fix now that agent is configured "
-                f"({'verifying deterministic patch' if fixed_deterministically else 'agent fix required'})...",
+                f"\n[Pulse] ⚠ Re-running ML anti-pattern check now that agent is configured "
+                f"({'verifying deterministic patch' if fixed_deterministically else 'agent to verify the findings'})...",
                 color=_RED,
             )
             self.ask_agent(
-                f"Pulse's start-of-run ML anti-pattern check found: {finding_summary}."
-                f"{fix_note} Use the full fix pipeline (diagnose, write a code fix, apply it).",
+                self._mllint_agent_question("start-of-run", finding_summary, fixed_deterministically),
                 include_code=True,
             )
 
