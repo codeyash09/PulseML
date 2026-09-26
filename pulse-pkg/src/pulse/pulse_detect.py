@@ -59,6 +59,15 @@ LOSS_NAME_HINTS = ("loss", "cost", "nll", "cross_entropy", "crossentropy", "obje
                    "kl", "kld", "divergence", "ppl", "perplexity", "mse", "mae", "rmse")
 METRIC_NAME_HINTS = ("acc", "accuracy", "f1", "auc", "precision", "recall", "iou", "dice",
                      "bleu", "rouge", "map", "mrr", "r2", "score")
+# The short ones are matched as whole name tokens, not substrings: `acc` is inside
+# `grad_accum_steps`, `dice` inside `indices`, `map` inside `heatmap`, `r2` inside
+# `layer2`, `iou` inside `previous` -- and each of those was checked as a score.
+_TOKEN_METRIC_HINTS = frozenset({"acc", "f1", "auc", "iou", "miou", "dice", "map", "mrr", "r2"})
+# A coefficient on a loss term is not a loss. `kl` is a loss hint, so the KL-annealing
+# weight every VAE ramps from 0 to 1 was reported as a loss "climbing, not falling";
+# `error_count` is a counter, and `loss_scale` is AMP's scaler.
+_COEFFICIENT_TOKENS = frozenset({"weight", "beta", "coef", "coeff", "anneal", "scale",
+                                 "count"})
 NORM_NAME_HINTS = ("grad_norm", "gradnorm", "grad_scale", "weight_norm", "param_norm",
                    "update_norm", "momentum_norm", "_norm", "logit_max", "logit_norm",
                    "activation_norm", "emb_norm")
@@ -78,7 +87,7 @@ MOVING_TARGET_HINTS = ("policy_loss", "value_loss", "actor_loss", "critic_loss",
 # usually ends as an out-of-memory kill several hours in.
 TIME_NAME_HINTS = ("step_time", "batch_time", "iter_time", "epoch_time", "elapsed_per",
                    "sec_per_step", "secs_per_step", "ms_per_batch", "ms_per_step", "time_per")
-VAL_PREFIXES = ("val", "valid", "validation", "test", "eval", "dev")
+VAL_PREFIXES = ("val", "valid", "validation", "test", "eval", "evaluation", "dev")
 
 # ---------------------------------------------------------------------------------------
 # What a variable *is*, beyond loss-or-metric.
@@ -103,8 +112,10 @@ SCORE_NAME_HINTS = ("reward", "return", "win_rate", "success_rate", "pass_rate",
 ENTROPY_NAME_HINTS = ("entropy", "perplexity_of_router", "router_prob_std", "diversity")
 
 # Should sit near zero. These are the "how much of the work is being wasted" numbers.
+# (An error rate is not here: it measures quality, not work thrown away, and a hard task's
+# 45% error was reported as "that share of every batch is being thrown away".)
 WASTE_NAME_HINTS = ("oov", "unk_rate", "padding_frac", "pad_frac", "dropped", "truncat",
-                    "error_rate", "err_rate", "clip_fraction", "clipped_frac", "skip_rate",
+                    "clip_fraction", "clipped_frac", "skip_rate",
                     "overflow", "collision", "retry", "timeout_rate", "miss_rate",
                     "invalid_frac", "reject")
 
@@ -114,6 +125,9 @@ UTILISATION_NAME_HINTS = ("util", "occupancy", "efficiency", "mfu", "hfu", "sm_a
 # Work per unit time. Falling is the fault.
 THROUGHPUT_NAME_HINTS = ("per_sec", "per_second", "_persec", "throughput", "samples_s",
                          "tokens_s", "it_s", "ips", "qps", "fps", "steps_s")
+# Short enough to turn up inside unrelated names (`it_s` in init_std, split_size and
+# logit_scale; `ips` in clips), so these only count as whole tokens.
+_TOKEN_THROUGHPUT_HINTS = ("it_s", "ips", "qps", "fps")
 
 # Growth is the fault: something is accumulating.
 MEMORY_NAME_HINTS = ("mem_", "memory", "vram", "rss", "allocated", "reserved", "heap")
@@ -137,14 +151,30 @@ def _lower(name: str) -> str:
     return (name or "").lower()
 
 
+def _tokens(name: str) -> List[str]:
+    """The words a name is made of: `val_loss` -> [val, loss], `valLoss` -> [val, loss]."""
+    split = re.sub(r"([a-z0-9])([A-Z][a-z])", r"\1_\2", name or "")
+    return [token for token in re.split(r"[^a-z0-9]+", split.lower()) if token]
+
+
+def _has_token(name: str, hints: Iterable[str]) -> bool:
+    """Is one of `hints` a whole word of the name? `acc1` still counts as `acc`."""
+    hints = set(hints)
+    return any(token in hints or token.rstrip("0123456789") in hints for token in _tokens(name))
+
+
 def looks_like_loss(name: str) -> bool:
     low = _lower(name)
-    return any(hint in low for hint in LOSS_NAME_HINTS)
+    if not any(hint in low for hint in LOSS_NAME_HINTS):
+        return False
+    return not any(token in _COEFFICIENT_TOKENS for token in _tokens(name))
 
 
 def looks_like_metric(name: str) -> bool:
     low = _lower(name)
-    return any(hint in low for hint in METRIC_NAME_HINTS) and not looks_like_loss(name)
+    matched = (any(hint in low for hint in METRIC_NAME_HINTS if hint not in _TOKEN_METRIC_HINTS)
+               or _has_token(name, _TOKEN_METRIC_HINTS))
+    return matched and not looks_like_loss(name)
 
 
 def looks_like_norm(name: str) -> bool:
@@ -180,6 +210,10 @@ def looks_like_score(name: str) -> bool:
 
 
 def looks_like_entropy(name: str) -> bool:
+    # A cross-entropy is a loss, not a distribution's entropy: every classification
+    # loss falling towards zero was reported as a collapse.
+    if "cross" in _lower(name) or "loss" in _tokens(name):
+        return False
     return _has(name, ENTROPY_NAME_HINTS)
 
 
@@ -193,7 +227,10 @@ def looks_like_utilisation(name: str) -> bool:
 
 
 def looks_like_throughput(name: str) -> bool:
-    return _has(name, THROUGHPUT_NAME_HINTS)
+    padded = "_" + "_".join(_tokens(name)) + "_"
+    if any(f"_{hint}_" in padded for hint in _TOKEN_THROUGHPUT_HINTS):
+        return True
+    return _has(name, tuple(h for h in THROUGHPUT_NAME_HINTS if h not in _TOKEN_THROUGHPUT_HINTS))
 
 
 def looks_like_memory(name: str) -> bool:
@@ -222,8 +259,9 @@ def looks_like_class_count(name: str) -> bool:
 
 
 def is_validation(name: str) -> bool:
-    low = _lower(name)
-    return any(low.startswith(prefix) or ("_" + prefix) in low for prefix in VAL_PREFIXES)
+    # Whole words: `loss_value` (the usual name for loss.item()) and RL's `value_loss`
+    # both contain "val", and were paired against the training loss as validation.
+    return any(token in VAL_PREFIXES for token in _tokens(name))
 
 
 def thresholds(sensitivity: float) -> Dict[str, float]:
@@ -345,6 +383,45 @@ def _finite(history: Sequence[Any]) -> List[float]:
         if number is not None and isfinite(number):
             out.append(number)
     return out
+
+
+def _nonempty(history: Any) -> bool:
+    """Does this history hold anything? Without `bool()`, which numpy arrays refuse."""
+    try:
+        return history is not None and len(history) > 0
+    except TypeError:
+        return False
+
+
+def _loss_stem(name: str) -> str:
+    """`val_loss` -> `loss`, `train_mae` -> `mae`: the quantity, without the split."""
+    return "_".join(t for t in _tokens(name) if t not in VAL_PREFIXES and t != "train")
+
+
+def _primary_train_loss(names: Iterable[str]) -> Optional[str]:
+    """The training loss: the one called loss (or train_loss) if there is one."""
+    trains = sorted(n for n in names if looks_like_loss(n) and not is_validation(n))
+    return next((n for n in trains if _loss_stem(n) == "loss"), trains[0] if trains else None)
+
+
+def _train_val_pairs(names: Iterable[str]) -> List[Tuple[str, str]]:
+    """Each validation loss with the training series it measures: val_X with X.
+
+    Taking the first training name and the first validation name, as this used to,
+    made the pairing depend on dict order -- and the CLI builds its histories from a
+    set, so with val_mae ahead of val_loss an overfitting val_loss was compared against
+    the wrong curve and never reported.
+    """
+    names = list(names)
+    primary = _primary_train_loss(names)
+    if primary is None:
+        return []
+    trains = [n for n in names if looks_like_loss(n) and not is_validation(n)]
+    pairs = []
+    for val in sorted(n for n in names if looks_like_loss(n) and is_validation(n)):
+        stem = _loss_stem(val)
+        pairs.append((next((n for n in sorted(trains) if _loss_stem(n) == stem), primary), val))
+    return pairs
 
 
 def _mean(values: Sequence[float]) -> float:
@@ -472,8 +549,21 @@ class DetectionEngine:
     """
 
     def __init__(self, sensitivity: float = 0.3, confirmations: int = 2, rearm_after: int = 3,
-                 overrides: Optional[Dict[str, float]] = None) -> None:
+                 overrides: Optional[Dict[str, float]] = None,
+                 require_new_data: bool = False) -> None:
         self.sensitivity = sensitivity
+        # A confirmation is a second look at *new* evidence. A caller that re-checks on
+        # every batch while its histories only grow once per epoch (the CLI under Keras)
+        # would otherwise confirm a finding by looking at the same epoch twice, and
+        # `confirmations` would do nothing. Off by default: a caller that feeds the
+        # engine once per new reading gets the same answer either way.
+        self.require_new_data = bool(require_new_data)
+        self._streak_evidence: Dict[Tuple[str, str], Any] = {}
+        # The level each variable opened at, kept once its history outgrows the analysis
+        # window: after that the window's first reading is ~1,500 readings in, and a run
+        # that came down 2.1 -> 0.1 and converged read as "no better than when it started".
+        self._openings: Dict[str, float] = {}
+        self.last_error: Optional[str] = None
         # Pinning one signal without moving the whole dial: /sensitivity spike 5 sets
         # the explosion multiplier and leaves everything else deriving from the dial.
         self.overrides: Dict[str, float] = dict(overrides or {})
@@ -500,33 +590,69 @@ class DetectionEngine:
         t = thresholds(self.sensitivity)
         t.update({name: value for name, value in self.overrides.items() if value is not None})
         fired: Dict[Tuple[str, str], Finding] = {}
-        histories = histories or {}
+        # Lists, once. `if history` on a numpy array raises ValueError, which took the
+        # whole update down for a caller that passed arrays instead of lists.
+        histories = {name: list(history) for name, history in (histories or {}).items()
+                     if _nonempty(history)}
+        for name, history in histories.items():
+            if name not in self._openings and len(history) > ANALYSIS_WINDOW:
+                head = _finite(history[:ANALYSIS_WINDOW // 5])
+                if head:
+                    self._openings[name] = _mean(head)
         # Convert once. Every check used to call _finite on the whole history for
         # itself, so a run logging 100 variables over 20k steps re-parsed four million
         # values on every update -- most of the detector's cost, and it lands on the
         # training thread in cli mode.
-        finite = {name: _finite(list(history)[-ANALYSIS_WINDOW:])
-                  for name, history in histories.items() if history}
+        finite = {name: _finite(history[-ANALYSIS_WINDOW:])
+                  for name, history in histories.items()}
         self._already_good = self._success_metric_is_high(finite)
         self._run_is_moving = self._something_is_still_changing(finite)
         self._lr_restarts = self._learning_rate_restarts(finite)
 
+        # One check that raises must not take the others with it. An exploding run is
+        # exactly where arithmetic overflows, and losing every finding at that moment --
+        # including the spike that says so -- is the worst time to go silent.
         for name, history in histories.items():
-            if not history:
-                continue
-            for finding in self._check_variable(name, list(history)[-ANALYSIS_WINDOW:], t,
-                                                step, finite.get(name) or []):
-                fired[finding.key] = finding
+            fired.update(self._guarded(self._check_variable, name, history[-ANALYSIS_WINDOW:],
+                                       t, step, finite.get(name) or []))
         for name, stats in (tensor_stats or {}).items():
-            finding = self._check_tensor(name, stats, step)
-            if finding is not None:
-                fired[finding.key] = finding
-        for finding in self._check_pairs(finite, t, step):
-            fired[finding.key] = finding
-        for finding in self._check_relations(finite, histories, t, step):
-            fired[finding.key] = finding
+            fired.update(self._guarded(lambda: [self._check_tensor(name, stats, step)]))
+        fired.update(self._guarded(self._check_pairs, finite, t, step))
+        fired.update(self._guarded(self._check_relations, finite, histories, t, step))
 
-        return self._settle(fired)
+        return self._settle(fired, self._evidence(histories, tensor_stats))
+
+    def _guarded(self, check, *args) -> Dict[Tuple[str, str], Finding]:
+        """Run one check; on an exception, note it and carry on without its findings."""
+        try:
+            return {f.key: f for f in check(*args) if f is not None}
+        except Exception as exc:
+            # Deliberately everything: the detector runs on the training thread.
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            return {}
+
+    @staticmethod
+    def _evidence(histories: Dict[str, List[Any]],
+                  tensor_stats: Optional[Dict[str, Dict[str, Any]]]) -> Dict[str, Any]:
+        """A cheap fingerprint of each input: has anything arrived since last time?"""
+        evidence: Dict[str, Any] = {name: (len(history), repr(history[-1]))
+                                    for name, history in histories.items()}
+        for name, stats in (tensor_stats or {}).items():
+            if isinstance(stats, dict):
+                evidence[name] = repr(sorted(stats.items(), key=lambda kv: str(kv[0])))
+        return evidence
+
+    @staticmethod
+    def _evidence_for(variable: str, evidence: Dict[str, Any]) -> Any:
+        """The inputs a finding about `variable` rests on."""
+        if variable in evidence:
+            return evidence[variable]
+        if " vs " in variable:
+            parts = variable.split(" vs ")
+            if all(part in evidence for part in parts):
+                return tuple(evidence[part] for part in parts)
+        # A group key or anything else not named after one input: the whole input.
+        return tuple(sorted(evidence.items()))
 
     @staticmethod
     def _learning_rate_restarts(finite: Dict[str, List[float]]) -> bool:
@@ -545,9 +671,14 @@ class DetectionEngine:
         for name, values in finite.items():
             if not looks_like_lr(name) or len(values) < 3:
                 continue
+            # A *return* to a level the schedule has already been at. Every warmup more
+            # than doubles the LR between two readings too, and counting that as a
+            # restart turned progress_lost off for the whole of any run with a warmup.
+            peak = values[0]
             for before, after in zip(values, values[1:]):
-                if before > 0 and after > before * 2.0:
+                if before > 0 and after > before * 2.0 and peak >= after * 0.5:
                     return True
+                peak = max(peak, before)
         return False
 
     @staticmethod
@@ -587,14 +718,19 @@ class DetectionEngine:
 
     # ------------------------------------------------------------------ state machine
 
-    def _settle(self, fired: Dict[Tuple[str, str], Finding]) -> Dict[str, List[Finding]]:
+    def _settle(self, fired: Dict[Tuple[str, str], Finding],
+                evidence: Optional[Dict[str, Any]] = None) -> Dict[str, List[Finding]]:
         raised: List[Finding] = []
         cleared: List[Finding] = []
 
         for key, finding in fired.items():
             self._clear_streak.pop(key, None)
             needed = 1 if finding.check in _IMMEDIATE_CHECKS else self.confirmations
-            streak = self._streak.get(key, 0) + 1
+            streak = self._streak.get(key, 0)
+            seen = self._evidence_for(finding.variable, evidence or {})
+            if not (self.require_new_data and streak and self._streak_evidence.get(key) == seen):
+                streak += 1              # otherwise the same data again: a re-check, not a confirmation
+                self._streak_evidence[key] = seen
             self._streak[key] = streak
             if key in self.active:
                 existing = self.active[key]
@@ -621,6 +757,7 @@ class DetectionEngine:
         for key in list(self._streak):
             if key not in fired:
                 self._streak.pop(key, None)
+                self._streak_evidence.pop(key, None)
 
         return {"raised": raised, "cleared": cleared}
 
@@ -649,7 +786,12 @@ class DetectionEngine:
         # arithmetic do not repeat a whole sequence by chance, so this means the same
         # data is going through the same weights: an exhausted iterator being re-used,
         # or per-epoch state being reset. Cheap to check and impossible to fake.
-        if (is_loss or is_metric) and len(values) >= 12:
+        # A metric on a small evaluation set is quantised -- 197 right out of 200 is
+        # exactly 0.985 every time -- so a good model's score repeats bit-for-bit for
+        # epochs on end. That is the metric having converged, not the run having died,
+        # and it is only "frozen" or "repeating" when the model is not already doing well.
+        frozen_matters = is_loss or not getattr(self, "_already_good", False)
+        if frozen_matters and (is_loss or is_metric) and len(values) >= 12:
             for period in range(2, min(13, len(values) // 3 + 1)):
                 tail = values[-period:]
                 if len(set(tail)) == 1:
@@ -662,11 +804,6 @@ class DetectionEngine:
                                        step, {"period": period, "cycle": tail}, 0.9))
                     break
 
-        # A metric on a small evaluation set is quantised -- 197 right out of 200 is
-        # exactly 0.985 every time -- so a good model's score repeats bit-for-bit for
-        # epochs on end. That is the metric having converged, not the run having died,
-        # and it is only "frozen" when the model is not already doing well.
-        frozen_matters = is_loss or not getattr(self, "_already_good", False)
         if frozen_matters and (is_loss or is_metric) and len(values) >= 6 and len(set(values[-6:])) == 1:
             out.append(Finding("frozen", name, WARNING,
                                f"{name} has been exactly {latest:g} for {min(len(values), 6)} readings",
@@ -783,14 +920,24 @@ class DetectionEngine:
         if is_score:
             peak = max(values)
             trough = _mean(values[-max(2, span // 2):])
-            noise = _stdev(values[-20:])
+            # Noise as reading-to-reading scatter as well as spread: the spread of the
+            # last 20 readings includes the fall itself, and a fall big enough to matter
+            # made its own noise too large to clear.
+            recent_deltas = [b - a for a, b in zip(values[-21:], values[-20:])]
+            noise = min(_stdev(values[-20:]), _stdev(recent_deltas) / 2 ** 0.5)
             fallen = peak - trough
-            if (peak > 0 and fallen > max(t["score_drop_frac"] * abs(peak), 3.0 * noise)
+            # How far down counts as a fall. A fraction of the peak only means something
+            # for a score that lives above zero; an RL reward climbing from -1500 to -200
+            # and collapsing back to -1200 has a negative peak, and measured against it
+            # the check could never fire. There, measure against the range covered.
+            reference = peak if peak > 0 else peak - min(values)
+            if (reference > 0 and fallen > max(t["score_drop_frac"] * reference, 3.0 * noise)
                     and values.index(peak) < len(values) - 2):
-                severity = CRITICAL if fallen > 0.25 * abs(peak) else WARNING
+                severity = CRITICAL if fallen > 0.25 * reference else WARNING
+                what = "of its best" if peak > 0 else "of the range it has covered"
                 out.append(Finding("score_regression", name, severity,
                                    f"{name} peaked at {peak:.4g} and has fallen to {trough:.4g} "
-                                   f"({100 * fallen / abs(peak):.0f}% of its best): higher is better "
+                                   f"({100 * fallen / reference:.0f}% {what}): higher is better "
                                    f"for this one, so it is getting worse",
                                    step, {"peak": peak, "now": trough, "fallen": fallen},
                                    _confidence(fallen / max(noise, 1e-12), 3.0, len(values))))
@@ -807,10 +954,17 @@ class DetectionEngine:
         # A learned temperature going to zero takes the loss with it, and the loss looks
         # wonderful on the way down.
         if looks_like_soft_temperature(name) and early > 0 and late < early * 0.2:
+            # A scale multiplies the logits, so it is an *inverse* temperature: CLIP's
+            # logit_scale shrinking flattens the softmax towards uniform, the opposite of
+            # a temperature shrinking.
+            if "scale" in _tokens(name):
+                effect = ("the softmax it scales is flattening towards uniform, so the "
+                          "logits stop telling the classes apart")
+            else:
+                effect = ("the softmax it scales is becoming a hard argmax, which makes the "
+                          "loss look better than the model is")
             out.append(Finding("temperature_collapse", name, WARNING,
-                               f"{name} collapsed from {early:.4g} to {late:.4g}: the softmax it "
-                               f"scales is becoming a hard argmax, which makes the loss look better "
-                               f"than the model is",
+                               f"{name} collapsed from {early:.4g} to {late:.4g}: {effect}",
                                step, {"early": early, "late": late}, 0.75))
 
         # The share of the work being thrown away. Both the climb and the level matter:
@@ -901,9 +1055,10 @@ class DetectionEngine:
         # coarsest cases, because a fine grid over a wide range still produces a
         # different value almost every reading while quantising away everything below
         # the step.
-        if is_loss and len(values) >= 20:
+        if is_loss and len(values) >= 20 and not self._is_error_rate(name):
             # Losses only. A score computed as k-correct-out-of-N lands on a grid by
-            # arithmetic, not by anything going wrong.
+            # arithmetic, not by anything going wrong -- and so does an error rate,
+            # which is the same count from the other side.
             finding = self._check_quantisation(name, values, step)
             if finding is not None:
                 out.append(finding)
@@ -960,6 +1115,11 @@ class DetectionEngine:
             if finding is not None:
                 out.append(finding)
         return out
+
+    @staticmethod
+    def _is_error_rate(name: str) -> bool:
+        """A classification / word / character error rate: k wrong out of N."""
+        return "err" in _lower(name) or _has_token(name, ("wer", "cer"))
 
     @staticmethod
     def _check_quantisation(name: str, values: List[float], step: Optional[int]) -> Optional[Finding]:
@@ -1109,15 +1269,39 @@ class DetectionEngine:
                 baseline = min(baseline, anchor)
             noise = _stdev(recent)
             big_for_this_run = latest > _mean(recent) + 4.0 * noise
-            if baseline > 0 and latest > baseline * t["explosion_multiplier"] and big_for_this_run:
+            # A floor near zero makes any move a large multiple of it: an MAE converged
+            # to 3e-4 moving to 6e-3 is "20x its floor" and 0.3% of the scale the run has
+            # lived on. The jump has to be a real share of that scale as well.
+            lived_on = max(values) - min(values)
+            real_jump = (latest - baseline) > 0.02 * lived_on
+            if baseline > 0:
+                ratio = latest / baseline
+            else:
+                # A loss that lives below zero (a Gaussian NLL, a negative ELBO) has no
+                # multiple to be measured in, so measure the jump against the loss's own
+                # spread, or its size, whichever is bigger.
+                ratio = 1.0 + (latest - baseline) / max(noise, abs(baseline), 1e-12)
+            if ratio > t["explosion_multiplier"] and big_for_this_run and real_jump:
+                size = (f"{ratio:.1f}x its recent floor of {baseline:g}" if baseline > 0
+                        else f"up {latest - baseline:g} from its recent floor of {baseline:g}")
                 out.append(Finding("loss_spike", name, CRITICAL,
-                                   f"{name} spiked to {latest:g}, {latest / baseline:.1f}x its recent floor of {baseline:g}",
+                                   f"{name} spiked to {latest:g}, {size}",
                                    step, {"latest": latest, "baseline": baseline},
-                                   _confidence(latest / baseline, t["explosion_multiplier"], len(values))))
+                                   _confidence(ratio, t["explosion_multiplier"], len(values))))
+
+        # How far the run has come down from where it opened: a run that came down 99%
+        # and then sat still has converged, and neither "plateau" nor "stagnation" is
+        # the word for that. The opening is remembered from before the analysis window
+        # when the history has outgrown it.
+        opening = self._openings.get(name)
+        if opening is None:
+            opening = _mean(values[:max(2, len(values) // 5)])
 
         if len(values) >= 8 and not directionless:
             scale = _mean([abs(v) for v in window]) or 1.0
-            if (max(window) - min(window)) <= scale * t["plateau_range_frac"]:
+            converged = (abs(opening) > 1e-12
+                         and (opening - _mean(window)) / abs(opening) >= 0.9)
+            if (max(window) - min(window)) <= scale * t["plateau_range_frac"] and not converged:
                 out.append(Finding("plateau", name, WARNING,
                                    f"{name} has barely moved over its last {len(window)} readings "
                                    f"(range {max(window) - min(window):.3g} around {scale:.3g})",
@@ -1158,7 +1342,6 @@ class DetectionEngine:
             # How far the run got before it stalled: a run that came down 99% and
             # then sat still has converged; one that came down 30% and stopped has
             # stalled, and those must not read the same.
-            opening = _mean(values[:max(2, len(values) // 5)])
             progress = (opening - late) / abs(opening) if abs(opening) > 1e-12 else 0.0
             stalled = spread < t["stagnation_frac"] and improving < t["stagnation_frac"]
             if stalled and progress < 0.9 and not getattr(self, "_already_good", False):
@@ -1213,16 +1396,23 @@ class DetectionEngine:
             # steps of a step-level run, a GAN, a small validation split -- no conclusion
             # is available yet, and the honest answer is to keep watching.
             se = _stdev(values[:span] + values[-span:]) * (2.0 / span) ** 0.5
-            precise_enough = 3.0 * se < start * 0.10
+            # abs(): a negative start made this false forever, which is what kept the
+            # check blind to a flat negative objective after the distance fix above.
+            precise_enough = 3.0 * se < abs(start) * 0.10
             improved_measurably = (start - end) > 3.0 * se
+            # The window's start is not the run's start once the history has outgrown
+            # the window; a run that learned before it was not "never" learning.
+            learned_earlier = (name in self._openings
+                               and (opening - end) > max(abs(opening) * (1.0 - t["never_learned_ratio"]),
+                                                         3.0 * se))
             if (abs(start) > 0 and precise_enough and not improved_measurably
-                    and (start - end) < worth_noticing and never_improved):
+                    and (start - end) < worth_noticing and never_improved and not learned_earlier):
                 out.append(Finding("never_learned", name, CRITICAL,
                                    f"{name} is no better than when it started ({start:.4g} -> {end:.4g} "
                                    f"over {len(values)} readings): this run is not learning",
                                    step, {"start": start, "end": end, "points": len(values)}, 0.9))
 
-        if is_validation(name) and len(values) >= 5:
+        if is_validation(name) and len(values) >= 5 and not directionless:
             last5 = values[-5:]
             worsening = sum(1 for a, b in zip(last5, last5[1:]) if b > a)
             # Four rises in a row happens by chance once every sixteen epochs on a noisy
@@ -1252,7 +1442,13 @@ class DetectionEngine:
         # Too good, too fast. The old version of this check compared len(history) to
         # exactly 2, so it could only ever fire in the single instant the history had
         # two points, and was dead for the rest of the run.
-        if 2 <= len(values) <= 6 and max(values) >= t["perfect_metric"]:
+        # "Perfect" means the ceiling of a 0..1 score. A metric in percent or on an open
+        # scale (SQuAD F1 of 50.1, BLEU of 21) was "perfect" by its third reading.
+        unit_scale = max(values) <= 1.0 + 1e-9
+        # Pinned at the ceiling, not touching it once: a leak keeps the score there,
+        # while one lucky small batch at 1.0 followed by 0.75 is just a small batch.
+        if (unit_scale and 2 <= len(values) <= 6
+                and min(values[-2:]) >= t["perfect_metric"]):
             out.append(Finding("suspiciously_perfect", name, WARNING,
                                f"{name} reached {max(values):.4g} within {len(values)} readings, "
                                f"which usually means the labels are reachable from the inputs",
@@ -1261,7 +1457,7 @@ class DetectionEngine:
         # to saturate looks like fast learning on the way up and is only visible once
         # the score sits at the ceiling and stays there. On validation, that is not a
         # model that has learned the task, it is a model that can see the answer.
-        elif (is_validation(name) and len(values) >= 8
+        elif (unit_scale and is_validation(name) and len(values) >= 8
                 and min(values[-8:]) >= t["perfect_metric"]):
             out.append(Finding("suspiciously_perfect", name, WARNING,
                                f"{name} has been a perfect {values[-1]:.4g} for its last 8 readings: "
@@ -1323,14 +1519,18 @@ class DetectionEngine:
         """Checks that need two histories at once: a loss against validation, or a score."""
         out: List[Finding] = []
         losses = {name: list(hist) for name, hist in histories.items() if looks_like_loss(name)}
-        train = next((name for name in losses if not is_validation(name)), None)
-        val = next((name for name in losses if is_validation(name)), None)
+        train = _primary_train_loss(losses)
 
         out.extend(self._check_metric_against_loss(histories, losses, train, t, step))
 
-        if not train or not val:
-            return out
-        train_hist, val_hist = losses[train], losses[val]
+        for train, val in _train_val_pairs(losses):
+            out.extend(self._check_overfitting(losses[train], losses[val], train, val, t, step))
+        return out
+
+    @staticmethod
+    def _check_overfitting(train_hist: List[float], val_hist: List[float], train: str, val: str,
+                           t: Dict[str, float], step: Optional[int]) -> Iterable[Finding]:
+        out: List[Finding] = []
         if len(train_hist) < 5 or len(val_hist) < 5:
             return out
         # Compare halves rather than endpoints, and require the rise to clear the
@@ -1346,7 +1546,9 @@ class DetectionEngine:
         train_early, train_late = _mean(train_window[:half]), _mean(train_window[-half:])
         if val_early <= 0 or train_early <= 0:
             return out
-        val_noise = (sum((v - _mean(val_window)) ** 2 for v in val_window) / len(val_window)) ** 0.5
+        # Rescaled like every other spread here: squared raw values overflow past ~1e154,
+        # and the OverflowError silenced the detector at the moment a run exploded.
+        val_noise = _stdev(val_window) * ((len(val_window) - 1) / len(val_window)) ** 0.5
         if (val_late - val_early) <= 1.5 * val_noise:
             return out
         val_relative = (val_late - val_early) / abs(val_early)
@@ -1480,6 +1682,11 @@ class DetectionEngine:
                 n = min(len(first), len(second))
                 if n < 10:
                     continue
+                # Two constants agreeing -- accuracy and val_accuracy both 1.0 on an
+                # easy dataset -- say nothing about where validation is computed; only
+                # a series that actually moves can be caught being the same one.
+                if len(set(first[-n:])) < 3:
+                    continue
                 if all(abs(x - y) <= t["identical_tolerance"]
                        for x, y in zip(first[-n:], second[-n:])):
                     out.append(Finding("identical_series", f"{a} vs {b}", WARNING,
@@ -1512,8 +1719,12 @@ class DetectionEngine:
                   if looks_like_loss(n) and not is_validation(n) and len(v) >= 12}
         # The total is not a component of itself: comparing `loss` against `kl_loss` and
         # `recon_loss` would have it dominate every share.
+        # And a metric is not a term: Keras `mse`/`mae` alongside a huber loss fall at
+        # different rates by arithmetic, and read as a term that stopped contributing.
+        # Only names that call themselves a loss or a term are components.
         components = {n: v for n, v in losses.items()
-                      if _lower(n) not in ("loss", "total_loss", "total", "train_loss")}
+                      if _lower(n) not in ("loss", "total_loss", "total", "train_loss")
+                      and {"loss", "term"} & set(_tokens(n))}
         if len(components) < 2:
             return out
 
@@ -1553,10 +1764,14 @@ class DetectionEngine:
         curve itself looks unremarkable.
         """
         out: List[Finding] = []
-        train = next((n for n in series if looks_like_loss(n) and not is_validation(n)), None)
-        val = next((n for n in series if looks_like_loss(n) and is_validation(n)), None)
-        if not train or not val:
-            return out
+        for train, val in _train_val_pairs(series):
+            out.extend(DetectionEngine._check_eval_noise_pair(series, train, val, step))
+        return out
+
+    @staticmethod
+    def _check_eval_noise_pair(series: Dict[str, List[float]], train: str, val: str,
+                               step: Optional[int]) -> Iterable[Finding]:
+        out: List[Finding] = []
         t_hist, v_hist = series[train], series[val]
         # Enough readings to have seen how much this number normally moves. Judged on
         # twelve it called an ordinary noisy validation split unusable.
@@ -1632,6 +1847,8 @@ class DetectionEngine:
                     continue
                 if looks_like_hardware_temp(name):
                     break                     # a thermometer, not a softmax temperature
+                if key == "eps" and {"clip", "greedy", "smoothing"} & set(_tokens(name)):
+                    break                     # PPO's clip_eps, epsilon-greedy: not an optimizer's
                 latest = values[-1]
                 if len(set(values)) > 3:
                     break                     # it is being scheduled, not configured
@@ -1681,12 +1898,30 @@ class DetectionEngine:
         are on the dashboard being used to make decisions.
         """
         out: List[Finding] = []
-        loss = next((v for n, v in series.items()
-                     if looks_like_loss(n) and not is_validation(n)), None)
-        ppl_name = next((n for n in series if "perplexity" in _lower(n) or _lower(n) == "ppl"), None)
-        if loss is None or ppl_name is None:
-            return out
-        ppl = series[ppl_name]
+
+        def is_ppl(n: str) -> bool:
+            return "perplexity" in _lower(n) or "ppl" in _tokens(n)
+
+        for ppl_name in sorted(n for n in series if is_ppl(n)):
+            # The loss of the same split, and never a perplexity: "perplexity" is itself
+            # a loss hint, so taking the first loss-like name compared perplexity with
+            # exp(perplexity), or val_perplexity with exp(training loss).
+            split = is_validation(ppl_name)
+            candidates = sorted(n for n in series if looks_like_loss(n) and not is_ppl(n)
+                                and is_validation(n) == split)
+            if not candidates:
+                continue
+            stem = _loss_stem(ppl_name).replace("perplexity", "loss").replace("ppl", "loss")
+            loss_name = next((n for n in candidates if _loss_stem(n) == stem),
+                             next((n for n in candidates if _loss_stem(n) == "loss"), candidates[0]))
+            out.extend(DetectionEngine._check_perplexity(series[loss_name], series[ppl_name],
+                                                         ppl_name, t, step))
+        return out
+
+    @staticmethod
+    def _check_perplexity(loss: List[float], ppl: List[float], ppl_name: str,
+                          t: Dict[str, float], step: Optional[int]) -> Iterable[Finding]:
+        out: List[Finding] = []
         n = min(len(loss), len(ppl))
         if n < 8:
             return out
@@ -1752,10 +1987,14 @@ class DetectionEngine:
         regression ever happens -- the gap is the whole signal.
         """
         out: List[Finding] = []
-        train = next((n for n in series if looks_like_loss(n) and not is_validation(n)), None)
-        val = next((n for n in series if looks_like_loss(n) and is_validation(n)), None)
-        if not train or not val:
-            return out
+        for train, val in _train_val_pairs(series):
+            out.extend(DetectionEngine._check_widening_gap_pair(series, train, val, step))
+        return out
+
+    @staticmethod
+    def _check_widening_gap_pair(series: Dict[str, List[float]], train: str, val: str,
+                                 step: Optional[int]) -> Iterable[Finding]:
+        out: List[Finding] = []
         t_hist, v_hist = series[train], series[val]
         n = min(len(t_hist), len(v_hist))
         if n < 14:
@@ -1843,25 +2082,43 @@ class DetectionEngine:
         the CPU, which is correct and fifty times slower.
         """
         previous = self._tensor_seen.get(name)
-        current = {"dtype": stats.get("dtype"), "device": stats.get("device")}
-        self._tensor_seen[name] = current
+        shape = stats.get("shape")
+        current = {"dtype": stats.get("dtype"), "device": stats.get("device"),
+                   "shape": tuple(shape) if isinstance(shape, (list, tuple)) else shape}
+
+        def integral(dtype: Any) -> bool:
+            low = str(dtype or "").lower()
+            return "int" in low or "bool" in low
 
         std = _as_float(stats.get("std"))
         mean = _as_float(stats.get("mean"))
+        # These two return before the dtype/device comparison, so they leave the last
+        # dtype/device as it was: recording the new one first meant a dtype change on
+        # the same reading as a norm explosion was compared new-to-new ever after.
         if std is not None and math.isfinite(std) and std > 1e6:
             return Finding("tensor_norm_explosion", name, CRITICAL,
                            f"{name} has a standard deviation of {std:g}: the values are finite and "
                            f"far outside anything a trained weight holds",
                            step, {"std": std, "mean": mean}, 0.9)
+        # An integer or boolean tensor is labels, indices or a mask -- never a layer --
+        # and all-zero labels or an empty mask are ordinary.
         if (std is not None and mean is not None and std == 0.0 and mean == 0.0
-                and stats.get("shape")):
+                and stats.get("shape") and not integral(current["dtype"])):
             return Finding("tensor_all_zeros", name, WARNING,
                            f"{name} is entirely zero: a layer that was never initialised, or one "
                            f"whose gradients cannot reach it",
                            step, {"shape": list(stats.get("shape") or [])}, 0.85)
+        self._tensor_seen[name] = current
 
         if previous:
-            if previous.get("dtype") and current["dtype"] and previous["dtype"] != current["dtype"]:
+            # A different shape as well is a different object bound to the same name --
+            # `for key, val in batch.items()` over float features and int labels -- not
+            # a tensor whose precision changed. Nor is an integer dtype a precision.
+            rebound = (previous.get("shape") is not None and current["shape"] is not None
+                       and previous["shape"] != current["shape"])
+            if (previous.get("dtype") and current["dtype"] and previous["dtype"] != current["dtype"]
+                    and not rebound and not integral(previous["dtype"])
+                    and not integral(current["dtype"])):
                 return Finding("tensor_dtype_change", name, WARNING,
                                f"{name} changed dtype from {previous['dtype']} to {current['dtype']} "
                                f"mid-run: precision is being lost somewhere it was not intended",
@@ -1871,7 +2128,10 @@ class DetectionEngine:
                                f"{name} moved from {previous['device']} to {current['device']}: "
                                f"every step now copies it across the bus",
                                step, {"from": previous["device"], "to": current["device"]}, 0.85)
-        elif current["device"] and "cpu" in str(current["device"]).lower():
+        elif (current["device"] and "cpu" in str(current["device"]).lower()
+                and stats.get("requires_grad")):
+            # Parameters only. The CLI also reports data tensors, and a batch is on the
+            # CPU until the line that moves it, which read as a layer left behind.
             others = [v.get("device") for k, v in self._tensor_seen.items() if k != name]
             if any(d and "cpu" not in str(d).lower() for d in others):
                 return Finding("tensor_device_change", name, WARNING,

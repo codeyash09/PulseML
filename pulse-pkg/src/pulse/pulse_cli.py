@@ -28,6 +28,7 @@ import traceback
 import itertools
 import subprocess
 import threading
+import weakref
 import tempfile
 import atexit
 import numpy as np
@@ -1031,6 +1032,28 @@ def _ui_code_version(sha: Optional[str], cwd: Optional[str]) -> None:
     except Exception:
         subject = None
     _ui.ok("Code version", sha[:10] + (f'  "{subject}"' if subject else ""))
+
+
+def _scalar_reading(stats, raw=None) -> float:
+    """The number a scalar's statistics() stands for, NaN and inf included.
+
+    statistics() summarises the *finite* elements, so a NaN or infinite scalar comes
+    back as mean=None with nan=1 / inf=1. float(None) raised, the reading was stored as
+    None ("could not be read"), and the detector -- whose first job is NaN -- never saw
+    one. Raises like float() for anything that really is unreadable.
+    """
+    mean = stats.get("mean")
+    if mean is not None:
+        return float(mean)
+    if stats.get("nan"):
+        return float("nan")
+    if stats.get("inf"):
+        try:
+            value = float(raw)          # for the sign
+        except Exception:
+            value = float("inf")
+        return value if abs(value) == float("inf") else float("inf")
+    return float(mean)
 
 
 def _values_equal(a, b) -> bool:
@@ -2942,6 +2965,11 @@ class PulseCLI:
         self.var_states: Dict[str, str] = {}
         self.auto_mode: bool = False
         self.scalar_histories: Dict[str, List[float]] = {}
+        # One reading per sample, repeats included, for the detector. scalar_histories
+        # only grows when a value changes (it is what /chart and the display show), so a
+        # loss stuck at one value -- the thing `frozen` exists to catch -- stayed a
+        # history of one reading however many steps passed.
+        self._detector_scalar_histories: Dict[str, List[float]] = {}
         self.step = 0
         # Global step advances from the first confident signal available, in priority order:
         # an explicit step number passed to update(), a real loop-counter variable in the
@@ -3681,6 +3709,7 @@ class PulseCLI:
             self.var_configs.clear()
             self.var_states.clear()
             self.scalar_histories.clear()
+            self._detector_scalar_histories.clear()
             self._matrix_cache.clear()
             self._matrix_cached_vars.clear()
             print(f"✓ Removed all variables from tracking: {', '.join(removed)}")
@@ -3718,6 +3747,7 @@ class PulseCLI:
         self.var_configs.pop(target, None)
         self.var_states.pop(target, None)
         self.scalar_histories.pop(target, None)
+        self._detector_scalar_histories.pop(target, None)
         self._matrix_cached_vars.discard(target)
 
         # Remove cached sliced entries belonging to this base variable.
@@ -10275,6 +10305,11 @@ class PulseCLI:
                 continue
             if values:
                 histories[name] = list(values)
+        # _record_keras_logs keeps "train_loss" as an alias of Keras's "loss" for the
+        # legacy detector and the agent. To the engine it is a second copy of the same
+        # series, and every loss finding came out twice.
+        if "train_loss" in histories and histories["train_loss"] == histories.get("loss"):
+            del histories["train_loss"]
         return histories
 
     def _detection_engine(self):
@@ -10288,11 +10323,23 @@ class PulseCLI:
             "stagnation_frac": self.stagnation_frac,
         }
         if engine is None:
-            engine = _pulse_detect.DetectionEngine(sensitivity=self.sensitivity)
+            # require_new_data: this is asked on every batch, and a Keras epoch history
+            # only grows once per epoch -- the next batch re-reading the same epoch is
+            # not a second confirmation of anything.
+            engine = _pulse_detect.DetectionEngine(sensitivity=self.sensitivity,
+                                                   require_new_data=True)
             self._detector = engine
         # /sensitivity takes effect on the next check, with no restart, as before.
         engine.sensitivity = self.sensitivity
         engine.overrides = {k: v for k, v in overrides.items() if v is not None}
+        # NORMAL_START: the agent's estimate of where each variable should start, from
+        # the code. Only the legacy detector read it, so on the default path it did
+        # nothing, and a loss that opened 40x too high was the run's "normal".
+        for name, value in (getattr(self, "_normal_start_baselines", {}) or {}).items():
+            try:
+                engine.set_baseline(name, value)
+            except (TypeError, ValueError):
+                pass
         return engine
 
     def _check_for_trouble(self) -> Optional[str]:
@@ -10317,7 +10364,9 @@ class PulseCLI:
         for name, entry in (getattr(self, "_matrix_cache", {}) or {}).items():
             if isinstance(entry, dict) and isinstance(entry.get("stats"), dict):
                 tensor_stats[name] = entry["stats"]
-        step = max((len(values) for values in histories.values()), default=0)
+        # The run's own step when there is one. The longest history stops growing at
+        # the 2,000-reading cap, so every finding past that point said "step 2000".
+        step = getattr(self, "step", 0) or max((len(values) for values in histories.values()), default=0)
         try:
             raised = self._detection_engine().update(
                 histories, step=step, tensor_stats=tensor_stats or None)["raised"]
@@ -11550,12 +11599,43 @@ class PulseCLI:
                 del hist[:-2000]
 
 
+    def _record_detector_scalar(self, name, value, source=None, step=None):
+        """Append one sampled reading to the detector's per-sample history.
+
+        Repeats count -- that is the point -- but only repeats that are new readings.
+        update() samples on a timer, so an epoch-level `val_loss` is read many times
+        per epoch while nobody reassigns it, and keeping every one of those would call
+        it "frozen" after one epoch. A repeated value is a new reading when the local
+        is a new object (the loop recomputed it and got the same number: a stuck loss),
+        or when the caller passed a new explicit step.
+        """
+        state = self.__dict__
+        histories = state.setdefault("_detector_scalar_histories", {})
+        sources = state.setdefault("_detector_scalar_sources", {})
+        hist = histories.setdefault(name, [])
+        last_ref, last_step = sources.get(name, (None, None))
+        same_object = (source is not None and last_ref is not None and last_ref() is source)
+        if (hist and _values_equal(hist[-1], value) and same_object
+                and (step is None or step == last_step)):
+            return
+        hist.append(value)
+        if len(hist) > 2000:
+            del hist[:-2000]
+        try:
+            # Weakly where possible: holding a loss tensor would keep its whole
+            # autograd graph alive until the next sample.
+            ref = weakref.ref(source)
+        except TypeError:
+            ref = (lambda obj: (lambda: obj))(source)      # a float: nothing to keep alive
+        sources[name] = (ref, step)
+
     def _history_for_detector(self, name):
         """
         Return the correct history for auto-diagnosis.
 
         Loss/validation metrics prefer epoch-level Keras history.
-        Other scalar variables continue using normal Pulse histories.
+        Other scalar variables use one reading per sample -- not the deduplicated
+        scalar_histories, where a value that never changes never grows.
         """
         epoch_histories = getattr(self, "epoch_scalar_histories", {})
 
@@ -11567,6 +11647,9 @@ class PulseCLI:
             if loss_hist:
                 return loss_hist
 
+        sampled = (getattr(self, "_detector_scalar_histories", {}) or {}).get(name)
+        if sampled:
+            return sampled
         return self.scalar_histories.get(name, [])
 
 
@@ -11954,9 +12037,7 @@ class PulseCLI:
             if kind == "scalar":
                 try:
                     stats = statistics(orig_val)
-                    scalar_val = float(
-                        stats.get("mean")
-                    )
+                    scalar_val = _scalar_reading(stats, orig_val)
 
                 except Exception as exc:
                     hist = self.scalar_histories.setdefault(
@@ -12006,6 +12087,8 @@ class PulseCLI:
 
                 if len(hist) > 2000:
                     del hist[:-2000]
+
+                self._record_detector_scalar(var_name, scalar_val, raw_local, step)
 
                 scalar_lines.append(
                     (var_name, scalar_val)
@@ -12059,9 +12142,7 @@ class PulseCLI:
 
                 if stats.get("kind") == "scalar":
                     try:
-                        scalar_val = float(
-                            stats.get("mean")
-                        )
+                        scalar_val = _scalar_reading(stats, val)
 
                     except Exception:
                         hist = self.scalar_histories.setdefault(
@@ -12104,6 +12185,8 @@ class PulseCLI:
 
                     if len(hist) > 2000:
                         del hist[:-2000]
+
+                    self._record_detector_scalar(sub_name, scalar_val, raw_local, step)
 
                     scalar_lines.append(
                         (sub_name, scalar_val)
