@@ -290,6 +290,48 @@ def test_ok_revert_ambiguous_and_created_files(tmp_path):
     assert idx is None and "ambiguous" in why
 
 
+def test_bug_exact_partial_line_match_is_not_reindented(tmp_path):
+    """Found by reading: `old` quoted without its indentation matches exactly part-way
+    into its line, and a multi-line `new` written the same way put its extra lines at
+    column 0 -- at the end of a loop body that parses, silently moving code out of the
+    loop. Correct: the extra lines get the matched line's indentation."""
+    code = "for i in range(3):\n    s = i\nprint(s)\n"
+    cli = make_cli(tmp_path, code)
+    cli._apply_code_fix({"old": ["s = i"], "new": ["s = i\nt = i"], "files": [None], "explanation": "x"})
+    assert (tmp_path / "train.py").read_text() == "for i in range(3):\n    s = i\n    t = i\nprint(s)\n"
+
+
+def test_bug_partial_line_match_with_a_nested_new_block(tmp_path):
+    """Same re-indent: a nested block in `new` keeps its relative indentation."""
+    code = "def f():\n    x = 1\n    return x\n"
+    cli = make_cli(tmp_path, code)
+    cli._apply_code_fix({"old": ["x = 1"], "new": ["if True:\n    x = 2"], "files": [None], "explanation": "x"})
+    assert (tmp_path / "train.py").read_text() == "def f():\n    if True:\n        x = 2\n    return x\n"
+
+
+def test_bug_prose_decline_is_confirmed_as_json_before_ending(tmp_path):
+    """A pure prose 'no change needed' is not trusted on its own: the model is asked
+    once for the {"no_change": true} JSON (not re-sent the implement prompt), and a fix
+    it sends instead is applied."""
+    def reply(instr):
+        if instr.startswith("PASS 1"):
+            return "- train.py:1"
+        if "PASS 2" in instr:
+            return "Diagnosis: lr = 10.0 diverges."
+        if "DEVELOP & IMPLEMENT" in instr:
+            return "No code change is needed."
+        if "reads as 'no code change needed'" in instr:
+            return json.dumps({"old": ["lr = 10.0"], "new": ["lr = 0.01"], "explanation": "lower lr"})
+        if "PASS 4" in instr:
+            return '{"passes": true, "reason": "ok"}'
+        return "?"
+    cli = make_cli(tmp_path, "lr = 10.0\n", replies=reply)
+    stub_context(cli)
+    cli._ask_agent_impl("the loss is NaN, please fix it", include_code=True)
+    assert (tmp_path / "train.py").read_text() == "lr = 0.01\n"
+    assert sum(1 for c in cli.calls if "DEVELOP & IMPLEMENT" in c) == 1
+
+
 # ==========================================================================
 # MLLINT auto-fix
 # ==========================================================================
@@ -349,6 +391,41 @@ def test_ok_mllint_auto_fix_patches_only_flagged_call(tmp_path):
     lines = (tmp_path / "train.py").read_text().splitlines()
     assert 'metrics=["accuracy"]' in lines[1] and 'metrics=["mae"]' in lines[2]
     assert cli._load_fix_log() and cli.code_text == (tmp_path / "train.py").read_text()
+
+
+def test_bug_mllint_auto_fix_uses_stale_line_numbers(tmp_path):
+    """Found by reading: findings carry the line numbers of the file as scanned. After
+    one patch deletes a line, a later finding in the same file points one line off and
+    is skipped (or patches a neighbouring call). Correct: both findings are fixed."""
+    code = ('model = None\n'
+            'model.add(Softmax())\n'
+            'x = 1\n'
+            'model.compile(loss="mse", optimizer="adam", metrics=["accuracy"])\n')
+    cli = make_cli(tmp_path, code)
+    label = next(iter(cli._iter_ast_trees()))[0]
+    findings = [(label, 2, "double softmax: Softmax layer feeding a loss that applies softmax"),
+                (label, 4, "regression loss with an accuracy metric")]
+    assert cli._mllint_auto_fix(findings)
+    text = (tmp_path / "train.py").read_text()
+    assert "Softmax" not in text and 'metrics=["mae"]' in text, text
+
+
+def test_bug_mllint_flagged_span_counts_form_feed_as_a_line(tmp_path):
+    """Found by reading: _mllint_flagged_span split lines with str.splitlines, which also
+    splits on a form feed (and other separators) that `ast` does not count, so such a
+    character earlier in the file shifted the patched region."""
+    src = ('# section\x0cbreak\n'
+           'reg = None\n'
+           'reg.compile(loss="mse", optimizer="adam", metrics=["accuracy"])\n')
+    start, end = pc._mllint_flagged_span(src, 3)
+    assert src[start:end].startswith("reg.compile("), repr(src[start:end])
+
+
+def test_bug_stale_prompt_text_and_dead_templates():
+    """Found by reading: the system prompt pointed at PASS 5 (off by default) and
+    pulse_cli kept an unused _PASS4_REVISE_TMPL."""
+    assert not hasattr(pc, "_PASS4_REVISE_TMPL")
+    assert "PASS 5" not in pc.SYSTEM_PROMPT
 
 
 # ==========================================================================
