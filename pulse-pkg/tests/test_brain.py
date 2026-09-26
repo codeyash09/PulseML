@@ -68,9 +68,14 @@ class ScheduleTest(unittest.TestCase):
         schedule = Schedule(self.path)
         schedule.apply_decision({"next_check_minutes": 20})
         before = schedule.interval
-        schedule.apply_decision({"next_check_minutes": "soon"})
-        schedule.apply_decision({})
-        self.assertEqual(schedule.interval, before)
+        # The look that was due has happened: a reply without a usable interval must
+        # still push the next one out (by the current interval), or the audit is due
+        # again on the very next poll and billed back to back.
+        for decision in ({"next_check_minutes": "soon"}, {}, {"next_check_minutes": float("nan")}):
+            schedule.next_at = time.time() - 1
+            schedule.apply_decision(decision)
+            self.assertEqual(schedule.interval, before)
+            self.assertGreaterEqual(schedule.seconds_remaining(), before - 5)
 
     def test_bring_forward_never_pushes_out(self):
         schedule = Schedule(self.path)

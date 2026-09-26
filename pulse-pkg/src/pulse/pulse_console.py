@@ -163,16 +163,30 @@ def _pid_alive(pid: Optional[int]) -> bool:
 _START_SLACK_SECONDS = 5.0
 
 
-def session_process_alive(pid: Optional[int], started: Any = None) -> bool:
+def session_process_alive(pid: Optional[int], started: Any = None,
+                          start_ticks: Any = None) -> bool:
     """Is the process that wrote this session still running?
 
     Not just "is something running with that pid": pids are reused, and a run killed
     without a word whose pid now belongs to some other program looked stalled forever --
-    and `pulse` auto-attached to it. A process that started after the session did is not
-    the session's process.
+    and `pulse` auto-attached to it.
+
+    With the start ticks the session recorded, the process is compared exactly, and no
+    clock is involved. Without them (a session written by an older Pulse, or a platform
+    with no /proc) a process that started after the session did is not the session's
+    process -- a comparison of wall-clock times, which a clock step can fool.
     """
     if not _pid_alive(pid):
         return False
+    if start_ticks is not None and not isinstance(start_ticks, bool):
+        try:
+            expected: Optional[int] = int(start_ticks)
+        except (TypeError, ValueError, OverflowError):
+            expected = None
+        if expected is not None:
+            current = stream.process_start_ticks(int(pid))
+            if current is not None:
+                return current == expected
     try:
         started = float(started)
     except (TypeError, ValueError):
@@ -181,6 +195,56 @@ def session_process_alive(pid: Optional[int], started: Any = None) -> bool:
         return True
     began = _process_started(int(pid), _boot_time())
     return began is None or began <= started + _START_SLACK_SECONDS
+
+
+def _same_pid_namespace(session: Dict[str, Any]) -> bool:
+    """Do this session's pids mean the same processes here as where they were written?
+
+    Not for a run in a container read from the host (its own pid namespace), or a spool
+    on shared storage written on another machine or before a reboot: there the pid names
+    some unrelated local process, and a finished run looked 'stalled' forever. Sessions
+    that did not record their namespace are assumed local, as before.
+    """
+    local = stream.pid_namespace()
+    for key in ("boot_id", "pid_ns"):
+        recorded = session.get(key)
+        if recorded and local.get(key) and str(recorded) != local[key]:
+            return False
+    return True
+
+
+def session_liveness(session: Dict[str, Any]) -> Optional[bool]:
+    """Is the process of this session running: True, False, or None when this machine
+    cannot tell (its pid is from another pid namespace or another boot)."""
+    if not _same_pid_namespace(session):
+        return None
+    return session_process_alive(session.get("pid"), session.get("started"),
+                                 session.get("start_ticks"))
+
+
+def _sampler_liveness(session: Dict[str, Any]) -> Optional[bool]:
+    """For an attached session: is the sampler that writes its spool still running?
+    None when the session did not record it (an older Pulse)."""
+    if not session.get("sampler_pid"):
+        return None
+    if not _same_pid_namespace(session):
+        return None
+    return session_process_alive(session.get("sampler_pid"), None,
+                                 session.get("sampler_start_ticks"))
+
+
+def _live_window(session: Dict[str, Any], state: Dict[str, Any]) -> float:
+    """How long a live run may go without writing a frame. Longer than the gap between
+    two samples: at `/interval 45` a 30 s window flipped a healthy run between live and
+    stalled."""
+    for source in (state, session):
+        try:
+            interval = float(source.get("interval") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(interval) and interval > 0:
+            return max(LIVE_WINDOW_SECONDS, 2.0 * interval + 5.0)
+    return LIVE_WINDOW_SECONDS
 
 
 def _scan_for_spools(root: str, max_depth: int = 4) -> List[str]:
@@ -258,8 +322,18 @@ def _describe_session(directory: str) -> Optional[Dict[str, Any]]:
         return None
     session_id = session.get("session_id") or os.path.basename(directory)
     pid = session.get("pid")
-    alive = session_process_alive(pid, session.get("started"))
-    fresh = (time.time() - last_seen) < LIVE_WINDOW_SECONDS
+    fresh = (time.time() - last_seen) < _live_window(session, state)
+    alive = session_liveness(session) if pid else False
+    if session.get("attached") and alive:
+        # The target runs, but this spool is written by the sampler that watched it. A
+        # sampler gone without cleaning up (its console lost to SIGHUP) left a spool
+        # that looked 'stalled' forever, and `pulse train.py` attached to it instead
+        # of watching the running process.
+        sampler = _sampler_liveness(session)
+        if sampler is False or (sampler is None and not fresh):
+            alive = False
+    if alive is None:
+        alive = fresh               # the pid means nothing here: go by the stream alone
     # Crashed first: the crash hook records it and then closing adds `finished`, so a run
     # that died of a CUDA OOM has both, and was listed as having finished normally.
     if state.get("crashed"):
@@ -288,8 +362,14 @@ def _describe_session(directory: str) -> Optional[Dict[str, Any]]:
     }
 
 
-# Files of the package that are not named pulse*: a user's ~/pulse/train.py is not Pulse.
-_PULSE_ENTRY_FILES = ("cli.py", "__main__.py", "__init__.py")
+# The package's own files. A user's ~/pulse/train.py is not Pulse, and neither is their
+# pulse_rate_net.py: a name starting with "pulse" hid every ECG, radar and laser-pulse
+# model from `pulse <script>`.
+_PULSE_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+try:
+    _PULSE_FILES = frozenset(n for n in os.listdir(_PULSE_PACKAGE_DIR) if n.endswith(".py"))
+except OSError:
+    _PULSE_FILES = frozenset()
 
 
 def _is_pulse_itself(script: str) -> bool:
@@ -297,12 +377,17 @@ def _is_pulse_itself(script: str) -> bool:
 
     Matching "pulse" anywhere in the path also excluded the user's own scripts: a
     project in ~/pulse-experiments, or a checkout of this repo, made every script in it
-    invisible to `pulse <script>`. Only the file's own name and the package directory
-    it sits in say whether it is Pulse.
+    invisible to `pulse <script>`. Only Pulse's actual files count: one in this package's
+    directory, one of its own pulse*.py modules wherever it is (another install), or one
+    of its generic entry files (cli.py, __main__.py) in a directory called pulse.
     """
     base = os.path.basename(script)
-    parent = os.path.basename(os.path.dirname(script))
-    return base.startswith("pulse") or (parent == "pulse" and base in _PULSE_ENTRY_FILES)
+    directory = os.path.dirname(script)
+    if directory and os.path.normcase(os.path.abspath(directory)) == os.path.normcase(_PULSE_PACKAGE_DIR):
+        return True
+    if base not in _PULSE_FILES:
+        return False
+    return base.startswith("pulse") or os.path.basename(directory) == "pulse"
 
 
 def _boot_time() -> Optional[float]:
@@ -351,7 +436,15 @@ def unmonitored_python_processes() -> List[Dict[str, Any]]:
     """
     if not os.path.isdir("/proc"):
         return []                   # Linux only; elsewhere the registry is all we have
-    monitored = {int(s["pid"]) for s in discover() if s.get("pid")}
+    # Not an ended session's pid: an attached spool whose sampler is gone is nobody
+    # watching, and its target is exactly the run to offer.
+    monitored = set()
+    for s in discover():
+        try:
+            if s.get("pid") and s.get("status") != "ended":
+                monitored.add(int(s["pid"]))
+        except (TypeError, ValueError, OverflowError):
+            continue
     boot = _boot_time()
     out = []
     for entry in os.listdir("/proc"):
@@ -1144,10 +1237,19 @@ def matching_sessions(sessions: List[Dict[str, Any]], wanted: str) -> List[Dict[
         # full of digits -- attached `pulse watch 4` to whichever run contained a 4.
         return []
     name = os.path.basename(wanted)
-    return [s for s in sessions
-            if wanted in (s.get("session_id") or "")
-            or name == os.path.basename(s.get("script") or "")
-            or wanted in os.path.basename(s.get("script") or "")]
+
+    def script_name(s: Dict[str, Any]) -> str:
+        return os.path.basename(s.get("script") or "")
+
+    # The script's exact name (or its name without .py) first. A substring test made
+    # `pulse train.py` match pretrain.py too, and attach to it when that was the live one.
+    exact = [s for s in sessions
+             if wanted in (s.get("session_id") or "")
+             or name == script_name(s)
+             or (script_name(s) and name == os.path.splitext(script_name(s))[0])]
+    if exact:
+        return exact
+    return [s for s in sessions if name and name in script_name(s)]
 
 
 def pick_session(sessions: List[Dict[str, Any]], wanted: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -1279,6 +1381,10 @@ def run_console(session: Dict[str, Any], sessions: List[Dict[str, Any]],
                 print(dim("\n  findings will print as they happen\n"))
             else:
                 print(f"\n  No such command: /{command}. /help lists them.\n")
+        except KeyboardInterrupt:
+            # Ctrl+C while waiting on the model (a question, /audit): give up on that
+            # answer, not on the console. It escaped as a traceback and ended the session.
+            print(dim("\n  (interrupted)\n"))
         except Exception as exc:
             print(red(f"\n  That failed: {type(exc).__name__}: {exc}\n"))
 

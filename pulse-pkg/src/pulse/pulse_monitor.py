@@ -34,6 +34,7 @@ import math
 import os
 import sys
 import threading
+import re
 import time
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -191,6 +192,17 @@ def _describe(value: Any) -> Optional[Dict[str, Any]]:
     return meta
 
 
+def _names(message: Dict[str, Any]) -> List[str]:
+    """The `names` of a control message as a list. A bare string is one name, not its
+    letters; anything else that is not a list is no names at all."""
+    names = message.get("names")
+    if isinstance(names, str):
+        return [names]
+    if isinstance(names, (list, tuple)):
+        return list(names)
+    return []
+
+
 class Monitor:
     """Collects values in the training process and streams them out.
 
@@ -237,6 +249,9 @@ class Monitor:
         self._samples = 0
         self._observe_seconds = 0.0
         self._started = time.time()
+        # The process's start ticks and pid namespace: what tells a reader this process
+        # apart from a later one with the same pid, without trusting the wall clock.
+        identity = stream.process_identity()
 
         self.writer.write_session({
             "session_id": self.session_id,
@@ -244,6 +259,7 @@ class Monitor:
             "pid": os.getpid(),
             "started": self._started,
             "interval": self.interval,
+            **identity,
         })
         self.writer.emit(stream.KIND_HELLO, {
             "session_id": self.session_id,
@@ -252,6 +268,7 @@ class Monitor:
             # A brain that started before session.json existed learns the start time
             # only from here; without it the run read "0.0s elapsed" forever.
             "started": self._started,
+            **identity,
         })
         # Tell the machine this run exists, so `pulse` typed anywhere can find it.
         stream.register_session(self.session_id, self.directory, {
@@ -259,6 +276,7 @@ class Monitor:
             "pid": os.getpid(),
             "started": self._started,
             "cwd": os.getcwd(),
+            **identity,
         })
 
     # ------------------------------------------------------------------ hot path
@@ -399,53 +417,66 @@ class Monitor:
             })
 
     def _handle_control(self) -> None:
+        # One message at a time, each on its own. The batch was read in one go (and the
+        # file offset moved past all of it), so one malformed message -- `names` that is
+        # a number -- raising out of this loop threw away every message after it,
+        # including a /stop.
         for message in self.writer.poll_control():
-            action = message.get("action")
-            if action == stream.CONTROL_SNAPSHOT:
-                names = message.get("names") or []
-                self._pending_probe.extend(str(n) for n in names)
-            elif action == stream.CONTROL_TRACK:
-                for name in message.get("names") or []:
-                    self._requested.add(str(name))
-            elif action == stream.CONTROL_UNTRACK:
-                for name in message.get("names") or []:
-                    self._requested.discard(str(name))
-            elif action == stream.CONTROL_SET_INTERVAL:
+            try:
+                self._handle_message(message)
+            except Exception as exc:
                 try:
-                    wanted = float(message.get("interval", self.interval))
-                except (TypeError, ValueError):
-                    continue
-                if not math.isfinite(wanted):
-                    continue
-                # Bounded on both sides. Unbounded, one `/interval 1e9` (or inf) put the
-                # monitor beyond reach of the next control message for the rest of the run.
-                wanted = min(MAX_INTERVAL, max(MIN_INTERVAL, wanted))
-                if self.sampler_interval is not None:
-                    self.sampler_interval = wanted
-                else:
-                    self.interval = wanted
-            elif action == stream.CONTROL_PAUSE:
-                self._paused = True
-                self.event("paused", reason=message.get("reason") or "")
-                if callable(self._on_pause):
-                    self._on_pause(message)
-            elif action == stream.CONTROL_RESUME:
-                self._paused = False
-                self.event("resumed")
-            elif action == stream.CONTROL_STOP:
-                self._stop_requested = True
-                self.event("stop_requested", reason=message.get("reason") or "")
-                self.snapshot_state({"stop_requested": True})
-                # Actually stop it. This used to set a flag that only the sampler thread
-                # read, and reading it made the sampler exit -- so "stop" left training
-                # running at full speed and destroyed Pulse's ability to watch it, while
-                # telling the user it had worked. interrupt_main raises KeyboardInterrupt
-                # in the training thread, which is what Ctrl-C does: the loop unwinds,
-                # finally blocks run, and the excepthook still records the ending.
-                try:
-                    self._interrupt_training()
-                except Exception as exc:
-                    self.event("stop_failed", error=f"{type(exc).__name__}: {exc}")
+                    self.event("control_failed", action=str(message.get("action")),
+                               error=f"{type(exc).__name__}: {exc}")
+                except Exception:
+                    pass
+
+    def _handle_message(self, message: Dict[str, Any]) -> None:
+        action = message.get("action")
+        if action == stream.CONTROL_SNAPSHOT:
+            self._pending_probe.extend(str(n) for n in _names(message))
+        elif action == stream.CONTROL_TRACK:
+            for name in _names(message):
+                self._requested.add(str(name))
+        elif action == stream.CONTROL_UNTRACK:
+            for name in _names(message):
+                self._requested.discard(str(name))
+        elif action == stream.CONTROL_SET_INTERVAL:
+            try:
+                wanted = float(message.get("interval", self.interval))
+            except (TypeError, ValueError):
+                return
+            if not math.isfinite(wanted):
+                return
+            # Bounded on both sides. Unbounded, one `/interval 1e9` (or inf) put the
+            # monitor beyond reach of the next control message for the rest of the run.
+            wanted = min(MAX_INTERVAL, max(MIN_INTERVAL, wanted))
+            if self.sampler_interval is not None:
+                self.sampler_interval = wanted
+            else:
+                self.interval = wanted
+        elif action == stream.CONTROL_PAUSE:
+            self._paused = True
+            self.event("paused", reason=message.get("reason") or "")
+            if callable(self._on_pause):
+                self._on_pause(message)
+        elif action == stream.CONTROL_RESUME:
+            self._paused = False
+            self.event("resumed")
+        elif action == stream.CONTROL_STOP:
+            self._stop_requested = True
+            self.event("stop_requested", reason=message.get("reason") or "")
+            self.snapshot_state({"stop_requested": True})
+            # Actually stop it. This used to set a flag that only the sampler thread
+            # read, and reading it made the sampler exit -- so "stop" left training
+            # running at full speed and destroyed Pulse's ability to watch it, while
+            # telling the user it had worked. interrupt_main raises KeyboardInterrupt
+            # in the training thread, which is what Ctrl-C does: the loop unwinds,
+            # finally blocks run, and the excepthook still records the ending.
+            try:
+                self._interrupt_training()
+            except Exception as exc:
+                self.event("stop_failed", error=f"{type(exc).__name__}: {exc}")
 
     def _interrupt_training(self) -> None:
         """KeyboardInterrupt in the training thread -- which is not always the main one.
@@ -495,6 +526,10 @@ class Monitor:
             "scalars": dict(self._last_values),
             "tensors": dict(self._known_tensors),
             "cost": self.cost(),
+            # The pace the run is sampled at now: the console's "live" window has to be
+            # longer than the gap between two samples, or `/interval 45` flips a healthy
+            # run between live and stalled.
+            "interval": self.sampler_interval if self.sampler_interval is not None else self.interval,
             **self._sticky,
         })
 
@@ -523,10 +558,61 @@ class Monitor:
 
 _ACTIVE: Optional["Monitor"] = None
 _SAMPLER: Optional[threading.Thread] = None
+# The stop signal of the CURRENT sampler. Each attach() makes a new one: a single shared
+# event that attach() cleared again revived an old sampler that had not yet noticed the
+# detach (it was inside a slow sample when join() gave up), and two samplers then ran.
 _STOP = threading.Event()
 
-_SKIP_PATH_MARKERS = (os.sep + "site-packages" + os.sep,
-                      os.sep + "lib" + os.sep + "python", "<frozen", "<string>")
+# Pseudo-files that are never the user's code.
+_SKIP_PATH_MARKERS = ("<frozen", "<string>")
+_LIBRARY_DIRS = frozenset({"site-packages", "dist-packages"})
+_PYTHON_LIB_DIR = re.compile(r"python\d+(\.\d+)*[a-z]?$")
+
+
+def _own_stdlib_dirs() -> Tuple[str, ...]:
+    dirs = set()
+    try:
+        import sysconfig
+
+        paths = sysconfig.get_paths()
+        for key in ("stdlib", "platstdlib"):
+            if paths.get(key):
+                dirs.add(os.path.normcase(os.path.abspath(paths[key])).rstrip("\\/") + os.sep)
+    except Exception:
+        pass
+    return tuple(sorted(dirs))
+
+
+_STDLIB_DIRS = _own_stdlib_dirs()
+
+
+def is_library_path(filename: str) -> bool:
+    """A file of an installed package or of the standard library, not the user's own.
+
+    Replaces a substring test for "/lib/python", which was too broad on Linux (a user's
+    ~/lib/python-experiments/train.py was skipped as library code) and never matched on
+    Windows, where the stdlib is <prefix>\\Lib\\ -- so the sampler read locals out of
+    threading.py and friends as if they were the training loop's. Judged by path
+    components, so it also works for a path out of another interpreter (the attach path).
+    """
+    if not filename:
+        return True
+    if any(marker in filename for marker in _SKIP_PATH_MARKERS):
+        return True
+    normalised = os.path.normcase(filename)
+    if _STDLIB_DIRS and normalised.startswith(_STDLIB_DIRS):
+        return True
+    parts = [p.lower() for p in filename.replace("\\", "/").split("/")][:-1]   # directories only
+    if _LIBRARY_DIRS.intersection(parts):
+        return True
+    for parent, part in zip(parts, parts[1:]):
+        # POSIX:   <prefix>/lib/python3.11/...   (also lib64)
+        if parent in ("lib", "lib64") and _PYTHON_LIB_DIR.match(part):
+            return True
+        # Windows: C:\\Python311\\Lib\\...,  ...\\Programs\\Python\\Python311\\Lib\\...
+        if part == "lib" and parent.startswith("python"):
+            return True
+    return False
 
 # Pulse's own package directory. Not any directory called "pulse": that marker also
 # matched ~/pulse/train.py, and a project living there streamed nothing at all.
@@ -538,7 +624,7 @@ def _is_user_frame(frame: Any) -> bool:
     filename = getattr(getattr(frame, "f_code", None), "co_filename", "") or ""
     if filename.startswith(_PULSE_DIR):
         return False
-    return not any(marker in filename for marker in _SKIP_PATH_MARKERS)
+    return not is_library_path(filename)
 
 
 def _collect_locals(frame: Any, depth: int) -> Dict[str, Any]:
@@ -557,7 +643,8 @@ def _collect_locals(frame: Any, depth: int) -> Dict[str, Any]:
     return merged
 
 
-def _sample_loop(monitor: "Monitor", thread_id: int, depth: int, interval: float) -> None:
+def _sample_loop(monitor: "Monitor", thread_id: int, depth: int, interval: float,
+                 stop: Optional[threading.Event] = None) -> None:
     """Read the training thread's variables from outside it.
 
     Pulse used to install sys.settrace and a frame-local trace function, which runs
@@ -566,7 +653,8 @@ def _sample_loop(monitor: "Monitor", thread_id: int, depth: int, interval: float
     it is never called back into, and the only interaction is this thread briefly
     holding the GIL a few times a second.
     """
-    while not _STOP.wait(monitor.sampler_interval or interval):
+    stop = stop if stop is not None else _STOP
+    while not stop.wait(monitor.sampler_interval or interval):
         frames = sys._current_frames()
         frame = frames.get(thread_id)
         if frame is None:
@@ -595,7 +683,7 @@ def attach(
     Returns the Monitor. Sampling happens on a background thread, so the training loop
     is not instrumented at all -- nothing is installed into it and nothing calls into it.
     """
-    global _ACTIVE, _SAMPLER
+    global _ACTIVE, _SAMPLER, _STOP
     if _ACTIVE is not None:
         return _ACTIVE
     monitor = Monitor(script_path=script_path, session_id=session_id, directory=directory,
@@ -603,11 +691,11 @@ def attach(
                       tensor_interval=tensor_interval)
     monitor.sampler_interval = max(0.01, interval)
     monitor.training_thread = thread_id or threading.get_ident()
-    _STOP.clear()
+    _STOP = threading.Event()        # never clear() the old one: its sampler may still run
     _ACTIVE = monitor
     _SAMPLER = threading.Thread(
         target=_sample_loop,
-        args=(monitor, thread_id or threading.get_ident(), depth, max(0.01, interval)),
+        args=(monitor, thread_id or threading.get_ident(), depth, max(0.01, interval), _STOP),
         name="pulse-monitor-sampler", daemon=True)
     _SAMPLER.start()
     atexit.register(detach)

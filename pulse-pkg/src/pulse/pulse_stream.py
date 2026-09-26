@@ -145,6 +145,56 @@ def registered_sessions() -> List[Dict[str, Any]]:
     return sorted(out, key=lambda e: e.get("started") or 0, reverse=True)
 
 
+def process_start_ticks(pid: int) -> Optional[int]:
+    """When a process started, in clock ticks since boot (field 22 of /proc/<pid>/stat).
+
+    The one identity of a process that no clock change moves: turning it into epoch
+    seconds needs /proc/stat's btime, which the kernel derives from the wall clock, so an
+    NTP step or a WSL resume shifted every process's "start time" and a live run looked
+    as if it had started after its own session. None where there is no /proc.
+    """
+    try:
+        with open(f"/proc/{int(pid)}/stat", "r", encoding="utf-8") as handle:
+            raw = handle.read()
+        # The comm field is parenthesised and may itself hold spaces and brackets.
+        return int(raw[raw.rindex(")") + 2:].split()[19])
+    except (OSError, ValueError, IndexError, TypeError, OverflowError):
+        return None
+
+
+def pid_namespace() -> Dict[str, str]:
+    """Which pid numbering this process sees, and which boot of which kernel.
+
+    A pid only means something in the namespace it came from: a run in a container, read
+    by a `pulse` on the host (or a spool on shared storage read from another machine),
+    names some unrelated process by the same number.
+    """
+    out: Dict[str, str] = {}
+    try:
+        out["pid_ns"] = os.readlink("/proc/self/ns/pid")
+    except (OSError, AttributeError, NotImplementedError):
+        pass
+    try:
+        with open("/proc/sys/kernel/random/boot_id", "r", encoding="utf-8") as handle:
+            boot_id = handle.read().strip()
+        if boot_id:
+            out["boot_id"] = boot_id
+    except OSError:
+        pass
+    return out
+
+
+def process_identity(pid: Optional[int] = None) -> Dict[str, Any]:
+    """What a session records so a reader can tell ITS process from a later one with the
+    same pid: the start ticks of `pid` (default: this process), and the namespace the pid
+    is numbered in. Only the fields this platform can supply."""
+    out: Dict[str, Any] = dict(pid_namespace())
+    ticks = process_start_ticks(os.getpid() if pid is None else pid)
+    if ticks is not None:
+        out["start_ticks"] = ticks
+    return out
+
+
 def session_dir_for(script_path: Optional[str], session_id: str) -> str:
     """Where a run's spool lives.
 
@@ -321,6 +371,7 @@ class StreamWriter:
         # writes `finished` while an older snapshot may still be in the queue).
         self._state_lock = threading.RLock()
         self._state_generation = 0
+        self._rotate_retry_at = 0.0
 
         _makedirs(self.directory)
         self._handle = _open_append(self.events_path)
@@ -333,10 +384,16 @@ class StreamWriter:
         """Queue one frame. Returns False if it was dropped. Never raises, never blocks."""
         if self._closed:
             return False
+        now = time.time()
+        # Numbered and queued under one lock. Taking the number, releasing the lock and
+        # queueing afterwards let two emitting threads (the sampler and the training
+        # thread) put seq N+1 on the queue before seq N, and the reader booked the
+        # reordering as a dropped frame.
         with self._seq_lock:
             self._seq += 1
-            seq = self._seq
-        item = (seq, time.time(), kind, payload or {})
+            return self._put_frame((self._seq, now, kind, payload or {}))
+
+    def _put_frame(self, item: tuple) -> bool:
         try:
             self._queue.put_nowait(item)
             return True
@@ -368,11 +425,15 @@ class StreamWriter:
     def write_state(self, state: Dict[str, Any]) -> None:
         """Replace the snapshot a late-attaching brain reads before tailing the log."""
         with self._state_lock:
+            # A direct write makes every snapshot queued before it stale.
             self._state_generation += 1
-            try:
-                _atomic_write_json(self.state_path, state)
-            except OSError as exc:
-                self._report(exc)
+            self._write_state_file(state)
+
+    def _write_state_file(self, state: Dict[str, Any]) -> None:
+        try:
+            _atomic_write_json(self.state_path, state)
+        except OSError as exc:
+            self._report(exc)
 
     def queue_state(self, state: Dict[str, Any]) -> bool:
         """write_state, done by the writer thread. Never blocks; False if it was skipped."""
@@ -402,20 +463,27 @@ class StreamWriter:
             else:
                 return []
         messages: List[Dict[str, Any]] = []
+        # Binary, like StreamReader: in text mode a line cut in the middle of a multi-byte
+        # character raised UnicodeDecodeError out of here, into the training loop.
         try:
-            with open(self.control_path, "r", encoding="utf-8") as handle:
+            with open(self.control_path, "rb") as handle:
                 handle.seek(self._control_offset)
-                for line in handle:
-                    if not line.endswith("\n"):
+                for raw in handle:
+                    if not raw.endswith(b"\n"):
                         break                   # partial write: leave the offset before it
-                    self._control_offset += len(line.encode("utf-8"))
-                    line = line.strip()
+                    self._control_offset += len(raw)
+                    try:
+                        line = raw.decode("utf-8").strip()
+                    except UnicodeDecodeError:
+                        continue
                     if not line:
                         continue
                     try:
-                        messages.append(json.loads(line))
+                        message = json.loads(line)
                     except ValueError:
                         continue
+                    if isinstance(message, dict):
+                        messages.append(message)
         except OSError as exc:
             self._report(exc)
         return messages
@@ -444,7 +512,10 @@ class StreamWriter:
                 if isinstance(item, tuple) and item and item[0] is _STATE:
                     with self._state_lock:
                         if item[2] == self._state_generation:   # nothing newer written since
-                            self.write_state(item[1])
+                            # Not write_state(): bumping the generation here made a NEWER
+                            # snapshot queued behind this one look stale, and state.json
+                            # went back in time whenever two were queued.
+                            self._write_state_file(item[1])
                     continue
                 if isinstance(item, tuple) and item and item[0] is _FLUSH:
                     # Somebody is waiting to read what has been emitted so far.
@@ -476,26 +547,42 @@ class StreamWriter:
             pending.append(json.dumps({"seq": -1, "t": round(time.time(), 4),
                                        "kind": KIND_DROP, "dropped": dropped}))
         try:
+            if self._handle.closed:
+                self._reopen()
             self._handle.write("\n".join(pending) + "\n")
             self._handle.flush()
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # ValueError is a closed handle (a reopen that failed). It must not escape:
+            # this runs on the writer thread, and nothing reached the spool once it died.
             self._report(exc)
         finally:
             pending.clear()
         self._maybe_rotate()
 
+    def _reopen(self) -> None:
+        # The same way as the first open: under sudo a plain open() here made the new
+        # file root's, and followed a symlink planted in the rotation window as root.
+        self._handle = _open_append(self.events_path)
+
     def _maybe_rotate(self) -> None:
         """Keep the spool bounded. The reader notices the truncation and re-attaches."""
         try:
-            if self._handle.tell() < self.max_bytes:
+            if self._handle.closed or self._handle.tell() < self.max_bytes:
                 return
+            if time.monotonic() < self._rotate_retry_at:
+                return                          # the last rename failed; not every flush
+            # Closed before the rename: on Windows an open file cannot be renamed.
             self._handle.close()
-            os.replace(self.events_path, self.events_path + ".prev")
-            # The same way as the first open: under sudo a plain open() here made the new
-            # file root's, and followed a symlink planted in the rotation window as root.
-            self._handle = _open_append(self.events_path)
-        except OSError as exc:
-            self._report(exc)
+            try:
+                os.replace(self.events_path, self.events_path + ".prev")
+            except OSError as exc:
+                # A sharing violation, say. Keep appending to the same file and try again
+                # later, rather than leaving the handle closed for good.
+                self._report(exc)
+                self._rotate_retry_at = time.monotonic() + 30.0
+            self._reopen()
+        except (OSError, ValueError) as exc:
+            self._report(exc)             # the reopen failed: _flush tries again next time
 
     def _report(self, exc: BaseException) -> None:
         if self._on_error is not None:
@@ -519,11 +606,14 @@ class StreamWriter:
         if self._closed or not self._thread.is_alive():
             return False
         done = threading.Event()
+        deadline = time.monotonic() + max(0.0, timeout)
         try:
-            self._queue.put_nowait((_FLUSH, done))
+            # A full queue is a busy writer, not a stuck one: wait for room, within the
+            # same timeout, instead of giving up at once.
+            self._queue.put((_FLUSH, done), timeout=max(0.0, timeout))
         except queue.Full:
             return False
-        return done.wait(max(0.0, timeout))
+        return done.wait(max(0.0, deadline - time.monotonic()))
 
     # ---------------------------------------------------------------- shutdown
 

@@ -110,7 +110,14 @@ class Schedule:
             minutes = decision.get("next_check")
         try:
             seconds = float(minutes) * 60.0
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            seconds = None
+        if seconds is None or not math.isfinite(seconds):
+            # No usable interval -- a reply cut off at max_tokens, no JSON, or 'later'.
+            # Re-arm with the current one anyway: returning here left next_at in the
+            # past, and a full-evidence audit was paid for again on every poll.
+            self.set(self.interval, "the last audit did not choose a next check",
+                     str(decision.get("risk") or self.risk))
             return
         self.set(seconds, str(decision.get("reason") or ""), str(decision.get("risk") or "unknown"))
 
@@ -136,15 +143,24 @@ class Schedule:
             return
         if not isinstance(saved, dict):
             return
+        # Every field checked on its own: a schedule file with one bad value in it (a
+        # hand edit, a string next_at, a history that is not a list) crashed the brain
+        # at startup, and with it the console.
         self.interval = self._clamp(saved.get("interval", self.interval))
         self.reason = str(saved.get("reason") or self.reason)
         self.risk = str(saved.get("risk") or self.risk)
-        self.history = list(saved.get("history") or [])
+        history = saved.get("history")
+        self.history = [h for h in history if isinstance(h, dict)] if isinstance(history, list) else []
         self.loaded = True
+        try:
+            saved_next = float(saved.get("next_at") or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            saved_next = 0.0
+        if not math.isfinite(saved_next):
+            saved_next = 0.0
         # A brain that was down while training continued should look promptly, but not
         # immediately-and-repeatedly if it is being restarted in a loop.
-        self.next_at = min(float(saved.get("next_at") or 0.0) or time.time(),
-                           time.time() + self.interval)
+        self.next_at = min(saved_next or time.time(), time.time() + self.interval)
 
 
 def downsample(values: Sequence[float], points: int = AUDIT_POINTS) -> List[Dict[str, float]]:
@@ -248,6 +264,9 @@ class Brain:
         # held it froze every one of them for as long as the model took to answer.
         self.state_lock = threading.RLock()
         self._last_activity = time.monotonic()
+        # Set once the run is over and it has had its closing audit: after that, a due
+        # schedule is not a reason to pay for another look at numbers that stopped moving.
+        self._final_audit_done = False
 
     # ------------------------------------------------------------------ ingest
 
@@ -475,29 +494,46 @@ class Brain:
     # ------------------------------------------------------------------ loop
 
     def poll_once(self) -> Dict[str, Any]:
-        """One turn of the loop: ingest, detect, and audit if one is due."""
+        """One turn of the loop: ingest, detect, and audit if one is due.
+
+        A finished run -- or one whose process is gone -- gets one audit at most. The
+        console calls this every 0.5 s for as long as it is open, not run(), so the check
+        has to be here: `pulse --model` left open on yesterday's run paid for an audit of
+        it every interval.
+        """
         frames = self.reader.poll()
+        if frames:
+            self._last_activity = time.monotonic()
         raised = self.ingest(frames) if frames else []
         audited = None
-        if self.schedule.due():
+        if self.schedule.due() and not self._final_audit_done:
+            if not self.finished and not frames:
+                self._check_process_gone()
+            was_finished = self.finished
             audited = self.audit()
+            if was_finished and (audited or {}).get("status") != "busy":
+                self._final_audit_done = True
         return {"frames": len(frames), "raised": raised, "audit": audited}
 
     def run(self, stop: Optional[Callable[[], bool]] = None) -> None:
         while not self.finished:
             if stop is not None and stop():
                 return
-            if self.poll_once()["frames"]:
-                self._last_activity = time.monotonic()
-            elif self._training_process_gone():
-                # Killed without a word (SIGKILL, the OOM killer, pre-emption): no
-                # 'finished' and no BYE will ever come, and audits would be billed forever.
-                self.events.append({"kind": stream.KIND_EVENT, "event": "process_gone",
-                                    "step": self.step})
-                self.finished = True
+            if not self.poll_once()["frames"] and self._check_process_gone():
                 break
             time.sleep(self.poll_interval)
         self.poll_once()        # drain whatever arrived with the closing frames
+
+    def _check_process_gone(self) -> bool:
+        """Mark the run over if its process died without a word. True if it did."""
+        if self.finished or not self._training_process_gone():
+            return False
+        # Killed without a word (SIGKILL, the OOM killer, pre-emption): no 'finished'
+        # and no BYE will ever come, and audits would be billed forever.
+        self.events.append({"kind": stream.KIND_EVENT, "event": "process_gone",
+                            "step": self.step})
+        self.finished = True
+        return True
 
     def _training_process_gone(self, quiet_seconds: float = 2.0) -> bool:
         """The run's process no longer exists, and nothing has arrived for a while."""
@@ -509,9 +545,11 @@ class Brain:
         pid = self.session.get("pid")
         if not pid:
             return False
-        from .pulse_console import session_process_alive
+        from .pulse_console import session_liveness
 
-        return not session_process_alive(pid, self.session.get("started"))
+        # False only when this machine can tell: a pid from a container's own namespace
+        # names some other process here, and says nothing either way.
+        return session_liveness(self.session) is False
 
 
 def _num(value: Any) -> str:

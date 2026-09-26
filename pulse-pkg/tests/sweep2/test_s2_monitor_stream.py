@@ -389,3 +389,88 @@ def test_bug_stream_mode_stop_is_recorded_as_a_crash(tmp_path):
     assert not state.get("crashed") and status != "crashed", \
         f"a deliberate /stop is listed as {status!r}; crash events: " \
         f"{[f.get('exception') for f in frames if f.get('event') == 'crash']}"
+
+
+# =====================================================================================
+# Found by reading in sweep 2; tests added with the fix (they fail on b6abffe)
+# =====================================================================================
+
+def test_bug_one_bad_control_message_does_not_lose_the_rest_of_its_batch(tmp_path):
+    """A malformed message (names that is a number, a line that is not an object) used
+    to raise out of _handle_control and take every later message of the batch with it."""
+    directory = str(tmp_path)
+    monitor = Monitor(script_path=None, directory=directory, interval=0.0)
+    try:
+        with open(os.path.join(directory, "control.jsonl"), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"action": "track", "names": 5}) + "\n")
+            handle.write("[1, 2]\n")
+            handle.write(json.dumps({"action": "track", "names": "grad_norm"}) + "\n")
+            handle.write(json.dumps({"action": "pause", "reason": "x"}) + "\n")
+        monitor._last_control_poll = 0.0
+        monitor.observe_locals({"loss": 0.5, "step": 1})
+        assert monitor.paused, "the /pause after a bad message was lost"
+        assert monitor._requested == {"grad_norm"}
+    finally:
+        monitor.close()
+
+
+@pytest.mark.parametrize("path, library", [
+    ("/usr/lib/python3.11/threading.py", True),
+    ("/home/u/.venv/lib/python3.12/site-packages/torch/nn/module.py", True),
+    ("/usr/lib/python3/dist-packages/numpy/core.py", True),
+    ("/opt/conda/lib/python3.10/json/__init__.py", True),
+    ("C:\\Python311\\Lib\\threading.py", True),
+    ("C:\\Users\\u\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\queue.py", True),
+    ("C:\\Users\\u\\proj\\.venv\\Lib\\site-packages\\torch\\x.py", True),
+    ("<frozen importlib._bootstrap>", True),
+    ("/home/u/lib/python-experiments/train.py", False),
+    ("/home/u/lib/python/train.py", False),
+    ("/home/u/code/lib/train.py", False),
+    ("C:\\Users\\u\\lib\\train.py", False),
+    ("/home/u/python3.11/train.py", False),
+])
+def test_bug_the_library_path_filter(path, library):
+    assert pulse_monitor.is_library_path(path) is library
+    frame = {"filename": path}
+    assert pulse_attach._is_user_frame(frame) is (not library)
+
+
+def test_bug_reattaching_does_not_revive_the_old_sampler(tmp_path):
+    """detach() gives up joining after 1 s; the old sampler, still inside a slow sample,
+    then saw attach() clear the shared stop event and ran on beside the new one."""
+    first = pulse_monitor.attach(directory=str(tmp_path / "a"), interval=0.05)
+    old_stop = pulse_monitor._STOP
+    pulse_monitor.detach()
+    second = pulse_monitor.attach(directory=str(tmp_path / "b"), interval=0.05)
+    try:
+        assert second is not first
+        assert old_stop.is_set(), "attach() cleared the stop signal of the old sampler"
+        assert pulse_monitor._STOP is not old_stop and not pulse_monitor._STOP.is_set()
+    finally:
+        pulse_monitor.detach()
+
+
+def test_bug_flush_waits_for_room_in_a_full_queue(tmp_path):
+    """flush() on a momentarily full queue waits (within its timeout) instead of failing."""
+    writer = stream.StreamWriter(str(tmp_path), max_frames=8, flush_seconds=5.0)
+    hold = threading.Event()
+    busy = threading.Event()
+    real_encode = writer._encode
+
+    def slow_encode(item):
+        busy.set()
+        hold.wait(5.0)
+        return real_encode(item)
+
+    writer._encode = slow_encode
+    writer.emit(stream.KIND_SCALARS, {"step": 0, "values": {"loss": 1.0}})
+    assert busy.wait(5.0)                        # the writer thread is stuck on a slow disk
+    for step in range(1, 20):                    # ... while the queue fills up
+        writer.emit(stream.KIND_SCALARS, {"step": step, "values": {"loss": 1.0}})
+    assert writer._queue.full()
+    threading.Timer(0.3, hold.set).start()
+    try:
+        assert writer.flush(5.0), "flush gave up on a full queue"
+    finally:
+        hold.set()
+        writer.close()

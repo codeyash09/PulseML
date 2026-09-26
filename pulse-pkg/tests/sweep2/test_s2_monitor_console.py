@@ -139,11 +139,18 @@ def test_bug_a_wall_clock_step_makes_a_live_run_look_dead_and_ends_the_brain(tmp
     began = pulse_console._process_started(me, boot)
     started = time.time()                        # the monitor starts now, in this process
     assert began is not None and began <= started + 1
-    assert pulse_console.session_process_alive(me, started)
-    # NTP steps the clock forward by one minute: /proc/stat btime now reads a minute later.
-    monkeypatch.setattr(pulse_console, "_boot_time", lambda: boot + 60.0)
-    assert pulse_console.session_process_alive(me, started), \
+    ticks = stream.process_identity(me).get("start_ticks")     # what session.json records
+    assert pulse_console.session_process_alive(me, started, ticks)
+    # NTP steps the clock forward by one minute more than this process has been running
+    # (a bare 60 s step only trips the old check when the test process is under ~55 s
+    # old, so this test used to pass in a long folder run and fail on its own):
+    # /proc/stat btime now reads that much later.
+    step = (started - began) + 60.0
+    monkeypatch.setattr(pulse_console, "_boot_time", lambda: boot + step)
+    assert pulse_console.session_process_alive(me, started, ticks), \
         "this very process is reported dead after a 60 s clock step"
+    assert pulse_console.session_liveness(
+        dict(stream.process_identity(me), pid=me, started=started)) is True
 
 
 def test_bug_brain_run_ends_on_a_live_quiet_run_after_a_clock_step(tmp_path, monkeypatch):
@@ -154,13 +161,116 @@ def test_bug_brain_run_ends_on_a_live_quiet_run_after_a_clock_step(tmp_path, mon
         pytest.skip("needs /proc/stat")
     monitor = _spool(tmp_path / "s", finish=False)          # pid = this live process
     boot = pulse_console._boot_time()
-    monkeypatch.setattr(pulse_console, "_boot_time", lambda: boot + 60.0)
+    # A step one minute longer than this process has been running (see above: a fixed
+    # 60 s step only bites while the test process is young).
+    age = time.time() - pulse_console._process_started(os.getpid(), boot)
+    monkeypatch.setattr(pulse_console, "_boot_time", lambda: boot + age + 60.0)
     brain = Brain(str(tmp_path / "s"), poll_interval=0.1)
     deadline = time.time() + 4.0
     brain.run(stop=lambda: time.time() > deadline)
     monitor.close()
     assert not any(e.get("event") == "process_gone" for e in brain.events), \
         "the brain gave up on a live run"
+
+
+def test_ok_a_session_without_start_ticks_still_catches_a_reused_pid():
+    """Backwards compatibility: a session.json from before start_ticks was recorded is
+    judged by wall-clock start time, so a process that began after it is not its own."""
+    if pulse_console._boot_time() is None:
+        pytest.skip("needs /proc/stat")
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        time.sleep(0.3)
+        old_session = {"pid": child.pid, "started": time.time() - 3600}   # an hour before
+        assert pulse_console.session_liveness(old_session) is False
+        assert pulse_console.session_liveness(dict(old_session, started=time.time())) is True
+        # With ticks recorded, a different process under the same pid is caught exactly.
+        ticks = stream.process_identity(child.pid)["start_ticks"]
+        assert pulse_console.session_process_alive(child.pid, None, ticks + 1) is False
+        assert pulse_console.session_process_alive(child.pid, None, ticks) is True
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_bug_a_pid_from_another_pid_namespace_is_judged_by_the_stream(tmp_path):
+    """A containerised run read from the host: its pid names some other local process,
+    so liveness is unknown and the stream's freshness decides."""
+    here = stream.pid_namespace()
+    if "pid_ns" not in here:
+        pytest.skip("needs /proc/self/ns/pid")
+    monitor = _spool(tmp_path / "s", finish=False)
+    info = json.loads((tmp_path / "s" / "session.json").read_text())
+    info.update(pid=1, pid_ns="pid:[1]" if here["pid_ns"] != "pid:[1]" else "pid:[2]")
+    info.pop("start_ticks", None)
+    (tmp_path / "s" / "session.json").write_text(json.dumps(info))
+    assert pulse_console.session_liveness(info) is None
+    assert pulse_console._describe_session(str(tmp_path / "s"))["status"] == "live"
+    old = time.time() - 600
+    os.utime(str(tmp_path / "s" / "events.jsonl"), (old, old))
+    assert pulse_console._describe_session(str(tmp_path / "s"))["status"] == "ended"
+    brain = Brain(str(tmp_path / "s"))
+    brain._last_activity -= 60
+    assert not brain._training_process_gone()
+    monitor.writer.close()
+
+
+def test_bug_the_live_window_covers_the_sampling_interval(tmp_path):
+    """At /interval 45 a run that writes every 45 s is live, not stalled, between samples."""
+    monitor = _spool(tmp_path / "s", finish=False)
+    monitor.sampler_interval = 45.0
+    monitor.snapshot_state()
+    old = time.time() - 40
+    os.utime(str(tmp_path / "s" / "events.jsonl"), (old, old))
+    assert pulse_console._describe_session(str(tmp_path / "s"))["status"] == "live"
+    old = time.time() - 200
+    os.utime(str(tmp_path / "s" / "events.jsonl"), (old, old))
+    assert pulse_console._describe_session(str(tmp_path / "s"))["status"] == "stalled"
+    monitor.close()
+
+
+@pytest.mark.parametrize("content", [
+    '{"interval": 120, "next_at": "tomorrow", "history": 5}',
+    '{"interval": "x", "next_at": [1], "history": [1, {"t": 1}], "reason": null}',
+    '{"next_at": 1e400}',
+    '[1, 2]',
+    '{"interval": 120',
+])
+def test_bug_a_corrupt_schedule_file_does_not_crash_the_brain(tmp_path, content):
+    _spool(tmp_path / "s", finish=False)
+    (tmp_path / "s" / "schedule.json").write_text(content)
+    brain = Brain(str(tmp_path / "s"))
+    assert isinstance(brain.schedule.next_at, float)
+    assert all(isinstance(h, dict) for h in brain.schedule.history)
+    brain.poll_once()
+
+
+def test_bug_ctrl_c_while_waiting_on_the_model_keeps_the_console(tmp_path, monkeypatch):
+    """Ctrl+C during a question to the agent abandons that answer, not the console."""
+    _spool(tmp_path / "s", finish=True)
+    session = pulse_console._describe_session(str(tmp_path / "s"))
+    lines = iter(["why is the loss flat?", "/status"])
+    seen = []
+
+    def fake_input(prompt=""):
+        try:
+            line = next(lines)
+        except StopIteration:
+            raise EOFError
+        seen.append(line)
+        return line
+
+    def agent(prompt):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    import io
+    from contextlib import redirect_stdout
+    with redirect_stdout(io.StringIO()) as out:
+        code = pulse_console.run_console(session, [session], agent=agent)
+    assert code == 0
+    assert seen == ["why is the loss flat?", "/status"]
+    assert "interrupted" in out.getvalue()
 
 
 def test_ok_brain_run_ends_when_the_process_is_really_gone(tmp_path):
