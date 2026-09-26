@@ -187,8 +187,8 @@ def test_bug_save_credentials_carries_previous_users_session_token():
     assert data.get("refresh_token") != "rt-A"
 
 
-def test_bug_git_remote_credentials_uploaded_to_team_repo(monkeypatch):
-    """create_team stores `git remote get-url origin` verbatim in Teams.repo. HTTPS
+def test_bug_git_remote_credentials_uploaded_to_project_repo(monkeypatch):
+    """create_project stores `git remote get-url origin` verbatim in Projects.repo. HTTPS
     remotes very often embed a token (https://x-access-token:ghp_...@github.com/...,
     or user:password@), which then gets uploaded to Supabase and shown to every
     teammate. encode_entry scrubs agent logs, but this path isn't scrubbed. Correct:
@@ -204,10 +204,10 @@ def test_bug_git_remote_credentials_uploaded_to_team_repo(monkeypatch):
 
     def fake_request(method, path, params=None, body=None, prefer=None, timeout=8):
         sent["body"] = body
-        return [dict(body, team_id="t1")]
+        return [dict(body, project_id="p1")]
 
     monkeypatch.setattr(cloud, "_request", fake_request)
-    cloud.create_team(UID_A)
+    cloud.create_project("t1", UID_A, "proj")
     assert token not in json.dumps(sent["body"])
     assert "github.com/org/repo" in sent["body"]["repo"]
 

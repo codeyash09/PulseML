@@ -1042,6 +1042,60 @@ def _ui_workspace_menu(existing: List[Dict[str, Any]], cached_team_id: Optional[
     return str(picked + 1) if picked < len(existing) else ("c" if picked == len(existing) else "j")
 
 
+def _ui_project_menu(projects: List[Dict[str, Any]], cached_project_id: Optional[str], describe,
+                     workspace_label: str, can_delete: bool, can_leave: bool) -> Optional[str]:
+    """The project picker (workspace -> project -> run) -> the same token the plain prompt
+    takes: "1".."n" for a listed project, or "c" / "j" / "l" / "d". None: use the plain prompt."""
+    if not _ui.enabled():
+        return None
+    try:
+        _flush_stdin()
+        _ui.header("Project", "Select a project",
+                   f"Runs, tracked variables and the repo live in a project.  Workspace: {workspace_label}")
+        options: List[Any] = []
+        initial = 0
+        for i, project in enumerate(projects):
+            name, _sep, rest = describe(project).partition("  --  ")
+            last_used = project.get("project_id") == cached_project_id
+            if last_used:
+                initial = i
+            tag = "last used" if last_used else ("secret" if project.get("is_secret") else None)
+            options.append(_ui.Option(name, rest or None, tag=tag))
+        options.append(_ui.Option("+ Create new project", "Start a new one", key="c"))
+        options.append(_ui.Option("Join a secret project", "Enter its join code", key="j"))
+        if not projects:
+            initial = 0  # nothing to pick yet: the cursor starts on "+ Create new project"
+        manage = ""
+        hotkeys: Dict[str, str] = {}
+        if can_leave:
+            manage += "    L Leave"
+            hotkeys["l"] = "l"
+        if can_delete:
+            manage += "    D Delete"
+            hotkeys["d"] = "d"
+        picked = _ui.choose(
+            options, initial=initial, allow_cancel=False, hotkeys=hotkeys or None,
+            footer=f"{_ui._g('up')}{_ui._g('down')} Select    Enter Continue    C New    J Join{manage}",
+        )
+    except _ui.Unavailable:
+        return None
+    if isinstance(picked, str):
+        return picked
+    return str(picked + 1) if picked < len(projects) else ("c" if picked == len(projects) else "j")
+
+
+def _ask_yes_no(question: str, default: bool = False) -> bool:
+    if _ui.enabled():
+        try:
+            _flush_stdin()
+            return _ui.confirm(question, default=default)
+        except _ui.Unavailable:
+            pass
+    _flush_stdin()
+    answer = input(f"{question} ({'Y/n' if default else 'y/N'}) > ").strip().lower()
+    return default if not answer else answer in ("y", "yes")
+
+
 def _say_plain(label: str, value: str, plain: str) -> None:
     """Like _say, for the places that used a bare print() rather than cprint()."""
     if _ui.enabled():
@@ -3572,6 +3626,12 @@ class PulseCLI:
         self.team_id: Optional[str] = None
         self.team_join_code: Optional[str] = None
         self.team_admin_ids: List[str] = []  # admin_ids of the currently-selected workspace
+        # workspace -> project -> run: the selected project owns this run's Debug_Sessions
+        # row, the repo, and the shared GPU-tracked variable list.
+        self.project_id: Optional[str] = None
+        self.project_name: Optional[str] = None
+        self.project_is_secret: bool = False
+        self.project_repo: Optional[str] = None
         self.debug_session_id: Optional[str] = None
         self._cloud_sync = cloud.BackgroundSync(on_error=self._on_cloud_error)
         self._cloud_warned = False
@@ -3866,15 +3926,13 @@ class PulseCLI:
                 color=_YELLOW,
             )
 
-        if self.team_id:
+        if self.project_id:
             try:
-                # Note: Requires `update_team_saved_vars` to be defined in `pulse_supabase.py`
-                # e.g., supabase.table("Teams").update({"saved_vars": list(...)}).eq("team_id", team_id)
-                cloud.update_team_saved_vars(self.team_id, list(self.gpu_tracked_vars))
+                cloud.update_project_saved_vars(self.project_id, list(self.gpu_tracked_vars))
                 if not quiet:
-                    print(f"✓ Synced '{var_name}' to team saved_vars.")
+                    print(f"✓ Synced '{var_name}' to the project's saved_vars.")
             except Exception as exc:
-                cprint(f"[Pulse CLI] ⚠ Could not sync to team table: {exc}", color=_RED)
+                cprint(f"[Pulse CLI] ⚠ Could not sync to the project: {exc}", color=_RED)
 
         return var_name
 
@@ -3896,11 +3954,11 @@ class PulseCLI:
             self.gpu_tracked_vars.clear()
             if not quiet:
                 print(f"✓ Stopped GPU tracking on {n} variable(s).")
-            if self.team_id and n:
+            if self.project_id and n:
                 try:
-                    cloud.update_team_saved_vars(self.team_id, [])
+                    cloud.update_project_saved_vars(self.project_id, [])
                 except Exception as exc:
-                    cprint(f"[Pulse CLI] ⚠ Could not sync to team table: {exc}", color=_RED)
+                    cprint(f"[Pulse CLI] ⚠ Could not sync to the project: {exc}", color=_RED)
             return "all" if n else None
 
         if var_name not in self.gpu_tracked_vars:
@@ -3911,11 +3969,11 @@ class PulseCLI:
         self.gpu_tracked_vars.discard(var_name)
         if not quiet:
             print(f"✓ '{var_name}' is no longer GPU-tracked.")
-        if self.team_id:
+        if self.project_id:
             try:
-                cloud.update_team_saved_vars(self.team_id, list(self.gpu_tracked_vars))
+                cloud.update_project_saved_vars(self.project_id, list(self.gpu_tracked_vars))
             except Exception as exc:
-                cprint(f"[Pulse CLI] ⚠ Could not sync to team table: {exc}", color=_RED)
+                cprint(f"[Pulse CLI] ⚠ Could not sync to the project: {exc}", color=_RED)
         return var_name
 
     def _default_state_for(self, name: str, val: Any) -> str:
@@ -4248,6 +4306,8 @@ class PulseCLI:
         cprint("  Pulse Code is ready" if code_mode else "  Pulse is ready")
         if self.user_id:
             cprint(f"  Signed in as {self.email}" + (f"  ·  workspace {self.team_join_code}" if self.team_join_code else "  ·  no workspace"))
+            if self.team_id:
+                cprint(f"  Project: {self._project_label()}" if self.project_id else "  Project: none (this run is not filed under a project)")
         else:
             cprint("  Running locally -- not signed in to Pulse Cloud (/cloud for details)")
         cprint(f"  Agent: {self.agent_provider or 'not configured (/agent to set one up)'}")
@@ -4268,6 +4328,7 @@ class PulseCLI:
         rows = [
             ("Account", (self.email or "signed in") if self.user_id else "local -- not signed in (/cloud)", bool(self.user_id)),
             ("Workspace", (f"join code {self.team_join_code}" if self.team_join_code else "selected") if self.team_id else "none", bool(self.team_id)),
+            ("Project", self._project_label() if self.project_id else "none", bool(self.project_id)),
             ("Code version", sha[:10] if known_sha else "unknown", known_sha),
         ]
         if self.agent_provider:
@@ -4398,10 +4459,7 @@ class PulseCLI:
         if not self.user_id:
             return  # user chose to skip auth entirely
 
-        try:
-            self._team_flow()
-        except cloud.SupabaseError as exc:
-            cprint(f"[Pulse] ⚠ Team setup failed, continuing without a team: {exc}", color=_RED)
+        self._select_workspace_and_project()
 
         try:
             # PULSE_AUTO_SESSION_ID/COMMIT_SHA/UPTIME/DOWNTIME: set by
@@ -4510,7 +4568,7 @@ class PulseCLI:
                 cprint(f"[Pulse] Resumed git commit {sha[:10]}… -- carried over, not re-detected (see /commit to update it manually).")
                 cprint(f"[Pulse] Resumed debug session (id={self.debug_session_id[:8]}…) after restart -- uptime/downtime counters carried over.")
             else:
-                self.debug_session_id = cloud.create_debug_session(self.team_id, self.user_id, git_commit_sha=sha)
+                self.debug_session_id = cloud.create_debug_session(self.project_id, self.user_id, git_commit_sha=sha)
                 self._last_synced_commit_sha = sha
                 if self.debug_session_id:
                     shown_sha = sha[:10] if sha else "unknown"
@@ -4615,6 +4673,7 @@ class PulseCLI:
                     self.user_id = user["id"]
                     self.email = user["email"]
                     self.team_id = cached.get("team_id")
+                    self.project_id = cached.get("project_id")
                     cprint(f"[Pulse] Signed in as {self.email}.")
                     return
                 # Cached user no longer exists server-side -- clear cache and fall through
@@ -4883,17 +4942,12 @@ class PulseCLI:
     def _describe_workspace(team: Dict[str, Any], user_id: Optional[str]) -> str:
         """Human-readable label for a workspace menu entry -- prefers an
         explicit name (see cloud.update_team_name) if the team has one,
-        then falls back to the repo basename, then a generic label built
-        from the join code, plus an admin tag.
+        then a generic label built from the join code, plus an admin tag.
+        (The repo lives on each project now, not on the workspace.)
         """
         custom_name = (team.get("name") or "").strip()
-        repo = team.get("repo")
         if custom_name:
             label = custom_name
-        elif repo and repo != "unknown":
-            label = repo.rstrip("/").rsplit("/", 1)[-1]
-            if label.endswith(".git"):
-                label = label[:-4]
         elif len(team.get("members") or []) <= 1:
             label = "Personal workspace"
         else:
@@ -4902,10 +4956,10 @@ class PulseCLI:
         return f"{label}{role}  --  join code {team.get('join_code', '?')}"
     
     def _prompt_and_set_repo(self) -> None:
-        """Prompt the user for a repository URL if the workspace repo is missing."""
-        if not self.team_id or self.non_interactive:
+        """Prompt the user for the project's repository URL (used when the project has none)."""
+        if not self.project_id or self.non_interactive:
             return
-        
+
         detected = cloud.git_remote_url(self._repo_cwd)
         _flush_stdin()
         prompt = (
@@ -4914,14 +4968,16 @@ class PulseCLI:
             "GitHub repo URL (optional, Enter to skip) > "
         )
         repo_input = _prompt_text(prompt, label="GitHub repository", placeholder=(f"Enter to use detected: {detected}" if detected else "optional -- Enter to skip")).strip()
-        repo_url = repo_input or detected
-        
+        repo_url = cloud.strip_url_credentials(repo_input or detected)
+
         if repo_url:
             try:
-                cloud.update_team_repo(self.team_id, repo_url)
-                cprint(f"[Pulse] ✓ Updated workspace repository to: {repo_url}")
+                cloud.update_project_repo(self.project_id, repo_url)
+                self.project_repo = repo_url
+                cprint(f"[Pulse] ✓ Updated project repository to: {repo_url}")
             except cloud.SupabaseError as exc:
-                cprint(f"[Pulse] ⚠ Could not update workspace repository: {exc}", color=_RED)
+                cprint(f"[Pulse] ⚠ Could not update project repository: {exc}", color=_RED)
+
     def _team_flow(self) -> None:
         """Pick (or create/join) the workspace for this run. Always shows
         the picker -- even when credentials were resumed from a cached
@@ -4954,12 +5010,9 @@ class PulseCLI:
                 workspace_action = str(workspace_options.get("action", workspace_action)).strip().lower()
                 workspace = workspace_options.get("name") or workspace_options.get("join_code") or workspace_options.get("team_id")
             if workspace_action in ("create", "new", "signup", "sign_up"):
-                repo = self._config_text("repo", "repository")
-                if not repo and workspace_options:
-                    repo = str(workspace_options.get("repo") or "").strip()
                 new_name = str(workspace_options.get("new_name") or "").strip() if workspace_options else ""
                 try:
-                    team = cloud.create_team(self.user_id, repo=repo or None, cwd=self._repo_cwd, name=new_name or None)
+                    team = cloud.create_team(self.user_id, name=new_name or None)
                     self.team_id = team["team_id"]
                     self.team_join_code = team.get("join_code")
                     self.team_admin_ids = list(team.get("admin_ids") or [])
@@ -5013,11 +5066,11 @@ class PulseCLI:
         # need a prompt at all when there's nothing else it could be.
         if not existing:
             try:
-                team = cloud.create_team(self.user_id, repo=cloud.git_remote_url(self._repo_cwd), cwd=self._repo_cwd)
+                team = cloud.create_team(self.user_id)
                 self.team_id = team["team_id"]
                 self.team_join_code = team.get("join_code")
                 self.team_admin_ids = list(team.get("admin_ids") or [])
-                cprint(f"[Pulse] ✓ Workspace ready (join code: {self.team_join_code}) -- share this to invite teammates, or /repo to set a repo.")
+                cprint(f"[Pulse] ✓ Workspace ready (join code: {self.team_join_code}) -- share this to invite teammates.")
                 cloud.save_cached_credentials(self.user_id, self.email, self.team_id)
             except cloud.SupabaseError as exc:
                 cprint(f"[Pulse] ⚠ Could not create a workspace ({exc}) -- continuing without a team. Try /repo or restart to pick one.", color=_RED)
@@ -5055,8 +5108,6 @@ class PulseCLI:
                 self.team_admin_ids = list(team.get("admin_ids") or [])
                 _say(f"[Pulse] Using workspace (join code: {self.team_join_code}).",
                      "Workspace", self._describe_workspace(team, self.user_id).replace("  --  ", "  ·  "))
-                if not team.get("repo") or team.get("repo") == "unknown":
-                    self._prompt_and_set_repo()
                 cloud.save_cached_credentials(self.user_id, self.email, self.team_id)
                 return
 
@@ -5064,16 +5115,8 @@ class PulseCLI:
                 _flush_stdin()
                 _ui_screen("New workspace", "Name your workspace")
                 name_input = _prompt_text("Workspace name (optional, Enter to skip) > ", label="Workspace name", placeholder="optional -- Enter to skip").strip()
-                detected = cloud.git_remote_url(self._repo_cwd)
-                _flush_stdin()
-                prompt = (
-                    f"GitHub repo URL (Enter to use detected: {detected}) > "
-                    if detected else
-                    "GitHub repo URL (optional, Enter to skip) > "
-                )
-                repo_input = _prompt_text(prompt, label="GitHub repository", placeholder=(f"Enter to use detected: {detected}" if detected else "optional -- Enter to skip")).strip()
                 try:
-                    team = cloud.create_team(self.user_id, repo=repo_input or detected, name=name_input or None)
+                    team = cloud.create_team(self.user_id, name=name_input or None)
                     self.team_id = team["team_id"]
                     self.team_join_code = team["join_code"]
                     self.team_admin_ids = list(team.get("admin_ids") or [])
@@ -5081,7 +5124,6 @@ class PulseCLI:
                     cprint(f"[Pulse] ✓ Workspace '{label}' created. Share this join code with teammates: {self.team_join_code}")
                     if name_input and not team.get("name"):
                         cprint("[Pulse]   ⚠ Name couldn't be saved (this deployment's Teams table doesn't have a 'name' column yet) -- the workspace still works, just unnamed.", color=_YELLOW)
-                    cprint(f"[Pulse]   Repo: {team.get('repo')}")
                     cloud.save_cached_credentials(self.user_id, self.email, self.team_id)
                     return
                 except cloud.SupabaseError as exc:
@@ -5100,8 +5142,6 @@ class PulseCLI:
                     self.team_join_code = team.get("join_code")
                     self.team_admin_ids = list(team.get("admin_ids") or [])
                     cprint(f"[Pulse] ✓ Joined workspace {self.team_join_code}.")
-                    if not team.get("repo") or team.get("repo") == "unknown":
-                        self._prompt_and_set_repo()
                     cloud.save_cached_credentials(self.user_id, self.email, self.team_id)
                     return
                 except cloud.SupabaseError as exc:
@@ -5123,7 +5163,7 @@ class PulseCLI:
                     if saved:
                         cprint(f"[Pulse] ✓ Renamed to '{new_name[:80]}'.")
                     else:
-                        cprint("[Pulse] ⚠ This deployment's Teams table doesn't have a 'name' column yet -- couldn't save the name.", color=_YELLOW)
+                        cprint("[Pulse] ⚠ This deployment's Teams table doesn't have a 'name' column -- couldn't save the name.", color=_YELLOW)
                 except cloud.SupabaseError as exc:
                     cprint(f"[Pulse] ⚠ Could not rename workspace: {exc}", color=_RED)
 
@@ -5189,6 +5229,311 @@ class PulseCLI:
             return int(resp) - 1
         cprint("[Pulse] Invalid selection.", color=_RED)
         return None
+
+    # ------------------------------------------------------------------
+    # Projects: workspace -> project -> run
+    # ------------------------------------------------------------------
+
+    def _select_workspace_and_project(self) -> None:
+        """Pick the workspace, then a project inside it. Everything below the
+        workspace (the run's Debug_Sessions row, repo, saved variables, history
+        context) hangs off the project, so a failure at either step just means
+        this run continues without that level."""
+        cached_project_id = self.project_id
+        self._clear_project()
+        try:
+            self._team_flow()
+        except cloud.SupabaseError as exc:
+            cprint(f"[Pulse] ⚠ Team setup failed, continuing without a team: {exc}", color=_RED)
+        if not self.team_id:
+            return
+        try:
+            self._project_flow(cached_project_id)
+        except cloud.SupabaseError as exc:
+            cprint(f"[Pulse] ⚠ Project setup failed, continuing without a project: {exc}", color=_RED)
+
+    def _clear_project(self) -> None:
+        self.project_id = None
+        self.project_name = None
+        self.project_is_secret = False
+        self.project_repo = None
+
+    def _team_ref(self) -> Dict[str, Any]:
+        """The selected workspace in the shape the cloud.*project* functions take."""
+        return {"team_id": self.team_id, "admin_ids": list(self.team_admin_ids)}
+
+    def _project_label(self) -> str:
+        label = self.project_name or "Untitled project"
+        return f"{label} (secret)" if self.project_is_secret else label
+
+    def _apply_project(self, project: Dict[str, Any]) -> None:
+        self.project_id = project["project_id"]
+        self.project_name = (project.get("name") or "").strip() or None
+        self.project_is_secret = bool(project.get("is_secret"))
+        self.project_repo = project.get("repo")
+        cloud.save_cached_credentials(self.user_id, self.email, self.team_id, project_id=self.project_id)
+
+    @staticmethod
+    def _describe_project(project: Dict[str, Any]) -> str:
+        """Menu label: name, a [secret] marker, then the repo's basename."""
+        name = (project.get("name") or "").strip() or "Untitled project"
+        if project.get("is_secret"):
+            name += "  [secret]"
+        repo = project.get("repo")
+        if repo and repo != "unknown":
+            repo_name = repo.rstrip("/").rsplit("/", 1)[-1]
+            if repo_name.endswith(".git"):
+                repo_name = repo_name[:-4]
+            return f"{name}  --  {repo_name}"
+        return name
+
+    def _default_project_name(self) -> str:
+        repo = cloud.git_remote_url(self._repo_cwd)
+        source = repo.rstrip("/").rsplit("/", 1)[-1] if repo else os.path.basename(os.path.abspath(self._repo_cwd or os.getcwd()))
+        if source.endswith(".git"):
+            source = source[:-4]
+        return source or "My project"
+
+    def _project_flow(self, cached_project_id: Optional[str] = None) -> None:
+        """Pick (or create / join) the project for this run, inside the selected
+        workspace. Always shown, even for a workspace with no projects yet (then
+        it goes straight to naming the first one). A secret project is listed
+        for the workspace's admins and for members who joined it with its code;
+        everyone else can only reach it through "Join a secret project"."""
+        if not self.user_id or not self.team_id:
+            return
+
+        team = self._team_ref()
+        if self.non_interactive:
+            self._project_flow_unattended(team, cloud.find_projects_for_team(team, self.user_id), cached_project_id)
+            return
+
+        while True:
+            _flush_stdin()
+            projects = cloud.find_projects_for_team(team, self.user_id)  # re-fetch so leave/delete show up at once
+            is_admin = self.is_team_admin
+            can_leave = any(p.get("is_secret") for p in projects)
+            can_delete = bool(projects) and is_admin
+            resp = _ui_project_menu(
+                projects, cached_project_id, self._describe_project,
+                workspace_label=self.team_join_code or "selected", can_delete=can_delete, can_leave=can_leave,
+            )
+            if resp is None:
+                cprint("\n--- Pulse Project ---")
+                default_choice = "c" if not projects else None
+                for i, project in enumerate(projects, start=1):
+                    is_default = project["project_id"] == cached_project_id
+                    if is_default:
+                        default_choice = str(i)
+                    marker = "  [last used]" if is_default else ""
+                    print(f"  {i}) {self._describe_project(project)}{marker}")
+                if not projects:
+                    print("  (no projects in this workspace yet)")
+                print("  c) Create a new project")
+                print("  j) Join a secret project with its code")
+                if can_leave:
+                    print("  l) Leave a secret project")
+                if can_delete:
+                    print("  d) Delete a project (admins only)")
+                suffix = f" (Enter = {default_choice})" if default_choice else ""
+                resp = input(f"[Pulse] Select a project{suffix} > ").strip().lower()
+                if not resp and default_choice:
+                    resp = default_choice
+
+            if resp.isdigit() and projects and 1 <= int(resp) <= len(projects):
+                project = projects[int(resp) - 1]
+                self._apply_project(project)
+                _say(f"[Pulse] Using project '{self.project_name}'.", "Project", self._describe_project(project).replace("  --  ", "  ·  "))
+                if not project.get("repo") or project.get("repo") == "unknown":
+                    self._prompt_and_set_repo()
+                return
+
+            if resp in ("c", "create"):
+                if self._create_project_interactive():
+                    return
+
+            elif resp in ("j", "join"):
+                _flush_stdin()
+                _ui_screen("Join project", "Enter the secret project's join code")
+                code = _prompt_text("Project join code > ", label="Project join code").strip().upper()
+                if not code:
+                    cprint("[Pulse] Join code cannot be blank.", color=_RED)
+                    continue
+                try:
+                    project = cloud.join_secret_project(team, code, self.user_id)
+                except cloud.SupabaseError as exc:
+                    cprint(f"[Pulse] ⚠ Could not join project: {exc}", color=_RED)
+                    continue
+                self._apply_project(project)
+                cprint(f"[Pulse] ✓ Joined secret project '{self.project_name}'.")
+                if not project.get("repo") or project.get("repo") == "unknown":
+                    self._prompt_and_set_repo()
+                return
+
+            elif resp in ("l", "leave") and can_leave:
+                target = self._pick_project(projects, "Leave which project", only_secret=True)
+                if target is None:
+                    continue
+                if not _ask_yes_no(f"Leave '{target.get('name')}'? You'll need its join code to get back in", default=False):
+                    continue
+                try:
+                    cloud.leave_project(target["project_id"], self.user_id)
+                    cprint("[Pulse] ✓ Left the project." + (" (Workspace admins can still see it.)" if is_admin else ""))
+                except cloud.SupabaseError as exc:
+                    cprint(f"[Pulse] ⚠ Could not leave project: {exc}", color=_RED)
+
+            elif resp in ("d", "delete") and can_delete:
+                target = self._pick_project(projects, "Delete which project")
+                if target is None:
+                    continue
+                _flush_stdin()
+                confirm = input(f"Permanently delete project '{target.get('name')}'? Type DELETE to confirm > ").strip()
+                if confirm != "DELETE":
+                    cprint("[Pulse] Cancelled -- deletion requires typing DELETE exactly.")
+                    continue
+                try:
+                    cloud.delete_project(target["project_id"], team, self.user_id)
+                    cprint("[Pulse] ✓ Project deleted.")
+                except cloud.SupabaseError as exc:
+                    cprint(f"[Pulse] ⚠ Could not delete project: {exc}", color=_RED)
+
+            else:
+                cprint("[Pulse] Invalid option.")
+
+    def _pick_project(self, projects: List[Dict[str, Any]], prompt_label: str, only_secret: bool = False) -> Optional[Dict[str, Any]]:
+        """Sub-picker for the leave/delete menu actions (same shape as _pick_workspace_index)."""
+        for i, project in enumerate(projects, start=1):
+            print(f"  {i}) {self._describe_project(project)}")
+        _flush_stdin()
+        resp = input(f"{prompt_label} (number, or Enter to cancel) > ").strip()
+        if not resp:
+            return None
+        if resp.isdigit() and 1 <= int(resp) <= len(projects):
+            project = projects[int(resp) - 1]
+            if only_secret and not project.get("is_secret"):
+                cprint("[Pulse] Only secret projects can be left -- every workspace member can see the others.", color=_RED)
+                return None
+            return project
+        cprint("[Pulse] Invalid selection.", color=_RED)
+        return None
+
+    def _create_project_interactive(self) -> bool:
+        """Name, repo and secret-or-not -> creates the project and selects it.
+        Returns False (after saying why) if nothing was created."""
+        _flush_stdin()
+        _ui_screen("New project", "Name your project", "A project holds your runs, tracked variables and repo.")
+        name = _prompt_text("Project name > ", label="Project name").strip()
+        if not name:
+            cprint("[Pulse] A project needs a name.", color=_RED)
+            return False
+        detected = cloud.git_remote_url(self._repo_cwd)
+        _flush_stdin()
+        prompt = (
+            f"GitHub repo URL (Enter to use detected: {detected}) > "
+            if detected else
+            "GitHub repo URL (optional, Enter to skip) > "
+        )
+        repo_input = _prompt_text(prompt, label="GitHub repository", placeholder=(f"Enter to use detected: {detected}" if detected else "optional -- Enter to skip")).strip()
+        is_secret = _ask_yes_no(
+            "Make it a secret project? Only workspace admins and people with its join code will see it",
+            default=False,
+        )
+        try:
+            project = cloud.create_project(
+                self.team_id, self.user_id, name, repo=repo_input or detected, cwd=self._repo_cwd, is_secret=is_secret,
+            )
+        except cloud.SupabaseError as exc:
+            cprint(f"[Pulse] ⚠ Could not create project: {exc}", color=_RED)
+            return False
+        self._apply_project(project)
+        cprint(f"[Pulse] ✓ Project '{self.project_name}' created.")
+        if is_secret and project.get("secret_join_code"):
+            cprint(f"[Pulse]   Secret join code (share it with the people who should see this project): {project['secret_join_code']}")
+        cprint(f"[Pulse]   Repo: {project.get('repo')}")
+        return True
+
+    def _project_flow_unattended(self, team: Dict[str, Any], projects: List[Dict[str, Any]],
+                                 cached_project_id: Optional[str]) -> None:
+        """Non-interactive project choice: the configured one, else the
+        previously-used project (which is what a fix-triggered restart resumes
+        into), else the only one, else -- for a workspace with no projects at
+        all -- a new one named after the repo/folder. With several projects and
+        no clear pick the run continues without one rather than blocking.
+        Config (pulse_config.json): "project": name | index | id | join code, or
+        {"action": create|join, "name"/"new_name", "repo", "secret", "join_code"}
+        and/or "project_action"."""
+        project = self._config_value("project", "project_id", default=None)
+        action = self._config_text("project_action").lower()
+        options = project if isinstance(project, dict) else {}
+        if options:
+            action = str(options.get("action", action)).strip().lower()
+            project = options.get("name") or options.get("join_code") or options.get("project_id")
+        repo = str(options.get("repo") or "").strip() or self._config_text("repo", "repository")
+        pick = None
+        try:
+            if action in ("create", "new"):
+                name = str(options.get("new_name") or (project if isinstance(project, str) else "") or "").strip() or self._default_project_name()
+                pick = cloud.create_project(
+                    self.team_id, self.user_id, name, repo=repo or None, cwd=self._repo_cwd,
+                    is_secret=bool(options.get("secret")),
+                )
+                cprint(f"[Pulse] Non-interactive mode -- created project '{pick.get('name')}'.")
+            else:
+                if project is not None:
+                    if isinstance(project, int) or (isinstance(project, str) and project.strip().isdigit()):
+                        index = int(project) - 1
+                        if 0 <= index < len(projects):
+                            pick = projects[index]
+                    else:
+                        wanted = str(project).strip().lower()
+                        matches = [
+                            p for p in projects
+                            if wanted == str(p.get("name") or "").strip().lower() or wanted == str(p.get("project_id", "")).lower()
+                        ] or [p for p in projects if wanted in str(p.get("name") or "").lower()]
+                        if len(matches) == 1:
+                            pick = matches[0]
+                if not pick:
+                    pick = next((p for p in projects if p["project_id"] == cached_project_id), None)
+                if not pick and len(projects) == 1:
+                    pick = projects[0]
+                if not pick and action in ("join", "join_code") and isinstance(project, str):
+                    pick = cloud.join_secret_project(team, project, self.user_id)
+                if not pick and not projects:
+                    pick = cloud.create_project(
+                        self.team_id, self.user_id, self._default_project_name(), repo=repo or None, cwd=self._repo_cwd,
+                    )
+                    cprint(f"[Pulse] Non-interactive mode -- created project '{pick.get('name')}' (the workspace had none).")
+        except cloud.SupabaseError as exc:
+            cprint(f"[Pulse] ⚠ Could not set up a project: {exc}. Continuing without one.", color=_RED)
+            return
+        if not pick:
+            cprint("[Pulse] Non-interactive mode and no unambiguous project to pick -- continuing without a project.")
+            return
+        self._apply_project(pick)
+        if self._resumed_after_restart:
+            cprint(f"[Pulse] Resumed project '{self.project_name}' -- auto-filled after restart.")
+        else:
+            cprint(f"[Pulse] Non-interactive mode -- using project '{self.project_name}'.")
+
+    def _cmd_project(self, arg: str) -> None:
+        """/project -- show the project this run belongs to (and, for a secret
+        project, its join code, which admins and members may share)."""
+        if not self.user_id:
+            cprint("[Pulse] Sign in to Pulse Cloud first.")
+            return
+        if not self.project_id:
+            cprint("[Pulse] No project is active for this run -- restart Pulse to pick or create one.")
+            return
+        cprint(f"[Pulse] Project: {self._project_label()}")
+        cprint(f"  Repo: {self.project_repo or 'unknown'}   (/repo [url] to change it)")
+        if self.project_is_secret:
+            try:
+                code = cloud.fetch_project_secret_code(self.project_id)
+            except cloud.SupabaseError as exc:
+                cprint(f"[Pulse] ⚠ Could not read the join code: {exc}", color=_RED)
+                return
+            if code:
+                cprint(f"  Secret join code: {code}   (only share it with people who should see this project)")
 
     def _cmd_admin(self, arg: str) -> None:
         """/admin add <email> | /admin remove <email> | /admin list
@@ -5271,7 +5616,7 @@ class PulseCLI:
         # Re-attach a fresh session token for THIS run (change_password just
         # revoked the old one along with everyone else's).
         token = cloud.attach_session_token(self.user_id)
-        cloud.save_cached_credentials(self.user_id, self.email, self.team_id, session_token=token)
+        cloud.save_cached_credentials(self.user_id, self.email, self.team_id, session_token=token, project_id=self.project_id)
         self._show_recovery_code(cloud.attach_recovery_code(self.user_id))
 
     def _cmd_recover(self, arg: str) -> None:
@@ -5330,6 +5675,7 @@ class PulseCLI:
         self.user_id = None
         self.email = None
         self.team_id = None
+        self._clear_project()
         self.debug_session_id = None
 
     def _cmd_logout(self, arg: str) -> None:
@@ -5363,6 +5709,7 @@ class PulseCLI:
         self.email = None
         self.team_id = None
         self.team_admin_ids = []
+        self._clear_project()
         self.debug_session_id = None
         cprint(f"[Pulse] ✓ Logged out of {old_email}.")
 
@@ -5376,14 +5723,11 @@ class PulseCLI:
             cprint("[Pulse] Continuing this run in local (no-cloud) mode.")
             return
 
-        try:
-            self._team_flow()
-        except cloud.SupabaseError as exc:
-            cprint(f"[Pulse] ⚠ Team setup failed, continuing without a team: {exc}", color=_RED)
+        self._select_workspace_and_project()
 
         try:
             sha = self._last_synced_commit_sha or cloud.current_git_commit_sha(self._repo_cwd) or "unknown"
-            self.debug_session_id = cloud.create_debug_session(self.team_id, self.user_id, git_commit_sha=sha)
+            self.debug_session_id = cloud.create_debug_session(self.project_id, self.user_id, git_commit_sha=sha)
             self._last_synced_commit_sha = sha
             if self.debug_session_id:
                 cprint(f"[Pulse] Debug session started (id={self.debug_session_id}, commit={sha[:10] if sha != 'unknown' else 'unknown'}).")
@@ -5451,38 +5795,20 @@ class PulseCLI:
         except Exception:
             return False
 
-
-        """Ask for a GitHub URL for the current team's `repo` column,
-        offering the git-detected remote (if any) as the default."""
-        if not self.team_id:
-            return
-        detected = cloud.git_remote_url(self._repo_cwd)
-        _flush_stdin()
-        prompt = (
-            f"GitHub repo URL for this team (Enter to use detected: {detected}) > "
-            if detected else
-            "GitHub repo URL for this team (optional, Enter to skip) > "
-        )
-        repo_input = input(prompt).strip()
-        repo = repo_input or detected
-        if repo:
-            try:
-                cloud.update_team_repo(self.team_id, repo)
-                cprint(f"[Pulse]   Repo: {repo}")
-            except cloud.SupabaseError as exc:
-                cprint(f"[Pulse] ⚠ Could not save repo URL: {exc}", color=_RED)
-
     def _cmd_repo(self, arg: str) -> None:
-        """/repo [url] -- show or set the current team's GitHub repo URL."""
-        if not self.team_id:
-            cprint("[Pulse] No team is active -- join or create one first (restart Pulse to do so).")
+        """/repo [url] -- show or set the current project's GitHub repo URL."""
+        if not self.project_id:
+            cprint("[Pulse] No project is active -- pick or create one (restart Pulse to do so).")
             return
         if not arg:
+            cprint(f"[Pulse] Current repo: {self.project_repo or 'unknown'}")
             self._prompt_and_set_repo()
             return
+        repo = cloud.strip_url_credentials(arg)
         try:
-            cloud.update_team_repo(self.team_id, arg)
-            cprint(f"[Pulse] ✓ Repo set to: {arg}")
+            cloud.update_project_repo(self.project_id, repo)
+            self.project_repo = repo
+            cprint(f"[Pulse] ✓ Repo set to: {repo}")
         except cloud.SupabaseError as exc:
             cprint(f"[Pulse] ⚠ Could not save repo URL: {exc}", color=_RED)
 
@@ -5784,7 +6110,8 @@ class PulseCLI:
                 ("/telemetry on|off", f"environment-info collection (currently {'ON' if self.telemetry_enabled else 'OFF'})"),
                 ("/webhook set|test|off", "get a Slack-style alert on crashes/auto-interventions"),
                 ("/admin add|remove|list", "manage workspace admins (admins only)"),
-                ("/repo [url]", "set/show the repo this run is associated with"),
+                ("/project", "show this run's project (and the join code, for a secret project)"),
+                ("/repo [url]", "set/show the repo this project is associated with"),
                 ("/log", "show recorded fixes/incidents for this session"),
             ]),
         ]
@@ -5806,6 +6133,10 @@ class PulseCLI:
             print(f"  Team: {self.team_id}  (join code: {self.team_join_code}){admin_tag}")
         else:
             print("  Team: none")
+        if self.project_id:
+            print(f"  Project: {self._project_label()}  ({self.project_id})")
+        else:
+            print("  Project: none")
         if self.debug_session_id:
             print(
                 f"  Debug session: {self.debug_session_id}  "
@@ -5843,8 +6174,8 @@ class PulseCLI:
         )
 
     def _load_history_context(self) -> None:
-        """Pull previous Debug_Sessions for this team (or this user, if no
-        team) and (1) build a short summary injected into the agent's
+        """Pull previous Debug_Sessions for this project (or this user, if no
+        project) and (1) build a short summary injected into the agent's
         context so it has memory of past crashes/fixes on this repo, and
         (2) index every fix that was actually applied by the signature of
         the traceback it fixed, so a recurring bug can be re-fixed
@@ -5852,7 +6183,7 @@ class PulseCLI:
         scratch every time.
         """
         try:
-            sessions = cloud.fetch_recent_sessions(self.team_id, self.user_id)
+            sessions = cloud.fetch_recent_sessions(self.project_id, self.user_id)
         except cloud.SupabaseError:
             return
 
@@ -13622,6 +13953,10 @@ class PulseCLI:
                 cprint(
                     "[Pulse] Cloud sync flushed."
                 )
+                continue
+
+            if cmd_lower == "/project":
+                self._cmd_project("")
                 continue
 
             if cmd_lower.startswith("/repo"):

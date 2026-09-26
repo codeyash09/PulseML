@@ -554,10 +554,13 @@ def save_cached_credentials(
     team_id: Optional[str] = None,
     session_token: Optional[str] = None,
     refresh_token: Optional[str] = None,
+    project_id: Optional[str] = None,
 ) -> None:
     try:
         _ensure_private_dir(CACHE_PATH.parent)
         payload = {"user_id": user_id, "email": email, "team_id": team_id, "cached_at": time.time()}
+        if project_id:
+            payload["project_id"] = project_id
         # refresh_token defaults to the current in-memory session's if the
         # caller didn't pass one explicitly -- covers call sites that just
         # want to re-save (e.g. to bump team_id) without re-deriving it.
@@ -1084,6 +1087,21 @@ def delete_account(user_id: str, password: str) -> None:
         except SupabaseError:
             pass  # best-effort -- still proceed to delete the account below
 
+    # ...and from every project's member list (secret projects they had joined).
+    try:
+        for project in _request(
+            "GET", "Projects",
+            params={"members": f"cs.{{{user_id}}}", "select": "project_id,members"},
+        ) or []:
+            _request(
+                "PATCH", "Projects",
+                params={"project_id": f"eq.{project['project_id']}"},
+                body={"members": [m for m in (project.get("members") or []) if m != user_id]},
+                prefer="return=minimal",
+            )
+    except SupabaseError:
+        pass  # best-effort, same as the team cleanup above
+
     # Delete the profile. A failure is raised, not swallowed: the caller
     # must not report the account as deleted while it still exists.
     _request("DELETE", "profiles", params={"id": f"eq.{user_id}"}, prefer="return=minimal")
@@ -1133,8 +1151,11 @@ def strip_url_credentials(url: Optional[str]) -> Optional[str]:
         return url
 
 
-_TEAM_SELECT = "team_id,members,admin_ids,join_code,plan,owner_id,repo,name"
-_TEAM_SELECT_NO_NAME = "team_id,members,admin_ids,join_code,plan,owner_id,repo"
+# Teams no longer carries `repo` or `saved_vars` -- both moved to Projects (see
+# the Projects section below). `name` is optional; a deployment without that
+# column is handled by _teams_request.
+_TEAM_SELECT = "team_id,members,admin_ids,join_code,plan,owner_id,name"
+_TEAM_SELECT_NO_NAME = "team_id,members,admin_ids,join_code,plan,owner_id"
 
 
 def _teams_request(method: str, params: Optional[Dict[str, str]] = None, body: Optional[Any] = None,
@@ -1193,8 +1214,6 @@ def find_teams_for_user(user_id: str) -> List[Dict[str, Any]]:
 def create_team(
     owner_id: str,
     plan: Optional[str] = None,
-    repo: Optional[str] = None,
-    cwd: Optional[str] = None,
     name: Optional[str] = None,
 ) -> Dict[str, Any]:
     body = {
@@ -1203,7 +1222,6 @@ def create_team(
         "join_code": _generate_join_code(),
         "plan": plan or _DEFAULT_PERSONAL_PLAN,
         "owner_id": owner_id,
-        "repo": strip_url_credentials(repo) or git_remote_url(cwd) or "unknown",
     }
     clean_name = (name or "").strip()
     if clean_name:
@@ -1243,29 +1261,6 @@ def update_team_name(team_id: str, name: str) -> bool:
         if _is_unknown_column_error(exc):
             return False
         raise
-
-
-def update_team_repo(team_id: str, repo: str) -> None:
-    _request(
-        "PATCH", "Teams",
-        params={"team_id": f"eq.{team_id}"},
-        body={"repo": strip_url_credentials(repo), "updated_at": datetime.now(timezone.utc).isoformat()},
-        prefer="return=minimal",
-    )
-
-
-def update_team_saved_vars(team_id: str, saved_vars: List[str]) -> None:
-    """Sync the team's shared GPU-tracked variable list (Teams.saved_vars)
-    so teammates see the same set. `/gputrack` and the agent's
-    GPUTRACK:/GPUUNTRACK: directives call this after changing
-    gpu_tracked_vars locally.
-    """
-    _request(
-        "PATCH", "Teams",
-        params={"team_id": f"eq.{team_id}"},
-        body={"saved_vars": list(saved_vars), "updated_at": datetime.now(timezone.utc).isoformat()},
-        prefer="return=minimal",
-    )
 
 
 def join_team(join_code: str, user_id: str) -> Dict[str, Any]:
@@ -1398,6 +1393,175 @@ def delete_team(team_id: str, requesting_user_id: str) -> None:
 
 
 # ----------------------------------------------------------------------------
+# Projects  (workspace -> project -> run)
+#
+# A Project belongs to a workspace (Teams row) and owns its runs
+# (Debug_Sessions.project_id), its repo, and the shared GPU-tracked variable
+# list (saved_vars). Visibility:
+#   * a normal project is visible to every member of the workspace;
+#   * a SECRET project (is_secret) is visible to the workspace's admins, and to
+#     the non-admin members who joined it with its secret_join_code (their id is
+#     then in Projects.members).
+# The filtering below keeps secret projects out of a member's picker, but it runs in
+# the client: for it to be a real boundary, mirror the same rule in a Row Level
+# Security policy on "Projects" and "Debug_Sessions".
+# ----------------------------------------------------------------------------
+
+# secret_join_code is deliberately NOT in the list select: it is only fetched (see
+# fetch_project_secret_code) for someone who is allowed to share it.
+_PROJECT_SELECT = "project_id,team_id,name,repo,saved_vars,is_secret,members,created_at"
+
+
+def project_visible_to(project: Dict[str, Any], team: Optional[Dict[str, Any]], user_id: str) -> bool:
+    """Whether `user_id` may see `project` in the picker."""
+    if not project.get("is_secret"):
+        return True
+    if team and is_team_admin(team, user_id):
+        return True
+    return user_id in (project.get("members") or [])
+
+
+def find_projects_for_team(team: Dict[str, Any], user_id: str) -> List[Dict[str, Any]]:
+    """The projects in `team` that `user_id` can see, oldest first. Admins
+    get every project; everyone else gets the non-secret ones plus any secret
+    project they have joined."""
+    team_id = team.get("team_id")
+    if not is_valid_uuid(team_id or "") or not is_valid_uuid(user_id):
+        return []
+    params = {"team_id": f"eq.{team_id}", "select": _PROJECT_SELECT, "order": "created_at.asc"}
+    if not is_team_admin(team, user_id):
+        params["or"] = f"(is_secret.is.null,is_secret.eq.false,members.cs.{{{user_id}}})"
+    rows = _request("GET", "Projects", params=params) or []
+    return [p for p in rows if project_visible_to(p, team, user_id)]
+
+
+def create_project(
+    team_id: str,
+    user_id: str,
+    name: str,
+    repo: Optional[str] = None,
+    cwd: Optional[str] = None,
+    is_secret: bool = False,
+) -> Dict[str, Any]:
+    """Create a project in a workspace. The creator is its first member. A
+    secret project gets a join code (returned in the row as `secret_join_code`,
+    the only place it is handed back in full)."""
+    clean_name = (name or "").strip()[:80]
+    if not clean_name:
+        raise SupabaseError("A project needs a name.")
+    body: Dict[str, Any] = {
+        "team_id": team_id,
+        "name": clean_name,
+        "repo": strip_url_credentials(repo) or git_remote_url(cwd) or "unknown",
+        "saved_vars": [],
+        "is_secret": bool(is_secret),
+        "members": [user_id],
+    }
+    if is_secret:
+        body["secret_join_code"] = _generate_join_code()
+    rows = _request("POST", "Projects", body=body, prefer="return=representation")
+    if not rows:
+        raise SupabaseError("Project creation succeeded but no row was returned.")
+    return rows[0]
+
+
+def _get_project(project_id: str) -> Dict[str, Any]:
+    if not is_valid_uuid(project_id):
+        raise SupabaseError("Invalid project.")
+    rows = _request("GET", "Projects", params={"project_id": f"eq.{project_id}", "select": _PROJECT_SELECT})
+    if not rows:
+        raise SupabaseError(f"No project found with id '{project_id}'.")
+    return rows[0]
+
+
+def fetch_project_secret_code(project_id: str) -> Optional[str]:
+    """A secret project's join code, for showing to someone who may share it
+    (the workspace admins and the project's members). None if it has none."""
+    if not is_valid_uuid(project_id):
+        return None
+    rows = _request("GET", "Projects", params={"project_id": f"eq.{project_id}", "select": "secret_join_code"})
+    return (rows[0].get("secret_join_code") if rows else None) or None
+
+
+def join_secret_project(team: Dict[str, Any], code: str, user_id: str) -> Dict[str, Any]:
+    """Join a secret project of `team` with its code. The code is only looked
+    up inside this workspace, so it can't be used to reach into another one."""
+    code = (code or "").strip().upper()
+    if not is_valid_join_code(code):
+        raise SupabaseError("That doesn't look like a project join code.")
+    rows = _request(
+        "GET", "Projects",
+        params={
+            "team_id": f"eq.{team['team_id']}",
+            "secret_join_code": f"eq.{code}",
+            "is_secret": "eq.true",
+            "select": _PROJECT_SELECT,
+        },
+    )
+    if not rows:
+        raise SupabaseError(f"No secret project in this workspace has join code '{code}'.")
+    project = rows[0]
+    members = list(project.get("members") or [])
+    if user_id not in members:
+        members.append(user_id)
+        _request(
+            "PATCH", "Projects",
+            params={"project_id": f"eq.{project['project_id']}"},
+            body={"members": members},
+            prefer="return=minimal",
+        )
+        project["members"] = members
+    return project
+
+
+def leave_project(project_id: str, user_id: str) -> None:
+    """Remove `user_id` from a project's member list. For a secret project this
+    also hides it from them again (unless they are a workspace admin)."""
+    project = _get_project(project_id)
+    members = [m for m in (project.get("members") or []) if m != user_id]
+    _request(
+        "PATCH", "Projects",
+        params={"project_id": f"eq.{project_id}"},
+        body={"members": members},
+        prefer="return=minimal",
+    )
+
+
+def delete_project(project_id: str, team: Dict[str, Any], requesting_user_id: str) -> None:
+    """Permanently delete a project -- workspace admins only. What happens to its
+    Debug_Sessions rows is up to that table's foreign key on project_id."""
+    if not is_team_admin(team, requesting_user_id):
+        raise SupabaseError("Only a workspace admin can delete a project.")
+    project = _get_project(project_id)
+    if project.get("team_id") != team.get("team_id"):
+        raise SupabaseError("That project isn't in this workspace.")
+    _request("DELETE", "Projects", params={"project_id": f"eq.{project_id}"}, prefer="return=minimal")
+
+
+def update_project_repo(project_id: str, repo: str) -> None:
+    _request(
+        "PATCH", "Projects",
+        params={"project_id": f"eq.{project_id}"},
+        body={"repo": strip_url_credentials(repo)},
+        prefer="return=minimal",
+    )
+
+
+def update_project_saved_vars(project_id: str, saved_vars: List[str]) -> None:
+    """Sync the project's shared GPU-tracked variable list (Projects.saved_vars)
+    so teammates see the same set. `/gputrack` and the agent's
+    GPUTRACK:/GPUUNTRACK: directives call this after changing
+    gpu_tracked_vars locally.
+    """
+    _request(
+        "PATCH", "Projects",
+        params={"project_id": f"eq.{project_id}"},
+        body={"saved_vars": list(saved_vars)},
+        prefer="return=minimal",
+    )
+
+
+# ----------------------------------------------------------------------------
 # Debug_Sessions
 # ----------------------------------------------------------------------------
 
@@ -1415,10 +1579,10 @@ def current_git_commit_sha(cwd: Optional[str] = None) -> Optional[str]:
 
 
 def create_debug_session(
-    team_id: Optional[str], user_id: Optional[str], git_commit_sha: Optional[str] = None,
+    project_id: Optional[str], user_id: Optional[str], git_commit_sha: Optional[str] = None,
 ) -> Optional[str]:
     body = {
-        "team_id": team_id,
+        "project_id": project_id,
         "user_id": user_id,
         "git_commit_sha": git_commit_sha or "unknown",
         "agent_logs": [],
@@ -1440,18 +1604,18 @@ _SESSION_SELECT_LEGACY = "id,created_at,git_commit_sha,agent_logs,error_tracebac
 
 
 def fetch_recent_sessions(
-    team_id: Optional[str], user_id: Optional[str], max_rows: int = 50,
+    project_id: Optional[str], user_id: Optional[str], max_rows: int = 50,
 ) -> List[Dict[str, Any]]:
-    """Debug_Sessions rows for this team (falling back to just this user
-    if there's no team), most recent first via created_at (server-side
+    """Debug_Sessions rows for this project (falling back to just this user
+    if there's no project), most recent first via created_at (server-side
     order + limit, so this scales instead of pulling every row ever
     logged). Falls back through progressively older select lists so this
     keeps working on a deployment that hasn't added the uptime_seconds/
     downtime_seconds/incidents columns yet (see the Teams.admin_ids-style
     manual column addition needed for the web dashboard).
     """
-    if team_id:
-        params = {"team_id": f"eq.{team_id}"}
+    if project_id:
+        params = {"project_id": f"eq.{project_id}"}
     elif user_id:
         params = {"user_id": f"eq.{user_id}"}
     else:

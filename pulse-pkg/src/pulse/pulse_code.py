@@ -994,6 +994,7 @@ _HELP = [
         ("/log", "the change history (.pulse_history)"),
         ("/cloud, /cloud flush", "sign-in, workspace and sync status"),
         ("/commit, /repo [url]", "the git commit / repo this session is associated with"),
+        ("/project", "the project this session belongs to (and a secret project's join code)"),
         ("/password, /recover, /logout", "account"),
         ("/exit", "leave"),
     ]),
@@ -1028,7 +1029,7 @@ def _resolve_arg(cli, arg):
 _FORWARDED = {
     "/password": "_cmd_password", "/recover": "_cmd_recover", "/deleteaccount": "_cmd_deleteaccount",
     "/admin": "_cmd_admin", "/webhook": "_cmd_webhook", "/telemetry": "_cmd_telemetry",
-    "/repo": "_cmd_repo", "/commit": "_cmd_commit",
+    "/repo": "_cmd_repo", "/commit": "_cmd_commit", "/project": "_cmd_project",
 }
 
 
