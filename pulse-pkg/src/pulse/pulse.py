@@ -81,10 +81,10 @@ from  pulse.pulse_cli import (
 )
 
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap, LogNorm
+# matplotlib (and litellm, below) are imported on first use, not here: `import pulse` runs
+# in every 'spawn' DataLoader worker, every epoch, and paid seconds for libraries only the
+# renderer process and the agent use. The renderer switches to Agg itself (_mpl), so
+# importing Pulse no longer changes the backend of the user's own plots either.
 
 # tkinter is not a pip package: it ships with the interpreter on desktop installs and is
 # absent from most server and container images, including a plain `apt install python3`.
@@ -109,9 +109,7 @@ from pulse.pulse_backend import (
 from pulse import pulse_detect as _pulse_detect
 from pulse.pulse_cli import _trackable_without_reading
 
-import multiprocessing as mp
-
-import litellm
+from pulse.pulse_cli import litellm      # lazy: the real module loads on first use
 
 
 
@@ -351,7 +349,26 @@ _COLORS = [
     (0.75, "#ffb020"),
     (1.0, "#ff5a1f"),
 ]
-CMAP = LinearSegmentedColormap.from_list("Heat", _COLORS)
+_MPL = {}
+
+
+def _mpl():
+    """matplotlib, loaded on first use (the renderer process): plt, LogNorm, CMAP."""
+    if not _MPL:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as _plt
+        from matplotlib.colors import LinearSegmentedColormap, LogNorm
+        _MPL.update(plt=_plt, LogNorm=LogNorm,
+                    CMAP=LinearSegmentedColormap.from_list("Heat", _COLORS))
+    return _MPL
+
+
+def __getattr__(name):
+    # Module attributes that used to be imported eagerly.
+    if name in ("plt", "LogNorm", "CMAP"):
+        return _mpl()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # Target number of points ever actually drawn on a scalar's line chart. The
 # raw (step, value) history kept in `scalar_histories` is NEVER truncated --
@@ -522,6 +539,8 @@ def _save_heatmap(arr2d, path, var, fig_cache):
         vmin, vmax = 1e-12, 1.0
 
     entry = fig_cache.get(var)
+    mpl = _mpl()
+    plt, LogNorm, CMAP = mpl["plt"], mpl["LogNorm"], mpl["CMAP"]
 
     if entry is None:
         fig, ax = plt.subplots(figsize=FIG_SIZE, dpi=FIG_DPI, facecolor=BG)
@@ -561,6 +580,7 @@ def _save_linechart(points, path, var_name, fig_cache):
     entry = fig_cache.get(var_name)
 
     if entry is None:
+        plt = _mpl()["plt"]
         fig, ax = plt.subplots(figsize=FIG_SIZE, dpi=FIG_DPI, facecolor=BG)
         ax.set_facecolor(BG)
         line, = ax.plot(xs, ys, color=ORANGE, linewidth=1.4, drawstyle="steps-post")
@@ -737,7 +757,13 @@ def _worker_main(queue, display_configs, session_id, var_states=None):
                     if stats.get("nan"):
                         value = float("nan")
                     elif stats.get("inf"):
-                        value = float("inf")
+                        # statistics() only counts infs: read the sign, or a
+                        # log-likelihood diverging to -inf was shown as +inf.
+                        try:
+                            negative = scalar_value(matrix) < 0
+                        except Exception:
+                            negative = False
+                        value = float("-inf") if negative else float("inf")
 
                 # Advance the SHARED step counter only when the loss-like
                 # scalar changes (once one has been identified); otherwise
@@ -1089,10 +1115,11 @@ def _write_rank_status(session_key, rank, local_rank, world_size, extra=None):
         pass
 
 
-def _read_all_rank_status(session_key):
+def _read_all_rank_status(session_key, this_rank=None, world_size=None):
     """All ranks' latest status payloads (see _write_rank_status), sorted
     by rank. A rank that hasn't written yet (or whose file vanished) is
-    just absent rather than raising."""
+    just absent rather than raising. `this_rank`/`world_size` identify the
+    job for a reader that isn't a rank itself (the dashboard process)."""
     out = []
     try:
         names = os.listdir(_rank_status_dir(session_key))
@@ -1108,21 +1135,34 @@ def _read_all_rank_status(session_key):
             continue
         if isinstance(payload, dict):
             out.append(payload)
-    return _current_job_rank_status(out)
+    return _current_job_rank_status(out, this_rank=this_rank, world_size=world_size)
 
 
-def _current_job_rank_status(statuses):
+def _current_job_rank_status(statuses, this_rank=None, world_size=None):
     """Keep only the statuses of the job this process belongs to. The status
     directory outlives jobs (and every non-rdzv torchrun job shares one key),
     so a 4-rank job's files are still there when a 2-rank job starts: drop
     files from before this process started, and ranks outside this job's
-    world size (taken from this process's own status)."""
+    world size (taken from this process's own status).
+
+    The dashboard runs in a process of its own -- its pid is never a rank's --
+    so it passes the job's world size; failing that, the job is the one the
+    status file of `this_rank` (which the current job has overwritten) belongs
+    to, or the most recently written one."""
     me = os.getpid()
-    world = None
-    for s in statuses:
-        if s.get("pid") == me:
-            world = s.get("world_size")
-            break
+    world = world_size
+    if world is None:
+        for s in statuses:
+            if s.get("pid") == me:
+                world = s.get("world_size")
+                break
+    if world is None and statuses:
+        mine = [s for s in statuses if this_rank is not None and s.get("rank") == this_rank]
+        try:
+            newest = max(mine or statuses, key=lambda p: float(p.get("updated", 0) or 0))
+            world = newest.get("world_size")
+        except (TypeError, ValueError):
+            world = None
     cutoff = _PROCESS_START_TIME - _RANK_STATUS_SKEW_SECONDS
     kept = []
     for s in statuses:
@@ -1139,8 +1179,8 @@ def _current_job_rank_status(statuses):
     return kept
 
 
-def _format_multi_rank_gpu_status(session_key, this_rank):
-    statuses = _read_all_rank_status(session_key)
+def _format_multi_rank_gpu_status(session_key, this_rank, world_size=None):
+    statuses = _read_all_rank_status(session_key, this_rank=this_rank, world_size=world_size)
     if not statuses:
         return f"GPUSTATUS (rank {this_rank}, distributed): no rank status files found yet -- other ranks may not have started reporting."
     now = time.time()
@@ -1204,22 +1244,14 @@ class HeatmapCreatorBG:
             self.queue.put_nowait(item)
             return True
         except Exception:
-            # Visualization is lossy by design. Never wait for the renderer.
-            try:
-                evicted = self.queue.get_nowait()
-            except Exception:
-                pass
-            else:
-                if _is_control_item(evicted):
-                    # A promote / axis change / stop is never the thing to
-                    # drop: put it back and drop this frame instead.
-                    self._put_back([evicted])
-                    return False
-            try:
-                self.queue.put_nowait(item)
-                return True
-            except Exception:
-                return False
+            # Visualization is lossy by design: a full queue drops THIS frame.
+            # Evicting the oldest item instead could take a control message
+            # (promote / axis change / stop) out: putting it back moved it
+            # behind a later one (a promote then demote ended promoted), and
+            # its blocking put-back stalled training for a second and lost it
+            # when the dashboard's own put took the freed slot first. A queue
+            # can't be peeked, so nothing already in it is ever touched here.
+            return False
 
     def log_cpu_snapshot(self, var, cpu_value, config_override=None):
         """Explicit API for an already-created CPU mirror.
@@ -2127,17 +2159,36 @@ _PASS5_SWEEP = (
     'the form {"other_errors_found": true or false, "summary": "short description, or empty string '
     'if none"}.'
 )
-# Whole words only: a substring test made 'prefix', 'suffix', 'credit' and
-# 'application' ask for a code edit.
+# A request to write code, not a question that happens to use the words: whole
+# words only (a substring test made 'prefix' and 'application' ask for an edit),
+# and only as an imperative -- at the start of a sentence, or after a request
+# ("please", "can you", "go ahead and", ...). "My loss is fixed at 2.30", "a
+# patch size of 16" and "does weight decay apply to biases?" wrote to the
+# user's script and restarted the run.
+_IMPLEMENT_VERB = r"(?:fix|edit|patch|apply|implement)"
 _IMPLEMENT_RE = re.compile(
-    r"\b(?:fix(?:es|ed|ing)?|edit(?:s|ed|ing)?|patch(?:es|ed|ing)?|change the code|apply|implement)\b",
+    r"(?:^|[.!?;:\n]\s*|\b(?:please|pls|can you|could you|would you|will you|can we|could we|"
+    r"go ahead and|let'?s|let us|try to|i want you to|i'd like you to|i need you to|you should|"
+    r"then|now|just)\s+)"
+    r"(?:(?:please|just|also|now|then)\s+)?" + _IMPLEMENT_VERB +
+    r"\b(?!\s+(?:size|sizes|embedding|embeddings|token|tokens|dim|dims|number)\b)"
+    r"|\bchange the code\b",
     re.IGNORECASE,
 )
 
 
+def _as_bool(value):
+    """A model's JSON boolean, read the way it was meant: "false"/"no"/"0" as
+    strings are False (bool("false") is True, which turned a failed check into
+    a passed one)."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "y", "1", "pass", "passed", "resolved")
+    return bool(value)
+
+
 def _wants_implementation(question):
     """Whether a question asks Pulse to write code (ChatPanel._ask)."""
-    return bool(_IMPLEMENT_RE.search(question or ""))
+    return bool(_IMPLEMENT_RE.search((question or "").strip()))
 _MAX_VERIFY_ATTEMPTS = 3
 
 _CALC_RE = re.compile(r"^\s*CALC:\s*(.+)$", re.MULTILINE)
@@ -2486,12 +2537,26 @@ def _exec_gradcheck(frame, param_name):
 # this is ever populated or consumed (see _replay_maybe_checkpoint, called
 # periodically from persistent_tracer's ticker, and _exec_replay below).
 _REPLAY_CHECKPOINTS = []
+_REPLAY_TAKEN_AT = {}       # snapshot step id -> when it was taken
 _REPLAY_MAX_CHECKPOINTS = 20
 # Snapshots are full serialized copies of every model/optimizer in scope, so
 # they are bounded in total size (oldest dropped first) and the tracer takes
 # one at most every _REPLAY_MIN_INTERVAL seconds, not on every tick; a state
 # too big for the budget is not snapshotted at all.
-_REPLAY_MAX_BYTES = int(float(os.environ.get("PULSE_REPLAY_MAX_MB", "256") or 256) * 1024 * 1024)
+def _replay_max_bytes_from_env(default_mb=256):
+    # Read at import time: a bad value ('512MB', '1g') must not make `import pulse` -- the
+    # training script's own import line -- raise.
+    raw = os.environ.get("PULSE_REPLAY_MAX_MB", "")
+    try:
+        mb = float(raw) if raw.strip() else float(default_mb)
+    except ValueError:
+        mb = float(default_mb)
+    if not math.isfinite(mb) or mb < 0:
+        mb = float(default_mb)
+    return int(mb * 1024 * 1024)
+
+
+_REPLAY_MAX_BYTES = _replay_max_bytes_from_env()
 _REPLAY_MIN_INTERVAL = 10.0
 
 
@@ -2509,21 +2574,86 @@ def _state_tensors(obj, depth=0):
             yield from _state_tensors(v, depth + 1)
 
 
-def _replay_maybe_checkpoint(frame, step):
+def _clone_state(obj, torch, depth=0):
+    """A detached host copy of a (possibly nested) state_dict: every tensor
+    copied, containers rebuilt, anything else deep-copied."""
+    if depth > 6:
+        return copy.deepcopy(obj)
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().to("cpu", copy=True)
+    if isinstance(obj, dict):
+        out = obj.__class__() if isinstance(obj, collections.OrderedDict) else {}
+        for k, v in obj.items():
+            out[k] = _clone_state(v, torch, depth + 1)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_clone_state(v, torch, depth + 1) for v in obj)
+    return copy.deepcopy(obj)
+
+
+# REPLAY snapshots taken by the UI tracer are copied on the training thread (so
+# they are consistent) and serialized here, off it: torch.save of up to
+# _REPLAY_MAX_BYTES used to run on the training thread on every snapshot.
+_REPLAY_SAVE_QUEUE = _queue.Queue(maxsize=1)
+_REPLAY_SAVER = {"thread": None}
+
+
+def _replay_store(step, states, taken_at):
+    """Serialize copied states and add them to _REPLAY_CHECKPOINTS."""
+    import torch
+    snap = {}
+    for name, state in states.items():
+        try:
+            buf = io.BytesIO()
+            torch.save(state, buf)
+            snap[name] = buf.getvalue()
+        except Exception:
+            continue
+    if snap:
+        _REPLAY_CHECKPOINTS.append((step, snap))
+        _REPLAY_TAKEN_AT[step] = taken_at
+        del _REPLAY_CHECKPOINTS[:-_REPLAY_MAX_CHECKPOINTS]
+        total = sum(len(b) for _, sn in _REPLAY_CHECKPOINTS for b in sn.values())
+        while len(_REPLAY_CHECKPOINTS) > 1 and total > _REPLAY_MAX_BYTES:
+            _, dropped = _REPLAY_CHECKPOINTS.pop(0)
+            total -= sum(len(b) for b in dropped.values())
+        live = {s for s, _ in _REPLAY_CHECKPOINTS}
+        for old in [s for s in _REPLAY_TAKEN_AT if s not in live]:
+            _REPLAY_TAKEN_AT.pop(old, None)
+
+
+def _replay_saver_loop():
+    while True:
+        step, states, taken_at = _REPLAY_SAVE_QUEUE.get()
+        try:
+            _replay_store(step, states, taken_at)
+        except Exception:
+            pass
+
+
+def _replay_maybe_checkpoint(frame, step, background=False):
     """Snapshot every in-scope object exposing state_dict() (model,
     optimizer, ...) so REPLAY has something to roll back to. Cheap
     best-effort: skipped entirely if torch isn't importable, and any
-    individual object that fails to serialize is just left out rather
+    individual object that fails to copy is just left out rather
     than aborting the whole snapshot. Call it from the training thread,
     between statements of the loop, so a snapshot is never taken half-way
     through an optimizer step. In strict CPU mode, state living on an
-    accelerator is left alone (serializing it is a device-to-host copy)."""
+    accelerator is left alone (copying it is a device-to-host copy).
+
+    background=True (the UI tracer): only the copy happens here; the
+    serialization runs on a saver thread. A snapshot still being saved when
+    the next one is due makes that one skipped, not queued."""
+    if "torch" not in sys.modules:
+        return      # nothing in this process has a torch state_dict
     try:
         import torch
     except ImportError:
         return
+    if background and _REPLAY_SAVE_QUEUE.full():
+        return
     ns = _exec_namespace(frame)
-    snap = {}
+    states = {}
     seen_ids = set()
     budget = _REPLAY_MAX_BYTES
     for name, v in ns.items():
@@ -2539,29 +2669,36 @@ def _replay_maybe_checkpoint(frame, step):
             size = sum(int(t.numel()) * int(t.element_size()) for t in tensors)
             if size > budget:
                 continue
-            buf = io.BytesIO()
-            torch.save(state, buf)
-            snap[name] = buf.getvalue()
-            budget -= len(snap[name])
+            states[name] = _clone_state(state, torch)
+            budget -= size
         except Exception:
             continue
-    if snap:
-        _REPLAY_CHECKPOINTS.append((step, snap))
-        del _REPLAY_CHECKPOINTS[:-_REPLAY_MAX_CHECKPOINTS]
-        total = sum(len(b) for _, sn in _REPLAY_CHECKPOINTS for b in sn.values())
-        while len(_REPLAY_CHECKPOINTS) > 1 and total > _REPLAY_MAX_BYTES:
-            _, dropped = _REPLAY_CHECKPOINTS.pop(0)
-            total -= sum(len(b) for b in dropped.values())
+    if not states:
+        return
+    if not background:
+        _replay_store(step, states, time.time())
+        return
+    if _REPLAY_SAVER["thread"] is None or not _REPLAY_SAVER["thread"].is_alive():
+        _REPLAY_SAVER["thread"] = threading.Thread(target=_replay_saver_loop, name="pulse-replay-saver", daemon=True)
+        _REPLAY_SAVER["thread"].start()
+    try:
+        _REPLAY_SAVE_QUEUE.put_nowait((step, states, time.time()))
+    except _queue.Full:
+        pass
 
 
 def _exec_replay(frame, arg):
-    """REPLAY: <n_steps> -- from the last checkpoint at least n_steps
-    back, restore a copy of tracked state and replay n_steps via a
-    zero-argument `train_step` callable the user defines in scope,
-    reporting the resulting loss curve, then restore live state back to
-    where it actually was. A much more conclusive check than restarting
-    the whole process and seeing if it crashes -- correctness becomes an
-    empirical fact instead of another LLM call asserting it."""
+    """REPLAY: <n_steps> -- restore a copy of tracked state from the most
+    recent snapshot and replay n_steps from there via a zero-argument
+    `train_step` callable the user defines in scope, reporting the
+    resulting loss curve, then restore live state back to where it
+    actually was. A much more conclusive check than restarting the whole
+    process and seeing if it crashes -- correctness becomes an empirical
+    fact instead of another LLM call asserting it.
+
+    Snapshots are taken every _REPLAY_MIN_INTERVAL seconds or more, not
+    every step, so n counts steps REPLAYED, not snapshots gone back: it
+    used to pick the n-th newest snapshot, i.e. n x 10 s or more back."""
     try:
         n_steps = int(str(arg).strip())
     except ValueError:
@@ -2573,10 +2710,9 @@ def _exec_replay(frame, arg):
             "with a state_dict() (model/optimizer); wait for at least one snapshot after training starts."
         )
 
-    if n_steps >= len(_REPLAY_CHECKPOINTS):
-        step, snap = _REPLAY_CHECKPOINTS[0]
-    else:
-        step, snap = _REPLAY_CHECKPOINTS[-1 - n_steps]
+    step, snap = _REPLAY_CHECKPOINTS[-1]
+    taken_at = _REPLAY_TAKEN_AT.get(step)
+    age = f", taken {max(0.0, time.time() - taken_at):.0f}s ago" if taken_at else ""
 
     try:
         import torch
@@ -2623,7 +2759,7 @@ def _exec_replay(frame, arg):
 
     curve = ", ".join(f"{l:.6g}" for l in losses)
     return (
-        f"REPLAY: replayed {len(losses)} step(s) from a checkpoint at step {step}, on an isolated copy of "
+        f"REPLAY: replayed {len(losses)} step(s) from the latest snapshot (#{step}{age}), on an isolated copy of "
         f"tracked state, then restored the live process back to its actual current values. Resulting loss "
         f"curve: [{curve}]"
     )
@@ -3737,6 +3873,10 @@ def _find_fuzzy_snippet_span(content, old):
     first_line_idx, last_line_idx = matches[0]
     start_offset = sum(len(l) for l in content_lines[:first_line_idx])
     end_offset = sum(len(l) for l in content_lines[:last_line_idx + 1])
+    # Stop before the last line's line break: the replacement has none of its own,
+    # so including it glued the following line onto the fix ("b = 3    return a").
+    last_line = content_lines[last_line_idx]
+    end_offset -= len(last_line) - len(last_line.rstrip("\r\n"))
     return start_offset, end_offset
 
 
@@ -3776,9 +3916,17 @@ def _splice_fix(content, start, end, old_given, new, path):
     file_indent = _leading_ws(actual_old)
     given_indent = _leading_ws(old_given)
     if file_indent != given_indent:
+        # A snippet copied from mid-line loses only its FIRST line's
+        # indentation: lines 2+ already sit at the file's indentation, and
+        # re-basing them too pushed the block right a level (the lint gate
+        # then rejected a correct fix). Measure lines 2+ separately.
+        given_lines, actual_lines = old_given.split("\n"), actual_old.split("\n")
+        rest_given = _leading_ws("\n".join(given_lines[1:]))
+        rest_actual = _leading_ws("\n".join(actual_lines[1:]))
+        only_first = len(given_lines) > 1 and len(given_lines) == len(actual_lines) and rest_given == rest_actual
         rebased = []
-        for line in new.split("\n"):
-            if line.strip() and line.startswith(given_indent):
+        for i, line in enumerate(new.split("\n")):
+            if (i == 0 or not only_first) and line.strip() and line.startswith(given_indent):
                 line = file_indent + line[len(given_indent):]
             rebased.append(line)
         new = "\n".join(rebased)
@@ -3963,6 +4111,31 @@ def _auto_rollback_after_failed_restarts_gui(script_path, chain_start_commit_id)
 
 
 _CHAT_PANEL_CLS = None
+
+
+def _module_is_project_code(dotted):
+    """Where `dotted` would be imported from, if importing it could run code
+    that isn't an installed library -- a file of the project (or any file
+    outside stdlib / site-packages), or a namespace-package folder of one
+    (a project folder without __init__.py has no file of its own) -- else
+    None. A module already imported is None: importing it again runs nothing.
+    A virtualenv inside the project folder is still site-packages, a library."""
+    if dotted in sys.modules:
+        return None
+    try:
+        import importlib.util as _ilu
+        spec = _ilu.find_spec(dotted)
+    except Exception:
+        return None
+    if spec is None:
+        return None
+    origin = getattr(spec, "origin", None)
+    if origin and os.path.isfile(origin):
+        return None if _is_library_frame(origin) else origin
+    for loc in list(getattr(spec, "submodule_search_locations", None) or []):
+        if not _is_library_frame(os.path.join(loc, "__init__.py")):
+            return loc
+    return None
 
 
 def _chat_panel_class():
@@ -4707,7 +4880,12 @@ def _chat_panel_class():
             if hist is None:
                 recent = stats.get("recent")
                 hist = list(enumerate(recent)) if recent else None
-            return name, hist
+            if hist:
+                # A step where the variable was unreadable is recorded as None; the
+                # statistics tools work on the readings that exist (NaN/inf stay:
+                # they are real readings, and each tool reports them).
+                hist = [p for p in hist if isinstance(p, (list, tuple)) and len(p) == 2 and p[1] is not None]
+            return name, (hist or None)
 
         def _run_corr(self, arg):
             """CORR: <var1> <var2> -- real correlation coefficient between two
@@ -4797,8 +4975,8 @@ def _chat_panel_class():
                 va, vb = values[int(a_str)], values[int(b_str)]
             except IndexError:
                 return f"DIFFSTATS '{name}': index out of range (history has {len(values)} point(s))."
-            if va is None or vb is None:
-                return f"DIFFSTATS '{name}': one of those points is None/unreadable."
+            if not (_finite_number(va) and _finite_number(vb)):
+                return f"DIFFSTATS '{name}' [{a_str}] -> [{b_str}]: {va} -> {vb} (non-finite/missing -- no delta)."
             delta = vb - va
             pct = f" ({delta / va * 100:+.2f}%)" if va else ""
             return f"DIFFSTATS '{name}' [{a_str}] -> [{b_str}]: {va:.6g} -> {vb:.6g}, delta = {delta:+.6g}{pct}"
@@ -4847,18 +5025,21 @@ def _chat_panel_class():
             root = parts[0]
             # Importing a module runs it: `DOCLOOKUP: train.build` would run
             # the user's own training script inside the agent call. Only look
-            # up libraries (installed, stdlib or built in) or modules already
-            # imported; the project's own code is read with VIEW/DEFOF.
-            if root not in sys.modules:
-                try:
-                    import importlib.util
-                    spec = importlib.util.find_spec(root)
-                except Exception:
-                    spec = None
-                origin = getattr(spec, "origin", None) if spec is not None else None
-                if spec is not None and origin and os.path.isfile(origin) and not _is_library_frame(origin):
-                    return (f"DOCLOOKUP '{arg}': '{root}' is a module of this project ({origin}), not an "
-                            "installed library -- importing it would run it. Use VIEW/DEFOF to read its code.")
+            # up libraries (installed, stdlib or built in); the project's own
+            # code is read with VIEW/DEFOF. Checked before EVERY import the
+            # lookup makes -- `mypkg.train_loop.main` imports a submodule of an
+            # already-imported package, and a project folder without an
+            # __init__.py is a namespace package with no file of its own.
+            def _refuse(dotted):
+                where = _module_is_project_code(dotted)
+                if where is None:
+                    return None
+                return (f"DOCLOOKUP '{arg}': '{dotted}' is a module of this project ({where}), not an "
+                        "installed library -- importing it would run it. Use VIEW/DEFOF to read its code.")
+
+            refusal = _refuse(root)
+            if refusal:
+                return refusal
             try:
                 obj = importlib.import_module(root)
             except Exception as exc:
@@ -4868,8 +5049,12 @@ def _chat_panel_class():
                 try:
                     obj = getattr(obj, attr)
                 except AttributeError:
+                    dotted = ".".join(resolved + [attr])
+                    refusal = _refuse(dotted)
+                    if refusal:
+                        return refusal
                     try:
-                        obj = importlib.import_module(".".join(resolved + [attr]))
+                        obj = importlib.import_module(dotted)
                     except Exception:
                         return f"DOCLOOKUP '{arg}': '{'.'.join(resolved)}' has no attribute '{attr}'."
                 resolved.append(attr)
@@ -4974,12 +5159,17 @@ def _chat_panel_class():
         # Automatic safety/verification gate -- NOT model-invoked, runs on
         # every proposed fix regardless of what directives the model used.
         # ------------------------------------------------------------------
-        def _lint_check(self, content, path):
+        def _lint_check(self, content, path, original=None):
             """Syntax/AST validation, then a real static-analysis pass
             (pyflakes) if it's importable, on the FULL proposed file content
             before it's ever written to disk -- catches undefined names, bad
             syntax, and unused imports deterministically instead of trusting
-            the agent's own read of its diff. Returns (ok, messages)."""
+            the agent's own read of its diff. Returns (ok, messages).
+
+            With `original` (the file before the fix), only problems the fix
+            INTRODUCED block it: a notebook export's display() or a name set
+            via globals() was 'undefined' before the fix too, and blocked
+            every fix to that file."""
             if os.path.splitext(path)[1] != ".py":
                 return True, []
             try:
@@ -4993,13 +5183,28 @@ def _chat_panel_class():
             except ImportError:
                 return True, []
 
-            out, err = io.StringIO(), io.StringIO()
-            _pyflakes_api.check(content, path, _pyflakes_reporter.Reporter(out, err))
-            messages = [l for l in (out.getvalue() + err.getvalue()).splitlines() if l.strip()]
-            # Only undefined-name-class errors block the write -- style-only
-            # warnings (unused imports/locals) are reported but don't block,
-            # since those are common in intentionally-scaffolded fixes.
-            blocking = [m for m in messages if "undefined name" in m.lower() or "syntaxerror" in m.lower()]
+            def _blocking(text):
+                out, err = io.StringIO(), io.StringIO()
+                _pyflakes_api.check(text, path, _pyflakes_reporter.Reporter(out, err))
+                msgs = [l for l in (out.getvalue() + err.getvalue()).splitlines() if l.strip()]
+                # Only undefined-name-class errors block the write -- style-only
+                # warnings (unused imports/locals) are reported but don't block,
+                # since those are common in intentionally-scaffolded fixes.
+                return msgs, [m for m in msgs if "undefined name" in m.lower() or "syntaxerror" in m.lower()]
+
+            messages, blocking = _blocking(content)
+            if blocking and original is not None:
+                # Compare without the "path:line:col:" prefix -- the fix may shift line numbers.
+                strip = lambda m: re.sub(r"^.*?:\d+:(?:\d+:)?\s*", "", m)   # noqa: E731
+                before = collections.Counter(strip(m) for m in _blocking(original)[1])
+                new_blocking = []
+                for m in blocking:
+                    key = strip(m)
+                    if before[key] > 0:
+                        before[key] -= 1
+                    else:
+                        new_blocking.append(m)
+                blocking = new_blocking
             return (len(blocking) == 0), messages
 
         def _run_gpustatus(self):
@@ -5010,7 +5215,7 @@ def _chat_panel_class():
             report instead of just this process's own device(s)."""
             rank, _local_rank, world_size, session_key = self.dist_info
             if world_size > 1 and session_key:
-                return _format_multi_rank_gpu_status(session_key, rank)
+                return _format_multi_rank_gpu_status(session_key, rank, world_size=world_size)
             return _format_gpu_status(_gpu_status_snapshot())
 
         def _run_rollback(self, arg):
@@ -5083,7 +5288,7 @@ def _chat_panel_class():
             rank, _local_rank, world_size, session_key = self.dist_info
             if world_size <= 1 or not session_key:
                 return "RANKDIVERGE: this process isn't part of a multi-rank launch (world_size == 1)."
-            statuses = _read_all_rank_status(session_key)
+            statuses = _read_all_rank_status(session_key, this_rank=rank, world_size=world_size)
             if not statuses:
                 return "RANKDIVERGE: no rank status files found yet."
             values = {}
@@ -5387,7 +5592,7 @@ def _chat_panel_class():
                     # Not a pass: nothing was verified. The fix still goes
                     # ahead as unverified best effort, like any failed check.
                     return fix, False, "(verification response was unparsable; applying as unverified best effort)"
-                passes = bool(verdict.get("passes"))
+                passes = _as_bool(verdict.get("passes"))
                 reason = str(verdict.get("reason", "")).strip()
                 if passes:
                     return fix, True, reason
@@ -5417,7 +5622,7 @@ def _chat_panel_class():
             sweep_answer = self._call_model(model_name, _PASS5_SWEEP, max_tokens=_AGENT_MAX_TOKENS)
             self.after(0, lambda: self._set_stage(None))
             sweep = self._parse_json_obj(sweep_answer)
-            found = bool(sweep.get("other_errors_found")) if sweep else False
+            found = _as_bool(sweep.get("other_errors_found")) if sweep else False
             summary = str(sweep.get("summary", "")).strip() if sweep else ""
 
             if not found or not summary:
@@ -5650,83 +5855,16 @@ def _chat_panel_class():
 
         @staticmethod
         def _parse_code_fix(answer):
-            """If `answer` is a well-formed code-fix JSON payload, return it, else None.
+            """If `answer` is a well-formed code-fix payload, return it, else None.
 
-            Two shapes are accepted:
-            - The intended one: "old"/"new" are each a list with one entry per
-              change, where each entry is that change's full snippet (possibly
-              multi-line via embedded "\\n"), zipped index-by-index with an
-              optional "files" list of the same length.
-            - One some models fall into anyway: "old"/"new" are each a flat
-              list of individual source *lines* for a single whole-block
-              change, rather than one entry per change -- since the fix
-              usually adds or removes lines, "old" and "new" end up different
-              lengths and can't be zipped pairwise. There's no "files" list in
-              this shape either. Detected by the length mismatch and handled
-              by joining each list into one snippet and treating it as a
-              single change.
-            """
-            text = (answer or "").strip()
-            if not text:
-                return None
-
-            # Agents sometimes wrap JSON in ```json ... ``` fences despite being told not to.
-            if text.startswith("```"):
-                text = text.strip("`")
-                if text.lower().startswith("json"):
-                    text = text[4:]
-                text = text.strip()
-
-            if not (text.startswith("{") and text.endswith("}")):
-                return None
-
-            try:
-                payload = json.loads(text)
-            except (ValueError, TypeError):
-                return None
-
-            if not isinstance(payload, dict):
-                return None
-
-            old, new, explanation = payload.get("old"), payload.get("new"), payload.get("explanation")
-            files = payload.get("files")
-            explanation = explanation if isinstance(explanation, str) else ""
-
-            def _valid_str_list(lst):
-                return isinstance(lst, list) and bool(lst) and all(isinstance(x, str) for x in lst)
-
-            if not _valid_str_list(old) or not _valid_str_list(new):
-                return None
-
-            if len(old) == len(new):
-                # Standard shape: one change per (old[i], new[i]) pair.
-                if files is not None:
-                    if not isinstance(files, list) or len(files) != len(old):
-                        return None
-                    if not all(f is None or isinstance(f, str) for f in files):
-                        return None
-                else:
-                    files = [None] * len(old)
-
-                return {"old": old, "new": new, "files": files, "explanation": explanation}
-
-            # Fallback shape: "old"/"new" are flat line arrays for a single
-            # change -- join them back into one snippet each.
-            joined_old = "\n".join(old)
-            joined_new = "\n".join(new)
-            if not joined_old.strip() or joined_old == joined_new:
-                return None
-
-            file_label = None
-            if isinstance(files, str):
-                file_label = files
-            elif isinstance(files, list) and files and isinstance(files[0], str):
-                file_label = files[0]
-
-            return {
-                "old": [joined_old], "new": [joined_new], "files": [file_label],
-                "explanation": explanation,
-            }
+            The CLI's parser, so the two agents read the same replies: the
+            {"old": [...], "new": [...], "files": [...]} shape or the flat
+            line-list shape, a fix object inside prose ("Here is the fix:
+            {...}") or one level down in an envelope, and "resume". The copy
+            that used to live here dropped "resume" and any fix with prose
+            around it."""
+            from .pulse_cli import PulseCLI
+            return PulseCLI._parse_code_fix(answer)
 
         def _resolve_fix_path(self, file_label):
             """Map a fix entry's optional "file" label back to a real path on
@@ -5842,7 +5980,7 @@ def _chat_panel_class():
                 # directives the model used. Syntax/AST validation (always)
                 # plus a real lint pass (pyflakes, if importable) on the FULL
                 # proposed file content, before anything touches disk.
-                lint_ok, lint_messages = self._lint_check(content, path)
+                lint_ok, lint_messages = self._lint_check(content, path, original=original_content)
                 if not lint_ok:
                     lines.append(
                         f"⚠ Fix for '{path}' failed the automatic syntax/lint gate and was NOT written:\n"
@@ -6217,6 +6355,21 @@ class Dashboard:
         return {}
 
     def _poll(self):
+        # Reschedules itself whatever happens: one bad tick (an image pruned
+        # between the exists() check and the open, a malformed manifest entry)
+        # used to raise out of here before the reschedule, and the dashboard
+        # never refreshed again.
+        try:
+            self._poll_once()
+        except Exception as exc:
+            _pulse_log(f"GUI POLL failed: {type(exc).__name__}: {exc}")
+        finally:
+            try:
+                self.root.after(self.REFRESH_MS, self._poll)
+            except Exception:
+                pass    # the window is gone
+
+    def _poll_once(self):
         if not self._crash_reported and os.path.exists(self.crash_path):
             self._crash_reported = True
             try:
@@ -6290,10 +6443,15 @@ class Dashboard:
             if tile is not None and tile.get("img_path") == current_img_path:
                 continue
 
-            img = Image.open(current_img_path)
-            thumb = img.copy()
-            thumb.thumbnail(self.THUMB_SIZE)
-            photo = ImageTk.PhotoImage(thumb)
+            try:
+                with Image.open(current_img_path) as img:
+                    thumb = img.copy()
+                thumb.thumbnail(self.THUMB_SIZE)
+                photo = ImageTk.PhotoImage(thumb)
+            except Exception:
+                # The worker prunes old PNGs: this one can vanish between the
+                # exists() check and the open. The next tick has a newer one.
+                continue
 
             nan = stats.get("nan", 0) or 0
             inf = stats.get("inf", 0) or 0
@@ -6359,7 +6517,6 @@ class Dashboard:
                         pass
 
         self._relayout()
-        self.root.after(self.REFRESH_MS, self._poll)
 
     def _check_for_trouble(self, manifest):
         """Look at the current manifest for signs training is going bad.
@@ -6899,9 +7056,82 @@ _STDLIB_DIR = os.path.normcase(os.path.abspath(sysconfig.get_paths()["stdlib"]))
 _CLI_TRACING_STOPPED = False
 _CLI_DISARM_ACTIVE = False      # True while the tracer is being armed/disarmed per window
 _CLI_TRACKER_STARTED = False
+# Each CLI session's ticker belongs to one generation; a new session (auto_track() after
+# shutdown(), or in a forked child) starts a new one, and an older ticker exits instead of
+# re-arming the tracer of a session that was stopped.
+_CLI_SESSION_GEN = 0
 # Held while the ticker arms a window and while tracing is stopped for good, so
 # the ticker can't re-arm the tracer between its "stopped?" check and the arm.
 _CLI_ARM_LOCK = threading.Lock()
+
+# What Pulse installed into this process, so a forked child can take exactly that back out
+# (and nothing a debugger or coverage installed): trace functions, and each excepthook
+# mapped to the hook it replaced. _AT_FORK_DISARMERS holds per-session callables that
+# switch a session's own state off (its window, its GUI tracer).
+_PULSE_TRACERS = set()
+_PULSE_EXCEPTHOOKS = {}
+_AT_FORK_DISARMERS = []
+
+
+def _disarm_in_forked_child():
+    """os.register_at_fork(after_in_child=...): Pulse is inert in a forked child.
+
+    A fork child (DataLoader worker, fork Pool worker, os.fork()) inherits the live tracer,
+    its open window and the crash hook, but not the ticker thread that closes the window --
+    so every line of the worker's code was traced and it ran the debugger's update(): in a
+    fork Pool search, a worker whose config diverged ran the whole fix pipeline, rewrote
+    train.py, re-ran the script inside the worker and hung the pool. The parent's Pulse is
+    the one watching the run. A child that calls auto_track() itself (a rank started by a
+    fork launcher) still gets its own session: the flags are reset for that."""
+    global _CLI_ARM_LOCK, _CLI_TRACING_STOPPED, _CLI_SESSION_GEN, _AUTO_TRACK_STARTED
+    global _debugger_bg, _session_id
+    try:
+        for disarm in list(_AT_FORK_DISARMERS):
+            try:
+                disarm()
+            except Exception:
+                pass
+        del _AT_FORK_DISARMERS[:]
+        if sys.gettrace() in _PULSE_TRACERS:
+            sys.settrace(None)
+        if getattr(threading, "_trace_hook", None) in _PULSE_TRACERS:
+            threading.settrace(None)
+        frame = sys._getframe()
+        while frame is not None:
+            if frame.f_trace in _PULSE_TRACERS:
+                frame.f_trace = None
+            frame = frame.f_back
+        hook = sys.excepthook
+        while hook in _PULSE_EXCEPTHOOKS:
+            hook = _PULSE_EXCEPTHOOKS[hook]
+        sys.excepthook = hook
+        _PULSE_TRACERS.clear()
+        _PULSE_EXCEPTHOOKS.clear()
+        # The ticker may have held the lock at the moment of the fork; it doesn't exist here.
+        _CLI_ARM_LOCK = threading.Lock()
+        _CLI_TRACING_STOPPED = True
+        _CLI_SESSION_GEN += 1
+        _CLI_EXCEPTHOOK_STATE["hook"] = None
+        _CLI_EXCEPTHOOK_STATE["cli"] = None
+        pulse_cli_mod = sys.modules.get("pulse.pulse_cli")
+        if pulse_cli_mod is not None:
+            # The Keras fit() hook and the exit hook act for the live session only.
+            pulse_cli_mod._PULSE_ACTIVE_INSTANCE = None
+        _AUTO_TRACK_STARTED = False
+        _debugger_bg = None
+        _session_id = None
+    except Exception:
+        pass
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_disarm_in_forked_child)
+
+
+def _set_excepthook(hook):
+    """Install one of Pulse's excepthooks, remembering what it replaced."""
+    _PULSE_EXCEPTHOOKS[hook] = sys.excepthook
+    sys.excepthook = hook
 
 
 def _stop_cli_tracing():
@@ -6937,7 +7167,7 @@ def _determine_mode(requested_mode):
     if requested_mode in ("ui", "cli"):
         return requested_mode
 
-    env_mode = os.environ.get("PULSE_MODE", "").lower()
+    env_mode = os.environ.get("PULSE_MODE", "").strip().lower()
     if env_mode in ("ui", "cli"):
         return env_mode
 
@@ -7009,7 +7239,7 @@ def _install_pulse_excepthook(session_id):
                 pass
         previous_hook(exc_type, exc_value, exc_tb)
 
-    sys.excepthook = _hook
+    _set_excepthook(_hook)
 
 
 def _stream_mode_requested(mode):
@@ -7048,19 +7278,38 @@ def _start_stream_monitor(caller_frame, throttle_interval):
     previous_excepthook = sys.excepthook
 
     def _stream_excepthook(exc_type, exc_value, exc_tb):
-        # The brain may be mid-sleep when the run dies. Put the traceback in the stream
-        # first, so the evidence is there whenever it next looks.
         try:
-            monitor.event("crash", urgent=True,
-                          exception=f"{getattr(exc_type, '__name__', exc_type)}: {exc_value}",
-                          traceback="".join(traceback.format_exception(exc_type, exc_value, exc_tb))[-8000:])
-            monitor.snapshot_state({"crashed": True})
+            if issubclass(exc_type, KeyboardInterrupt):
+                # The console's /stop raises KeyboardInterrupt in the training thread
+                # (what Ctrl-C does), and so does Ctrl-C itself: a deliberate stop, not a
+                # crash -- recorded as one, the run was listed in red and the agent was
+                # handed "KeyboardInterrupt" as crash evidence.
+                reason = ("stopped from the Pulse console" if getattr(monitor, "stop_requested", False)
+                          else "interrupted (Ctrl-C)")
+                monitor.event("stopped", reason=reason)
+                monitor.snapshot_state({"stopped": True})
+            else:
+                # The brain may be mid-sleep when the run dies. Put the traceback in the
+                # stream first, so the evidence is there whenever it next looks.
+                monitor.event("crash", urgent=True,
+                              exception=f"{getattr(exc_type, '__name__', exc_type)}: {exc_value}",
+                              traceback="".join(traceback.format_exception(exc_type, exc_value, exc_tb))[-8000:])
+                monitor.snapshot_state({"crashed": True})
             pulse_monitor.detach()
         except Exception:
             pass
         return previous_excepthook(exc_type, exc_value, exc_tb)
 
-    sys.excepthook = _stream_excepthook
+    _set_excepthook(_stream_excepthook)
+
+    def _forget_monitor_in_child():
+        # A forked child must not write into the parent's stream (its exit would close
+        # the parent's monitor as "finished"); the sampler thread didn't survive the fork.
+        if getattr(pulse_monitor, "_ACTIVE", None) is monitor:
+            pulse_monitor._ACTIVE = None
+            pulse_monitor._SAMPLER = None
+
+    _AT_FORK_DISARMERS.append(_forget_monitor_in_child)
 
     print(f"[Pulse] Monitoring this run into {monitor.directory}")
     print(f"[Pulse] Watch it with:  python -m pulse.brain {monitor.directory} --model <model>")
@@ -7070,7 +7319,7 @@ def _start_stream_monitor(caller_frame, throttle_interval):
 _AUTO_TRACK_STARTED = False
 
 
-def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_root=None, mode="cli"):
+def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_root=None, mode=None):
     """
     Call this once before your training loop, optionally passing your
     training function for a one-off dry run that discovers shapes:
@@ -7079,35 +7328,37 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
     mode: "ui" (dashboard + chat), "cli" (headless, Colab/SSH-friendly),
     "stream" (monitor only: stream to a separate brain process, the lightest
     option and the one that never blocks training), or "auto" (detects a
-    real display and falls back to cli). The default is "cli". Modes are
+    real display and falls back to cli). Without one, the PULSE_MODE
+    environment variable decides, and "cli" if that is unset. Modes are
     case-insensitive.
 
-    Call it once per process: a later call is a no-op, and so is a call in a
-    multiprocessing child (a 'spawn' worker re-imports the main module and so
-    re-runs a module-level auto_track()).
+    Call it once per process: a later call is a no-op until shutdown(), and
+    so is a call while a multiprocessing child re-imports the parent's
+    modules (a 'spawn' worker re-runs a module-level auto_track() -- in the
+    script or in a helper module it imports). A forked child never inherits
+    a running Pulse.
     """
-    global _debugger_bg, _session_id, _AUTO_TRACK_STARTED
+    global _AUTO_TRACK_STARTED
     mp.freeze_support()
 
-    # A 'spawn'/'forkserver' child re-imports the main module under the name
-    # __mp_main__ -- before parent_process() is set, which only happens once
-    # the child starts its target -- so check both. Only a module-level call is
-    # that re-import; auto_track() called inside the worker's own function is a
-    # deliberate one (a DDP rank started with torch.multiprocessing.spawn) and
-    # goes ahead, so each rank still gets its Pulse.
-    try:
-        caller = sys._getframe(1)
-        in_child = (caller.f_code.co_name == "<module>"
-                    and (mp.parent_process() is not None
-                         or caller.f_globals.get("__name__") == "__mp_main__"))
-    except Exception:
-        in_child = False
-    if in_child:
-        # A multiprocessing worker ('spawn' re-imports the main module, so a
-        # module-level auto_track() runs again in every worker): the parent's
-        # Pulse already watches the run. Starting another one here meant a
-        # banner, a setup and a billed start-of-run call per worker.
-        _pulse_log("AUTO_TRACK skipped: running inside a multiprocessing child process")
+    caller_frame = sys._getframe(1)
+    # `from pulse import auto_track` is the package's thin wrapper (pulse/__init__.py):
+    # the caller is the frame that called it.
+    while (caller_frame is not None and caller_frame.f_code.co_name == "auto_track"
+           and caller_frame.f_globals.get("__name__") == __package__):
+        caller_frame = caller_frame.f_back
+
+    # A 'spawn'/'forkserver' child re-imports the main module (as __mp_main__)
+    # and every module that imports, before it runs its target. Only that
+    # replay is skipped; auto_track() called inside the worker's own function
+    # is a deliberate one (a DDP rank started with torch.multiprocessing.spawn)
+    # and goes ahead, so each rank still gets its Pulse -- and so does a real
+    # __main__ script a launcher runs inside a worker.
+    from . import _in_multiprocessing_bootstrap
+    if _in_multiprocessing_bootstrap(caller_frame):
+        # The parent's Pulse already watches the run. Starting another one here
+        # meant a banner, a setup and a billed start-of-run call per worker.
+        _pulse_log("AUTO_TRACK skipped: a multiprocessing child is re-importing the parent's modules")
         return None
     if _AUTO_TRACK_STARTED:
         # One Pulse session per process. A second call (a train() helper run
@@ -7115,10 +7366,38 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
         # second session: banner, setup, start-of-run call, tracer, excepthook.
         _pulse_log("AUTO_TRACK skipped: Pulse is already running in this process")
         return None
+
+    if mode is None:
+        # The environment decides when the call doesn't: a plain auto_track()
+        # used to pass "cli" and so overrode PULSE_MODE=ui.
+        env_mode = os.environ.get("PULSE_MODE", "").strip().lower()
+        mode = env_mode if env_mode in ("ui", "cli", "auto", "stream") else "cli"
+
+    # Marked only for as long as a session is actually starting: a first call
+    # that fails (the Tk setup dialog over SSH raises) or is cancelled must not
+    # turn the retry into a silent no-op.
     _AUTO_TRACK_STARTED = True
+    try:
+        result = _auto_track_session(caller_frame, train_fn, throttle_interval, code_text, project_root, mode)
+    except BaseException:
+        _AUTO_TRACK_STARTED = False
+        raise
+    if result is _NO_SESSION:
+        _AUTO_TRACK_STARTED = False
+        return None
+    return result
+
+
+# Returned by _auto_track_session when no session was started (setup cancelled,
+# nothing to show), so the next auto_track() is not blocked.
+_NO_SESSION = object()
+
+
+def _auto_track_session(caller_frame, train_fn, throttle_interval, code_text, project_root, mode):
+    global _debugger_bg, _session_id
 
     if _stream_mode_requested(mode):
-        return _start_stream_monitor(sys._getframe(1), throttle_interval)
+        return _start_stream_monitor(caller_frame, throttle_interval)
 
     # Multi-GPU / multi-process launch detection (torchrun,
     # torch.distributed.launch, OpenMPI, Slurm) -- world_size > 1 means
@@ -7160,7 +7439,7 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
                 # person to notice a frozen terminal on their own.
                 if is_primary_rank:
                     try:
-                        statuses = _read_all_rank_status(session_key)
+                        statuses = _read_all_rank_status(session_key, this_rank=rank, world_size=world_size)
                         now = time.time()
                         stale_now = {s.get("rank") for s in statuses if now - s.get("updated", 0) > 15}
                         newly_stale = stale_now - _previously_stale_ranks
@@ -7177,7 +7456,6 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
         threading.Thread(target=_rank_status_ticker, daemon=True).start()
 
     active_mode = _determine_mode(mode)
-    caller_frame = sys._getframe(1)
     _pulse_log(
         f"AUTO_TRACK start requested_mode={mode!r} active_mode={active_mode!r} "
         f"caller={caller_frame.f_code.co_filename}:{caller_frame.f_lineno} "
@@ -7264,7 +7542,7 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
         # (e.g. using a name that was never defined) is exactly the case
         # that needs them. The UI dashboard has nothing to show, so it stops.
         if active_mode != "cli":
-            return
+            return _NO_SESSION
 
     if is_distributed and not is_primary_rank:
         # Multiple ranks racing for the same GUI window or the same
@@ -7286,7 +7564,7 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
             _write_rank_status(session_key, rank, local_rank, world_size, extra={"error": formatted})
             sys.__excepthook__(exc_type, exc_value, exc_tb)
 
-        sys.excepthook = _rank_excepthook
+        _set_excepthook(_rank_excepthook)
         return
 
     if active_mode == "cli":
@@ -7326,7 +7604,7 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
         result = dialog.run()
     if not result:
         print("[PULSE] Setup cancelled.")
-        return
+        return _NO_SESSION
     initial_provider, api_key = result
     env_key = PROVIDERS[initial_provider].get("env_key")
     if env_key:
@@ -7339,7 +7617,7 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
 
     if not tracked_vars:
         print("[PULSE] No trackable variables found.")
-        return
+        return _NO_SESSION
 
     var_states = {name: _default_var_state(name, runtime_shapes.get(name)) for name in tracked_vars}
 
@@ -7408,16 +7686,52 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
     # including caller_frame's own.
     _CAPTURE_SPAN = min(0.05, throttle_interval / 4 if throttle_interval > 0 else 0.05)
     window = {"open": True}  # start open so initial discovery isn't starved
+    # Set by shutdown() (and in a forked child): the tracer and its threads stop.
+    gui_session = {"stopped": False}
     _replay_checkpoint_counter = itertools.count()
     # REPLAY snapshots are taken by the tracer itself -- on the training
     # thread, between two statements of the loop -- rather than by the ticker
     # thread, which could serialize a model half-way through an optimizer step.
     replay_state = {"next": 0.0}
+    # The frame the training loop runs in: caller_frame, or -- auto_track() at
+    # module level -- the function it calls (main()). EXEC requests (REPL,
+    # REPLAY, ...) run against it: the module frame has none of main()'s
+    # `model` / `train_step`.
+    loop_frame = {"frame": caller_frame}
+    _training_thread_id = threading.get_ident()
+
+    def _retrace_running_frames():
+        # Same as the CLI tracer's: a frame that was already running when an
+        # earlier window closed had its line events switched off, and one
+        # entered between windows was never traced -- it never sees another
+        # 'call' event. That is main()'s frame whenever auto_track() runs at
+        # module level, so without this nothing after the first window was
+        # observed and the control queue was never polled again.
+        try:
+            frame = sys._current_frames().get(_training_thread_id)
+        except Exception:
+            return
+        while frame is not None:
+            if frame is not caller_frame:
+                filename = frame.f_code.co_filename
+                norm = os.path.normcase(os.path.abspath(filename))
+                if not _is_library_frame(filename) and not norm.startswith(_PULSE_PACKAGE_DIR) and (
+                        not root or _path_within(norm, root)):
+                    try:
+                        if frame.f_trace is None:
+                            frame.f_trace = persistent_tracer
+                        frame.f_trace_lines = True
+                    except Exception:
+                        pass
+            frame = frame.f_back
 
     def _ticker():
-        while True:
+        while not gui_session["stopped"]:
             time.sleep(throttle_interval)
+            if gui_session["stopped"]:
+                return
             window["open"] = True
+            _retrace_running_frames()
             time.sleep(_CAPTURE_SPAN)
             window["open"] = False
 
@@ -7439,6 +7753,26 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
     _CONTROL_POLL_INTERVAL = 0.1
     control_poll = {"next": 0.0}
 
+    def _control_watch():
+        # A step made only of library calls (torch/numpy, nn.Sequential) makes
+        # no user-code event between windows, so a pause, a chat tool call or
+        # the restart that applies a fix waited for the next window -- or, with
+        # the loop's line events switched off, forever. When a message is
+        # waiting, have the training thread's user frames report their next line
+        # (the message is then handled there, on the training thread, where the
+        # live objects are). A queue without empty() is simply nudged every time.
+        while not gui_session["stopped"]:
+            time.sleep(_CONTROL_POLL_INTERVAL)
+            try:
+                waiting = not control_queue.empty()
+            except Exception:
+                waiting = True
+            if waiting:
+                control_poll["next"] = 0.0
+                _retrace_running_frames()
+
+    threading.Thread(target=_control_watch, daemon=True).start()
+
     def _run_exec(msg):
         # ("EXEC", req_id, kind, arg) from ChatPanel's execution
         # directives (REPL/DRYRUN/SHAPETRACE/GRADCHECK/REPLAY)
@@ -7446,7 +7780,7 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
         # hand the result back over response_queue.
         _req_id, _kind, _arg = msg[1], msg[2], msg[3]
         try:
-            _result = _handle_exec_request(caller_frame, _kind, _arg)
+            _result = _handle_exec_request(loop_frame["frame"], _kind, _arg)
         except Exception:
             _result = f"{_kind} '{_arg}': Pulse's own dispatcher raised\n{_format_exc_short(traceback.format_exc())}"
         if response_queue is not None:
@@ -7628,6 +7962,11 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
                     _auto_rollback_after_failed_restarts_gui(entry_path, restart_state.get("chain_start"))
                 except Exception as exc:
                     print(f"[PULSE] ⚠ Automatic rollback failed ({type(exc).__name__}: {exc}).")
+            # That chain is over: one rollback for it. The agent's next fix
+            # starts a new chain with its own attempts -- the count used to
+            # stay at the cap, so every later fix was rolled back untried.
+            restart_state["attempts"] = 0
+            restart_state.pop("chain_start", None)
         elif restart_result is not None:
             try:
                 _atomic_write_json(
@@ -7660,11 +7999,17 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
             _restart(msg)
 
     def persistent_tracer(frame, event, arg):
+        if gui_session["stopped"]:
+            return None
         filename = frame.f_code.co_filename
         if _is_library_frame(filename):
             return None
         if root and not _path_within(os.path.normcase(os.path.abspath(filename)), root):
             return None
+
+        is_loop_frame = event == "line" and (frame is caller_frame or frame.f_back is caller_frame)
+        if is_loop_frame:
+            loop_frame["frame"] = frame
 
         now = time.time()
         if now >= control_poll["next"]:
@@ -7698,18 +8043,25 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
             # not via a 'call' event.
             return persistent_tracer if window["open"] else None
 
+        if event == "return":
+            if frame is loop_frame["frame"] and frame is not caller_frame:
+                loop_frame["frame"] = caller_frame
+            return persistent_tracer
+
         if event != "line":
             return persistent_tracer
 
         # REPLAY: <n_steps> needs something to roll back to. The loop runs in
         # caller_frame, or -- auto_track() at module level -- in a function
         # it calls (main()).
-        if now >= replay_state["next"] and (is_caller or frame.f_back is caller_frame):
-            replay_state["next"] = now + max(_REPLAY_MIN_INTERVAL, throttle_interval)
-            try:
-                _replay_maybe_checkpoint(frame, next(_replay_checkpoint_counter))
-            except Exception:
-                pass
+        if is_loop_frame:
+            if now >= replay_state["next"]:
+                replay_state["next"] = now + max(_REPLAY_MIN_INTERVAL, throttle_interval)
+                try:
+                    # Copied here, between two statements; serialized off the training thread.
+                    _replay_maybe_checkpoint(frame, next(_replay_checkpoint_counter), background=True)
+                except Exception:
+                    pass
 
         if not window["open"]:
             if not is_caller:
@@ -7774,10 +8126,25 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
 
         return persistent_tracer
 
+    def _stop_gui_session():
+        gui_session["stopped"] = True
+        if sys.gettrace() is persistent_tracer:
+            sys.settrace(None)
+        try:
+            caller_frame.f_trace = None
+        except Exception:
+            pass
+
+    _GUI_SESSION_STOPPERS.append(_stop_gui_session)
+    _AT_FORK_DISARMERS.append(_stop_gui_session)
+    _PULSE_TRACERS.add(persistent_tracer)
     sys.settrace(persistent_tracer)
     caller_frame.f_trace = persistent_tracer
     caller_frame.f_trace_lines = True
 
+
+# shutdown() runs these to stop the UI-mode tracer of each session started.
+_GUI_SESSION_STOPPERS = []
 
 _CRASH_RETRY_DELAYS = (5, 20, 60)
 _CLI_EXCEPTHOOK_STATE = {"hook": None, "cli": None}
@@ -7903,7 +8270,7 @@ def _install_cli_excepthook(cli):
             print("[Pulse] ⚠ Agent still unavailable after retries -- exiting without a fix.")
 
     _CLI_EXCEPTHOOK_STATE["hook"] = _hook
-    sys.excepthook = _hook
+    _set_excepthook(_hook)
 
 
 def _start_cli_tracker(
@@ -8023,8 +8390,14 @@ def _start_cli_tracker(
         and os.environ.get("PULSE_TRACE_DISARM", "1").strip().lower() not in ("0", "off", "false", "no")
     )
 
-    global _CLI_DISARM_ACTIVE, _CLI_TRACKER_STARTED
+    global _CLI_DISARM_ACTIVE, _CLI_TRACKER_STARTED, _CLI_SESSION_GEN, _CLI_TRACING_STOPPED
     _CLI_DISARM_ACTIVE = _disarm_between_windows
+    with _CLI_ARM_LOCK:
+        # A new session (auto_track() after shutdown()): tracing may run again, and the
+        # previous session's ticker -- which checks the generation -- stays stopped.
+        _CLI_SESSION_GEN += 1
+        _session_gen = _CLI_SESSION_GEN
+        _CLI_TRACING_STOPPED = False
     if not _CLI_TRACKER_STARTED:
         _CLI_TRACKER_STARTED = True
         # Disarm at a normal exit too, not only on a crash: a tracer left
@@ -8092,7 +8465,7 @@ def _start_cli_tracker(
             with _CLI_ARM_LOCK:
                 # Checked under the lock _stop_cli_tracing takes, so a crash
                 # (or shutdown) can't land between this check and the arm.
-                if _CLI_TRACING_STOPPED:
+                if _CLI_TRACING_STOPPED or _CLI_SESSION_GEN != _session_gen:
                     return
                 window["open"] = True
                 window["closes_at"] = time.time() + _CAPTURE_SPAN
@@ -8228,6 +8601,12 @@ def _start_cli_tracker(
 
         return cli_tracer
 
+    def _disarm_in_child():
+        # See _disarm_in_forked_child: the window the child inherited never closes there.
+        window["open"] = False
+
+    _AT_FORK_DISARMERS.append(_disarm_in_child)
+    _PULSE_TRACERS.add(cli_tracer)
     sys.settrace(cli_tracer)
     caller_frame.f_trace = cli_tracer
     caller_frame.f_trace_lines = True
@@ -8236,10 +8615,29 @@ def _start_cli_tracker(
 
 
 def shutdown():
-    global _debugger_bg
+    """Stop Pulse in this process. A later auto_track() starts a new session
+    (it used to be a silent no-op: the started flag was never cleared)."""
+    global _debugger_bg, _AUTO_TRACK_STARTED
     if _CLI_TRACKER_STARTED:
-        # CLI mode (the default): disarm the tracer and its ticker for good.
+        # CLI mode (the default): disarm the tracer and its ticker.
         _stop_cli_tracing()
+    for stop in list(_GUI_SESSION_STOPPERS):
+        try:
+            stop()
+        except Exception:
+            pass
+    del _GUI_SESSION_STOPPERS[:]
     if _debugger_bg:
-        _debugger_bg.shutdown()
+        try:
+            _debugger_bg.shutdown()
+        except Exception:
+            pass
         _debugger_bg = None
+    monitor_mod = sys.modules.get("pulse.pulse_monitor")
+    if monitor_mod is not None:
+        try:
+            if monitor_mod.active() is not None:
+                monitor_mod.detach()
+        except Exception:
+            pass
+    _AUTO_TRACK_STARTED = False

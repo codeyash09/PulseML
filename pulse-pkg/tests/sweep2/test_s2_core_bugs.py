@@ -726,6 +726,146 @@ def test_bug_gui_gpustatus_shows_ranks_of_previous_job():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# --- found by reading (ledger r:1), tests added with the fix -----------------------
+
+def test_bug_gui_doclookup_imports_unimported_submodule_of_project_package(chat_cls, tmp_path, monkeypatch):
+    """The GUI DOCLOOKUP only vetted the ROOT name, and only when it wasn't imported yet:
+    for an already-imported project package, `DOCLOOKUP: pkg.train_loop.main` imported
+    (= ran) pkg/train_loop.py in the attribute walk. Correct: refused, nothing runs."""
+    pkg = tmp_path / "s2core_projpkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    marker = tmp_path / "ran.txt"
+    (pkg / "train_loop.py").write_text(f"open({str(marker)!r}, 'w').write('ran')\ndef main():\n    return 1\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    import s2core_projpkg  # noqa: F401  (the script imported its own package)
+    try:
+        out = make_panel(chat_cls)._run_doclookup("s2core_projpkg.train_loop.main")
+        assert not marker.exists(), out
+        assert "s2core_projpkg.train_loop" not in sys.modules
+    finally:
+        for name in [m for m in sys.modules if m.startswith("s2core_projpkg")]:
+            sys.modules.pop(name, None)
+
+
+def test_bug_gui_doclookup_runs_project_file_in_namespace_package(chat_cls, tmp_path, monkeypatch):
+    """A project folder without __init__.py is a namespace package: find_spec() gives
+    no file, so the GUI check let it through and the walk imported its modules."""
+    ns = tmp_path / "s2core_nsproj"
+    ns.mkdir()
+    marker = tmp_path / "ran.txt"
+    (ns / "job.py").write_text(f"open({str(marker)!r}, 'w').write('ran')\ndef run():\n    return 1\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    try:
+        out = make_panel(chat_cls)._run_doclookup("s2core_nsproj.job.run")
+        assert not marker.exists(), out
+        assert "project" in out, out
+    finally:
+        for name in [m for m in sys.modules if m.startswith("s2core_nsproj")]:
+            sys.modules.pop(name, None)
+
+
+def test_bug_gui_poll_stops_for_good_after_one_failed_tick():
+    """Dashboard._poll rescheduled itself only as its last statement. The worker prunes
+    old PNGs, so an image can vanish between the exists() check and Image.open(): the
+    exception escaped, the reschedule never ran and the dashboard froze for good.
+    Correct: the next tick is scheduled whatever this one did."""
+    d = core.Dashboard.__new__(core.Dashboard)
+    scheduled = []
+    d.root = types.SimpleNamespace(after=lambda ms, fn: scheduled.append(fn))
+
+    def _boom():
+        raise FileNotFoundError("heatmap_123.png was pruned")
+    d._poll_once = _boom
+    d._poll()
+    assert len(scheduled) == 1 and scheduled[0] == d._poll
+
+
+def test_bug_replay_counts_snapshots_and_serializes_on_the_training_thread(monkeypatch):
+    """REPLAY: n picked the n-th newest SNAPSHOT (taken >= 10 s apart), not n steps back,
+    and every snapshot's torch.save (up to 256 MB) ran on the training thread. Correct:
+    REPLAY replays n steps from the latest snapshot; the UI tracer's snapshots are only
+    copied on the training thread (consistently) and serialized elsewhere."""
+    torch = pytest.importorskip("torch")
+    import threading
+    old = list(core._REPLAY_CHECKPOINTS)
+    core._REPLAY_CHECKPOINTS[:] = []
+    save_threads = []
+    real_save = torch.save
+
+    def _save(*a, **k):
+        save_threads.append(threading.get_ident())
+        return real_save(*a, **k)
+    monkeypatch.setattr(torch, "save", _save)
+    try:
+        model = torch.nn.Linear(2, 1)
+        seen = []
+
+        def train_step():
+            seen.append(float(model.weight[0, 0]))
+            return 0.0
+        frame = types.SimpleNamespace(f_globals={}, f_locals={"model": model, "train_step": train_step})
+
+        def snapshot(value, count):
+            with torch.no_grad():
+                model.weight.fill_(value)
+            core._replay_maybe_checkpoint(frame, count, background=True)
+            with torch.no_grad():
+                model.weight.fill_(-99.0)     # training moves on while it is being saved
+            deadline = time.time() + 10
+            while len(core._REPLAY_CHECKPOINTS) < count + 1 and time.time() < deadline:
+                time.sleep(0.01)
+        snapshot(1.0, 0)
+        snapshot(2.0, 1)
+        assert len(core._REPLAY_CHECKPOINTS) == 2
+        assert save_threads and threading.get_ident() not in save_threads
+        out = core._exec_replay(frame, "1")
+        assert "replayed 1 step" in out, out
+        assert seen == [2.0], f"replayed from a snapshot with weight {seen}, not the latest (2.0)"
+    finally:
+        core._REPLAY_CHECKPOINTS[:] = old
+
+
+def test_bug_pulse_mode_env_is_ignored_by_a_plain_auto_track(monkeypatch):
+    """auto_track()'s default mode="cli" beat PULSE_MODE=ui, so the environment variable
+    only ever worked for 'stream'. Correct: PULSE_MODE decides when the call doesn't; an
+    explicit mode still wins."""
+    seen = []
+
+    def _fake(mode):
+        seen.append(mode)
+        raise RuntimeError("stop before any setup")
+    monkeypatch.setattr(core, "_determine_mode", _fake)
+    monkeypatch.setenv("PULSE_MODE", "ui")
+    with pytest.raises(RuntimeError):
+        core.auto_track()
+    with pytest.raises(RuntimeError):
+        core.auto_track(mode="cli")
+    assert seen == ["ui", "cli"]
+    assert core._AUTO_TRACK_STARTED is False
+
+
+def test_bug_gui_copies_miss_the_clis_fixes(chat_cls):
+    """The dashboard's copies of CLI helpers never got the CLI's fixes: _lint_check had no
+    `original` (a name undefined before the fix blocked every fix), _parse_code_fix
+    dropped "resume" and any fix with prose around it, _scalar_history kept None
+    readings, DIFFSTATS subtracted NaN, and PASS 4/5 read the string "false" as True."""
+    pytest.importorskip("pyflakes")
+    p = make_panel(chat_cls)
+    original = "x = display(1)\ny = 1\n"
+    ok, msgs = p._lint_check("x = display(1)\ny = 2\n", "train.py", original=original)
+    assert ok, msgs
+    ok, _ = p._lint_check("x = display(1)\ny = undefined_new\n", "train.py", original=original)
+    assert not ok
+    fix = chat_cls._parse_code_fix('Here is the fix:\n{"old": ["a = 1"], "new": ["a = 2"], "resume": false}')
+    assert fix is not None and fix["old"] == ["a = 1"] and fix["resume"] is False
+    p.get_manifest_fn = lambda: {"loss": {"history": [[0, 1.0], [1, None], [2, float("nan")]]}}
+    name, hist = p._scalar_history("loss")
+    assert [s for s, _ in hist] == [0, 2]
+    assert "non-finite" in p._run_diffstats("loss 0 1")
+    assert core._as_bool("false") is False and core._as_bool("true") is True and core._as_bool(True)
+
+
 # ===========================================================================
 # OK -- verified behaviour
 # ===========================================================================

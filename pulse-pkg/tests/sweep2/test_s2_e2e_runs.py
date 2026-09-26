@@ -190,7 +190,10 @@ def test_bug_fork_pool_worker_runs_pulse_fixes_the_script_and_hangs_the_pool():
     assert not r.timed_out, "the run hung (Pool.map never returned):\n" + r.show(2500)
     assert r.returncode == 0, r.show()
     assert "RESULTS [(0.1," in r.stdout
-    assert len(pids) == 1, f"model calls from {len(pids)} processes (a fork worker ran Pulse)"
+    # The parent's start-of-run check may be answered without a model call, so the parent
+    # alone can make none: at most one process calls the model, and only one Pulse starts.
+    assert len(pids) <= 1, f"model calls from {len(pids)} processes (a fork worker ran Pulse)"
+    assert r.stdout.count("Pulse is ready") == 1, "a pool worker started a Pulse session of its own"
     assert not r.modified, "a pool worker rewrote train.py"
 
 

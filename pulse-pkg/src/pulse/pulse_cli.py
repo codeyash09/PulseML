@@ -46,25 +46,67 @@ from pulse.pulse_backend import (
     statistics,
     to_numpy,
 )
-from pulse.pulse_pdf import generate_heatmap_pdf
 from pulse import pulse_detect as _pulse_detect
 from pulse import pulse_supabase as cloud
 from pulse import pulse_ui as _ui
 from pulse import pulse_terminal as _terminal
 from pulse import pulse_approver as _approver
 from pulse import pulse_trace as _pulse_trace
-try:
-    import litellm
-    # Quiets litellm's own verbose provider-runtime logging unless explicitly enabled.
-    if os.environ.get("PULSE_LITELLM_DEBUG", "").strip().lower() not in ("1", "true", "yes"):
-        litellm.suppress_debug_info = True
-except ImportError:
-    print(
-        "\n[Pulse] Missing dependency: litellm (used to talk to AI providers).\n"
-        "         Install it with:  pip install litellm\n",
-        file=sys.stderr,
-    )
-    sys.exit(1)
+
+
+class _LazyLitellm:
+    """`litellm`, imported on first use.
+
+    Importing litellm takes ~3 s (it pulls in openai, aiohttp, pydantic models for every
+    provider). Imported at module level, every `import pulse` paid for it -- including each
+    'spawn' DataLoader worker, every epoch, which never makes a model call. Attribute reads
+    and writes go straight to the real module, so `pulse_cli.litellm.completion = fake`
+    (and monkeypatch.setattr on it) patches the module every caller uses."""
+
+    def _module(self):
+        configured = self.__dict__.get("_configured", False)   # never through __getattr__
+        mod = sys.modules.get("litellm")
+        if mod is not None and configured:
+            return mod
+        try:
+            import litellm as mod
+        except ImportError:
+            print(
+                "\n[Pulse] Missing dependency: litellm (used to talk to AI providers).\n"
+                "         Install it with:  pip install litellm\n",
+                file=sys.stderr,
+            )
+            raise
+        if not configured:
+            object.__setattr__(self, "_configured", True)
+            # Quiets litellm's own verbose provider-runtime logging unless explicitly enabled.
+            if os.environ.get("PULSE_LITELLM_DEBUG", "").strip().lower() not in ("1", "true", "yes"):
+                mod.suppress_debug_info = True
+        return mod
+
+    def __getattr__(self, name):
+        return getattr(self._module(), name)
+
+    def __setattr__(self, name, value):
+        setattr(self._module(), name, value)
+
+    def __delattr__(self, name):
+        delattr(self._module(), name)
+
+    def __repr__(self):
+        loaded = sys.modules.get("litellm")
+        return repr(loaded) if loaded is not None else "<lazy module 'litellm' (not imported yet)>"
+
+
+litellm = _LazyLitellm()
+
+
+def generate_heatmap_pdf(*args, **kwargs):
+    """pulse_pdf imports matplotlib (half a second): only load it for a PDF snapshot."""
+    from pulse.pulse_pdf import generate_heatmap_pdf as _generate
+    return _generate(*args, **kwargs)
+
+
 
 
 
@@ -312,6 +354,9 @@ def _install_keras_fit_hook():
         # Which fit() of the run this is (1, 2, ...): a fix checkpoint records it, so a
         # pretrain + fine-tune script resumes into the fit() the checkpoint was taken in.
         instance = _PULSE_ACTIVE_INSTANCE
+        if instance is None:
+            # No live session: a forked child (pulse.pulse makes Pulse inert there).
+            return original_fit(self, *args, **kwargs)
         fit_index = getattr(instance, "_keras_fit_count", 0) + 1
         try:
             instance._keras_fit_count = fit_index
