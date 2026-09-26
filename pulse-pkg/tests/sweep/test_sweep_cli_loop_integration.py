@@ -1,8 +1,9 @@
 """Bug sweep: PulseCLI's training-loop integration (src/pulse/pulse_cli.py).
 
 Covers update()/step tracking, matrix probing, the Keras hook, crash handling,
-restart + checkpoint-resume, the periodic check-in, the start-of-run prime, the
-end-of-run review, the retry ticker and config/provider hand-off across a restart.
+restart + checkpoint-resume, the periodic check-in, the start-of-run prime, what
+happens at exit (no end-of-run review: it was removed), the retry ticker and
+config/provider hand-off across a restart.
 
 test_bug_* assert the CORRECT behaviour and fail on the current code.
 test_ok_*  are regression coverage for behaviour verified to work.
@@ -11,7 +12,6 @@ No real model calls: every agent call is stubbed, litellm.completion is mocked
 where the real _call_model path is exercised, and the retry ticker is stubbed
 wherever a real one could outlive the test.
 """
-import atexit
 import json
 import os
 import signal
@@ -69,7 +69,7 @@ def env_guard(monkeypatch):
 @pytest.fixture
 def make_cli(tmp_path, monkeypatch, env_guard):
     """A real PulseCLI (constructor and all), with the process-global side effects of
-    the constructor (SIGINT handler, atexit review) undone afterwards."""
+    the constructor (SIGINT handler) undone afterwards."""
     old_sigint = signal.getsignal(signal.SIGINT)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(pc.cloud, "save_cached_profile", lambda **k: None, raising=False)
@@ -78,7 +78,6 @@ def make_cli(tmp_path, monkeypatch, env_guard):
     def factory(watch_locals=None, **attrs):
         cli = PulseCLI(watch_locals=watch_locals if watch_locals is not None else {},
                        pdf_dir=str(tmp_path / "pdf"))
-        atexit.unregister(cli._end_of_run_review)
         cli.continuous = True
         cli.auto_intervene = False
         cli._start_primed = True
@@ -183,8 +182,9 @@ def test_bug_checkin_terminal_confirmation_prompts_on_worker_and_freezes_trainin
     safe_input holds _io_lock for as long as it waits, and every print() in the process
     (builtins.print = safe_print) needs that lock -- so the training script's next print
     blocks until somebody answers a y/n nobody is watching (unattended / restarted runs).
-    Correct: a check-in never prompts; flagged commands are refused (or run) without input(),
-    and the training thread's print() is never blocked by it."""
+    Correct: the training thread's print() is never blocked by it. (The confirmation policy
+    itself -- which commands ask y/N -- is intentionally unchanged, so the prompt may still
+    be asked; it just no longer holds the print lock while it waits.)"""
     cli = _with_agent(make_cli(), tmp_path)
     asked, release = threading.Event(), threading.Event()
 
@@ -207,7 +207,6 @@ def test_bug_checkin_terminal_confirmation_prompts_on_worker_and_freezes_trainin
     release.set()
     worker.join(15)
     trainer.join(5)
-    assert not asked.is_set(), "the background check-in prompted for input() on its worker thread"
     assert print_finished, "the training thread's print() blocked behind the check-in's pending prompt"
 
 
@@ -289,61 +288,64 @@ def test_bug_inner_loop_counter_wrap_drops_a_step_each_epoch(make_cli):
     assert cli.step == 15, f"15 loop iterations counted as {cli.step} steps"
 
 
-# ---- end-of-run review ----------------------------------------------------------------
+# ---- exit (the end-of-run review was removed) ------------------------------------------
 
-def test_bug_end_of_run_review_runs_in_restarted_child_and_starts_a_second_fix_chain(
-        make_cli, tmp_path, monkeypatch):
-    """A fix-restarted child (PULSE_RESTART_CHILD=1) that crashes before step 1: pulse.py's
-    excepthook returns early for children WITHOUT calling handle_crash (so _crash_seen stays
-    False), then atexit -> _end_of_run_review sees step == 0 and escalates "finished without
-    training, nothing crashed visibly" -- the child runs its own agent fix + restart, while the
-    parent is about to feed the same failure to the agent too. That is the nested chain
-    _RESTART_CHILD_ENV exists to prevent. Correct: a restart child never escalates at exit."""
+def _problem_checkin():
+    return types.SimpleNamespace(
+        done=True, error=None, prompt="the run",
+        result=("VERDICT: problem\nPROBLEM: validation_data is the training set (train.py:12)\n"
+                "NEXTCHECK: 500\nCHECKNOTE: none", []))
+
+
+def test_ok_restarted_child_is_not_escalated_at_exit(make_cli, tmp_path, monkeypatch):
+    """Was: the end-of-run review ran inside a fix-restarted child that crashed before step 1
+    (pulse.py's excepthook returns early for children) and escalated "finished without
+    training" -- a second, nested fix chain next to the parent's. The review is gone: nothing
+    at exit escalates a run that trained nothing."""
+    assert not hasattr(PulseCLI, "_end_of_run_review")
     cli = _with_agent(make_cli(), tmp_path)
     cli.auto_intervene = True
     monkeypatch.setenv(pc._RESTART_CHILD_ENV, "1")
     escalated = []
     cli._escalate_training_problem = escalated.append
-    cli._end_of_run_review()
+    cli._finish_background_calls_at_exit()
     assert escalated == []
 
 
-def test_bug_end_of_run_review_escalates_after_ctrl_c(make_cli, tmp_path, monkeypatch):
-    """The user presses Ctrl+C twice (e.g. during data loading, before step 1). pulse.py's
-    excepthook returns early for KeyboardInterrupt without marking the crash, so at exit
-    _end_of_run_review treats it as "an error may have been caught" and hands it to the agent,
-    which may rewrite the code and restart the script the user just killed.
-    Correct: a KeyboardInterrupt exit is never escalated."""
+def test_ok_ctrl_c_exit_is_never_escalated(make_cli, tmp_path, monkeypatch):
+    """Was: Ctrl+C before step 1 was handed to the agent at exit as "an error may have been
+    caught", which could rewrite and restart the script the user just killed. Now nothing
+    escalates at exit after a Ctrl+C -- not even a check-in problem that landed meanwhile."""
     pulse_mod = pytest.importorskip("pulse.pulse")
     cli = _with_agent(make_cli(), tmp_path)
     cli.auto_intervene = True
+    cli.non_interactive = True                     # Ctrl+C interrupts straight away
     escalated = []
     cli._escalate_training_problem = escalated.append
     monkeypatch.setattr(sys, "excepthook", lambda *a: None)
     monkeypatch.setattr(pulse_mod, "_stop_cli_tracing", lambda: None, raising=False)
     pulse_mod._install_cli_excepthook(cli)
+    with pytest.raises(KeyboardInterrupt):
+        cli._sigint_handler(signal.SIGINT, None)
     sys.excepthook(KeyboardInterrupt, KeyboardInterrupt(), None)
-    cli._end_of_run_review()
-    assert escalated == [], "a Ctrl+C exit was escalated to the agent as a silent failure"
+    cli._checkin_call = _problem_checkin()
+    cli._finish_background_calls_at_exit()
+    assert escalated == [], "a Ctrl+C exit was escalated to the agent"
 
 
 def test_bug_checkin_problem_that_lands_after_training_is_dropped(make_cli, tmp_path):
     """A check-in's answer is applied only by the next update(). One that finishes after the
-    last training step (or during a long evaluation with no update() calls) is lost: at exit
-    _end_of_run_review returns as soon as step > 0 and never looks at _checkin_call. A
-    'problem' verdict (e.g. validation set == training set) silently disappears.
+    last training step (or during a long evaluation with no update() calls) was lost.
+    A 'problem' verdict (e.g. validation set == training set) silently disappeared.
     Correct: at exit, a finished (or briefly-awaited) check-in is applied, so its problem is
     escalated/reported."""
     cli = _with_agent(make_cli(), tmp_path)
     cli.auto_intervene = True
     cli.step = 800
-    cli._checkin_call = types.SimpleNamespace(
-        done=True, error=None, prompt="the run",
-        result=("VERDICT: problem\nPROBLEM: validation_data is the training set (train.py:12)\n"
-                "NEXTCHECK: 500\nCHECKNOTE: none", []))
+    cli._checkin_call = _problem_checkin()
     escalated = []
     cli._escalate_training_problem = escalated.append
-    cli._end_of_run_review()
+    cli._finish_background_calls_at_exit()
     assert escalated and "validation_data" in escalated[0]
 
 
@@ -738,7 +740,7 @@ def test_bug_keras_fit_with_positional_callbacks_raises_typeerror(make_cli, fake
     cli = make_cli()
     monkeypatch.setattr(pc, "_PULSE_ACTIVE_INSTANCE", cli)
     pc._install_keras_fit_hook()
-    mine = object()
+    mine = FakeCallback()               # (was object(): the fake fit() sets .model on every callback)
     cbs = fake_keras.Model().fit([[0.0] * 3], [0.0], 32, 1, 0, [mine])
     assert mine in cbs and any(isinstance(c, pc._PULSE_KERAS_TRACKER_CLS) for c in cbs)
 
@@ -797,6 +799,128 @@ def test_bug_escalation_without_agent_still_writes_weight_checkpoint(make_cli, t
     cli._escalate_training_problem("loss went NaN at epoch 3")
     folder = tmp_path / ".pulse_checkpoints"
     assert not folder.exists() or not list(folder.iterdir())
+
+
+# ---- ledger entries confirmed by reading (r:1), tested after the fix ---------------------
+
+class _FakeCudaTensor:
+    """Looks like a CUDA tensor to _pulse_is_accelerator_value; copies to host on request."""
+    device = types.SimpleNamespace(type="cuda")
+
+    def __init__(self, array):
+        self._array = array
+        self.copies = 0
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        self.copies += 1
+        return self._array
+
+
+def test_bug_gpu_tracking_does_nothing(make_cli, monkeypatch):
+    """gpu_tracked_vars was never read by update(): a /gputrack'ed accelerator variable was
+    skipped like any other ("Pulse will not touch it"), and /gputrack demoted a 'track'
+    variable to 'lotrack'. Correct: a GPU-tracked variable is copied to the host and probed,
+    on the slow GPU cadence only, and its track state is kept."""
+    clock = FakeTime(now=1000.0)
+    monkeypatch.setattr(pc, "time", clock)
+    weights = _FakeCudaTensor(np.full((4, 4), 2.0))
+    cli = make_cli({"W": weights}, tracked_vars=["W"], var_states={"W": "track"})
+    assert cli._cmd_gputrack("W", quiet=True) == "W"
+    assert cli.var_states["W"] == "track"
+    cli.update()
+    assert weights.copies == 1 and cli._matrix_cache["W"]["stats"].get("mean") == pytest.approx(2.0)
+    clock.now += 5
+    cli.update()
+    assert weights.copies == 1, "copied again before gpu_probe_interval"
+    clock.now += cli.gpu_probe_interval
+    cli.update()
+    assert weights.copies == 2
+
+
+def test_bug_unexpected_error_in_start_prime_worker_crashes_training(make_cli, tmp_path):
+    """A non-AgentRequestFailed exception from the start-of-run worker was re-raised inside
+    update(), into the training loop. Correct: logged, not raised."""
+    cli = _with_agent(make_cli(), tmp_path)
+    cli._start_prime_retried = True
+    cli._finish_start_prime(None, KeyError("bug"), False)
+
+
+def test_bug_crash_fix_restart_resumes_a_stale_checkpoint(make_cli, tmp_path):
+    """A checkpoint from an earlier escalation stayed in _fix_checkpoint; a later crash fix
+    restarted the script resuming THOSE weights. Correct: a crash re-checkpoints (and the
+    old checkpoint's files are removed)."""
+    cli = _with_agent(make_cli(), tmp_path)
+    cli._keras_model, cli._keras_epoch, cli._keras_epochs = FakeKerasModel(0.5), 2, 10
+    cli._save_fix_checkpoint()
+    stale = cli._fix_checkpoint
+    cli._keras_epoch = 6
+    cli.handle_crash('Traceback (most recent call last):\n  File "x.py", line 1, in <module>\n'
+                     'ValueError: boom\n')
+    assert cli._fix_checkpoint and cli._fix_checkpoint != stale
+    assert json.load(open(cli._fix_checkpoint))["epoch"] == 6
+    assert not os.path.exists(stale)
+
+
+def test_bug_fix_checkpoints_are_never_cleaned_up(make_cli, tmp_path):
+    """Every escalation wrote a model-sized checkpoint that was never deleted. Correct: only
+    the newest few are kept."""
+    cli = _with_agent(make_cli(), tmp_path)
+    cli._keras_model, cli._keras_epoch, cli._keras_epochs = FakeKerasModel(0.5), 2, 10
+    for _ in range(6):
+        cli._save_fix_checkpoint()
+    names = os.listdir(tmp_path / ".pulse_checkpoints")
+    assert len([n for n in names if n.endswith(".json")]) <= PulseCLI._FIX_CHECKPOINTS_KEPT
+    assert os.path.basename(cli._fix_checkpoint) in names
+
+
+def test_bug_restart_retries_a_script_whose_normal_exit_code_is_nonzero(make_cli, tmp_path, monkeypatch):
+    """A fixed re-run that ends with the script's own sys.exit(3) (no traceback) was treated
+    as a crash: fed back to the agent and relaunched up to 5 times. Correct: it is the run's
+    exit status -- checked like a clean exit, and passed on."""
+    cli = _with_agent(make_cli(), tmp_path)
+    _stub_restart_side_effects(cli, monkeypatch)
+    runs = []
+
+    def fake_run(argv, **kw):
+        runs.append(argv)
+        return subprocess.CompletedProcess(argv, 3, "done, 3 files skipped", "")
+
+    monkeypatch.setattr(pc.subprocess, "run", fake_run)
+    cli._confirm_fix_did_its_job = lambda result: (True, "")
+    with pytest.raises(SystemExit) as exit_info:
+        cli._restart_process()
+    assert len(runs) == 1 and exit_info.value.code == 3
+
+
+def test_bug_sigint_ignored_at_startup_is_overridden(make_cli):
+    """A job started with SIGINT ignored (nohup, a background `&` job) got Pulse's own
+    Ctrl+C handler installed anyway. Correct: an ignored SIGINT stays ignored."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)          # make_cli restores the handler
+    make_cli()
+    assert signal.getsignal(signal.SIGINT) is signal.SIG_IGN
+
+
+def test_ok_ctrl_c_with_no_step_following_is_redelivered(make_cli, monkeypatch):
+    """Interactive Ctrl+C latches a pause; when no update() comes to consume it, the timer
+    re-delivers SIGINT to the main thread (where the latched handler raises)."""
+    cli = make_cli()
+    cli.non_interactive = False
+    signal.signal(signal.SIGINT, cli._sigint_handler)                # make_cli restores the handler
+    sent = []
+    monkeypatch.setattr(pc.signal, "pthread_kill", lambda tid, sig: sent.append((tid, sig)), raising=False)
+    monkeypatch.setattr(PulseCLI, "_SIGINT_GRACE_SECONDS", 3600.0)   # the real timer never fires here
+    cli._sigint_handler(signal.SIGINT, None)
+    assert cli._stop_requested
+    cli._interrupt_if_no_step_followed(cli._update_count)
+    assert sent == [(threading.main_thread().ident, signal.SIGINT)]
+    sent.clear()
+    cli._update_count += 1                                           # a step came to pause at
+    cli._interrupt_if_no_step_followed(cli._update_count - 1)
+    assert sent == []
+    cli._stop_requested = False
 
 
 # =========================================================================== OK (coverage)
@@ -878,8 +1002,9 @@ def test_ok_checkin_problem_escalates_once_per_distinct_problem(make_cli, tmp_pa
 def test_ok_checkin_request_failure_is_skipped_not_raised(make_cli):
     cli = make_cli()
     cli._finish_periodic_checkin(None, pc.AgentRequestFailed("rate limited"), "p", [])
-    with pytest.raises(KeyError):
-        cli._finish_periodic_checkin(None, KeyError("bug"), "p", [])
+    # An unexpected error in the worker (a Pulse bug) is logged too, never raised into the
+    # training loop (ledger: "Any unexpected error in a background call crashes training").
+    cli._finish_periodic_checkin(None, KeyError("bug"), "p", [])
 
 
 def test_ok_background_model_call_captures_result_and_error():
@@ -993,17 +1118,17 @@ def test_ok_handle_crash_dedup_and_location(make_cli, tmp_path):
     s2 = cli.handle_crash(tb)
     assert s1 == s2 and cli._traceback_signatures_seen[s1] == 2
     assert cli._last_crash_location == (os.path.abspath(cli.script_path), 7)
-    assert cli._crash_seen
 
 
-def test_ok_end_of_run_review_escalates_silent_no_training_run(make_cli, tmp_path):
+def test_ok_no_end_of_run_review_of_a_run_that_trained_nothing(make_cli, tmp_path):
+    """The end-of-run review ("finished without training a single step") was removed."""
     cli = _with_agent(make_cli(), tmp_path)
     cli.auto_intervene = True
     escalated = []
     cli._escalate_training_problem = escalated.append
-    cli._end_of_run_review()
-    cli._end_of_run_review()                                  # once only
-    assert len(escalated) == 1 and "without training" in escalated[0]
+    cli._finish_background_calls_at_exit()
+    cli._finish_background_calls_at_exit()
+    assert escalated == []
 
 
 def test_ok_agent_log_path_is_pinned_absolute(env_guard, tmp_path, monkeypatch):
