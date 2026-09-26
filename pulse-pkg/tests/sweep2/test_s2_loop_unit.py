@@ -497,6 +497,10 @@ def test_bug_ctrl_c_in_a_keras_epoch_longer_than_5s_kills_training_instead_of_pa
     monkeypatch.setattr(pc.threading, "Timer", FakeTimer)
     monkeypatch.setattr(pc.signal, "pthread_kill", lambda tid, sig: kills.append(sig))
     cli = make_cli({"loss": 1.0}, tracked_vars=["loss"], var_states={"loss": "track"})
+    # Under pytest-xdist (or a runner started in the background) SIGINT starts out ignored, so
+    # PulseCLI leaves it alone and the re-delivery timer bails out: the test then passed for
+    # the wrong reason. Install the handler as it is in a normal run (make_cli restores it).
+    signal.signal(signal.SIGINT, cli._sigint_handler)
     for epoch in range(3):                   # epoch-end updates every 30 s
         clock.now += 30.0
         cli.watch_locals["loss"] = 1.0 / (epoch + 1)

@@ -463,6 +463,73 @@ def _at_interpreter_exit() -> None:
     cli._finish_background_calls_at_exit()
 
 
+_REAL_SUBPROCESS_RUN = subprocess.run
+
+
+def _interpreter_options() -> List[str]:
+    """This interpreter's own command-line options (`python -O -W error train.py` -> ['-O',
+    '-W', 'error']), from sys.orig_argv, up to the script / -m / -c."""
+    orig = list(getattr(sys, "orig_argv", None) or [])
+    options: List[str] = []
+    i = 1
+    while i < len(orig):
+        arg = orig[i]
+        if arg == "--" or arg == "-" or not arg.startswith("-"):
+            break
+        if arg in ("-W", "-X", "--check-hash-based-pycs"):
+            options += orig[i:i + 2]
+            i += 2
+            continue
+        if arg.startswith(("-W", "-X")) or arg.startswith("--"):
+            options.append(arg)
+        elif "c" in arg[1:] or "m" in arg[1:]:
+            break                   # -c / -m (possibly after other flags): the program itself
+        elif arg != "-i":           # an interactive prompt after the re-run would be stranded
+            options.append(arg)
+        i += 1
+    return options
+
+
+def _stop_child_process(proc) -> None:
+    """Stop a child after Ctrl+C. The terminal's Ctrl+C usually reached it too: give it a
+    moment to stop on its own (its handler may be saving a checkpoint), then pass SIGINT on,
+    then terminate, then kill. Another Ctrl+C moves straight to the next, harder step."""
+    steps = ((None, 3.0), (getattr(signal, "SIGINT", None), 30.0), ("terminate", 5.0), ("kill", 5.0))
+    for action, timeout in steps:
+        try:
+            if action == "terminate":
+                proc.terminate()
+            elif action == "kill":
+                proc.kill()
+            elif action is not None:
+                proc.send_signal(action)
+            proc.wait(timeout)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+        except KeyboardInterrupt:
+            continue
+        except (OSError, ValueError):
+            continue
+
+
+def _exit_after_interrupt_or_crash(cli) -> bool:
+    """Ctrl+C, or a crash the crash handler already owns: nothing is handed to the agent."""
+    return bool(getattr(cli, "_interrupted", False) or getattr(sys, "last_value", None) is not None)
+
+
+def _exit_process_now(code) -> None:
+    """End the whole process with a SystemExit's code, from where raising it would not: a
+    worker thread (it would end only the thread) or a threading exit hook (only printed)."""
+    code = code if isinstance(code, int) else (0 if code is None else 1)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    os._exit(code)
+
+
 def _register_exit_hook() -> None:
     """Once per process, for the live session. threading._register_atexit hooks run at the
     start of interpreter shutdown -- worker threads still running, concurrent.futures (which
@@ -3544,7 +3611,11 @@ class PulseCLI:
         self._stop_requested = False
         self._interrupted = False        # any Ctrl+C this run: never handed to the agent at exit
         self._update_count = 0           # update() calls so far -- see _sigint_handler
-        self._update_running = False
+        self._update_running = False     # update()'s own work (not its pause prompt) is running
+        self._in_update = False          # anywhere inside update(), its pause prompt included
+        self._update_exit_ts: Optional[float] = None
+        self._update_gaps = collections.deque(maxlen=5)   # recent seconds between steps
+        self._restart_deferred = False   # a restart the retry ticker left to the training thread
         self.original_sigint = signal.getsignal(signal.SIGINT)
         try:
             # Ctrl+C ignored at startup (nohup, a background job): leave it ignored.
@@ -3737,33 +3808,53 @@ class PulseCLI:
 
         Only while a training step can still come to consume it: outside the
         loop (a long evaluation, a download, a sleep after training) no update()
-        follows, so if none starts within _SIGINT_GRACE_SECONDS the interrupt is
-        delivered as a normal KeyboardInterrupt. Non-interactive runs have nobody
-        to answer the pause prompt: Ctrl+C interrupts straight away there.
+        follows, so if none starts within the grace (see _sigint_grace_seconds) the
+        interrupt is delivered after all. Non-interactive runs have nobody to answer
+        the pause prompt, and at the pause prompt itself there is nothing left to
+        pause: Ctrl+C is delivered straight away there. Delivered means the script's
+        own SIGINT handler when it installed one (one that saves a checkpoint and
+        stops), else KeyboardInterrupt.
         """
         self._interrupted = True
-        if not self._stop_requested and not getattr(self, "non_interactive", False):
+        at_prompt = getattr(self, "_in_update", False) and not getattr(self, "_update_running", False)
+        if not self._stop_requested and not getattr(self, "non_interactive", False) and not at_prompt:
             self._stop_requested = True
             self.continuous = False
-            cprint("\n[Pulse] Ctrl+C received. Pausing after the current training step...")
+            cprint("\n[Pulse] Ctrl+C received. Pausing after the current training step "
+                   "(Ctrl+C again to stop now)...")
             updates_seen = self._update_count
-            timer = threading.Timer(self._SIGINT_GRACE_SECONDS, self._interrupt_if_no_step_followed,
+            timer = threading.Timer(self._sigint_grace_seconds(), self._interrupt_if_no_step_followed,
                                     args=(updates_seen,))
             timer.daemon = True
             timer.start()
             return
 
+        # Pulse is not going to pause: the script's own handler, if it has one, decides.
+        original = self.original_sigint
+        if callable(original) and original is not signal.default_int_handler and not at_prompt:
+            original(sig, frame)
+            return
         # A second Ctrl+C while already paused keeps the old hard-exit
         # behavior, which is useful if the user really wants to terminate.
-        if self.original_sigint:
-            signal.signal(signal.SIGINT, self.original_sigint)
+        if original:
+            signal.signal(signal.SIGINT, original)
         raise KeyboardInterrupt
 
     _SIGINT_GRACE_SECONDS = 5.0
+    _SIGINT_GRACE_MAX_SECONDS = 1800.0
+
+    def _sigint_grace_seconds(self) -> float:
+        """How long a latched Ctrl+C waits for the next update() before it is delivered.
+        At least _SIGINT_GRACE_SECONDS, and longer than the recent gaps between steps: a
+        Keras run gets an update() only at epoch end, so with 30 s epochs a fixed 5 s grace
+        interrupted every epoch instead of pausing after it. A second Ctrl+C always stops now."""
+        gaps = getattr(self, "_update_gaps", None) or ()
+        grace = max(self._SIGINT_GRACE_SECONDS, 1.5 * max(gaps, default=0.0))
+        return min(grace, max(self._SIGINT_GRACE_SECONDS, self._SIGINT_GRACE_MAX_SECONDS))
 
     def _interrupt_if_no_step_followed(self, updates_seen: int) -> None:
         """Timer thread: a Ctrl+C that no update() has picked up since is re-delivered to the
-        main thread, where _sigint_handler (the latch already set) raises KeyboardInterrupt."""
+        main thread, where _sigint_handler (the latch already set) delivers it."""
         if not self._stop_requested or self._update_count != updates_seen or self._update_running:
             return                           # a step came (or is running) to pause at
         try:
@@ -6289,8 +6380,11 @@ class PulseCLI:
         tail = re.sub(r"0x[0-9a-fA-F]+", "0x?", "\n".join(lines[-4:]))
         return hashlib.sha1(tail.encode("utf-8")).hexdigest()[:12]
 
-    # How long interpreter exit waits for model calls still running on worker threads.
+    # How long interpreter exit waits for model calls still running on worker threads: the
+    # start-of-run call gets _EXIT_WAIT_SECONDS; a periodic check-in (up to
+    # _CHECKIN_MAX_ROUNDS + 1 calls) is waited for up to _EXIT_WAIT_MAX_SECONDS, with a notice.
     _EXIT_WAIT_SECONDS = 10.0
+    _EXIT_WAIT_MAX_SECONDS = 300.0
 
     def _finish_background_calls_at_exit(self) -> None:
         """At interpreter exit: wait (bounded) for model calls still running on worker threads,
@@ -6302,27 +6396,49 @@ class PulseCLI:
         off in the middle of a model call can hold an import lock (litellm imports lazily) that
         the main thread then waits on forever -- a short script (`train.py --help`) hung at
         exit. Nothing new is asked here: there is no review of the run itself at exit.
+
+        A fix that ends in a restart makes this process a stand-in for the fixed run: it exits
+        with that run's status (os._exit -- an exception from a threading exit hook is only
+        printed, and the process would exit 0).
         """
         if getattr(self, "_exit_calls_finished", False):
             return
         self._exit_calls_finished = True
+        if _exit_after_interrupt_or_crash(self):
+            return              # the answer would be thrown away: don't wait for it
         calls = [c for c in (getattr(self, "_start_prime_call", None), getattr(self, "_checkin_call", None))
                  if c is not None]
-        give_up_at = time.monotonic() + self._EXIT_WAIT_SECONDS
-        while any(not c.done for c in calls) and time.monotonic() < give_up_at:
+        started = time.monotonic()
+        noticed = False
+        while any(not c.done for c in calls):
+            if _exit_after_interrupt_or_crash(self):
+                self._stop_requested = False     # Ctrl+C skipped the wait: nothing to re-deliver
+                return
+            waited = time.monotonic() - started
+            if waited >= self._EXIT_WAIT_MAX_SECONDS:
+                break
+            if waited >= self._EXIT_WAIT_SECONDS and not noticed:
+                checkin = getattr(self, "_checkin_call", None)
+                if checkin is None or checkin.done:
+                    break       # only the start-of-run call is left: not worth holding exit for
+                noticed = True
+                cprint(f"[Pulse] Waiting for the periodic check-in to finish before exiting (up to "
+                       f"{self._EXIT_WAIT_MAX_SECONDS - waited:.0f}s more; Ctrl+C to skip)...",
+                       color=_YELLOW)
             time.sleep(0.05)
-        call = getattr(self, "_checkin_call", None)
-        if call is None or not call.done:
-            return
-        # Ctrl+C, or a crash the crash handler already owns: nothing is handed to the agent.
-        if getattr(self, "_interrupted", False) or getattr(sys, "last_value", None) is not None:
-            return
-        self._checkin_call = None
-        answer, transcript = call.result if call.result else (None, [])
         try:
+            if getattr(self, "_restart_deferred", False):
+                # A fix the retry ticker applied, and no training step came to restart it.
+                self._restart_deferred = False
+                self._restart_process()
+            call = getattr(self, "_checkin_call", None)
+            if call is None or not call.done:
+                return
+            self._checkin_call = None
+            answer, transcript = call.result if call.result else (None, [])
             self._finish_periodic_checkin(answer, call.error, call.prompt, transcript)
-        except SystemExit:
-            pass        # a fix restarted the script, and the restarted run finished
+        except SystemExit as exc:
+            _exit_process_now(exc.code)     # a fix restarted the script, and the restarted run finished
         except Exception as exc:
             _pulse_log(f"EXIT CHECK-IN failed: {type(exc).__name__}: {exc}")
 
@@ -6810,6 +6926,17 @@ class PulseCLI:
         calls sys.exit() once a replacement process has actually been
         spawned to take over.
         """
+        ticker = getattr(self, "_retry_ticker_thread", None)
+        if ticker is not None and threading.current_thread() is ticker:
+            # A queued restart, or a retried diagnosis whose fix landed. The training thread is
+            # still running the old code: a replacement started from here would train beside
+            # it (same GPU, same output files). The next update() restarts, on that thread.
+            self._restart_deferred = True
+            cprint("[Pulse] Fix saved -- the training script restarts with it at the next training step.")
+            return
+        if self._restart_blocked_by_ctrl_c():
+            return
+
         # Captured now (before the retry loop below can apply further
         # fixes of its own) -- this is "the fix that triggered this
         # restart chain", i.e. what _auto_rollback_after_failed_restarts
@@ -6962,6 +7089,8 @@ class PulseCLI:
             for clear_cmd in (["stty", "sane"], ["clear"]):
                 if clear_cmd[0] == "stty" and not sys.stdin.isatty():
                     continue
+                if clear_cmd[0] == "clear" and not os.environ.get("TERM"):
+                    continue        # it would only print "TERM environment variable not set."
                 try:
                     subprocess.run(clear_cmd, timeout=5)
                 except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
@@ -6983,6 +7112,10 @@ class PulseCLI:
             argv = [python_exe, "-m", main_module] + sys.argv[1:]
         if _RESTART_ARGV_HOOK is not None:
             argv = _RESTART_ARGV_HOOK(python_exe, script_path, sys.argv[1:]) or argv
+        if argv and argv[0] == python_exe:
+            # The interpreter's own options (-O, -W error, -X utf8, -u): the fixed re-run must
+            # be the same program, or an assert disabled with -O fires and looks like a bad fix.
+            argv = [argv[0]] + _interpreter_options() + list(argv[1:])
         # Only the child gets the marker (not this process's os.environ):
         # if every retry fails and this process keeps running the old code,
         # its own later crashes must still go through the agent as normal.
@@ -6997,6 +7130,11 @@ class PulseCLI:
         launch_cwd = getattr(self, "_launch_cwd", None)
         if launch_cwd and not os.path.isdir(launch_cwd):
             launch_cwd = None
+
+        # A check-in (or the start-of-run call) still out is about the old code: its answer
+        # must not be applied -- at exit, after the fixed run -- to code that has been fixed.
+        self._checkin_call = None
+        self._start_prime_call = None
 
         # Retry the restart itself instead of ever falling back to "keep
         # running the old, already-in-memory process" on a bad exit code.
@@ -7020,6 +7158,8 @@ class PulseCLI:
         attempt = 0
         while True:
             attempt += 1
+            if attempt > 1 and self._restart_blocked_by_ctrl_c():
+                return
             try:
                 # Streamed live to this process's stdout/stderr, and kept, so
                 # a failure's output can be fed back to the agent below.
@@ -7037,6 +7177,19 @@ class PulseCLI:
                     return
                 time.sleep(min(RETRY_BACKOFF_SECONDS * attempt, 30))
                 continue
+
+            stopped_by = self._restart_child_stop_signal(result)
+            if stopped_by is not None:
+                # Ctrl+C (or SIGTERM) ended the re-run: the user stopping it, not a crash of
+                # the fix. No agent, no relaunch -- stop, as that signal would have.
+                if not streamed:
+                    sys.stdout.write(result.stdout or "")
+                    sys.stderr.write(result.stderr or "")
+                cprint(f"\n[Pulse] The restarted run was stopped ({signal.Signals(stopped_by).name}) -- "
+                       "stopping. The fix stays saved on disk.", color=_YELLOW)
+                self._log_incident("restart_interrupted",
+                                   f"restarted run stopped by {signal.Signals(stopped_by).name}")
+                sys.exit(128 + stopped_by)
 
             # A nonzero exit without a traceback or a signal is the script's own
             # exit status (sys.exit(3) at the end of a run), not a crash.
@@ -7131,38 +7284,90 @@ class PulseCLI:
                 cprint(f"[Pulse] ⚠ {message}. Retrying restart...", color=_YELLOW)
                 time.sleep(min(RETRY_BACKOFF_SECONDS * attempt, 30))
 
+    def _restart_blocked_by_ctrl_c(self) -> bool:
+        """A Ctrl+C still waiting for its pause (pressed while the fix pipeline ran inside
+        update()) means the user wants to stop: don't launch a new, unattended full training
+        run over it. The fix stays on disk; update() pauses right after this."""
+        if not getattr(self, "_stop_requested", False):
+            return False
+        cprint("[Pulse] Ctrl+C is pending -- not restarting the training script. The fix is saved "
+               "on disk; run the script again to use it.", color=_YELLOW)
+        self._log_incident("restart_skipped", "Ctrl+C pending when the fix landed")
+        return True
+
+    def _restart_child_stop_signal(self, result) -> Optional[int]:
+        """The signal (SIGINT/SIGTERM) that ended the restarted run, when it was stopped rather
+        than crashed: Ctrl+C in the terminal reaches the child too (it dies of SIGINT, or exits
+        130 from its own handler), or Pulse passed a Ctrl+C / SIGTERM on (_run_restart_child)."""
+        forwarded = getattr(self, "_restart_child_stopped_by", None)
+        if forwarded is not None:
+            return int(forwarded)
+        stops = [signal.SIGINT] + ([signal.SIGTERM] if hasattr(signal, "SIGTERM") else [])
+        for sig in stops:
+            if result.returncode in (-int(sig), 128 + int(sig)):
+                return int(sig)
+        if result.returncode != 0 and getattr(self, "_stop_requested", False):
+            return int(signal.SIGINT)    # this process latched the same Ctrl+C: a pause request
+        return None
+
+    # How much of each output stream of a restarted run is kept for the post-fix check and the
+    # agent (which use the last few thousand characters): a bounded tail, not the whole run.
+    _RESTART_OUTPUT_KEEP_BYTES = 8 * 1024 * 1024
+
     def _run_restart_child(self, argv: List[str], env: Dict[str, str], cwd: Optional[str]):
         """Run the restarted script to the end with its output shown live -- a fixed re-run is
         often the rest of a long training job, and its log, metrics and 'saved model' lines
-        belong on the user's screen -- while keeping a copy for the post-fix check and for the
-        agent if it fails. Returns (CompletedProcess with text stdout/stderr, whether the
-        output was already shown)."""
-        pipes = (os.pipe(), os.pipe())
-        copies: Tuple[List[str], List[str]] = ([], [])
+        belong on the user's screen -- while keeping the tail of it for the post-fix check and
+        for the agent if it fails. Returns (CompletedProcess with text stdout/stderr, whether
+        the output was already shown).
 
-        def pump(fd: int, stream, kept: List[str]) -> None:
-            decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        Output is passed on as bytes (binary output stays intact); only the kept tail is
+        decoded. Ctrl+C here stops the child (it usually got the same Ctrl+C from the terminal)
+        and SIGTERM is passed on to it; _restart_child_stopped_by records either."""
+        pipes = (os.pipe(), os.pipe())
+        keep = self._RESTART_OUTPUT_KEEP_BYTES
+        tails: Tuple[collections.deque, collections.deque] = (collections.deque(), collections.deque())
+        self._restart_child_stopped_by = None
+
+        def pump(fd: int, stream, tail: collections.deque) -> None:
+            raw = getattr(stream, "buffer", None)
+            decoder = None if raw is not None else codecs.getincrementaldecoder("utf-8")("replace")
+            kept = 0
             with os.fdopen(fd, "rb", buffering=0) as source:
                 while True:
                     chunk = source.read(65536)
-                    text = decoder.decode(chunk, final=not chunk)
-                    if text:
-                        kept.append(text)
-                        try:
-                            with _io_lock:
-                                stream.write(text)
-                                stream.flush()
-                        except Exception:
-                            pass
+                    if chunk:
+                        tail.append(chunk)
+                        kept += len(chunk)
+                        while kept - len(tail[0]) >= keep:
+                            kept -= len(tail.popleft())
+                    try:
+                        with _io_lock:
+                            if raw is not None:
+                                if chunk:
+                                    stream.flush()          # what Pulse printed first stays first
+                                    raw.write(chunk)
+                                    raw.flush()
+                            else:
+                                text = decoder.decode(chunk, final=not chunk)
+                                if text:
+                                    stream.write(text)
+                                    stream.flush()
+                    except Exception:
+                        pass
                     if not chunk:
                         return
 
-        readers = [threading.Thread(target=pump, args=(read_fd, stream, kept), daemon=True)
-                   for (read_fd, _w), stream, kept in zip(pipes, (sys.stdout, sys.stderr), copies)]
+        readers = [threading.Thread(target=pump, args=(read_fd, stream, tail), daemon=True)
+                   for (read_fd, _w), stream, tail in zip(pipes, (sys.stdout, sys.stderr), tails)]
         for reader in readers:
             reader.start()
         try:
-            result = subprocess.run(argv, stdout=pipes[0][1], stderr=pipes[1][1], env=env, cwd=cwd)
+            if subprocess.run is not _REAL_SUBPROCESS_RUN:
+                # A stand-in for subprocess.run (tests): it gets the same call as always.
+                result = subprocess.run(argv, stdout=pipes[0][1], stderr=pipes[1][1], env=env, cwd=cwd)
+            else:
+                result = self._wait_for_restart_child(argv, pipes[0][1], pipes[1][1], env, cwd)
         finally:
             for _r, write_fd in pipes:
                 os.close(write_fd)
@@ -7170,7 +7375,42 @@ class PulseCLI:
                 reader.join(5)      # a worker the child left behind may hold the pipe open
         if result.stdout is not None or result.stderr is not None:
             return result, False    # a stand-in for subprocess.run that captured on its own
-        return subprocess.CompletedProcess(argv, result.returncode, "".join(copies[0]), "".join(copies[1])), True
+        out, err = (b"".join(list(tail)).decode("utf-8", "replace") for tail in tails)
+        return subprocess.CompletedProcess(argv, result.returncode, out, err), True
+
+    def _wait_for_restart_child(self, argv: List[str], stdout_fd: int, stderr_fd: int,
+                                env: Dict[str, str], cwd: Optional[str]):
+        """Start the restarted script and wait for it. This process is only its stand-in now:
+        SIGTERM (a scheduler, `kill`) is passed on instead of leaving the child training as an
+        orphan, and Ctrl+C stops the child instead of escaping from here (an interrupt in the
+        crash hook showed the old, already-fixed crash and exited 1)."""
+        proc = subprocess.Popen(argv, stdout=stdout_fd, stderr=stderr_fd, env=env, cwd=cwd)
+        previous_term = None
+        if hasattr(signal, "SIGTERM") and threading.current_thread() is threading.main_thread():
+            def _pass_on(signum, frame):
+                self._restart_child_stopped_by = signum
+                try:
+                    proc.send_signal(signum)
+                except (OSError, ValueError):
+                    pass
+            try:
+                previous_term = signal.signal(signal.SIGTERM, _pass_on)
+            except (ValueError, OSError):
+                previous_term = None
+        try:
+            try:
+                proc.wait()
+            except KeyboardInterrupt:
+                self._restart_child_stopped_by = signal.SIGINT
+                cprint("\n[Pulse] Ctrl+C -- stopping the restarted run...", color=_YELLOW)
+                _stop_child_process(proc)
+        finally:
+            if previous_term is not None:
+                try:
+                    signal.signal(signal.SIGTERM, previous_term)
+                except (ValueError, OSError):
+                    pass
+        return subprocess.CompletedProcess(argv, proc.returncode, None, None)
 
     def _confirm_fix_did_its_job(self, result) -> tuple:
         """One small question after a re-run that finished cleanly: did the fix
@@ -9103,24 +9343,19 @@ class PulseCLI:
                         self._last_restart_retry = pending_restart
                         cprint("\n[Pulse] retrying an earlier restart that failed to launch...", color=_YELLOW)
                         try:
-                            self._restart_process()  # does not return on success
+                            self._restart_process()  # left to the training thread -- see there
                         except Exception:
                             pass
                 except SystemExit as exc:
-                    # A restart (queued, or after a retried fix) whose fixed run has finished.
-                    # sys.exit on this thread would end only the thread, and the old process
-                    # would train on with the old code: end the process itself.
-                    code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
-                    for stream in (sys.stdout, sys.stderr):
-                        try:
-                            stream.flush()
-                        except Exception:
-                            pass
-                    os._exit(code)
+                    # Should a restart still end here: sys.exit on this thread would end only
+                    # the thread, and the old process would train on: end the process itself.
+                    _exit_process_now(exc.code)
                 finally:
                     self._retry_ticker_lock.release()
 
-        threading.Thread(target=_loop, daemon=True).start()
+        ticker = threading.Thread(target=_loop, daemon=True, name="pulse-retry-ticker")
+        self._retry_ticker_thread = ticker
+        ticker.start()
 
     def _queue_agent_retry(self, question: str, include_code: bool, traceback_signature: Optional[str]) -> None:
         """Called when a top-level ask_agent() call failed only because
@@ -9574,6 +9809,10 @@ class PulseCLI:
         fresh start."""
         env = dict(os.environ, **{_RESTART_CHILD_ENV: "1", _RESTART_DEPTH_ENV: str(depth + 1)})
         env.pop(_RESUME_ENV, None)
+        if not env.get("PYTHONUNBUFFERED") and _stdout_is_tty():
+            # The child writes into Pulse's pipe, not the terminal: block-buffered, its lines
+            # would reach the screen in bursts, or only when it exits.
+            env["PYTHONUNBUFFERED"] = "1"
         checkpoint = getattr(self, "_fix_checkpoint", None)
         if not checkpoint:
             return env
@@ -13089,6 +13328,27 @@ class PulseCLI:
         return None
 
     def update(self, step: Optional[int] = None,
+            generate_pdfs: Optional[bool] = None) -> None:
+        """Called at every training step/checkpoint (the work is _update_step's)."""
+        now = time.monotonic()
+        if self._update_exit_ts is not None:
+            # Time spent in the training code since the last step -- see _sigint_grace_seconds.
+            self._update_gaps.append(max(0.0, now - self._update_exit_ts))
+        if self._restart_deferred:
+            # A fix the retry ticker applied: restart here, on the training thread, so the
+            # replacement run never trains beside this one (see _restart_process).
+            self._restart_deferred = False
+            self._restart_process()  # does not return on success
+        self._in_update = True
+        try:
+            self._update_step(step, generate_pdfs)
+        finally:
+            # Even when update() raises: otherwise Ctrl+C re-delivery stays off for good.
+            self._update_running = False
+            self._in_update = False
+            self._update_exit_ts = time.monotonic()
+
+    def _update_step(self, step: Optional[int] = None,
             generate_pdfs: Optional[bool] = None) -> None:
         """Called at every training step/checkpoint."""
 
