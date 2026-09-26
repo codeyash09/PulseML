@@ -53,6 +53,14 @@ def test_bug_bfloat16_torch_tensor_pdf_fails(tmp_path):
     assert os.path.isfile(path)
 
 
+def test_bug_float_step_crashes_pdf_filename(tmp_path):
+    """f'step{step:06d}' raises for a float step (e.g. a fractional epoch)."""
+    p1 = generate_heatmap_pdf("v", np.ones((2, 2)), 3.0, output_dir=str(tmp_path))
+    assert os.path.basename(p1) == "step000003.pdf"
+    p2 = generate_heatmap_pdf("v", np.ones((2, 2)), 2.5, output_dir=str(tmp_path))
+    assert os.path.isfile(p2)
+
+
 # ============================================================================ ok
 
 def test_ok_basic_layout_and_path(tmp_path):

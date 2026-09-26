@@ -124,6 +124,35 @@ def test_bug_scalar_value_of_empty_array_raises_indexerror():
         B.scalar_value(np.array([]))
 
 
+def test_bug_jax_device_is_none_on_current_jax(monkeypatch):
+    """Current JAX exposes `.device` as a property (not a method), so `x.device()` raised
+    and device_of returned None."""
+    class _Dev:
+        def __str__(self):
+            return "cuda:0"
+
+    class _FakeJaxArray:
+        device = _Dev()
+
+    monkeypatch.setattr(B, "detect_backend", lambda x: "JAX")
+    assert B.device_of(_FakeJaxArray()) == "cuda:0"
+
+
+def test_bug_tf_sparse_and_ragged_crash_statistics():
+    tf = pytest.importorskip("tensorflow")
+    s = B.statistics(tf.sparse.from_dense(tf.eye(3)))
+    assert s["max"] == 1.0 and s["min"] == 0.0
+    r = B.statistics(tf.ragged.constant([[1.0, 2.0], [3.0]]))
+    assert r["mean"] == 2.0
+
+
+def test_ok_frameworks_detected_without_importing_them():
+    import sys
+    assert B.detect_backend(np.zeros(2)) == "NumPy"
+    if "torch" in sys.modules:
+        assert B.detect_backend(sys.modules["torch"].zeros(2)) == "PyTorch"
+
+
 # ----------------------------------------------------------------------------- ok
 
 def test_ok_numpy_passthrough_no_copy():

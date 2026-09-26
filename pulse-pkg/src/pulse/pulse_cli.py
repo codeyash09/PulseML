@@ -450,6 +450,9 @@ def _agent_log_write(text: str) -> None:
     if not path:
         return
     try:
+        # The log holds prompts verbatim (TERMINAL output, the user's code, tracebacks):
+        # never let an API key reach it.
+        text = cloud.scrub_secrets(text)
         with _agent_log_lock, open(path, "a", encoding="utf-8") as f:
             f.write(text)
     except Exception:
@@ -742,7 +745,9 @@ _enable_windows_ansi()
 # Kept deliberately small: "Pulse" is always orange, error/warning text is
 # always red, and code patches/diffs are always blue. Nothing else in the
 # CLI is colored.
-_COLOR_ENABLED = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+# no-color.org: only a non-empty NO_COLOR disables colour; TERM=dumb can't show it.
+_COLOR_ENABLED = (sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+                  and os.environ.get("TERM", "").lower() != "dumb")
 _ORANGE = "\033[38;5;208m"
 _RED = "\033[91m"
 _GREEN = "\033[92m"
@@ -2886,7 +2891,17 @@ class PulseCLI:
                     continue
         return None
 
+    @property
+    def agent_key(self) -> Optional[str]:
+        return self.__dict__.get("_agent_key_value")
 
+    @agent_key.setter
+    def agent_key(self, value: Optional[str]) -> None:
+        # Every provider key Pulse holds is scrubbed from logs and cloud entries, also a
+        # custom provider's key that isn't in a *_API_KEY env var.
+        if value and value != "local":
+            cloud.register_secret(value)
+        self.__dict__["_agent_key_value"] = value
 
     def __init__(
         self,
@@ -3233,6 +3248,11 @@ class PulseCLI:
         # writes infrequent enough for a small compute tier to keep up with,
         # instead of a request every few seconds all training run long.
         self._cloud_dirty_fields: set = set()
+        # Set when resuming a session whose saved history could not be loaded:
+        # until it is, the array columns are never PATCHed (a PATCH replaces the
+        # whole array, so it would wipe the history -- see _build_cloud_patch_body).
+        self._cloud_history_unloaded: bool = False
+        self._cloud_history_retry_at: float = 0.0
         self.cloud_flush_interval: float = 600.0  # 10 minutes, for the noisy stuff (telemetry)
         self._last_cloud_flush: float = 0.0
         self._last_telemetry_sample: float = 0.0
@@ -4068,15 +4088,7 @@ class PulseCLI:
                 # on -- worst case is the pre-restart history is briefly
                 # at risk on the next flush rather than the run refusing
                 # to continue.
-                try:
-                    existing = cloud.fetch_debug_session(self.debug_session_id)
-                except cloud.SupabaseError:
-                    existing = None
-                if existing:
-                    self._agent_logs = cloud.decode_entries(existing.get("agent_logs"))
-                    self._error_tracebacks = cloud.decode_entries(existing.get("error_tracebacks"))
-                    self._telemetry = cloud.decode_entries(existing.get("telemetry"))
-                    self._incidents = cloud.decode_entries(existing.get("incidents"))
+                if self._preload_cloud_history():
                     cprint(
                         f"[Pulse] Loaded {len(self._agent_logs)} agent log(s), {len(self._incidents)} "
                         f"incident(s) from before the restart -- history preserved."
@@ -4084,8 +4096,8 @@ class PulseCLI:
                 else:
                     cprint(
                         "[Pulse] ⚠ Could not load this session's history before the restart -- "
-                        "new entries will be appended locally, but the next sync may not include "
-                        "everything logged before the restart.",
+                        "new entries are kept locally and synced once it has been loaded, so the "
+                        "saved history is never overwritten.",
                         color=_YELLOW,
                     )
                 cprint(f"[Pulse] Resumed git commit {sha[:10]}… -- carried over, not re-detected (see /commit to update it manually).")
@@ -4173,8 +4185,14 @@ class PulseCLI:
             # empty under RLS no matter how valid the cached login is.
             # Best-effort: an older cache with no refresh_token yet, or an
             # expired one, just leaves us on the anon key as before.
-            cloud.refresh_session(cached.get("refresh_token"))
-            verified = cloud.verify_session_token(cached["user_id"], cached.get("session_token"))
+            refreshed = cloud.refresh_session(cached.get("refresh_token"))
+            session_email = cloud.session_email() if refreshed else None
+            if session_email and session_email != str(cached.get("email") or "").strip().lower():
+                # The refresh token belongs to a different account than the cached
+                # user id/email: don't run as one user with another's session.
+                verified = False
+            else:
+                verified = cloud.verify_session_token(cached["user_id"], cached.get("session_token"))
             # verified is True (token matches -- trust it), False (token
             # present but WRONG -- someone/something tampered with or
             # forged this credentials.json; do not trust it, force a
@@ -5159,6 +5177,27 @@ class PulseCLI:
         self._cloud_dirty_fields.add("incidents")
         self._maybe_flush_cloud(force=True)
 
+    _CLOUD_ARRAY_FIELDS = ("agent_logs", "error_tracebacks", "telemetry", "incidents")
+
+    def _preload_cloud_history(self) -> bool:
+        """Load the resumed session's saved arrays and put this process's entries after
+        them. False (and _cloud_history_unloaded set) if the fetch failed; a missing row
+        counts as loaded -- there is nothing to overwrite."""
+        try:
+            existing = cloud.fetch_debug_session(self.debug_session_id)
+        except cloud.SupabaseError:
+            self._cloud_history_unloaded = True
+            self._cloud_history_retry_at = time.monotonic() + 60.0
+            return False
+        self._cloud_history_unloaded = False
+        if existing:
+            self._agent_logs = cloud.decode_entries(existing.get("agent_logs")) + list(self._agent_logs)
+            self._error_tracebacks = (cloud.decode_entries(existing.get("error_tracebacks"))
+                                      + list(self._error_tracebacks))
+            self._telemetry = cloud.decode_entries(existing.get("telemetry")) + list(self._telemetry)
+            self._incidents = cloud.decode_entries(existing.get("incidents")) + list(self._incidents)
+        return True
+
     def _build_cloud_patch_body(self) -> Dict[str, Any]:
         """Compress and package every dirty field into ONE PATCH body,
         clearing the dirty set. Each array entry is individually
@@ -5168,6 +5207,14 @@ class PulseCLI:
         each entry keeps that resend cheap instead of the dominant cost.
         """
         body: Dict[str, Any] = {}
+        held: set = set()
+        if getattr(self, "_cloud_history_unloaded", False):
+            if time.monotonic() >= self._cloud_history_retry_at:
+                self._preload_cloud_history()
+            if self._cloud_history_unloaded:
+                # Still unknown what is saved: sending the arrays now would replace it.
+                held = self._cloud_dirty_fields & set(self._CLOUD_ARRAY_FIELDS)
+                self._cloud_dirty_fields -= held
         if "agent_logs" in self._cloud_dirty_fields:
             body["agent_logs"] = [cloud.encode_entry(e) for e in self._agent_logs]
         if "error_tracebacks" in self._cloud_dirty_fields:
@@ -5191,6 +5238,7 @@ class PulseCLI:
         if "git_commit_sha" in self._cloud_dirty_fields:
             body["git_commit_sha"] = self._last_synced_commit_sha
         self._cloud_dirty_fields.clear()
+        self._cloud_dirty_fields |= held
         return body
 
     def _maybe_flush_cloud(self, force: bool = False) -> None:

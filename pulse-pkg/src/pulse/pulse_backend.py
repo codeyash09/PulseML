@@ -44,53 +44,58 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 # ----------------------------------------------------------------------
-# Optional imports
+# Optional backends -- looked up lazily
 # ----------------------------------------------------------------------
+#
+# None of the optional frameworks is imported here: importing Pulse must not
+# pay for a TensorFlow/PyTorch/JAX import (seconds, and GPU memory on some
+# builds) in a script that never uses them. An object can only be a
+# torch.Tensor / tf.Tensor / jax.Array / DataFrame if the script already
+# imported that framework, so each backend is looked up in sys.modules at the
+# moment an object is inspected.
 
-HAS_TORCH = False
-HAS_TF = False
-HAS_CUPY = False
-HAS_JAX = False
-HAS_SCIPY_SPARSE = False
-HAS_PANDAS = False
+import importlib.util
+import sys
 
-try:
-    import torch
-    HAS_TORCH = True
-except Exception:
-    torch = None
 
-try:
-    import tensorflow as tf
-    HAS_TF = True
-except Exception:
-    tf = None
+def _loaded(name, attr):
+    """The already-imported module `name`, or None. A module that is still
+    half-way through its own import (no `attr` yet) counts as not loaded."""
+    mod = sys.modules.get(name)
+    if mod is None or not hasattr(mod, attr):
+        return None
+    return mod
 
-try:
-    import cupy
-    HAS_CUPY = True
-except Exception:
-    cupy = None
 
-try:
-    import jax
-    import jax.numpy as jnp
-    HAS_JAX = True
-except Exception:
-    jax = None
-    jnp = None
+def _torch():
+    return _loaded("torch", "Tensor")
 
-try:
-    import scipy.sparse as sp_sparse
-    HAS_SCIPY_SPARSE = True
-except Exception:
-    sp_sparse = None
 
-try:
-    import pandas as pd
-    HAS_PANDAS = True
-except Exception:
-    pd = None
+def _tf():
+    return _loaded("tensorflow", "is_tensor")
+
+
+def _cupy():
+    return _loaded("cupy", "ndarray")
+
+
+def _jax():
+    return _loaded("jax", "Array")
+
+
+def _sp_sparse():
+    return _loaded("scipy.sparse", "issparse")
+
+
+def _pd():
+    return _loaded("pandas", "DataFrame")
+
+
+def _installed(name):
+    try:
+        return importlib.util.find_spec(name) is not None
+    except Exception:
+        return False
 
 
 # ----------------------------------------------------------------------
@@ -113,16 +118,24 @@ class TensorInfo:
 # ----------------------------------------------------------------------
 
 def detect_backend(x):
-    if HAS_TORCH and isinstance(x, torch.Tensor):
+    torch = _torch()
+    if torch is not None and isinstance(x, torch.Tensor):
         return "PyTorch"
 
-    if HAS_TF and tf.is_tensor(x):
-        return "TensorFlow"
+    tf = _tf()
+    if tf is not None:
+        try:
+            if tf.is_tensor(x):
+                return "TensorFlow"
+        except Exception:
+            pass
 
-    if HAS_CUPY and isinstance(x, cupy.ndarray):
+    cupy = _cupy()
+    if cupy is not None and isinstance(x, cupy.ndarray):
         return "CuPy"
 
-    if HAS_JAX:
+    jax = _jax()
+    if jax is not None:
         try:
             if isinstance(x, jax.Array):
                 return "JAX"
@@ -134,12 +147,14 @@ def detect_backend(x):
     # Checked before the generic numpy/pandas branches since sp.issparse
     # is the canonical, version-stable way to recognize any of scipy's
     # several sparse matrix/array classes.
-    if HAS_SCIPY_SPARSE and sp_sparse.issparse(x):
+    sp_sparse = _sp_sparse()
+    if sp_sparse is not None and sp_sparse.issparse(x):
         return "SciPy Sparse"
 
     # pandas DataFrame/Series -- the standard input/output of most sklearn
     # preprocessing steps (ColumnTransformer, train_test_split, ...).
-    if HAS_PANDAS and isinstance(x, (pd.DataFrame, pd.Series)):
+    pd = _pd()
+    if pd is not None and isinstance(x, (pd.DataFrame, pd.Series)):
         return "Pandas"
 
     # NOTE: catches BOTH real arrays (np.ndarray) and numpy *scalar*
@@ -183,8 +198,15 @@ def device_of(x):
             return "cuda"
 
     if backend == "JAX":
+        # Current JAX: `.device` is a property (older: a method), and
+        # `.devices()` is the set for sharded arrays.
         try:
-            return str(x.device())
+            dev = getattr(x, "device", None)
+            if callable(dev):
+                dev = dev()
+            if dev is None:
+                dev = next(iter(x.devices()))
+            return str(dev)
         except Exception:
             return None
 
@@ -298,19 +320,19 @@ def to_numpy(x):
 
     if backend == "PyTorch":
         try:
-            return x.detach().cpu().numpy()
+            return _torch_to_numpy(x)
         except Exception:
             return _generic_to_numpy(x)
 
     if backend == "TensorFlow":
         try:
-            return x.numpy()
+            return _tf_to_numpy(x)
         except Exception:
             return _generic_to_numpy(x)
 
     if backend == "CuPy":
         try:
-            return cupy.asnumpy(x)
+            return _cupy().asnumpy(x)
         except Exception:
             return _generic_to_numpy(x)
 
@@ -343,19 +365,80 @@ def to_numpy(x):
         raise TypeError(f"Cannot convert {type(x)} to numpy.")
 
 
+def _torch_to_numpy(x):
+    """Host copy of a torch tensor. Sparse layouts are densified, and dtypes
+    numpy has no type for (bfloat16, float8_*) are upcast to float32 -- on
+    the host, after the copy, so no kernel runs on the accelerator."""
+    torch = _torch()
+    t = x.detach()
+    if t.layout != torch.strided:
+        t = t.to_dense()
+    t = t.cpu()
+    try:
+        return t.numpy()
+    except TypeError:
+        if t.is_floating_point():
+            return t.float().numpy()
+        if t.is_complex():
+            return t.to(torch.complex64).numpy()
+        raise
+
+
+def _tf_to_numpy(x):
+    tf = _tf()
+    if isinstance(x, tf.sparse.SparseTensor):
+        return tf.sparse.to_dense(x).numpy()
+    ragged = getattr(tf, "RaggedTensor", None)
+    if ragged is not None and isinstance(x, ragged):
+        # The stored values; padding to a dense tensor would invent zeros.
+        return x.flat_values.numpy()
+    return x.numpy()
+
+
 def scalar_value(x) -> float:
     """Pull a plain Python float out of any backend's 0-d tensor/array,
     or a bare Python number. Used for loss/metric line charts."""
-    arr = to_numpy(x)
-    return float(np.asarray(arr).reshape(-1)[0])
+    arr = np.asarray(to_numpy(x)).reshape(-1)
+    if arr.size == 0:
+        raise ValueError("scalar_value() of an empty array")
+    return float(arr[0])
 
 
 # ----------------------------------------------------------------------
 # Metadata (renamed from inspect to avoid stdlib conflict)
 # ----------------------------------------------------------------------
 
+def _metadata_dtype(x, backend):
+    """dtype name of an accelerator tensor read from its metadata, without
+    copying its data to the host; None for backends that need a conversion."""
+    if backend == "PyTorch":
+        return str(x.dtype).replace("torch.", "")
+    if backend == "TensorFlow":
+        return x.dtype.name
+    if backend in ("CuPy", "JAX"):
+        return str(x.dtype)
+    return None
+
+
 def describe_tensor(x):
     backend = detect_backend(x)
+    dtype = None
+    try:
+        dtype = _metadata_dtype(x, backend)
+        shape = tuple(x.shape) if dtype is not None else None
+    except Exception:
+        dtype = None
+    if dtype is not None and shape is not None and None not in shape:
+        return TensorInfo(
+            backend=backend,
+            kind=tensor_kind(x),
+            shape=shape,
+            ndim=len(shape),
+            dtype=dtype,
+            device=device_of(x),
+            object=x,
+        )
+
     arr = to_numpy(x)
 
     return TensorInfo(
@@ -383,14 +466,15 @@ def label(x):
 # ----------------------------------------------------------------------
 
 def available_backends():
+    """Which backends are installed (checked without importing them)."""
     return {
         "NumPy": True,
-        "PyTorch": HAS_TORCH,
-        "TensorFlow": HAS_TF,
-        "CuPy": HAS_CUPY,
-        "JAX": HAS_JAX,
-        "SciPy Sparse": HAS_SCIPY_SPARSE,
-        "Pandas": HAS_PANDAS,
+        "PyTorch": _installed("torch"),
+        "TensorFlow": _installed("tensorflow"),
+        "CuPy": _installed("cupy"),
+        "JAX": _installed("jax"),
+        "SciPy Sparse": _installed("scipy"),
+        "Pandas": _installed("pandas"),
     }
 
 
@@ -412,6 +496,9 @@ def statistics(x):
 
     if np.issubdtype(arr.dtype, np.floating):
         work = arr
+    elif np.issubdtype(arr.dtype, np.complexfloating):
+        # Magnitude: casting to float would silently drop the imaginary part.
+        work = np.abs(arr)
     else:
         work = arr.astype(np.float64)
 
@@ -425,8 +512,10 @@ def statistics(x):
         "device": device_of(x),
         "min": float(finite.min()) if finite.size else None,
         "max": float(finite.max()) if finite.size else None,
-        "mean": float(finite.mean()) if finite.size else None,
-        "std": float(finite.std()) if finite.size else None,
+        # Accumulate in float64: a float16/float32 sum or variance overflows
+        # to inf on perfectly finite data.
+        "mean": float(finite.mean(dtype=np.float64)) if finite.size else None,
+        "std": float(finite.std(dtype=np.float64)) if finite.size else None,
         "nan": int(np.isnan(work).sum()) if work.size else 0,
         "inf": int(np.isinf(work).sum()) if work.size else 0,
     }
@@ -442,8 +531,23 @@ def is_trackable(obj):
     that happen to survive a best-effort np.asarray() call."""
     if not has_shape(obj):
         return False
+    backend = detect_backend(obj)
     try:
+        if backend == "PyTorch":
+            dt = obj.dtype
+            return dt != _torch().bool and not str(dt).startswith("torch.q")
+        if backend == "TensorFlow":
+            dt = obj.dtype
+            return bool(dt.is_floating or dt.is_complex or dt.is_integer) and not dt.is_bool
         info = describe_tensor(obj)
     except Exception:
         return False
-    return np.issubdtype(np.dtype(info.dtype), np.number)
+    return _numeric_dtype_name(info.dtype)
+
+
+def _numeric_dtype_name(name):
+    try:
+        return bool(np.issubdtype(np.dtype(name), np.number))
+    except Exception:
+        # bfloat16 / float8_* (ml_dtypes) are numeric but not numpy types.
+        return "float" in str(name)

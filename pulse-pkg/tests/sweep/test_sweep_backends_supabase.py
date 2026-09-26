@@ -318,6 +318,108 @@ def test_bug_fetch_recent_sessions_retries_network_failures_four_times(monkeypat
     assert len(calls) == 1
 
 
+# ------------------------------------------------- read-only (r:1) ledger items, now tested
+
+def test_bug_cloud_history_not_wiped_after_failed_preload(monkeypatch):
+    """After an auto-fix restart the resumed process preloads the session's saved arrays;
+    if that fetch failed, the next flush PATCHed the arrays with only the new entries,
+    replacing (wiping) the whole saved history. Correct: hold the arrays back until the
+    history is loaded, then send saved + new."""
+    from pulse import pulse_cli as cli
+    obj = cli.PulseCLI.__new__(cli.PulseCLI)
+    obj.debug_session_id = "sid"
+    obj._agent_logs, obj._error_tracebacks, obj._telemetry, obj._incidents = [{"a": "new"}], [], [], []
+    obj._uptime_seconds, obj._downtime_seconds = 5.0, 0.0
+    obj._cloud_history_unloaded, obj._cloud_history_retry_at = False, 0.0
+
+    def offline(session_id):
+        raise cloud.SupabaseError("GET Debug_Sessions -> network error: timed out")
+
+    monkeypatch.setattr(cloud, "fetch_debug_session", offline)
+    assert obj._preload_cloud_history() is False
+    obj._cloud_dirty_fields = {"agent_logs", "uptime_seconds"}
+    obj._cloud_history_retry_at = 0.0
+    body = obj._build_cloud_patch_body()
+    assert "agent_logs" not in body and body["uptime_seconds"] == 5
+    assert "agent_logs" in obj._cloud_dirty_fields
+
+    monkeypatch.setattr(cloud, "fetch_debug_session",
+                        lambda sid: {"agent_logs": [cloud.encode_entry({"a": "old"})]})
+    obj._cloud_history_retry_at = 0.0
+    body = obj._build_cloud_patch_body()
+    assert [e["a"] for e in cloud.decode_entries(body["agent_logs"])] == ["old", "new"]
+    assert not obj._cloud_dirty_fields
+
+
+def test_bug_last_team_admin_can_be_removed(monkeypatch):
+    """remove_team_admin removed the only admin, leaving a workspace nobody can manage."""
+    monkeypatch.setattr(cloud, "_teams_request", lambda *a, **k: [{"team_id": "t", "admin_ids": [UID_A],
+                                                                     "members": [UID_A, UID_B]}])
+    patched = []
+    monkeypatch.setattr(cloud, "_request", lambda *a, **k: patched.append(k.get("body")))
+    with pytest.raises(cloud.SupabaseError):
+        cloud.remove_team_admin("t", UID_A)
+    with pytest.raises(cloud.SupabaseError):
+        cloud.leave_team("t", UID_A)
+    assert patched == []
+
+
+def test_bug_background_sync_reports_only_the_first_error_ever(monkeypatch):
+    """BackgroundSync reported one error for the whole run: after an HTTP 500, a later
+    network outage was never mentioned. Correct: once per kind."""
+    errs = iter([cloud.SupabaseError("PATCH -> HTTP 500: x"), cloud.SupabaseError("PATCH -> HTTP 500: y"),
+                 cloud.SupabaseError("PATCH -> network error: unreachable")])
+
+    def fail(session_id, fields, timeout=5):
+        raise next(errs)
+
+    monkeypatch.setattr(cloud, "patch_debug_session", fail)
+    errors = []
+    sync = cloud.BackgroundSync(on_error=errors.append)
+    for _ in range(3):
+        assert sync.submit("sid", {"x": 1}, wait=True).wait(2)
+    assert len(errors) == 2 and "network" in errors[1]
+
+
+def test_bug_custom_provider_key_escapes_scrubbing(monkeypatch):
+    """A custom provider's key (from pulse_config.json, or an env var whose name has no
+    KEY/TOKEN in it) matched no pattern, so it was never scrubbed. Setting the CLI's
+    agent_key now registers it with the scrubber."""
+    from pulse import pulse_cli as cli
+    monkeypatch.setattr(cloud, "_EXTRA_SECRETS", set())
+    key = "custom9f8e7d6c5b4a3210zz"
+    obj = cli.PulseCLI.__new__(cli.PulseCLI)
+    obj.agent_key = key
+    assert obj.agent_key == key
+    assert key not in cloud.scrub_secrets(f"auth failed for {key}")
+
+
+def test_bug_sign_up_duplicate_email_never_detected(monkeypatch):
+    """The pre-signup profiles lookup ran without a session, so under RLS it never found
+    an existing account. Supabase Auth itself signals the duplicate (a user with no
+    identities, when email confirmation is on)."""
+    monkeypatch.setattr(cloud.urllib.request, "urlopen", lambda *a, **k: _Resp(
+        {"user": {"email": "a@example.com", "identities": []}}))
+    monkeypatch.setattr(cloud, "_request", lambda *a, **k: [])
+    with pytest.raises(cloud.SupabaseError, match="already taken"):
+        cloud.sign_up("a@example.com", "password123")
+
+
+def test_bug_refreshed_session_account_is_known(monkeypatch):
+    """_auth_flow couldn't compare the account a refresh token belongs to with the cached
+    user; refresh_session now records the session's email."""
+    monkeypatch.setattr(cloud.urllib.request, "urlopen", lambda *a, **k: _Resp(
+        {"access_token": "at", "refresh_token": "rt", "user": {"email": "B@Example.com"}}))
+    assert cloud.refresh_session("rt-old") is True
+    assert cloud.session_email() == "b@example.com"
+
+
+def test_ok_cache_dir_created_private(tmp_path):
+    d = tmp_path / "newdir"
+    cloud._ensure_private_dir(d)
+    assert stat.S_IMODE(os.stat(d).st_mode) == 0o700
+
+
 # ============================================================================ ok
 
 def test_ok_encode_decode_roundtrip_and_legacy_passthrough():

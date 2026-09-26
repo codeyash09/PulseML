@@ -29,6 +29,7 @@ import shutil
 import sys
 import threading
 import time
+import unicodedata
 
 __all__ = [
     "Unavailable", "enabled", "color_enabled", "header", "rule", "ok", "warn", "fail",
@@ -62,7 +63,10 @@ def enabled():
 
 
 def color_enabled():
-    return _isatty(sys.stdout) and os.environ.get("NO_COLOR") is None
+    # no-color.org: only a non-empty NO_COLOR disables colour; a dumb terminal can't show it.
+    if os.environ.get("NO_COLOR") or os.environ.get("TERM", "").lower() == "dumb":
+        return False
+    return _isatty(sys.stdout)
 
 
 def _can_encode(text):
@@ -120,8 +124,20 @@ def _s(text, *styles):
 _ANSI_RE = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
 
 
+def _char_width(ch):
+    """Terminal columns one character takes: 2 for wide (CJK, most emoji), 0 for
+    combining marks, else 1."""
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
 def _visible_len(text):
-    return len(_ANSI_RE.sub("", text))
+    """Display width in terminal columns (ANSI-aware), not the character count."""
+    plain = _ANSI_RE.sub("", text)
+    if plain.isascii():
+        return len(plain)
+    return sum(_char_width(ch) for ch in plain)
 
 
 def _width():
@@ -150,8 +166,11 @@ def _clip(text, width):
             out.append(m.group(0))
             i = m.end()
             continue
+        w = _char_width(text[i])
+        if visible + w > width - 1:
+            break
         out.append(text[i])
-        visible += 1
+        visible += w
         i += 1
     return "".join(out) + "…" * (1 if _unicode() else 0) + (_RESET if color_enabled() else "")
 
@@ -220,10 +239,13 @@ def kv(label, value, indent=2):
 
 
 def elapsed_text(seconds):
-    if seconds < 1:
+    # Choose the unit from the value as it will be shown: 0.9996 s is "1.0s", not
+    # "1000ms", and 59.96 s is "1m 00s", not "60.0s".
+    if round(seconds * 1000) < 1000:
         return f"{seconds * 1000:.0f}ms"
-    if seconds < 60:
+    if round(seconds, 1) < 60:
         return f"{seconds:.1f}s"
+    seconds = round(seconds)
     minutes, secs = divmod(int(seconds), 60)
     return f"{minutes}m {secs:02d}s"
 

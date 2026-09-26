@@ -134,7 +134,7 @@ class TerminalResult:
         ]
         if self.launch_error:
             lines.append(f"Could not start: {self.launch_error}")
-            return "\n".join(lines)
+            return _scrub("\n".join(lines))
         lines.append(f"Exit code: {self.exit_code if self.exit_code is not None else '(none -- see below)'}")
         lines.append(f"Timed out: {'true' if self.timed_out else 'false'}")
         lines.append(f"Duration: {self.duration:.2f}s")
@@ -148,7 +148,17 @@ class TerminalResult:
                 "terminated. Output above is whatever it had produced up to that point. Treat this "
                 "as \"did not complete\", not as success or failure of the command itself."
             )
-        return "\n".join(lines)
+        return _scrub("\n".join(lines))
+
+
+def _scrub(text: str) -> str:
+    """Redact API keys/tokens from what goes back to the model (and from there to logs):
+    the command itself stays unrestricted, only its reported output is scrubbed."""
+    try:
+        from pulse.pulse_supabase import scrub_secrets
+        return scrub_secrets(text)
+    except Exception:
+        return text
 
 
 # ---------------------------------------------------------------------------------------

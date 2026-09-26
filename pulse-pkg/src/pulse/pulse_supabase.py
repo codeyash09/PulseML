@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import platform
@@ -89,6 +90,7 @@ except ValueError:
 
 _SECRET_PATTERNS = [
     re.compile(r"sk-ant-[A-Za-z0-9\-_]{10,}"),          # Anthropic
+    re.compile(r"sk-or-v1-[A-Za-z0-9]{20,}"),            # OpenRouter
     re.compile(r"sk-(?!ant-)[A-Za-z0-9]{20,}"),          # OpenAI-style
     re.compile(r"sk-proj-[A-Za-z0-9\-_]{10,}"),          # OpenAI project keys
     re.compile(r"AIza[0-9A-Za-z\-_]{20,}"),              # Gemini/Google
@@ -97,8 +99,21 @@ _SECRET_PATTERNS = [
     re.compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}"),        # Slack tokens
     re.compile(r"ghp_[A-Za-z0-9]{20,}"),                 # GitHub PAT
     re.compile(r"(?i)bearer\s+[A-Za-z0-9\-_.=]{10,}"),
-    re.compile(r"(?i)(api[_-]?key|api[_-]?secret|access[_-]?token|password)\s*[:=]\s*['\"]?[A-Za-z0-9\-_./+=]{8,}['\"]?"),
+    # `api_key=...`, and also JSON/dict reprs (`"api_key": "..."`), where a
+    # closing quote sits between the name and the colon.
+    re.compile(r"(?i)(api[_-]?key|api[_-]?secret|access[_-]?token|password)['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9\-_./+=]{8,}['\"]?"),
 ]
+
+# Literal secret values this process knows about but that don't match a
+# vendor pattern or live in a *_API_KEY-style env var (e.g. a custom
+# provider's key read from a config file) -- see register_secret.
+_EXTRA_SECRETS: set = set()
+
+
+def register_secret(value: Optional[str]) -> None:
+    """Make scrub_secrets redact this literal value from now on."""
+    if isinstance(value, str) and len(value.strip()) >= 8:
+        _EXTRA_SECRETS.add(value.strip())
 
 
 def scrub_secrets(text: Optional[str]) -> Optional[str]:
@@ -117,6 +132,9 @@ def scrub_secrets(text: Optional[str]) -> Optional[str]:
             continue
         if re.search(r"(?i)(api[_-]?key|token|secret|password)", env_name) and env_val in scrubbed:
             scrubbed = scrubbed.replace(env_val, "[REDACTED_SECRET]")
+    for value in list(_EXTRA_SECRETS):
+        if value in scrubbed:
+            scrubbed = scrubbed.replace(value, "[REDACTED_SECRET]")
     return scrubbed
 
 
@@ -158,11 +176,29 @@ def encode_entry(obj: Any) -> str:
     scrub individually."""
     try:
         obj = scrub_secrets_deep(obj)
-        raw = json.dumps(obj, separators=(",", ":"), default=str).encode("utf-8")
-        comp = zlib.compress(raw, level=9)
+        try:
+            raw = json.dumps(obj, separators=(",", ":"), default=str)
+        except (TypeError, ValueError):
+            # Non-string dict keys (a tuple-keyed confusion matrix, ...):
+            # default= never applies to keys, so stringify them.
+            raw = json.dumps(_string_keys(obj), separators=(",", ":"), default=str)
+        comp = zlib.compress(raw.encode("utf-8"), level=9)
         return _CODEC_PREFIX + base64.b64encode(comp).decode("ascii")
     except Exception:
-        return obj if isinstance(obj, str) else json.dumps(obj, default=str)
+        if isinstance(obj, str):
+            return obj
+        try:
+            return scrub_secrets(repr(obj))
+        except Exception:
+            return "<unencodable entry>"
+
+
+def _string_keys(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {(k if isinstance(k, str) else str(k)): _string_keys(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_string_keys(v) for v in obj]
+    return obj
 
 
 def decode_entry(value: Any) -> Any:
@@ -189,6 +225,14 @@ def decode_entries(values: Optional[List[Any]]) -> List[Any]:
 
 class SupabaseError(Exception):
     pass
+
+
+# Everything a urllib call can raise besides HTTPError/URLError: a read
+# timeout (TimeoutError), a dropped connection (ConnectionResetError,
+# http.client.RemoteDisconnected), a non-JSON body from a captive portal
+# (JSONDecodeError), undecodable bytes (UnicodeDecodeError). OSError and
+# ValueError cover all but http.client's own exceptions.
+_NETWORK_ERRORS = (OSError, ValueError, http.client.HTTPException)
 
 
 class SupabaseEmailConfirmationRequired(SupabaseError):
@@ -218,6 +262,7 @@ class SupabaseEmailConfirmationRequired(SupabaseError):
 # ----------------------------------------------------------------------------
 _ACCESS_TOKEN: Optional[str] = None
 _REFRESH_TOKEN: Optional[str] = None
+_SESSION_EMAIL: Optional[str] = None
 
 
 def set_session(access_token: Optional[str], refresh_token: Optional[str] = None) -> None:
@@ -234,9 +279,10 @@ def clear_session() -> None:
     """Drop back to the anon key for all requests (e.g. on logout/account
     deletion). Does not revoke the refresh token server-side -- see
     revoke_session_token for the app-level equivalent of that."""
-    global _ACCESS_TOKEN, _REFRESH_TOKEN
+    global _ACCESS_TOKEN, _REFRESH_TOKEN, _SESSION_EMAIL
     _ACCESS_TOKEN = None
     _REFRESH_TOKEN = None
+    _SESSION_EMAIL = None
 
 
 def has_active_session() -> bool:
@@ -269,12 +315,21 @@ def refresh_session(refresh_token: Optional[str]) -> bool:
         req = urllib.request.Request(url, data=data, method="POST", headers=_headers())
         with urllib.request.urlopen(req, timeout=_TIMEOUT_INTERACTIVE) as resp:
             auth_response = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.HTTPError, urllib.error.URLError):
+    except Exception:
         return False
-    if not auth_response or "access_token" not in auth_response:
+    if not isinstance(auth_response, dict) or "access_token" not in auth_response:
         return False
     set_session(auth_response.get("access_token"), auth_response.get("refresh_token"))
+    global _SESSION_EMAIL
+    user = auth_response.get("user")
+    _SESSION_EMAIL = (user.get("email") or "").strip().lower() or None if isinstance(user, dict) else None
     return True
+
+
+def session_email() -> Optional[str]:
+    """Email of the account the last refresh_session() authenticated as
+    (lower-cased), or None if the server didn't say."""
+    return _SESSION_EMAIL
 
 
 def _headers(prefer: Optional[str] = None) -> Dict[str, str]:
@@ -325,8 +380,8 @@ def _request(
         raise SupabaseError(f"{method} {path} -> HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise SupabaseError(f"{method} {path} -> network error: {exc.reason}") from exc
-    except (json.JSONDecodeError, TimeoutError) as exc:
-        raise SupabaseError(f"{method} {path} -> {exc}") from exc
+    except _NETWORK_ERRORS as exc:
+        raise SupabaseError(f"{method} {path} -> network error: {type(exc).__name__}: {exc}") from exc
 
 
 # ----------------------------------------------------------------------------
@@ -423,9 +478,10 @@ def verify_session_token(user_id: str, token: Optional[str]) -> Optional[bool]:
     doesn't (cached login should NOT be trusted -- force a fresh login),
     or None if this deployment doesn't support session tokens at all
     (caller should fall back to the old TTL-only trust model rather than
-    treating None as a mismatch)."""
-    if not token:
-        return None
+    treating None as a mismatch).
+
+    Always asks the server, even without a local token: a credentials.json
+    with no token for an account that HAS one on file is not trusted."""
     try:
         rows = _request(
             "GET", "profiles",
@@ -440,6 +496,8 @@ def verify_session_token(user_id: str, token: Optional[str]) -> Optional[bool]:
     stored_hash = rows[0].get("session_token_hash")
     if not stored_hash:
         return None  # column exists but no token attached yet (e.g. pre-upgrade account)
+    if not token:
+        return False  # the account has a token on file, this cache doesn't
     return hmac.compare_digest(_hash_session_token(token), stored_hash)
 
 
@@ -474,14 +532,16 @@ def load_cached_credentials() -> Optional[Dict[str, str]]:
         data = json.loads(CACHE_PATH.read_text())
         if not (data.get("user_id") and data.get("email")):
             return None
-        cached_at = data.get("cached_at")
-        if cached_at and SESSION_TTL_DAYS > 0:
+        if SESSION_TTL_DAYS > 0:
+            # A missing/unreadable timestamp, or one in the future (beyond a
+            # few minutes of clock adjustment), can't prove the cache is
+            # fresh: treat it as expired.
             try:
-                age_days = (time.time() - float(cached_at)) / 86400.0
-                if age_days > SESSION_TTL_DAYS:
-                    return None  # expired -- caller falls through to a fresh login
+                age_days = (time.time() - float(data.get("cached_at"))) / 86400.0
             except (TypeError, ValueError):
-                pass
+                return None
+            if age_days != age_days or age_days > SESSION_TTL_DAYS or age_days < -300 / 86400.0:
+                return None  # expired -- caller falls through to a fresh login
         return data
     except Exception:
         pass
@@ -496,7 +556,7 @@ def save_cached_credentials(
     refresh_token: Optional[str] = None,
 ) -> None:
     try:
-        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_private_dir(CACHE_PATH.parent)
         payload = {"user_id": user_id, "email": email, "team_id": team_id, "cached_at": time.time()}
         # refresh_token defaults to the current in-memory session's if the
         # caller didn't pass one explicitly -- covers call sites that just
@@ -513,19 +573,49 @@ def save_cached_credentials(
             if CACHE_PATH.exists():
                 try:
                     existing = json.loads(CACHE_PATH.read_text())
+                    if existing.get("user_id") != user_id:
+                        existing = {}  # another account's tokens never carry over
                     if not session_token and existing.get("session_token"):
                         payload["session_token"] = existing["session_token"]
                     if not refresh_token and existing.get("refresh_token"):
                         payload["refresh_token"] = existing["refresh_token"]
                 except Exception:
                     pass
-        CACHE_PATH.write_text(json.dumps(payload, indent=2))
-        try:
-            os.chmod(CACHE_PATH, 0o600)  # never store even a hash for anyone else to read
-        except OSError:
-            pass
+        # Created 0600 from the start (never store even a hash for anyone
+        # else to read) and swapped in atomically.
+        _write_private(CACHE_PATH, json.dumps(payload, indent=2))
     except Exception:
         pass  # local caching is a convenience, never a hard requirement
+
+
+def _ensure_private_dir(path: Path) -> None:
+    """Create the cache dir 0700; tighten Pulse's own default ~/.pulse if an
+    older version left it world-readable (a user-chosen PULSE_CACHE_DIR is
+    left as the user set it)."""
+    existed = path.exists()
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not existed or path == Path.home() / ".pulse":
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Write `text` to `path` readable by the owner only: the data goes into
+    a temp file created 0600 in the same dir, then os.replace()s the old one."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(str(tmp), str(path))
+    except Exception:
+        try:
+            os.unlink(str(tmp))
+        except OSError:
+            pass
+        raise
 
 
 def clear_cached_credentials() -> None:
@@ -568,12 +658,8 @@ def save_cached_profile(**fields: Any) -> None:
     try:
         current = load_cached_profile()
         current.update({k: v for k, v in fields.items() if v is not None})
-        PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        PROFILE_PATH.write_text(json.dumps(current, indent=2))
-        try:
-            os.chmod(PROFILE_PATH, 0o600)
-        except OSError:
-            pass
+        _ensure_private_dir(PROFILE_PATH.parent)
+        _write_private(PROFILE_PATH, json.dumps(current, indent=2))
     except Exception:
         pass  # local caching is a convenience, never a hard requirement
 
@@ -596,6 +682,7 @@ def telemetry_enabled() -> bool:
 
 def find_user_by_email(email: str) -> Optional[Dict[str, Any]]:
     """Fetch user profile by email from the profiles table."""
+    email = _normalize_email(email)
     if not is_valid_email(email):
         return None
     rows = _request(
@@ -607,18 +694,29 @@ def find_user_by_email(email: str) -> Optional[Dict[str, Any]]:
 
 _DEFAULT_PERSONAL_PLAN = "free"
 
+
+def _normalize_email(email: Any) -> str:
+    # Supabase Auth stores emails lower-cased (and the signup trigger copies
+    # that into profiles), so a lookup with the email as typed would miss.
+    return (email or "").strip().lower() if isinstance(email, str) else ""
+
+
 def sign_up(email: str, password: str, plan: Optional[str] = None) -> Dict[str, Any]:
     """Sign up a new user via Supabase Auth. Email is generated from email.
     The profile is automatically created by the Supabase trigger.
-    Returns the user profile from the profiles table."""
+    Returns the user profile from the profiles table.
+
+    Duplicate emails are detected by Supabase Auth itself, not by a
+    profiles lookup beforehand: before signing up there is no session, so
+    under RLS that lookup always came back empty (and without RLS it would
+    let anyone probe which emails have accounts)."""
+    email = _normalize_email(email)
     if not is_valid_email(email):
         raise SupabaseError(
             "Enter a valid email address (min. 8 characters), e.g. name@example.com."
         )
     if len(password) < 8:
         raise SupabaseError("Password must be at least 8 characters.")
-    if find_user_by_email(email):
-        raise SupabaseError(f"Email '{email}' is already taken.")
     
     # Store the original email input, then map it to the placeholder format
     original_email = email
@@ -638,11 +736,22 @@ def sign_up(email: str, password: str, plan: Optional[str] = None) -> Dict[str, 
             auth_response = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
+        if exc.code in (400, 422) and ("already" in detail.lower() or "user_already_exists" in detail):
+            raise SupabaseError(f"Email '{email}' is already taken.") from exc
         raise SupabaseError(f"POST /auth/v1/signup -> HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise SupabaseError(f"POST /auth/v1/signup -> network error: {exc.reason}") from exc
+    except _NETWORK_ERRORS as exc:
+        raise SupabaseError(f"POST /auth/v1/signup -> network error: {type(exc).__name__}: {exc}") from exc
     
-    if not auth_response or "user" not in auth_response:
+    if not isinstance(auth_response, dict):
+        raise SupabaseError("Sign up succeeded but no user was returned.")
+    user = auth_response.get("user", auth_response)
+    if isinstance(user, dict) and user.get("identities") == []:
+        # With email confirmation on, Supabase answers a signup for an
+        # existing address with a user that has no identities.
+        raise SupabaseError(f"Email '{email}' is already taken.")
+    if "user" not in auth_response:
         raise SupabaseError("Sign up succeeded but no user was returned.")
     
     access_token = auth_response.get("access_token")
@@ -696,6 +805,7 @@ def log_in(email: str, password: str) -> Dict[str, Any]:
     regardless of the password. It's looked up by email rather than by
     matching the auth id to profiles.id because this deployment's signup
     trigger doesn't guarantee those two ids are the same value."""
+    email = _normalize_email(email)
     if not is_valid_email(email):
         raise SupabaseError("Invalid email or password.")  # Don't leak format rules
 
@@ -710,8 +820,10 @@ def log_in(email: str, password: str) -> Dict[str, Any]:
             auth_response = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.HTTPError, urllib.error.URLError):
         raise SupabaseError("Invalid email or password.")
+    except _NETWORK_ERRORS as exc:
+        raise SupabaseError(f"POST /auth/v1/token -> network error: {type(exc).__name__}: {exc}") from exc
 
-    if not auth_response or "user" not in auth_response or "access_token" not in auth_response:
+    if not isinstance(auth_response, dict) or "user" not in auth_response or "access_token" not in auth_response:
         raise SupabaseError("Invalid email or password.")
 
     # Authenticate every subsequent request in this process (starting with
@@ -763,23 +875,20 @@ def change_password(user_id: str, current_password: str, new_password: str) -> N
             _ = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.HTTPError, urllib.error.URLError):
         raise SupabaseError("Current password is incorrect.")
+    except _NETWORK_ERRORS as exc:
+        raise SupabaseError(f"POST /auth/v1/token -> network error: {type(exc).__name__}: {exc}") from exc
     
     # Update password in Auth (requires an access token, which we don't have in this context)
     # For CLI usage, you may need to use the Admin API endpoint instead:
     # PATCH /auth/v1/admin/users/{id} with the admin JWT, or implement password reset via email
-    # For now, raise an error noting this limitation
-    try:
-        # Attempt to update via admin API if we had access
-        # This is a limitation of the current architecture
-        raise SupabaseError(
-            "Password change requires an authenticated session. "
-            "Implement this via email verification link or admin API with proper JWT."
-        )
-    except SupabaseError:
-        raise
-    finally:
-        # Revoke all session tokens
-        revoke_session_token(user_id)
+    # For now, raise an error noting this limitation. Session tokens are
+    # only revoked (revoke_session_token) once a password has actually been
+    # changed -- revoking here would log every device out while nothing
+    # changed.
+    raise SupabaseError(
+        "Password change requires an authenticated session. "
+        "Implement this via email verification link or admin API with proper JWT."
+    )
 
 
 def fetch_user_with_password(user_id: str) -> Optional[Dict[str, Any]]:
@@ -841,6 +950,7 @@ def recover_account(email: str, recovery_code: str, new_password: str) -> Option
     """Reset `email`'s password using a previously-issued recovery code.
     Requires implementation of Auth API password reset or admin endpoint.
     Single-use: a new recovery code is generated after a successful recovery."""
+    email = _normalize_email(email)
     if not is_valid_email(email):
         raise SupabaseError("Invalid email or recovery code.")
     if len(new_password) < 8:
@@ -957,6 +1067,8 @@ def delete_account(user_id: str, password: str) -> None:
             _ = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.HTTPError, urllib.error.URLError):
         raise SupabaseError("Password is incorrect.")
+    except _NETWORK_ERRORS as exc:
+        raise SupabaseError(f"POST /auth/v1/token -> network error: {type(exc).__name__}: {exc}") from exc
 
     # Remove user from all teams
     for team in find_teams_for_user(user_id):
@@ -972,13 +1084,9 @@ def delete_account(user_id: str, password: str) -> None:
         except SupabaseError:
             pass  # best-effort -- still proceed to delete the account below
 
-    # Delete profile (profile->auth.users cascade will handle auth deletion)
-    try:
-        _request("DELETE", "profiles", params={"id": f"eq.{user_id}"}, prefer="return=minimal")
-    except SupabaseError:
-        # If profile delete fails, try to delete the auth user directly via admin API
-        # This requires proper JWT admin token setup
-        pass
+    # Delete the profile. A failure is raised, not swallowed: the caller
+    # must not report the account as deleted while it still exists.
+    _request("DELETE", "profiles", params={"id": f"eq.{user_id}"}, prefer="return=minimal")
 
 
 def fetch_user(user_id: str) -> Optional[Dict[str, Any]]:
@@ -1005,9 +1113,24 @@ def git_remote_url(cwd: Optional[str] = None) -> Optional[str]:
             ["git", "remote", "get-url", "origin"],
             capture_output=True, text=True, timeout=3, cwd=cwd,
         )
-        return out.stdout.strip() or None if out.returncode == 0 else None
+        return strip_url_credentials(out.stdout.strip()) or None if out.returncode == 0 else None
     except Exception:
         return None
+
+
+def strip_url_credentials(url: Optional[str]) -> Optional[str]:
+    """`https://user:token@host/path` -> `https://host/path`. HTTPS remotes
+    often embed a token; the team repo URL is uploaded and shown to every
+    teammate. scp-style `git@host:path` has no secret and is left alone."""
+    if not url or "://" not in url:
+        return url
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if "@" not in parts.netloc:
+            return url
+        return urllib.parse.urlunsplit(parts._replace(netloc=parts.netloc.rsplit("@", 1)[1]))
+    except Exception:
+        return url
 
 
 _TEAM_SELECT = "team_id,members,admin_ids,join_code,plan,owner_id,repo,name"
@@ -1080,7 +1203,7 @@ def create_team(
         "join_code": _generate_join_code(),
         "plan": plan or _DEFAULT_PERSONAL_PLAN,
         "owner_id": owner_id,
-        "repo": repo or git_remote_url(cwd) or "unknown",
+        "repo": strip_url_credentials(repo) or git_remote_url(cwd) or "unknown",
     }
     clean_name = (name or "").strip()
     if clean_name:
@@ -1126,7 +1249,7 @@ def update_team_repo(team_id: str, repo: str) -> None:
     _request(
         "PATCH", "Teams",
         params={"team_id": f"eq.{team_id}"},
-        body={"repo": repo, "updated_at": datetime.now(timezone.utc).isoformat()},
+        body={"repo": strip_url_credentials(repo), "updated_at": datetime.now(timezone.utc).isoformat()},
         prefer="return=minimal",
     )
 
@@ -1206,6 +1329,10 @@ def remove_team_admin(team_id: str, user_id: str) -> Dict[str, Any]:
         raise SupabaseError(f"No team found with id '{team_id}'.")
 
     admin_ids = [uid for uid in (team.get("admin_ids") or []) if uid != user_id]
+    if not admin_ids and (team.get("admin_ids") or []):
+        raise SupabaseError(
+            "Can't remove the workspace's last admin -- make someone else an admin first."
+        )
     _request(
         "PATCH", "Teams",
         params={"team_id": f"eq.{team_id}"},
@@ -1234,6 +1361,11 @@ def leave_team(team_id: str, user_id: str) -> None:
 
     members = [uid for uid in (team.get("members") or []) if uid != user_id]
     admin_ids = [uid for uid in (team.get("admin_ids") or []) if uid != user_id]
+    if members and not admin_ids and (team.get("admin_ids") or []):
+        raise SupabaseError(
+            "You're the workspace's last admin -- make someone else an admin before leaving "
+            "(or delete the workspace)."
+        )
     _request(
         "PATCH", "Teams",
         params={"team_id": f"eq.{team_id}"},
@@ -1326,19 +1458,25 @@ def fetch_recent_sessions(
         return []
     params["order"] = "created_at.desc"
     params["limit"] = str(max_rows)
+    # Only an unknown-column error moves on to the next, older select list;
+    # anything else (offline, timeout, 5xx) is raised at once instead of
+    # being retried three more times.
     for select in (_SESSION_SELECT, _SESSION_SELECT_LEGACY):
         try:
             params["select"] = select
             return _request("GET", "Debug_Sessions", params=params, timeout=_TIMEOUT_INTERACTIVE) or []
-        except SupabaseError:
-            continue
+        except SupabaseError as exc:
+            if not _is_unknown_column_error(exc):
+                raise
     # Last resort: no created_at either (caller sorts client-side by the
     # `t` timestamps stamped into agent_logs/telemetry instead).
     params.pop("order", None)
     params["select"] = _SESSION_SELECT_NO_CREATED_AT
     try:
         return _request("GET", "Debug_Sessions", params=params, timeout=_TIMEOUT_INTERACTIVE) or []
-    except SupabaseError:
+    except SupabaseError as exc:
+        if not _is_unknown_column_error(exc):
+            raise
         params["select"] = "id,git_commit_sha,agent_logs,error_tracebacks,telemetry"
         return _request("GET", "Debug_Sessions", params=params, timeout=_TIMEOUT_INTERACTIVE) or []
 
@@ -1359,20 +1497,23 @@ def fetch_debug_session(session_id: str) -> Optional[Dict[str, Any]]:
     just the handful of entries logged since. Falls back to the legacy
     select list for deployments that don't have the incidents/uptime/
     downtime columns yet.
+
+    Returns None only when there is no such row; a failed fetch raises
+    SupabaseError, so the caller can tell "nothing saved yet" apart from
+    "couldn't load it" (and must not overwrite the history in that case).
     """
     try:
         rows = _request(
             "GET", "Debug_Sessions",
             params={"id": f"eq.{session_id}", "select": _SESSION_SELECT},
         )
-    except SupabaseError:
-        try:
-            rows = _request(
-                "GET", "Debug_Sessions",
-                params={"id": f"eq.{session_id}", "select": _SESSION_SELECT_LEGACY},
-            )
-        except SupabaseError:
-            return None
+    except SupabaseError as exc:
+        if not _is_unknown_column_error(exc):
+            raise
+        rows = _request(
+            "GET", "Debug_Sessions",
+            params={"id": f"eq.{session_id}", "select": _SESSION_SELECT_LEGACY},
+        )
     if not rows:
         return None
     return rows[0]
@@ -1552,12 +1693,13 @@ class BackgroundSync:
     """Runs Debug_Sessions PATCHes on a single daemon thread so agent-log,
     traceback, and telemetry syncing never blocks the training loop or the
     interactive prompt on network latency. Best-effort: failures are
-    reported at most once per kind, then swallowed."""
+    reported at most once per kind, then swallowed -- whatever they are, so
+    one dropped connection never kills the thread."""
 
     def __init__(self, on_error=None):
         self._q: "queue.Queue" = queue.Queue()
         self._on_error = on_error
-        self._warned = False
+        self._warned_kinds: set = set()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -1572,10 +1714,27 @@ class BackgroundSync:
             try:
                 if fields:
                     patch_debug_session(session_id, fields)
-            except SupabaseError as exc:
-                if not self._warned and self._on_error:
-                    self._warned = True
-                    self._on_error(str(exc))
+            except Exception as exc:
+                kind = _error_kind(exc)
+                if kind not in self._warned_kinds:
+                    self._warned_kinds.add(kind)
+                    if self._on_error:
+                        try:
+                            self._on_error(str(exc))
+                        except Exception:
+                            pass
             finally:
                 if done is not None:
                     done.set()
+
+
+def _error_kind(exc: BaseException) -> str:
+    """Bucket for BackgroundSync's report-once logic: the HTTP status for a
+    server error, 'network' for a connection problem, else the type."""
+    msg = str(exc)
+    m = re.search(r"HTTP (\d{3})", msg)
+    if m:
+        return f"http-{m.group(1)}"
+    if "network error" in msg or isinstance(exc, _NETWORK_ERRORS):
+        return "network"
+    return type(exc).__name__

@@ -27,6 +27,7 @@ fpdf.
 from __future__ import annotations
 
 import os
+import re
 import time
 import tempfile
 
@@ -113,6 +114,26 @@ def _render_heatmap_png(arr2d, path, var_name, step):
 # public entry point
 # ----------------------------------------------------------------------
 
+def _safe_dir_name(name):
+    """One path component: no separators, no '..', nothing absolute -- a dict key
+    such as '../x' or 'train/loss' must stay inside output_dir."""
+    return re.sub(r"[^\w.-]", "_", str(name)).strip(".") or "_"
+
+
+def _latin1(text):
+    """The core PDF fonts only cover latin-1: θ, α, λ become '?' instead of crashing."""
+    return str(text).encode("latin-1", "replace").decode("latin-1")
+
+
+def _step_label(step):
+    try:
+        if float(step).is_integer():
+            return f"{int(step):06d}"
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return _safe_dir_name(step)
+
+
 def generate_heatmap_pdf(var_name, value, step, output_dir="Pulse_Output"):
     """Render `value` (any Pulse-trackable array/tensor, any backend) as a
     labeled heatmap and save it as a one-page PDF at:
@@ -121,7 +142,7 @@ def generate_heatmap_pdf(var_name, value, step, output_dir="Pulse_Output"):
 
     Returns the path to the saved PDF.
     """
-    var_dir = os.path.join(output_dir, var_name)
+    var_dir = os.path.join(output_dir, _safe_dir_name(var_name))
     os.makedirs(var_dir, exist_ok=True)
 
     arr = to_numpy(value)
@@ -149,7 +170,7 @@ def generate_heatmap_pdf(var_name, value, step, output_dir="Pulse_Output"):
 
         pdf.set_text_color(152, 152, 159)
         pdf.set_font("Helvetica", "", 11)
-        pdf.cell(0, 7, f"{var_name}  -  step {step}", ln=1)
+        pdf.cell(0, 7, _latin1(f"{var_name}  -  step {step}"), ln=1)
         pdf.cell(0, 6, time.strftime("%Y-%m-%d %H:%M:%S"), ln=1)
         pdf.ln(4)
 
@@ -174,7 +195,7 @@ def generate_heatmap_pdf(var_name, value, step, output_dir="Pulse_Output"):
         ]
         for label, val in rows:
             formatted = f"{val:.6g}" if isinstance(val, float) else str(val)
-            pdf.cell(0, 6, f"{label:<8} {formatted}", ln=1)
+            pdf.cell(0, 6, _latin1(f"{label:<8} {formatted}"), ln=1)
 
         if stats.get("nan") or stats.get("inf"):
             pdf.set_text_color(255, 77, 77)
@@ -185,7 +206,7 @@ def generate_heatmap_pdf(var_name, value, step, output_dir="Pulse_Output"):
         img_w = pdf.w - 20
         pdf.image(tmp_png, x=10, w=img_w)
 
-        out_path = os.path.join(var_dir, f"step{step:06d}.pdf")
+        out_path = os.path.join(var_dir, f"step{_step_label(step)}.pdf")
         pdf.output(out_path)
     finally:
         try:
