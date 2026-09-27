@@ -13938,7 +13938,6 @@ class PulseCLI:
         """
         locals_map = getattr(self, "watch_locals", None) or {}
         last_seen = self._loop_var_last_seen
-        strides = self.__dict__.setdefault("_loop_var_strides", {})
         for name in self._LOOP_VAR_CANDIDATES:
             if name not in locals_map:
                 continue
@@ -13950,20 +13949,87 @@ class PulseCLI:
             if prev is None:
                 continue  # first sighting -- nothing to diff against yet, try the next candidate
             delta = raw - prev
-            if delta > self._LOOP_VAR_MAX_STEP_JUMP:
-                continue  # implausible jump for one tick -- probably not a step counter after all
             if delta > 0:
-                stride = strides[name] = math.gcd(strides.get(name, 0), delta)
+                stride = self._loop_var_stride(name, prev, raw, locals_map)
+                # The jump limit applies to the raw advance unless the source says this loop
+                # moves by `stride` per iteration (a stride guessed from the values alone
+                # would turn any huge jump from 0 into "one step").
+                if (delta // stride if self._loop_var_stride_is_known(name) else delta) \
+                        > self._LOOP_VAR_MAX_STEP_JUMP:
+                    continue  # implausible jump for one tick -- probably not a step counter after all
                 delta //= stride
             elif delta < 0:
                 # wrapped: iterations 0..raw of the loop's next pass ran
-                delta = raw // (strides.get(name) or 1) + 1
+                delta = raw // self._loop_var_stride(name, prev, raw, locals_map) + 1
                 if delta > self._LOOP_VAR_MAX_STEP_JUMP:
                     continue
             if delta == 0 and name in self._COARSE_LOOP_VARS:
                 return None  # an epoch counter standing still is no evidence either way
             return delta  # first (finest-grained) match wins, including a confident 0
         return None
+
+    def _loop_var_stride(self, name: str, prev: int, raw: int, locals_map) -> int:
+        """How far loop counter `name` moves per iteration.
+
+        From the source when Pulse has it: `for name in range(a, b, step)` gives the step (a
+        literal, or an int variable such as batch_size read from the locals), and a plain
+        `range(n)` / `range(a, b)` means 1. That is exact however update() happens to sample
+        the counter -- a guess from sampled values is not: update() can run at a perfectly
+        regular period (every 52 iterations, say), and every advance then shares that factor.
+
+        Without a usable source: the stride must divide every value the counter has taken,
+        not only its advances. `range(0, n, 32)` visits multiples of 32; a plain counter
+        sampled at a regular period almost never lands only on multiples of its period."""
+        known = self.__dict__.setdefault("_loop_var_source_strides", {})
+        if name not in known:
+            known[name] = self._loop_var_stride_from_source(name)
+        spec = known[name]
+        if isinstance(spec, int):
+            return max(1, spec)
+        if isinstance(spec, str):          # range(a, b, some_variable)
+            value = locals_map.get(spec)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+        strides = self.__dict__.setdefault("_loop_var_strides", {})
+        stride = math.gcd(strides.get(name, 0), math.gcd(abs(prev), abs(raw)))
+        strides[name] = stride
+        return max(1, stride)
+
+    def _loop_var_stride_is_known(self, name: str) -> bool:
+        spec = self.__dict__.get("_loop_var_source_strides", {}).get(name)
+        return isinstance(spec, (int, str))
+
+    def _loop_var_stride_from_source(self, name: str):
+        """int stride, a variable name holding it, or None when the source doesn't say
+        (no source, no `for name in range(...)`, or loops that disagree)."""
+        texts = [getattr(self, "code_text", None)] + list((getattr(self, "extra_files", None) or {}).values())
+        found = set()
+        for text in texts:
+            if not isinstance(text, str):
+                continue
+            try:
+                tree = ast.parse(text)
+            except (SyntaxError, ValueError):
+                continue
+            for node in ast.walk(tree):
+                if not (isinstance(node, (ast.For, ast.AsyncFor)) and isinstance(node.target, ast.Name)
+                        and node.target.id == name):
+                    continue
+                it = node.iter
+                if not (isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range"
+                        and not it.keywords and 1 <= len(it.args) <= 3):
+                    return None   # enumerate(loader) etc.: the source doesn't pin the stride
+                if len(it.args) < 3:
+                    found.add(1)
+                    continue
+                step = it.args[2]
+                if isinstance(step, ast.Constant) and isinstance(step.value, int) and step.value > 0:
+                    found.add(step.value)
+                elif isinstance(step, ast.Name):
+                    found.add(step.id)
+                else:
+                    return None
+        return found.pop() if len(found) == 1 else None
 
     def update(self, step: Optional[int] = None,
             generate_pdfs: Optional[bool] = None) -> None:

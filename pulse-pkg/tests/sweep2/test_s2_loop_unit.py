@@ -612,3 +612,45 @@ def test_ok_restart_child_that_leaves_a_grandchild_holding_the_pipe_returns(make
         devnull.close()
     assert result.returncode == 0 and "done" in result.stdout
     assert took < 15, f"took {took:.1f}s"
+
+
+def test_ok_plain_counter_sampled_at_a_regular_period_is_not_a_stride(make_cli):
+    """update() can run at a perfectly regular period (every 52 iterations here). A stride
+    guessed from the advances alone then becomes 52 and each tick counts as one step. With
+    the source, `for step in range(400)` pins the stride at 1."""
+    watch = {"step": 12}
+    cli = make_cli(watch)
+    cli.code_text = "for step in range(400):\n    pass\n"
+    cli.update()
+    base = cli.step
+    for v in range(64, 400, 52):
+        watch["step"] = v
+        cli.update()
+    assert cli.step - base >= 300, f"6 ticks of 52 iterations counted as {cli.step - base} steps"
+
+
+def test_ok_plain_counter_at_a_regular_period_without_source(make_cli):
+    """No source: a counter first seen at 12 and then every 52 iterations is not all
+    multiples of 52, so it is not taken as a stride-52 loop (which would count 7 steps).
+    Values alone can't pin the stride exactly (12 and 64 share a factor 4); the source
+    path above is the exact one."""
+    watch = {"step": 12}
+    cli = make_cli(watch)
+    cli.update()
+    base = cli.step
+    for v in range(64, 400, 52):
+        watch["step"] = v
+        cli.update()
+    assert cli.step - base >= 60
+
+
+def test_ok_strided_counter_from_source_with_a_batch_size_variable(make_cli):
+    watch = {"i": 0, "batch_size": 32}
+    cli = make_cli(watch)
+    cli.code_text = "for i in range(0, len(X), batch_size):\n    pass\n"
+    cli.update()
+    base = cli.step
+    for i in range(32 * 7, 32 * 70, 32 * 7):     # sampled every 7 minibatches
+        watch["i"] = i
+        cli.update()
+    assert 60 <= cli.step - base <= 72, cli.step - base
