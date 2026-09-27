@@ -994,7 +994,8 @@ def test_ok_worker_scalar_history_and_manifest(tmp_path, monkeypatch):
 def test_ok_find_fuzzy_snippet_span_unique_only():
     content = "def f():\n    a = 1\n\n    b = 2\n    return a + b\n"
     span = core._find_fuzzy_snippet_span(content, "a = 1\nb = 2")
-    assert span is not None and content[span[0]:span[1]] == "    a = 1\n\n    b = 2\n"
+    # The span stops before the last line's line break (the replacement has none of its own).
+    assert span is not None and content[span[0]:span[1]] == "    a = 1\n\n    b = 2"
     assert core._find_fuzzy_snippet_span("x = 1\nx = 1\n", "x = 1") is None
 
 
