@@ -155,3 +155,26 @@ def test_run_flag_sets_the_approver(monkeypatch):
     assert os.environ[ap.APPROVER_ENV] == "openrouter/a/b"
     entry._parse_run_args(["--approver=openrouter/c/d", "train.py"])
     assert os.environ[ap.APPROVER_ENV] == "openrouter/c/d"
+
+
+def test_no_approver_chosen_means_the_agents_own_model_answers():
+    s = ap.settings_from(None, agent_model="openrouter/deepseek/v4", agent_key="sk-agent",
+                         agent_base=None)
+    assert s.model == "openrouter/deepseek/v4" and s.api_key == "sk-agent" and s.same_as_agent
+
+
+def test_approver_off_still_asks_the_person():
+    assert ap.settings_from("off", agent_model="openrouter/deepseek/v4", agent_key="k") is None
+
+
+def test_the_default_approver_does_not_see_the_agents_reasoning(monkeypatch, tmp_path):
+    cli, seen, asked = cli_with_approver(monkeypatch, tmp_path, "APPROVE: rebuilds the cache")
+    monkeypatch.delenv(ap.APPROVER_ENV)
+    cli.agent_provider = "openrouter"
+    cli.agent_model_string = "openrouter/deepseek/v4"
+    cli.agent_key = "sk-agent"
+    cli._agent_thoughts = "SECRET-REASONING the loss is NaN because ..."
+    assert cli._confirm_terminal_command("rm -rf .cache", {"deletes_files": True}) is True
+    assert asked == [] and seen[0]["model"] == "openrouter/deepseek/v4"
+    sent = "\n".join(m["content"] for m in seen[0]["messages"])
+    assert "SECRET-REASONING" not in sent and "rm -rf .cache" in sent

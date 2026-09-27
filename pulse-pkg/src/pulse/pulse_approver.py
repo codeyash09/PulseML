@@ -66,6 +66,7 @@ class ApproverSettings:
     model: str
     api_key: Optional[str] = None
     api_base: Optional[str] = None
+    same_as_agent: bool = False      # no approver chosen: the agent's own model answers
 
 
 @dataclass
@@ -76,6 +77,10 @@ class Decision:
 
 class ApproverUnavailable(Exception):
     """The approver could not give a usable answer; the caller falls back to asking."""
+
+
+def _endpoint_or_none(base):
+    return (base or "").strip().rstrip("/") or None
 
 
 def settings_from(config_value=None, agent_model: Optional[str] = None,
@@ -97,8 +102,18 @@ def settings_from(config_value=None, agent_model: Optional[str] = None,
             api_base = api_base or (str(config_value.get("api_base") or "").strip() or None)
         else:
             model = str(config_value).strip()
-    if not model or model.lower() in ("off", "none", "no", "false", "0"):
-        return None
+    if model.lower() in ("off", "none", "no", "false", "0"):
+        return None                  # explicitly off: the person answers
+    if not model:
+        # No approver chosen: the agent's own model answers. It only ever sees the command,
+        # why it was flagged, the folder and the problem -- never the agent's reasoning --
+        # so it judges the command on its own. Same model, key and endpoint as the agent,
+        # so no key goes anywhere new.
+        if not agent_model:
+            return None
+        return ApproverSettings(model=agent_model,
+                                api_key=None if agent_key in (None, "", "local") else agent_key,
+                                api_base=_endpoint_or_none(agent_base), same_as_agent=True)
     def _endpoint(base):
         return (base or "").strip().rstrip("/") or None
     if not api_key and agent_key and agent_key != "local" and agent_model:

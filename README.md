@@ -438,23 +438,24 @@ Pulse can pause training when configured detection logic identifies serious nume
 
 ### Auto mode: no stopping to ask
 
-Some shell commands the agent wants to run need your OK first: ones that delete files,
+Some shell commands the agent wants to run need an OK first: ones that delete files,
 rewrite git state, reach outside the project, start a background process or overwrite a
-file. In an unattended run nobody is there to answer, so the run waits or the command is
-declined. Auto mode hands that y/N to a second model you choose at startup:
+file. So that a long run never stops to wait for you, a model answers that y/N. By default
+it is the agent's own model, asked separately: it sees only the command, why it was
+flagged, the project folder and what the agent was working on -- never the agent's
+reasoning -- so it judges the command on its own. To use a different model:
 
 ```bash
 pulse run --approver openrouter/anthropic/claude-sonnet-5 train.py
 ```
 
-(or `PULSE_APPROVER=<model>`, or `"approver": "<model>"` in `pulse_config.json`; an
-interactive session also offers to pick one). The same commands are flagged as before;
-only who answers changes. The approver sees the command, why it was flagged, the project
-folder and what the agent was working on, and answers APPROVE or DENY with a reason that
-goes back to the agent. It is told to deny anything that could destroy work that can't be
-regenerated, touch files outside the project, handle credentials or use sudo, and to deny
-when unsure. If it can't be reached, Pulse falls back to asking you. Every decision is
-printed, and recorded with `--agent-log`.
+(or `PULSE_APPROVER=<model>`, or `"approver": "<model>"` in `pulse_config.json`). To be
+asked yourself instead, use `--approver off` (or `"approver": "off"`). The same commands
+are flagged either way; only who answers changes. The approver answers APPROVE or DENY
+with a reason that goes back to the agent. It is told to deny anything that could destroy
+work that can't be regenerated, touch files outside the project, handle credentials or use
+sudo, and to deny when unsure. If it can't be reached, Pulse asks you (or declines, in a
+non-interactive run). Every decision is printed, and recorded with `--agent-log`.
 
 ---
 

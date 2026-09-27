@@ -8939,30 +8939,16 @@ class PulseCLI:
                                        agent_base=getattr(self, "agent_api_base", None))
 
     def _approver_setup(self) -> None:
-        """At startup: say whether auto mode is on, and in an interactive session with an
-        agent but no approver chosen yet, offer to choose one. A choice is stored in the
-        environment, so a fix-triggered restart keeps it."""
+        """At startup: say who answers the y/N for flagged shell commands. With no approver
+        chosen, the agent's own model does (it sees the command and the problem, never the
+        agent's reasoning); `--approver off` / "approver": "off" puts the person back."""
         settings = self._approver_settings()
         if settings:
-            cprint(f"[Pulse] Auto mode: {settings.model} answers the y/N for flagged shell "
-                   "commands, so the run never waits on you.", color=_YELLOW)
-            return
-        if (getattr(self, "non_interactive", False) or getattr(self, "_code_mode", False)
-                or not getattr(self, "agent_provider", None)):
-            return
-        try:
-            _flush_stdin()
-            choice = _prompt_text(
-                "Auto mode -- a model to approve risky shell commands instead of you, so a long run "
-                "never stops to ask (a model id like openrouter/anthropic/claude-sonnet-5; Enter to "
-                "keep asking me) > ",
-                label="Auto-mode approver model (Enter = ask me)").strip()
-        except (EOFError, KeyboardInterrupt):
-            return
-        if choice:
-            os.environ[_approver.APPROVER_ENV] = choice
-            cprint(f"[Pulse] Auto mode on: {choice} will answer for flagged shell commands.",
-                   color=_YELLOW)
+            who = (f"{settings.model} (the agent's own model, judging each command without "
+                   "its reasoning)" if settings.same_as_agent else settings.model)
+            cprint(f"[Pulse] Auto mode: {who} answers the y/N for flagged shell commands, so "
+                   "the run never waits on you. `--approver <model>` picks another model; "
+                   "`--approver off` asks you instead.", color=_YELLOW)
 
     # What the approver is told a periodic check-in is doing (never a stale investigation's
     # problem: _last_problem_description is not cleared after the investigation ends).
