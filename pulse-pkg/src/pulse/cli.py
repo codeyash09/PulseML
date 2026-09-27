@@ -305,14 +305,26 @@ _CHILD_BOOT = (
 )
 
 
+# (sys.argv[0] as the run set it, the directory it is relative to): a restart passes the
+# script the same way, so the restarted run's sys.argv[0] is still what was typed.
+_RUN_ARGV0 = None
+
+
 def _restart_argv(python_exe, script_path, script_args):
     # -c with an explicit path rather than `-m pulse`: the restart has to find this same
     # package whatever directory the run is in, including under --cwd, and whether Pulse
     # is installed or being run from a checkout.
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     head = ["run"] + (["--stream"] if _RUN_MODE == "stream" else [])
+    script = script_path
+    if _RUN_ARGV0 is not None:
+        typed, base = _RUN_ARGV0
+        # The restart runs in the directory the run was launched from (`base`).
+        if (typed and not os.path.isabs(typed) and os.path.isdir(base)
+                and os.path.normpath(os.path.join(base, typed)) == os.path.normpath(script_path)):
+            script = typed
     return [python_exe, "-c", _CHILD_BOOT.format(root=root, head=head),
-            script_path] + list(script_args)
+            script] + list(script_args)
 
 
 # ---------------------------------------------------------------------------------------
@@ -529,7 +541,7 @@ def run_code(paths, prompt=None, yes=False, cwd=None):
 
 def run_script(script, script_args, stream=False, cwd=None, again=False):
     """Run `script` under Pulse. Returns the exit status."""
-    global _RUN_MODE
+    global _RUN_MODE, _RUN_ARGV0
     from . import pulse_cli
 
     _RUN_MODE = "stream" if stream else "cli"
@@ -594,6 +606,7 @@ def run_script(script, script_args, stream=False, cwd=None, again=False):
     # where a relative path was typed.
     argv0 = script if (cwd is None or os.path.isabs(script)) else script_path
     _set_process_view(script_path, script_args, argv0=argv0)
+    _RUN_ARGV0 = (argv0, os.getcwd())
 
     # A run that Pulse itself restarted reports back to the process that restarted it,
     # which owns the retry loop and feeds the output to the agent. It must not start a
@@ -668,7 +681,7 @@ def main(argv=None):
         for i, a in enumerate(argv):
             if a.split("=", 1)[0] in launch_options:
                 offered.append(a)
-                if a == "--cwd" and i + 1 < len(argv):      # --cwd takes the next argument
+                if a in ("--cwd", "--approver") and i + 1 < len(argv):   # these take the next argument
                     offered.append(argv[i + 1])
                     values.add(i + 1)
         if offered:

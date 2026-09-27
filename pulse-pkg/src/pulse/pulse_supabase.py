@@ -30,6 +30,7 @@ import queue
 import re
 import secrets
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -88,21 +89,51 @@ except ValueError:
 # the first place.
 # ----------------------------------------------------------------------------
 
+# `(?<![A-Za-z0-9])` keeps a vendor prefix from matching inside an ordinary
+# word ("desk-...", "whisk-..." are not OpenAI keys).
+_NB = r"(?<![A-Za-z0-9])"
+
+# Names whose assigned value is a secret. A bare `token` only counts on its
+# own (`token=...`): `eos_token="<|endoftext|>"`, `pad_token=...` are not.
+_SECRET_NAME = (
+    r"(?:(?<![A-Za-z0-9_])[A-Za-z0-9_]*?[_-])?"
+    r"(?:api[_-]?key|api[_-]?secret|secret[_-]?access[_-]?key|secret[_-]?key|"
+    r"client[_-]?secret|(?:access|refresh|auth|api|bearer|session|hf|github|gh|oauth|slack|bot)[_-]?token|"
+    r"secret|password|passwd)"
+    r"|(?<![A-Za-z0-9_])token"
+)
+
 _SECRET_PATTERNS = [
-    re.compile(r"sk-ant-[A-Za-z0-9\-_]{10,}"),          # Anthropic
-    re.compile(r"sk-or-v1-[A-Za-z0-9]{20,}"),            # OpenRouter
-    re.compile(r"sk-(?!ant-)[A-Za-z0-9]{20,}"),          # OpenAI-style
-    re.compile(r"sk-proj-[A-Za-z0-9\-_]{10,}"),          # OpenAI project keys
-    re.compile(r"AIza[0-9A-Za-z\-_]{20,}"),              # Gemini/Google
+    re.compile(_NB + r"sk-ant-[A-Za-z0-9\-_]{10,}"),          # Anthropic
+    re.compile(_NB + r"sk-or-v1-[A-Za-z0-9]{20,}"),            # OpenRouter
+    re.compile(_NB + r"sk-(?:proj|svcacct|admin|None)-[A-Za-z0-9\-_]{10,}"),  # OpenAI project/service/admin keys
+    re.compile(_NB + r"sk-(?!ant-)[A-Za-z0-9]{20,}"),          # OpenAI-style
+    re.compile(_NB + r"AIza[0-9A-Za-z\-_]{20,}"),              # Gemini/Google
     re.compile(r"sb_(publishable|secret)_[A-Za-z0-9_\-]{10,}"),  # Supabase
-    re.compile(r"gsk_[A-Za-z0-9]{20,}"),                 # Groq
-    re.compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}"),        # Slack tokens
-    re.compile(r"ghp_[A-Za-z0-9]{20,}"),                 # GitHub PAT
+    re.compile(_NB + r"gsk_[A-Za-z0-9]{20,}"),                 # Groq
+    re.compile(_NB + r"xox[baprs]-[A-Za-z0-9\-]{10,}"),        # Slack tokens
+    re.compile(_NB + r"gh[pousr]_[A-Za-z0-9]{20,}"),           # GitHub PAT / OAuth / app tokens
+    re.compile(_NB + r"github_pat_[A-Za-z0-9_]{20,}"),         # GitHub fine-grained PAT
+    re.compile(_NB + r"hf_[A-Za-z0-9]{30,}"),                  # Hugging Face
+    re.compile(_NB + r"xai-[A-Za-z0-9]{20,}"),                 # xAI
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),              # AWS access key id
     re.compile(r"(?i)bearer\s+[A-Za-z0-9\-_.=]{10,}"),
-    # `api_key=...`, and also JSON/dict reprs (`"api_key": "..."`), where a
-    # closing quote sits between the name and the colon.
-    re.compile(r"(?i)(api[_-]?key|api[_-]?secret|access[_-]?token|password)['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9\-_./+=]{8,}['\"]?"),
+    # `api_key=...`, `SECRET_KEY = "..."`, `client_secret: ...`, and also
+    # JSON/dict reprs (`"api_key": "..."`), where a closing quote sits between
+    # the name and the colon. A quoted value may contain any character
+    # (passwords with @ ! #); an unquoted one is a run of token characters.
+    re.compile(r"(?i)(?:" + _SECRET_NAME + r")['\"]?\s*[:=]\s*"
+               r"(?:\"[^\"\n]{8,}\"|'[^'\n]{8,}'|[A-Za-z0-9\-_./+=]{8,})"),
 ]
+
+# The password in a connection URL (`postgres://user:pw@host/db`); the user
+# name and host are kept.
+_URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s@/]+@")
+
+# Environment variables whose value is a secret: the NAME ends in a secret-ish
+# word (HF_TOKEN, OPENAI_API_KEY, DB_PASSWORD, DJANGO_SECRET_KEY) -- not merely
+# contains one (TOKENIZER_NAME=bert-base-uncased is a model name).
+_SECRET_ENV_NAME = re.compile(r"(?i)(?:^|[_-])(?:api[_-]?key|key|token|secret|password|passwd|pat)$")
 
 # Literal secret values this process knows about but that don't match a
 # vendor pattern or live in a *_API_KEY-style env var (e.g. a custom
@@ -127,10 +158,11 @@ def scrub_secrets(text: Optional[str]) -> Optional[str]:
     scrubbed = text
     for pattern in _SECRET_PATTERNS:
         scrubbed = pattern.sub("[REDACTED_SECRET]", scrubbed)
+    scrubbed = _URL_USERINFO.sub(r"\1:[REDACTED_SECRET]@", scrubbed)
     for env_name, env_val in os.environ.items():
         if not env_val or len(env_val) < 8:
             continue
-        if re.search(r"(?i)(api[_-]?key|token|secret|password)", env_name) and env_val in scrubbed:
+        if _SECRET_ENV_NAME.search(env_name) and env_val in scrubbed:
             scrubbed = scrubbed.replace(env_val, "[REDACTED_SECRET]")
     for value in list(_EXTRA_SECRETS):
         if value in scrubbed:
@@ -367,21 +399,69 @@ def _request(
         url = f"{url}?{qs}"
 
     data = json.dumps(body).encode("utf-8") if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers=_headers(prefer))
 
+    for attempt in (0, 1):
+        sent_token = _ACCESS_TOKEN
+        req = urllib.request.Request(url, data=data, method=method, headers=_headers(prefer))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+                if not raw:
+                    return None
+                return json.loads(raw.decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            # The access token (a JWT, ~1 h by default) expired mid-run:
+            # refresh it once and retry this request once -- never loop.
+            if attempt == 0 and sent_token and _is_expired_jwt_error(exc.code, detail) \
+                    and _refresh_expired_session(sent_token):
+                continue
+            raise SupabaseError(f"{method} {path} -> HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise SupabaseError(f"{method} {path} -> network error: {exc.reason}") from exc
+        except _NETWORK_ERRORS as exc:
+            raise SupabaseError(f"{method} {path} -> network error: {type(exc).__name__}: {exc}") from exc
+
+
+_REFRESH_LOCK = threading.Lock()
+
+
+def _is_expired_jwt_error(code: int, detail: str) -> bool:
+    if code == 401:
+        return True
+    return code in (400, 403) and "jwt expired" in (detail or "").lower()
+
+
+def _refresh_expired_session(sent_token: str) -> bool:
+    """Swap the expired access token `sent_token` for a fresh one. Only one
+    thread refreshes (refresh tokens are single-use); a thread that waited
+    for the lock just retries with the token the other one got. Returns
+    whether a retry with a different access token is worthwhile."""
+    with _REFRESH_LOCK:
+        if _ACCESS_TOKEN and _ACCESS_TOKEN != sent_token:
+            return True  # another thread already refreshed
+        old_refresh = _REFRESH_TOKEN
+        if not old_refresh or not refresh_session(old_refresh):
+            return False
+        _persist_rotated_refresh_token(old_refresh, _REFRESH_TOKEN)
+        return _ACCESS_TOKEN is not None and _ACCESS_TOKEN != sent_token
+
+
+def _persist_rotated_refresh_token(old: Optional[str], new: Optional[str]) -> None:
+    """Supabase rotates the refresh token on every refresh; keep the cached
+    login (credentials.json) usable by the next run by swapping the old one
+    for the new one there too."""
+    if not old or not new or old == new:
+        return
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-            if not raw:
-                return None
-            return json.loads(raw.decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise SupabaseError(f"{method} {path} -> HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise SupabaseError(f"{method} {path} -> network error: {exc.reason}") from exc
-    except _NETWORK_ERRORS as exc:
-        raise SupabaseError(f"{method} {path} -> network error: {type(exc).__name__}: {exc}") from exc
+        if not CACHE_PATH.exists():
+            return
+        data = json.loads(CACHE_PATH.read_text())
+        if isinstance(data, dict) and data.get("refresh_token") == old:
+            data["refresh_token"] = new
+            _write_private(CACHE_PATH, json.dumps(data, indent=2))
+    except Exception:
+        pass
 
 
 # ----------------------------------------------------------------------------
@@ -1704,10 +1784,10 @@ def _gpu_info() -> Dict[str, Any]:
       1. `nvidia-smi` / `rocm-smi` -- these see the hardware directly and
          work no matter which (if any) of Pulse's five supported array
          backends (torch, tensorflow, jax, cupy, mlx) the project uses.
-      2. Each backend's own device API, purely as a fallback/cross-check
-         for environments where the CLI tools aren't on PATH (some
-         containers) -- every one of the five is tried independently and
-         none is required or treated as primary.
+      2. A backend's own device API, purely as a fallback/cross-check for
+         environments where the CLI tools aren't on PATH (some containers)
+         -- only for a backend already imported and initialised by the
+         script; none is ever imported or initialised here.
     """
     info: Dict[str, Any] = {"gpu_name": None, "gpu_count": 0, "cuda_version": None, "vendor": None}
 
@@ -1766,9 +1846,14 @@ def _gpu_info() -> Dict[str, Any]:
         if not info["vendor"] and vendor:
             info["vendor"] = vendor
 
+    # Only frameworks the script has ALREADY imported are looked at, and only
+    # through calls that don't initialise a device runtime: importing torch/
+    # tensorflow/jax here costs seconds, and initialising CUDA or the XLA GPU
+    # client before the script's own code runs freezes CUDA_VISIBLE_DEVICES and
+    # can preallocate most of the GPU's memory.
+    torch = sys.modules.get("torch")
     try:
-        import torch
-        if torch.cuda.is_available():
+        if torch is not None and torch.cuda.is_initialized():
             n = torch.cuda.device_count()
             _merge(torch.cuda.get_device_name(0) if n else None, n, "nvidia")
             if not info["cuda_version"]:
@@ -1777,39 +1862,17 @@ def _gpu_info() -> Dict[str, Any]:
         pass
 
     try:
-        import tensorflow as tf
-        gpus = tf.config.list_physical_devices("GPU")
-        if gpus:
-            _merge(gpus[0].name, len(gpus))
+        xla_bridge = sys.modules.get("jax._src.xla_bridge")
+        if sys.modules.get("jax") is not None and xla_bridge is not None and getattr(xla_bridge, "_backends", None):
+            devs = [d for d in sys.modules["jax"].devices() if getattr(d, "platform", "") in ("gpu", "tpu")]
+            if devs:
+                _merge(f"{devs[0].platform}:{getattr(devs[0], 'device_kind', '?')}", len(devs))
     except Exception:
         pass
 
+    mx = sys.modules.get("mlx.core")
     try:
-        import jax
-        devs = [d for d in jax.devices() if getattr(d, "platform", "") in ("gpu", "tpu")]
-        if devs:
-            _merge(f"{devs[0].platform}:{getattr(devs[0], 'device_kind', '?')}", len(devs))
-    except Exception:
-        pass
-
-    try:
-        import cupy
-        n = cupy.cuda.runtime.getDeviceCount()
-        if n:
-            name = None
-            try:
-                props = cupy.cuda.runtime.getDeviceProperties(0)
-                raw_name = props.get("name")
-                name = raw_name.decode() if isinstance(raw_name, bytes) else raw_name
-            except Exception:
-                pass
-            _merge(name, n, "nvidia")
-    except Exception:
-        pass
-
-    try:
-        import mlx.core as mx
-        if mx.metal.is_available():
+        if mx is not None and mx.metal.is_available():
             _merge("Apple Metal (MLX)", 1, "apple")
     except Exception:
         pass
@@ -1819,13 +1882,12 @@ def _gpu_info() -> Dict[str, Any]:
 
 def _framework_versions() -> Dict[str, str]:
     """Reports whichever of Pulse's five supported array backends (plus
-    numpy) are actually importable -- not every project has all, or any,
-    of them."""
+    numpy) the process has already imported -- never imports one itself
+    (see _gpu_info)."""
     versions: Dict[str, str] = {}
     for mod_name in ("torch", "tensorflow", "jax", "cupy", "mlx", "numpy"):
-        try:
-            mod = __import__(mod_name)
-        except Exception:
+        mod = sys.modules.get(mod_name)
+        if mod is None:
             continue
         v = getattr(mod, "__version__", None)
         if v:

@@ -26,6 +26,7 @@ fpdf.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import time
@@ -83,7 +84,9 @@ def _reduce_to_2d(arr):
 
 
 def _render_heatmap_png(arr2d, path, var_name, step):
-    safe = np.abs(arr2d.astype(np.float64)) + 1e-12
+    # abs() before the float cast: casting a complex array first drops its
+    # imaginary part.
+    safe = np.abs(arr2d).astype(np.float64) + 1e-12
 
     # LogNorm needs finite, positive vmin/vmax. NaN/Inf entries are already
     # reported separately via backend.statistics() on the original tensor --
@@ -116,8 +119,14 @@ def _render_heatmap_png(arr2d, path, var_name, step):
 
 def _safe_dir_name(name):
     """One path component: no separators, no '..', nothing absolute -- a dict key
-    such as '../x' or 'train/loss' must stay inside output_dir."""
-    return re.sub(r"[^\w.-]", "_", str(name)).strip(".") or "_"
+    such as '../x' or 'train/loss' must stay inside output_dir. A name that had
+    to be changed gets a short hash of the original, so two distinct names
+    ('train/loss' and 'train_loss') never share a folder."""
+    raw = str(name)
+    safe = re.sub(r"[^\w.-]", "_", raw).strip(".") or "_"
+    if safe != raw:
+        safe += "-" + hashlib.sha1(raw.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+    return safe
 
 
 def _latin1(text):
