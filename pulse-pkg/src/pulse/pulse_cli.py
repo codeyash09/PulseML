@@ -4407,6 +4407,9 @@ class PulseCLI:
             self._detector_scalar_histories.clear()
             self._matrix_cache.clear()
             self._matrix_cached_vars.clear()
+            # The engine remembers each series' opening level and its confirmations; a
+            # variable tracked again after this is a new series, not the old one resumed.
+            self._detector = None
             print(f"✓ Removed all variables from tracking: {', '.join(removed)}")
             return
 
@@ -4444,6 +4447,9 @@ class PulseCLI:
         self.scalar_histories.pop(target, None)
         self._detector_scalar_histories.pop(target, None)
         self._matrix_cached_vars.discard(target)
+        engine = getattr(self, "_detector", None)
+        if engine is not None:
+            engine.forget(target)
 
         # Remove cached sliced entries belonging to this base variable.
         for cache_name in list(self._matrix_cache):
@@ -12346,9 +12352,15 @@ class PulseCLI:
                 histories[name] = list(values)
         # _record_keras_logs keeps "train_loss" as an alias of Keras's "loss" for the
         # legacy detector and the agent. To the engine it is a second copy of the same
-        # series, and every loss finding came out twice.
-        if "train_loss" in histories and histories["train_loss"] == histories.get("loss"):
-            del histories["train_loss"]
+        # series, and every loss finding came out twice. Dropped because of where it came
+        # from, not by comparing the lists: NaN != NaN, so a NaN loss made the two copies
+        # unequal and the NaN was reported twice.
+        if "train_loss" in histories and "loss" in histories:
+            loss, alias = histories["loss"], histories["train_loss"]
+            if (getattr(self, "_keras_train_loss_alias", False)
+                    or (len(loss) == len(alias)
+                        and all(_values_equal(a, b) for a, b in zip(loss, alias)))):
+                del histories["train_loss"]
         return histories
 
     def _detection_engine(self):
@@ -12400,15 +12412,35 @@ class PulseCLI:
         if not histories:
             return None
         tensor_stats = {}
+        # How many readings each series has taken, not how long it is: histories are
+        # capped at 2,000, and past that a frozen loss -- same length, same last value
+        # -- looked like the same data re-checked and was never confirmed.
+        counts = {}
+        for name in histories:
+            count = self._detector_count(name)
+            if count is not None:
+                counts[name] = count
+        # Each probe of a tensor is a new look at it, even when nothing about it has
+        # changed: a weight stuck at all-zero gives identical statistics every time, and
+        # was never confirmed. Every probe stores a new stats dict; hold the last one so
+        # its identity cannot be reused.
+        probes = self.__dict__.setdefault("_tensor_probe_seen", {})
         for name, entry in (getattr(self, "_matrix_cache", {}) or {}).items():
             if isinstance(entry, dict) and isinstance(entry.get("stats"), dict):
                 tensor_stats[name] = entry["stats"]
+                last = probes.get(name)
+                if last is None or last[0] is not entry["stats"]:
+                    probes[name] = (entry["stats"], (last[1] if last else 0) + 1)
+                counts[name] = probes[name][1]
+        for name in [n for n in probes if n not in tensor_stats]:
+            del probes[name]
         # The run's own step when there is one. The longest history stops growing at
         # the 2,000-reading cap, so every finding past that point said "step 2000".
         step = getattr(self, "step", 0) or max((len(values) for values in histories.values()), default=0)
+        engine = self._detection_engine()
         try:
-            raised = self._detection_engine().update(
-                histories, step=step, tensor_stats=tensor_stats or None)["raised"]
+            raised = engine.update(histories, step=step, tensor_stats=tensor_stats or None,
+                                   counts=counts)["raised"]
         except Exception as exc:
             # A detector that raises takes the training run with it. Say nothing.
             if _PULSE_LOGGING:
@@ -12417,6 +12449,17 @@ class PulseCLI:
                 except Exception:
                     pass
             return None
+        # One check that throws is skipped and the rest carry on -- which also meant it
+        # disappeared without a word. Say so once per distinct failure.
+        error = getattr(engine, "last_error", None)
+        if error and error != getattr(self, "_detector_error_reported", None):
+            self._detector_error_reported = error
+            try:
+                _pulse_log(f"DETECTOR CHECK FAILED (skipped) {error}")
+                cprint(f"[Pulse] A detection check failed and is being skipped: {error}",
+                       color=_YELLOW)
+            except Exception:
+                pass
         # Info-level findings are observations, not problems: "accuracy has not moved"
         # on a fine-tune sitting at 97% is true and worth showing, and pausing the run
         # to ask an agent about it is not. Only actionable severities escalate.
@@ -13591,6 +13634,7 @@ class PulseCLI:
             # Preserve NaN / inf.
             # The detector needs to see these instead of silently losing them.
             hist = self.epoch_scalar_histories.setdefault(name, [])
+            self._count_detector_reading("epoch", name, len(hist))
             hist.append(value)
 
             if len(hist) > 2000:
@@ -13599,8 +13643,10 @@ class PulseCLI:
             recorded[name] = value
 
         # Keras calls the training loss simply "loss".
-        # Pulse also understands "train_loss", so maintain an alias.
-        if "loss" in logs:
+        # Pulse also understands "train_loss", so maintain an alias -- unless the logs
+        # carry a train_loss of their own, which the loop above has already recorded.
+        if "loss" in logs and "train_loss" not in logs:
+            self._keras_train_loss_alias = True
             try:
                 value = logs["loss"]
 
@@ -13612,6 +13658,7 @@ class PulseCLI:
                 hist = self.epoch_scalar_histories.setdefault(
                     "train_loss", []
                 )
+                self._count_detector_reading("epoch", "train_loss", len(hist))
                 hist.append(value)
 
                 if len(hist) > 2000:
@@ -13708,11 +13755,20 @@ class PulseCLI:
         histories = state.setdefault("_detector_scalar_histories", {})
         sources = state.setdefault("_detector_scalar_sources", {})
         hist = histories.setdefault(name, [])
-        last_ref, last_step = sources.get(name, (None, None))
+        last_ref, last_step, last_run_step = (tuple(sources.get(name, ())) + (None, None, None))[:3]
         same_object = (source is not None and last_ref is not None and last_ref() is source)
+        run_step = getattr(self, "step", None)
+        # A counter or a configured constant is the SAME object on every update while it
+        # does not change -- a stopped counter is not reassigned, and neither is
+        # adam_eps -- so skipping same-object repeats kept its history at one reading,
+        # and counter_stalled / hyperparameter_out_of_range could never fire under the
+        # tracer. For those, a tick on which the run itself moved on is a new reading.
+        ticked = (run_step is not None and last_run_step is not None and run_step != last_run_step
+                  and _pulse_detect.records_every_tick(name))
         if (hist and _values_equal(hist[-1], value) and same_object
-                and (step is None or step == last_step)):
+                and (step is None or step == last_step) and not ticked):
             return
+        self._count_detector_reading("sample", name, len(hist))
         hist.append(value)
         if len(hist) > 2000:
             del hist[:-2000]
@@ -13722,7 +13778,29 @@ class PulseCLI:
             ref = weakref.ref(source)
         except TypeError:
             ref = (lambda obj: (lambda: obj))(source)      # a float: nothing to keep alive
-        sources[name] = (ref, step)
+        sources[name] = (ref, step, run_step)
+
+    def _count_detector_reading(self, kind, name, before):
+        """One more reading taken into a detector history, which the cap never undoes.
+
+        `before` is the history's length before this reading: a history that was filled
+        in without being counted starts its count from what it already holds.
+        """
+        counts = self.__dict__.setdefault("_detector_reading_counts", {})
+        counts[(kind, name)] = counts.get((kind, name), before) + 1
+
+    def _detector_count(self, name):
+        """How many readings the history _history_for_detector(name) returns has taken,
+        or None when that history is not one that is counted."""
+        counts = self.__dict__.get("_detector_reading_counts", {}) or {}
+        epoch_histories = getattr(self, "epoch_scalar_histories", {}) or {}
+        if name in epoch_histories and epoch_histories[name]:
+            return counts.get(("epoch", name))
+        if name == "train_loss" and epoch_histories.get("loss"):
+            return counts.get(("epoch", "loss"))
+        if (getattr(self, "_detector_scalar_histories", {}) or {}).get(name):
+            return counts.get(("sample", name))
+        return None
 
     def _history_for_detector(self, name):
         """
