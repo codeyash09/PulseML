@@ -45,6 +45,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -60,6 +61,11 @@ MAX_OUTPUT_CHARS = 8_000          # per stream (stdout, stderr), after head/tail
 HEAD_CHARS = 2_000                # how much of the *start* of a truncated stream to keep
 TAIL_CHARS = MAX_OUTPUT_CHARS - HEAD_CHARS
 MAX_HISTORY_ENTRIES = 200         # bounded ring buffer -- this is a debugging aid, not a log file
+# Captured output kept on disk per stream while a command runs. Past this the middle is
+# dropped (only HEAD_CHARS/TAIL_CHARS are ever shown), so a `cat` of a multi-GB checkpoint
+# or 600 s of chatty output can't fill /tmp.
+MAX_CAPTURE_BYTES = 64 * 1024 * 1024
+_CAPTURE_POLL_SECONDS = 0.25
 
 
 def _truncate_stream(text: str, limit: int = MAX_OUTPUT_CHARS) -> "tuple[str, bool]":
@@ -82,6 +88,67 @@ def _truncate_stream(text: str, limit: int = MAX_OUTPUT_CHARS) -> "tuple[str, bo
     gap = f"\n... [truncated: {omitted:,} characters omitted -- re-run with a narrower " \
           f"command (e.g. pipe to head/tail/grep) to see a different slice] ...\n"
     return head + gap + tail, True
+
+
+def _pread(f, n: int, offset: int) -> bytes:
+    if n <= 0:
+        return b""
+    if hasattr(os, "pread"):
+        return os.pread(f.fileno(), n, offset)
+    f.seek(offset)
+    return f.read(n)
+
+
+class _CaptureFile:
+    """One output stream's temp file, capped at MAX_CAPTURE_BYTES while the command runs.
+    When more than that is on disk, the head (once) and the current tail are saved and the
+    file is truncated to zero; the command's later writes land past a hole (sparse), so the
+    file's size still counts every byte written and what follows the cut is the newest
+    output."""
+
+    def __init__(self, f):
+        self.f = f
+        self.head: Optional[bytes] = None       # saved at the first cut
+        self.tail_at_cut = b""                  # the last bytes before the latest cut
+        self.cut_at = 0                         # file offset of the latest cut
+
+    def enforce_cap(self) -> None:
+        try:
+            size = os.fstat(self.f.fileno()).st_size
+            if size - self.cut_at <= MAX_CAPTURE_BYTES:
+                return
+            if self.head is None:
+                self.head = _pread(self.f, HEAD_CHARS * 4, 0)
+            self.tail_at_cut = _pread(self.f, TAIL_CHARS * 4, max(self.cut_at, size - TAIL_CHARS * 4))
+            self.cut_at = size
+            os.ftruncate(self.f.fileno(), 0)
+        except (OSError, ValueError):
+            pass
+
+    def read(self) -> "tuple[str, bool]":
+        """(text, truncated): the whole stream when small, else only its head and tail
+        windows -- never the whole file in memory."""
+        f = self.f
+        size = os.fstat(f.fileno()).st_size
+        if self.head is None and size <= MAX_OUTPUT_CHARS * 4:
+            f.seek(0)
+            return _truncate_stream(f.read().decode("utf-8", "replace"))
+        window = TAIL_CHARS * 4
+        if self.head is None:
+            head_b = _pread(f, HEAD_CHARS * 4, 0)
+            tail_b = _pread(f, window, max(0, size - window))
+            total = size
+        else:
+            head_b = self.head
+            start = max(self.cut_at, size - window)
+            tail_b = (self.tail_at_cut + _pread(f, size - start, start))[-window:]
+            total = max(size, self.cut_at)
+        head = head_b.decode("utf-8", "replace")[:HEAD_CHARS]
+        tail = tail_b.decode("utf-8", "replace")[-TAIL_CHARS:] if TAIL_CHARS > 0 else ""
+        omitted = max(0, total - len(head.encode("utf-8")) - len(tail.encode("utf-8")))
+        gap = f"\n... [truncated: about {omitted:,} bytes omitted -- re-run with a narrower " \
+              f"command (e.g. pipe to head/tail/grep) to see a different slice] ...\n"
+        return head + gap + tail, True
 
 
 # ---------------------------------------------------------------------------------------
@@ -189,8 +256,31 @@ _HARMLESS_REDIRECT_TARGETS = {"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/t
 # Programs that run the command given in their arguments (`sudo rm x`, `xargs rm`).
 _WRAPPER_COMMANDS = {
     "sudo", "doas", "env", "nohup", "time", "nice", "ionice", "exec", "command", "builtin",
-    "stdbuf", "xargs", "timeout", "setsid", "chronic", "unbuffer",
+    "stdbuf", "xargs", "timeout", "setsid", "chronic", "unbuffer", "busybox",
 }
+# Wrapper options whose VALUE is the next word (`nice -n 10 rm`: '10' is not the program).
+_WRAPPER_OPTIONS_WITH_VALUE = {
+    "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "--user", "--group",
+             "--host", "--prompt", "--close-from", "--chdir", "--role", "--type", "--other-user",
+             "--command-timeout"},
+    "doas": {"-u", "-C"},
+    "env": {"-u", "-C", "-S", "--unset", "--chdir", "--split-string"},
+    "nice": {"-n", "--adjustment"},
+    "ionice": {"-c", "-n", "-p", "-P", "-u", "--class", "--classdata", "--pid", "--pgid", "--uid"},
+    "timeout": {"-s", "-k", "--signal", "--kill-after"},
+    "xargs": {"-n", "-I", "-L", "-P", "-d", "-s", "-a", "-E", "--max-args", "--max-lines",
+              "--max-procs", "--delimiter", "--max-chars", "--arg-file", "--eof", "--replace"},
+    "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
+    "time": {"-f", "-o", "--format", "--output"},
+    "exec": {"-a"},
+}
+# Shell reserved words that can stand before the command they introduce
+# (`for f in x; do rm "$f"; done`, `if ...; then rm x; fi`, `{ rm x; }`, `! rm x`).
+_SHELL_RESERVED_WORDS = {
+    "do", "then", "else", "elif", "if", "while", "until", "{", "}", "!", "done", "fi",
+    "time", "coproc",
+}
+_SHELL_PROGRAMS = {"bash", "sh", "zsh", "dash", "ksh", "mksh", "ash", "fish"}
 _DELETE_COMMANDS = {"rm", "rmdir", "shred", "unlink", "truncate", "srm", "wipe"}
 _NETWORK_COMMANDS = {
     "sudo", "su", "doas", "curl", "wget", "ssh", "scp", "sftp", "rsync", "ftp", "nc",
@@ -207,16 +297,67 @@ _SENSITIVE_PATH_MARKERS = (
     "${home}/.aws", "/.ssh/", "/.aws/",
 )
 _BACKGROUND_COMMANDS = {"nohup", "disown", "setsid", "systemctl", "daemonize", "crontab", "at"}
+# systemctl subcommands that only look (everything else starts/stops/enables something).
+_SYSTEMCTL_READ_ONLY = {
+    "status", "show", "cat", "help", "list-units", "list-unit-files", "list-timers",
+    "list-sockets", "list-jobs", "list-dependencies", "list-machines", "is-active",
+    "is-enabled", "is-failed", "is-system-running", "get-default", "show-environment",
+}
+# Killing processes / stopping the machine reaches past the project (the user's own
+# training run, everything the user owns).
+_PROCESS_KILL_COMMANDS = {"kill", "pkill", "killall", "skill", "shutdown", "reboot", "poweroff",
+                          "halt"}
 _PYTHON_DELETE_RE = re.compile(
     r"shutil\s*\.\s*rmtree|\bos\s*\.\s*(remove|unlink|rmdir|removedirs)\b|\.unlink\s*\(|"
     r"\.rmdir\s*\(|send2trash"
 )
+# The same for the other interpreters' one-liners (perl -e, node -e, ruby -e).
+_SCRIPT_DELETE_RE = re.compile(
+    r"\bunlink(Sync)?\b|\brm(dir)?Sync\b|\brmtree\b|\bremove_tree\b|\bFile\s*\.\s*(delete|unlink)\b|"
+    r"\bDir\s*\.\s*(delete|rmdir|unlink)\b|\bFileUtils\s*\.\s*(rm|rm_r|rm_rf|rm_f|remove\w*|rmdir|rmtree)\b|"
+    r"\bfs(\.promises)?\s*\.\s*(rm|rmdir)\s*\("
+)
+# A call that hands a string (or an argv list) to a shell/exec: os.system('rm -rf x'),
+# subprocess.run(['rm', ...]), system("rm x") in perl/ruby, execSync('rm x') in node.
+_SHELL_OUT_CALL_RE = re.compile(
+    r"\b(?:os\s*\.\s*(?:system|popen|exec\w*|spawn\w*)|subprocess\s*\.\s*\w+|"
+    r"system|exec|execSync|execFileSync|spawn|spawnSync|execFile|qx|Popen|run|call|check_call|"
+    r"check_output)\s*\("
+)
+# Interpreters and the options that take one-line code (`python -c CODE`, `perl -e CODE`).
+_INTERPRETER_CODE_OPTIONS = {
+    "python": "c", "perl": "eE", "ruby": "e", "node": "ep", "nodejs": "ep", "deno": "",
+}
 
 
-def _shell_tokens(command: str) -> "List[tuple[str, bool]]":
+def _substitution_end(text: str, start: int) -> int:
+    """Index just past the `)` closing the `$(` at text[start] (end of text if none)."""
+    depth, j, n = 0, start + 1, len(text)
+    while j < n:
+        ch = text[j]
+        if ch == "\\":
+            j += 2
+            continue
+        if ch == "'" and depth > 1:
+            k = text.find("'", j + 1)
+            j = n if k < 0 else k + 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        j += 1
+    return n
+
+
+def _shell_tokens(command: str, substitutions: "Optional[List[str]]" = None) -> "List[tuple[str, bool]]":
     """Split shell text into (token, is_operator) pairs. Quotes and backslashes are
     honoured (a quoted `>` is part of a word), `#` comments are dropped. Never raises:
-    an unbalanced quote just ends the last word at the end of the text."""
+    an unbalanced quote just ends the last word at the end of the text. The text of every
+    `$(...)` / backtick substitution inside double quotes -- which still RUNS -- is
+    appended to `substitutions` when a list is given."""
     tokens: "List[tuple[str, bool]]" = []
     word: List[str] = []
     in_word = False
@@ -250,6 +391,22 @@ def _shell_tokens(command: str) -> "List[tuple[str, bool]]":
                 if command[j] == "\\" and j + 1 < n and command[j + 1] in '"\\$`':
                     buf.append(command[j + 1])
                     j += 2
+                    continue
+                if command.startswith("$(", j):
+                    end = _substitution_end(command, j + 1)
+                    if substitutions is not None:
+                        substitutions.append(command[j + 2:end - 1] if command[end - 1:end] == ")"
+                                             else command[j + 2:end])
+                    buf.append(command[j:end])
+                    j = end
+                    continue
+                if command[j] == "`":
+                    k = command.find("`", j + 1)
+                    k = n if k < 0 else k
+                    if substitutions is not None:
+                        substitutions.append(command[j + 1:k])
+                    buf.append(command[j:k + 1])
+                    j = k + 1
                     continue
                 buf.append(command[j])
                 j += 1
@@ -289,6 +446,9 @@ def _strip_wrappers(argv: List[str], flags: Dict[str, bool]) -> List[str]:
     argv = list(argv)
     while argv:
         head = argv[0]
+        if head in _SHELL_RESERVED_WORDS:
+            argv.pop(0)
+            continue
         if "=" in head and not head.startswith("=") and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", head):
             argv.pop(0)
             continue
@@ -297,14 +457,122 @@ def _strip_wrappers(argv: List[str], flags: Dict[str, bool]) -> List[str]:
             break
         _judge_program(base, argv[1:], flags)
         argv.pop(0)
-        if base == "timeout":
-            while argv and argv[0].startswith("-"):
-                argv.pop(0)
-            if argv:
-                argv.pop(0)             # the duration
+        takes_value = _WRAPPER_OPTIONS_WITH_VALUE.get(base, set())
         while argv and (argv[0].startswith("-") or (base == "env" and "=" in argv[0])):
-            argv.pop(0)
+            opt = argv.pop(0)
+            if opt == "--":
+                break
+            if base == "env" and opt in ("-S", "--split-string") and argv:
+                _merge_flags(flags, classify_command(argv[0]))      # env -S 'rm -rf x'
+            elif base == "env" and opt.startswith("--split-string="):
+                _merge_flags(flags, classify_command(opt.split("=", 1)[1]))
+            if opt in takes_value and argv:
+                argv.pop(0)
+        if base == "timeout" and argv:
+            argv.pop(0)                 # the duration
     return argv
+
+
+def _merge_flags(flags: Dict[str, bool], other: Dict[str, bool]) -> None:
+    for k, v in other.items():
+        if v:
+            flags[k] = True
+
+
+def _judge_argv(argv: List[str], flags: Dict[str, bool]) -> None:
+    """Judge one simple command: wrappers and reserved words off, then its program."""
+    argv = _strip_wrappers(argv, flags)
+    if argv:
+        _judge_program(os.path.basename(argv[0]).lower(), argv[1:], flags)
+
+
+def _code_argument(base: str, args: List[str]) -> "Optional[str]":
+    """The one-line code of an interpreter invocation (`python -c CODE`, `perl -ne CODE`,
+    `node --eval CODE`), or None."""
+    family = re.sub(r"[0-9.]+$", "", base)
+    letters = _INTERPRETER_CODE_OPTIONS.get(family)
+    if letters is None:
+        return None
+    skip_value = False
+    for j, a in enumerate(args):
+        if skip_value:
+            skip_value = False
+            continue
+        if family in ("node", "nodejs") and a in ("--eval", "--print", "-e", "-p"):
+            return args[j + 1] if j + 1 < len(args) else None
+        if family in ("node", "nodejs") and (a.startswith("--eval=") or a.startswith("--print=")):
+            return a.split("=", 1)[1]
+        if family == "python" and a in ("-W", "-X", "--check-hash-based-pycs"):
+            skip_value = True
+            continue
+        if len(a) > 1 and a[0] == "-" and a[1] != "-" and letters:
+            cluster = a[1:]
+            if family != "python" and not cluster.isalpha():
+                continue                        # an attached value: -MFile::Path, -pi.bak
+            pos = next((k for k, c in enumerate(cluster) if c in letters), None)
+            if pos is None:
+                continue
+            if family == "python" and cluster[pos + 1:]:
+                return cluster[pos + 1:]        # `-cCODE`
+            return args[j + 1] if j + 1 < len(args) else None
+        if not a.startswith("-"):
+            return None                 # a script file: its code isn't on the command line
+    return None
+
+
+def _reads_code_from_stdin(base: str, args: List[str]) -> bool:
+    """`python`, `python -`, `perl` with no script: the program text comes from stdin
+    (a pipe or a redirect in the same command line)."""
+    family = re.sub(r"[0-9.]+$", "", base)
+    if family not in _INTERPRETER_CODE_OPTIONS:
+        return False
+    if _code_argument(base, args) is not None:
+        return False
+    positional = [a for a in args if not a.startswith("-") or a == "-"]
+    if family == "python" and "-m" in args:
+        return False
+    return not positional or positional[0] == "-"
+
+
+def _string_literals(code: str, start: int) -> "tuple[List[str], int]":
+    """The quoted string literals inside the call whose `(` is at code[start], and where
+    the call ends. A small scanner, not a parser: good enough for a one-liner."""
+    lits: List[str] = []
+    depth, j, n = 0, start, len(code)
+    while j < n:
+        ch = code[j]
+        if ch in "'\"`":
+            k = j + 1
+            buf: List[str] = []
+            while k < n and code[k] != ch:
+                if code[k] == "\\" and k + 1 < n:
+                    buf.append(code[k + 1])
+                    k += 2
+                    continue
+                buf.append(code[k])
+                k += 1
+            lits.append("".join(buf))
+            j = k + 1
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth <= 0:
+                return lits, j + 1
+        j += 1
+    return lits, n
+
+
+def _judge_code(code: str, flags: Dict[str, bool]) -> None:
+    """An interpreter's one-line code: its own delete calls, and every shell command it
+    hands to os.system / subprocess / system / execSync (the literal text or argv list)."""
+    if _PYTHON_DELETE_RE.search(code) or _SCRIPT_DELETE_RE.search(code):
+        flags["deletes_files"] = True
+    for m in _SHELL_OUT_CALL_RE.finditer(code):
+        lits, _end = _string_literals(code, m.end() - 1)
+        if lits:
+            _merge_flags(flags, classify_command(" ".join(lits)))
 
 
 def _judge_git(args: List[str], flags: Dict[str, bool]) -> None:
@@ -328,8 +596,16 @@ def _judge_git(args: List[str], flags: Dict[str, bool]) -> None:
     elif sub == "clean":
         destructive = "--force" in rest or "f" in short or "x" in short
     elif sub == "push":
-        destructive = (any(a.startswith("--force") for a in rest) or "f" in short
-                       or "--delete" in rest or "--mirror" in rest)
+        # `+main` force-pushes that ref, `:old-branch` deletes the remote branch.
+        refspecs = [a for a in rest if not a.startswith("-")][1:]
+        destructive = (any(a.startswith("--force") for a in rest) or "f" in short or "d" in short
+                       or "--delete" in rest or "--mirror" in rest or "--prune" in rest
+                       or any(r.startswith("+") or r.startswith(":") for r in refspecs))
+    elif sub == "commit":
+        destructive = "--amend" in rest
+    elif sub == "switch":
+        destructive = ("--discard-changes" in rest or "--force" in rest or "f" in short
+                       or "C" in short or "--force-create" in rest)
     elif sub in ("rebase", "filter-branch", "filter-repo"):
         destructive = True
     elif sub == "stash":
@@ -345,30 +621,49 @@ def _judge_program(base: str, args: List[str], flags: Dict[str, bool]) -> None:
     """Classify one program invocation (basename lower-cased, args as typed)."""
     if base in _DELETE_COMMANDS:
         flags["deletes_files"] = True
-    elif base == "find" and ("-delete" in args or any(
-            a in ("-exec", "-execdir", "-ok", "-okdir") and j + 1 < len(args)
-            and os.path.basename(args[j + 1]).lower() in _DELETE_COMMANDS
-            for j, a in enumerate(args))):
-        flags["deletes_files"] = True
+    elif base == "find":
+        if "-delete" in args:
+            flags["deletes_files"] = True
+        for j, a in enumerate(args):
+            if a in ("-exec", "-execdir", "-ok", "-okdir"):
+                inner: List[str] = []
+                for b in args[j + 1:]:
+                    if b in (";", "+"):
+                        break
+                    inner.append(b)
+                _judge_argv(inner, flags)
+    elif base in ("mv", "cp", "ln") and "/dev/null" in args:
+        # mv f /dev/null deletes f; cp /dev/null f and ln -sf /dev/null f empty/replace f.
+        flags["deletes_files" if base == "mv" else "overwrites_via_redirect"] = True
     elif base == "git":
         _judge_git(args, flags)
     elif base == "tee":
         flags["overwrites_via_redirect"] = True
     elif base == "dd" and any(a.startswith("of=") and a[3:] not in _HARMLESS_REDIRECT_TARGETS for a in args):
         flags["overwrites_via_redirect"] = True
-    elif base in ("bash", "sh", "zsh", "dash", "ksh", "eval") and args:
+    elif (base in _SHELL_PROGRAMS or base == "eval") and args:
         script = None
         if base == "eval":
             script = " ".join(args)
-        elif "-c" in args and args.index("-c") + 1 < len(args):
-            script = args[args.index("-c") + 1]
+        else:
+            # `-c`, or any short-option cluster with c in it (`-lc`, `-ec`, `-xc`): the
+            # script is the next word that isn't an option.
+            for j, a in enumerate(args):
+                if len(a) > 1 and a[0] == "-" and a[1] != "-" and "c" in a[1:]:
+                    script = next((b for b in args[j + 1:] if not b.startswith("-")), None)
+                    break
         if script:
-            for k, v in classify_command(script).items():
-                if v:
-                    flags[k] = True
+            _merge_flags(flags, classify_command(script))
+    else:
+        code = _code_argument(base, args)
+        if code:
+            _judge_code(code, flags)
 
     if base in _NETWORK_COMMANDS:
         flags["reaches_outside_workspace"] = True
+    if base in _PROCESS_KILL_COMMANDS and not (
+            base == "kill" and any(a in ("-0", "-l", "-L", "--list") for a in args[:1])):
+        flags["reaches_outside_workspace"] = True       # `kill -0 PID` / `kill -l` only look
     pip_args = None
     if re.match(r"^pip[0-9.]*$", base) or base in ("pipx", "uv"):
         pip_args = args[1:] if base == "uv" and args[:1] == ["pip"] else args
@@ -385,7 +680,19 @@ def _judge_program(base: str, args: List[str], flags: Dict[str, bool]) -> None:
             and any(a.startswith("/") for a in args):
         flags["reaches_outside_workspace"] = True
 
-    if base in _BACKGROUND_COMMANDS:
+    if base == "systemctl":
+        sub = next((a for a in args if not a.startswith("-")), "list-units")
+        if sub not in _SYSTEMCTL_READ_ONLY:
+            flags["launches_persistent_process"] = True
+    elif base == "crontab":
+        # `crontab -l` only lists; -e/-r/-i, a file, or stdin (no args) installs or removes.
+        rest = list(args)
+        if "-u" in rest:                                # `-u USER` picks whose table
+            k = rest.index("-u")
+            del rest[k:k + 2]
+        if rest != ["-l"]:
+            flags["launches_persistent_process"] = True
+    elif base in _BACKGROUND_COMMANDS:
         flags["launches_persistent_process"] = True
     elif base == "docker" and args[:1] == ["run"] and ("d" in _short_flags(args) or "--detach" in args):
         flags["launches_persistent_process"] = True
@@ -393,6 +700,45 @@ def _judge_program(base: str, args: List[str], flags: Dict[str, bool]) -> None:
         flags["launches_persistent_process"] = True
     elif base == "tmux" and "d" in _short_flags(args):
         flags["launches_persistent_process"] = True
+
+
+def _resolve_substituted_program(words: List[str]) -> "Optional[str]":
+    """`$(which rm)` / `$(command -v rm)` / `$(type -P rm)` -> 'rm'; None when the
+    substitution computes the program some other way."""
+    words = [w for w in words if w]
+    if len(words) >= 2 and words[0] in ("which", "whereis", "realpath", "readlink"):
+        return next((w for w in words[1:] if not w.startswith("-")), None)
+    if len(words) >= 3 and words[0] in ("command", "type") and words[1].startswith("-"):
+        return next((w for w in words[2:] if not w.startswith("-")), None)
+    return None
+
+
+# Stand-in argv[0] for a program word that is computed (`$(...) args`): can't be judged.
+_COMPUTED_PROGRAM = "\0computed-program"
+
+
+def has_heredoc(command: str) -> bool:
+    """Does the (one-line) command use a heredoc (`<<WORD`, `<<-'EOF'`) outside quotes?
+    A `<<` inside a quoted argument (python3 -c "print(1 << n)") is a bit shift, and
+    `$((1 << 3))` has no delimiter word."""
+    tokens = _shell_tokens(command or "")
+    depth = 0
+    arithmetic: List[int] = []          # paren depths where a `((` / `$((` started
+    for i, (tok, is_op) in enumerate(tokens):
+        if not is_op:
+            continue
+        if tok == "(":
+            depth += 1
+            if i + 1 < len(tokens) and tokens[i + 1] == ("(", True) and not arithmetic:
+                arithmetic.append(depth)
+        elif tok == ")":
+            if arithmetic and arithmetic[-1] == depth:
+                arithmetic.pop()
+            depth -= 1
+        elif tok == "<<" and not arithmetic and i + 1 < len(tokens) and not tokens[i + 1][1]:
+            if re.match(r"^-?[A-Za-z_]\w*$", tokens[i + 1][0]):
+                return True
+    return False
 
 
 def classify_command(command: str) -> Dict[str, bool]:
@@ -409,14 +755,63 @@ def classify_command(command: str) -> Dict[str, bool]:
     }
     text = command or ""
     lowered = text.lower()
-    if _PYTHON_DELETE_RE.search(text) or "del /s" in lowered or "del /q" in lowered:
+    if "del /s" in lowered or "del /q" in lowered:
         flags["deletes_files"] = True
 
-    tokens = _shell_tokens(text)
+    substitutions: List[str] = []
+    tokens = _shell_tokens(text, substitutions)
+    for sub in substitutions:                   # "$(rm -rf x)" inside double quotes still runs
+        _merge_flags(flags, classify_command(sub))
+
+    def at_program_position() -> bool:
+        return all(w in _SHELL_RESERVED_WORDS or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w)
+                   for w in simple[-1])
+
+    def matching_close(open_idx: int, open_tok: str) -> int:
+        depth = 0
+        for k in range(open_idx, len(tokens)):
+            t, op = tokens[k]
+            if not op:
+                continue
+            if open_tok == "`":
+                if t == "`" and k > open_idx:
+                    return k
+            elif t == "(":
+                depth += 1
+            elif t == ")":
+                depth -= 1
+                if depth == 0:
+                    return k
+        return len(tokens)
+
     simple: List[List[str]] = [[]]
+    computed_close: Dict[int, str] = {}     # token index closing a computed program -> argv[0]
+    backticks = 0
     idx = 0
     while idx < len(tokens):
         tok, is_op = tokens[idx]
+        if idx in computed_close:
+            simple.append([computed_close.pop(idx)])
+            if tok == "`":
+                backticks += 1
+            idx += 1
+            continue
+        # The program word itself is a substitution: `$(which rm) -rf x`, `` `which rm` x ``.
+        open_idx = None
+        if (not is_op and tok == "$" and idx + 1 < len(tokens) and tokens[idx + 1] == ("(", True)
+                and at_program_position()):
+            open_idx = idx + 1
+        elif is_op and tok == "`" and backticks % 2 == 0 and at_program_position():
+            open_idx = idx
+        if open_idx is not None:
+            close = matching_close(open_idx, tokens[open_idx][0])
+            inner = [t for t, op in tokens[open_idx + 1:close] if not op]
+            computed_close[close] = _resolve_substituted_program(inner) or _COMPUTED_PROGRAM
+            if tok == "$":
+                idx += 1                        # the "(" below starts the inner command
+                continue
+        if is_op and tok == "`":
+            backticks += 1
         if not is_op:
             if any(m in tok.lower() for m in _SENSITIVE_PATH_MARKERS) or tok == "/etc" \
                     or tok.startswith("/etc/"):
@@ -441,10 +836,21 @@ def classify_command(command: str) -> Dict[str, bool]:
                 idx += 1
         idx += 1
 
+    stdin_interpreter = False
     for argv in simple:
         argv = _strip_wrappers(argv, flags)
-        if argv:
-            _judge_program(os.path.basename(argv[0]).lower(), argv[1:], flags)
+        if not argv:
+            continue
+        if argv[0] == _COMPUTED_PROGRAM:
+            # The program is computed at run time and can't be judged: ask.
+            flags["reaches_outside_workspace"] = True
+            continue
+        base = os.path.basename(argv[0]).lower()
+        _judge_program(base, argv[1:], flags)
+        stdin_interpreter = stdin_interpreter or _reads_code_from_stdin(base, argv[1:])
+    if stdin_interpreter and (_PYTHON_DELETE_RE.search(text) or _SCRIPT_DELETE_RE.search(text)):
+        # `echo "import os; os.remove('x')" | python`: the code is somewhere in this line.
+        flags["deletes_files"] = True
     return flags
 
 
@@ -552,6 +958,16 @@ class TerminalExecutor:
                     )
                     self._record(result)
                     return result
+                captures = (_CaptureFile(out_f), _CaptureFile(err_f))
+                done = threading.Event()
+
+                def cap_output():
+                    while not done.wait(_CAPTURE_POLL_SECONDS):
+                        for c in captures:
+                            c.enforce_cap()
+
+                capper = threading.Thread(target=cap_output, daemon=True, name="pulse-terminal-cap")
+                capper.start()
                 try:
                     proc.communicate(
                         input=request.stdin.encode("utf-8", "replace") if request.stdin is not None else None,
@@ -564,11 +980,22 @@ class TerminalExecutor:
                         proc.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         pass
+                except BaseException:
+                    # Ctrl-C (or anything else) while waiting: the command runs in its own
+                    # session, so the terminal's SIGINT never reached it -- don't leave it
+                    # (and everything it started) running with nobody to reap it.
+                    self._kill_group(proc)
+                    try:
+                        proc.wait(timeout=5)
+                    except BaseException:
+                        pass
+                    raise
+                finally:
+                    done.set()
+                    capper.join()
                 duration = time.monotonic() - started
-                out_f.seek(0)
-                err_f.seek(0)
-                out = out_f.read().decode("utf-8", "replace")
-                err = err_f.read().decode("utf-8", "replace")
+                out, stdout_trunc = captures[0].read()
+                err, stderr_trunc = captures[1].read()
         except OSError as exc:
             duration = time.monotonic() - started
             result = TerminalResult(
@@ -578,10 +1005,8 @@ class TerminalExecutor:
             )
             self._record(result)
             return result
-        stdout, stdout_trunc = _truncate_stream(out)
-        stderr, stderr_trunc = _truncate_stream(err)
         result = TerminalResult(
-            command=request.command, working_directory=cwd, stdout=stdout, stderr=stderr,
+            command=request.command, working_directory=cwd, stdout=out, stderr=err,
             exit_code=None if timed_out else proc.returncode, duration=duration,
             timed_out=timed_out, stdout_truncated=stdout_trunc, stderr_truncated=stderr_trunc,
             is_verification=is_verification,

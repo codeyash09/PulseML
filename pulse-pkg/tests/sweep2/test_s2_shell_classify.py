@@ -204,3 +204,19 @@ def test_ok_listed_forms_are_flagged(cmd, flag):
 ])
 def test_ok_plain_commands_not_flagged(cmd):
     assert _flags(cmd) == set()
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo \"$(date)\"", "$PYTHON train.py", "python3 -c \"print('rm is fine')\"", "kill -0 1234",
+    "for f in *.py; do wc -l \"$f\"; done", "git push origin HEAD:main", "echo $((1 << 3))",
+    "crontab -u bob -l", "$(which python) train.py", "systemctl --user list-units",
+    "python3 -c \"import subprocess; subprocess.run(['ls', '-la'])\"",
+])
+def test_ok_fixed_forms_do_not_flag_ordinary_commands(cmd):
+    assert _flags(cmd) == set(), cmd
+
+
+def test_ok_heredoc_detection_ignores_bit_shifts():
+    assert T.has_heredoc("python3<<EOF") and T.has_heredoc("cat <<-'EOF'")
+    assert not T.has_heredoc('python3 -c "print(1 << n)"') and not T.has_heredoc("echo $((1<<n))")
+    assert not T.has_heredoc("cat <<< hi")

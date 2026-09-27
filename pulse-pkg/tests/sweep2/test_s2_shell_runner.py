@@ -108,3 +108,15 @@ def test_ok_parse_inline_timeout():
     assert T.parse_inline_timeout("echo a | tr a b --timeout=30") == ("echo a | tr a b", 30.0)
     assert T.parse_inline_timeout("echo 'x --timeout=5'") == ("echo 'x --timeout=5'", None)
     assert T.parse_inline_timeout("ls --timeout=inf") == ("ls", None)
+
+
+def test_ok_capture_file_is_capped_and_keeps_head_and_tail(tmp_path, monkeypatch):
+    monkeypatch.setattr(T, "MAX_CAPTURE_BYTES", 200_000)
+    monkeypatch.setattr(T, "_CAPTURE_POLL_SECONDS", 0.02)
+    ex = T.TerminalExecutor(default_cwd=str(tmp_path))
+    r = ex.run(T.TerminalRequest(
+        "echo FIRSTLINE; for i in $(seq 1 60); do head -c 100000 /dev/zero | tr '\\0' a; "
+        "sleep 0.01; done; echo; echo LASTLINE", timeout=60))
+    assert r.exit_code == 0 and r.stdout_truncated
+    assert r.stdout.startswith("FIRSTLINE") and r.stdout.rstrip().endswith("LASTLINE")
+    assert "\0" not in r.stdout
