@@ -154,19 +154,14 @@ def test_fix_checkin_tells_the_approver_it_is_a_checkin_not_an_old_problem(monke
     """During a periodic check-in, `purpose` fell back to _last_problem_description -- the
     last investigation's question, never cleared -- so the approver judged the command
     against a problem that was already over."""
-    cli, _seen, _asked = _cli(monkeypatch, tmp_path, "DENY: x")
+    cli, seen, _asked = _cli(monkeypatch, tmp_path, "DENY: x")
     cli._last_problem_description = "OLD PROBLEM: loss was NaN at step 10"
-    calls = []
-    monkeypatch.setattr(cli, "_run_terminal", lambda arg, **kw: calls.append((arg, kw)) or "ran",
-                        raising=False)
+    cli._run_terminal = lambda arg: str(cli._confirm_terminal_command(arg, {"deletes_files": True}))
     cli._checkin_service_tools("TERMINAL: rm -f stale.cache")
-    assert calls and calls[0][1].get("purpose") == PulseCLI._CHECKIN_APPROVER_PURPOSE
-    cli2, seen, _asked = _cli(monkeypatch, tmp_path, "DENY: x")
-    cli2._last_problem_description = "OLD PROBLEM: loss was NaN at step 10"
-    cli2._confirm_terminal_command("rm x", {"deletes_files": True},
-                                   purpose=PulseCLI._CHECKIN_APPROVER_PURPOSE)
     prompt = seen[0]["messages"][1]["content"]
     assert "OLD PROBLEM" not in prompt and "periodic check-in" in prompt
+    cli._confirm_terminal_command("rm x", {"deletes_files": True})     # outside a check-in
+    assert "OLD PROBLEM" in seen[1]["messages"][1]["content"]
 
 
 def test_fix_denial_reason_is_per_thread(monkeypatch, tmp_path):

@@ -494,8 +494,9 @@ _agent_log_seen: Dict[str, int] = {}     # message hash -> the number it was log
 _agent_log_call_no = 0
 _agent_log_resolved: Dict[str, str] = {}  # setting -> absolute path, fixed at first write
 _agent_log_warned: set = set()             # paths already reported as unwritable
-# Why the last flagged TERMINAL command was declined -- per thread, because a check-in
-# worker and the training thread can both be confirming a command at the same time.
+# Why the last flagged TERMINAL command was declined (.reason), and whether this thread is
+# running a check-in's tools (.checkin) -- per thread, because a check-in worker and the
+# training thread can both be confirming a command at the same time.
 _terminal_denial = threading.local()
 
 
@@ -8482,6 +8483,8 @@ class PulseCLI:
                 # don't ask it again every round.
                 _terminal_denial.reason = unanswered[command]
                 return False
+            if purpose is None and getattr(_terminal_denial, "checkin", False):
+                purpose = self._CHECKIN_APPROVER_PURPOSE
             if purpose is None:
                 purpose = (getattr(self, "_pending_agent_problem", None)
                            or getattr(self, "_last_problem_description", None) or "")
@@ -9919,21 +9922,24 @@ class PulseCLI:
             return f"{key.upper()} {', '.join(names)}: noted -- applied when you give your verdict."
 
         runners = {
-            "terminal": lambda arg: self._run_terminal(arg, purpose=self._CHECKIN_APPROVER_PURPOSE),
-            "trace": self._run_trace,
+            "terminal": self._run_terminal, "trace": self._run_trace,
             "corr": self._run_corr, "outlier": self._run_outlier,
             "diffstats": self._run_diffstats, "histogram": self._run_histogram,
             "mllint": lambda _arg: self._run_mllint(),
             "gputrack": lambda _arg: queue_gpu("gputrack", gpu_track),
             "gpuuntrack": lambda _arg: queue_gpu("gpuuntrack", gpu_untrack),
         }
-        for name in self._CHECKIN_TOOL_NAMES:
-            for arg in requests.get(name, []):
-                try:
-                    results.append(runners[name](arg))
-                except Exception as exc:          # one broken tool must not end the check-in
-                    results.append(f"{name.upper()} {arg}: failed ({type(exc).__name__}: {exc})")
-                summary.append(f"{name.upper()} {arg}".strip())
+        _terminal_denial.checkin = True      # the approver is told this is a check-in
+        try:
+            for name in self._CHECKIN_TOOL_NAMES:
+                for arg in requests.get(name, []):
+                    try:
+                        results.append(runners[name](arg))
+                    except Exception as exc:          # one broken tool must not end the check-in
+                        results.append(f"{name.upper()} {arg}: failed ({type(exc).__name__}: {exc})")
+                    summary.append(f"{name.upper()} {arg}".strip())
+        finally:
+            _terminal_denial.checkin = False
         refused = sorted(set(requests) - set(self._CHECKIN_TOOL_NAMES))
         if refused:
             results.append(
