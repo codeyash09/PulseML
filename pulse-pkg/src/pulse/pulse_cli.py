@@ -651,6 +651,13 @@ _agent_log_warned: set = set()             # paths already reported as unwritabl
 # running a check-in's tools (.checkin) -- per thread, because a check-in worker and the
 # training thread can both be confirming a command at the same time.
 _terminal_denial = threading.local()
+# One prompt on the terminal at a time. The periodic check-in runs on a worker thread and
+# can reach the y/N for a flagged command while the training thread is at its own prompt
+# (the pause prompt, "Fix other errors?", ...); both reading stdin at once splits the
+# user's answer between them. Every prompt that can happen while training runs takes this
+# lock around its input() call. Re-entrant: a command typed at the pause prompt can lead
+# the agent to a y/N on the same thread.
+_PROMPT_LOCK = threading.RLock()
 
 
 def _agent_log_path() -> Optional[str]:
@@ -6699,8 +6706,9 @@ class PulseCLI:
             resp = "y"
         else:
             try:
-                _flush_stdin()
-                resp = input("Re-apply that fix now? (y/n) > ").strip().lower()
+                with _PROMPT_LOCK:
+                    _flush_stdin()
+                    resp = input("Re-apply that fix now? (y/n) > ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 return False
         if resp not in ("y", "yes"):
@@ -8964,8 +8972,13 @@ class PulseCLI:
                     _terminal_denial.reason = f"the auto-mode approver ({settings.model}) denied it: {decision.reason}"
                 return decision.approved
         try:
-            _flush_stdin()
-            resp = _prompt_text(f"Run it anyway? (y/N) > ", label="Run it anyway? (y/N)").strip().lower()
+            with _PROMPT_LOCK:
+                if threading.current_thread() is not threading.main_thread():
+                    # Another prompt may have been on screen while this one waited:
+                    # repeat which command the question is about.
+                    cprint(f"[Pulse] (background check-in) {command}", color=_YELLOW)
+                _flush_stdin()
+                resp = _prompt_text(f"Run it anyway? (y/N) > ", label="Run it anyway? (y/N)").strip().lower()
         except (EOFError, KeyboardInterrupt) as exc:
             if isinstance(exc, EOFError):
                 _terminal_denial.reason = "not run -- it needs the user's OK and there is no user to ask (no input)"
@@ -10880,8 +10893,9 @@ class PulseCLI:
             resp = "y"
         else:
             try:
-                _flush_stdin()
-                resp = input("Fix other errors? (y/n) > ").strip().lower()
+                with _PROMPT_LOCK:
+                    _flush_stdin()
+                    resp = input("Fix other errors? (y/n) > ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 return
         if resp not in ("y", "yes"):
@@ -14684,15 +14698,16 @@ class PulseCLI:
         # ------------------------------------------------------------
         while True:
             try:
-                _flush_stdin()
+                with _PROMPT_LOCK:
+                    _flush_stdin()
 
-                cmd = input(
-                    _highlight_pulse(
-                        "\nPulse "
-                        "[Enter=step, /c=continuous, "
-                        "/help, or ask AI] > "
-                    )
-                ).strip()
+                    cmd = input(
+                        _highlight_pulse(
+                            "\nPulse "
+                            "[Enter=step, /c=continuous, "
+                            "/help, or ask AI] > "
+                        )
+                    ).strip()
 
             except (
                 EOFError,
