@@ -487,8 +487,16 @@ class Monitor:
         target = self.training_thread
         main = threading.main_thread().ident
         if target is None or target == main:
-            _thread.interrupt_main()
-            return
+            import signal as _signal
+
+            # interrupt_main() only simulates SIGINT: when Python isn't handling it -- a run
+            # started in the background (`nohup python train.py &`) inherits SIGINT ignored
+            # -- it does nothing and /stop silently leaves training running. Raise the
+            # KeyboardInterrupt in the main thread directly in that case.
+            if callable(_signal.getsignal(_signal.SIGINT)):
+                _thread.interrupt_main()
+                return
+            target = main
         import ctypes
 
         hit = ctypes.pythonapi.PyThreadState_SetAsyncExc(

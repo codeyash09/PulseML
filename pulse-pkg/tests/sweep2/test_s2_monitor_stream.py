@@ -474,3 +474,43 @@ def test_bug_flush_waits_for_room_in_a_full_queue(tmp_path):
     finally:
         hold.set()
         writer.close()
+
+
+def test_bug_stream_stop_does_nothing_when_sigint_is_ignored(tmp_path):
+    """A run started in the background (`nohup python train.py &`) inherits SIGINT ignored.
+    /stop used _thread.interrupt_main(), which only simulates SIGINT and does nothing when
+    Python isn't handling it -- training kept running. Correct: the run stops."""
+    import signal as _signal
+    script = tmp_path / "train.py"
+    script.write_text(_STOP_SCRIPT)
+    env = dict(os.environ, PULSE_SRC=SRC, PULSE_HOME=str(tmp_path / "home"),
+               PULSE_STREAM_DIR=str(tmp_path / "spool"), CUDA_VISIBLE_DEVICES="",
+               PYTHONPATH=os.pathsep.join([FAKE_LLM, SRC]), MPLBACKEND="Agg")
+    env.pop("OPENROUTER_API_KEY", None)
+    env.pop("OPENAI_API_KEY", None)
+    proc = subprocess.Popen([sys.executable, str(script)], cwd=str(tmp_path), env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            preexec_fn=lambda: _signal.signal(_signal.SIGINT, _signal.SIG_IGN))
+    try:
+        directory = None
+        for _ in range(200):
+            line = proc.stdout.readline()
+            if not line:
+                break
+            if line.startswith("DIR="):
+                directory = line[4:].strip()
+                break
+        assert directory, "the script never printed its spool directory"
+        reader = stream.StreamReader(directory)
+        deadline = time.time() + 30
+        while time.time() < deadline and not any(
+                f.get("kind") == "scalars" for f in reader.poll()):
+            time.sleep(0.2)
+        reader.send_control(stream.CONTROL_STOP, reason="asked from the Pulse console")
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            raise AssertionError("/stop did nothing: training kept running with SIGINT ignored")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
