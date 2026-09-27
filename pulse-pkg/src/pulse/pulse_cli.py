@@ -100,23 +100,64 @@ def _build_keras_tracker_class(callback_base):
         Pulse injects it automatically into Model.fit().
         """
 
-        def __init__(self, pulse_instance):
+        def __init__(self, pulse_instance, position_only=False):
             super().__init__()
             self.pulse = pulse_instance
+            # position_only: the copy pulse_fit puts FIRST in the callback list. It only
+            # records where training is (the epoch a fix checkpoint resumes after) the moment
+            # an epoch ends, before any user callback can raise out of on_epoch_end -- that
+            # left the checkpoint one epoch behind, and the epoch was trained twice.
+            self._position_only = position_only
+            self._batches_this_epoch = 0
 
         def on_train_begin(self, logs=None):
-            if not hasattr(self.pulse, "epoch_scalar_histories"):
-                self.pulse.epoch_scalar_histories = {}
+            if self._position_only:
+                return
+            pulse = self.pulse
+            if not hasattr(pulse, "epoch_scalar_histories"):
+                pulse.epoch_scalar_histories = {}
 
-            if not hasattr(self.pulse, "batch_scalar_histories"):
-                self.pulse.batch_scalar_histories = {}
+            if not hasattr(pulse, "batch_scalar_histories"):
+                pulse.batch_scalar_histories = {}
+
+            # A new fit() is a new series: k-fold CV or a hyperparameter loop starts every
+            # fold from a fresh model, and reading fold 2 as the continuation of fold 1 made
+            # its opening epochs a CRITICAL regression. The histories keep the whole run
+            # (charts, the agent's view); the detector sees this fit's segment only (see
+            # _history_for_detector) and starts over with fresh state.
+            pulse._keras_segment_start = {
+                name: len(values) for name, values in pulse.epoch_scalar_histories.items()}
+            pulse._detector = None
+
+            # Where a fix checkpoint would resume: this fit's model, before its first epoch.
+            try:
+                if self.model is not None:
+                    pulse._keras_model = self.model
+                pulse._keras_epoch = -1
+                pulse._keras_epochs = (self.params or {}).get("epochs")
+            except Exception:
+                pass
+
+        def on_epoch_begin(self, epoch, logs=None):
+            self._batches_this_epoch = 0
 
         def on_train_batch_end(self, batch, logs=None):
+            if self._position_only:
+                return
             # Keep batch handling extremely cheap.
             # Steps are batches, counted across every fit() of the run: check-ins are scheduled
             # in steps, and one step per epoch left a 15-epoch Keras run short of the 20-step
-            # minimum -- never checked at all.
-            self.pulse._keras_steps = getattr(self.pulse, "_keras_steps", 0) + 1
+            # minimum -- never checked at all. `batch` is the index of the LAST batch run:
+            # with compile(steps_per_execution=N) this hook fires once per N batches.
+            try:
+                done = int(batch) + 1
+            except (TypeError, ValueError):
+                done = self._batches_this_epoch + 1
+            if done <= self._batches_this_epoch:
+                self._batches_this_epoch = 0          # a new epoch without on_epoch_begin
+            self.pulse._keras_steps = (getattr(self.pulse, "_keras_steps", 0)
+                                       + max(1, done - self._batches_this_epoch))
+            self._batches_this_epoch = done
             try:
                 self.pulse._record_keras_batch_logs(logs)
             except Exception as exc:
@@ -130,6 +171,16 @@ def _build_keras_tracker_class(callback_base):
                         pass
 
         def on_epoch_end(self, epoch, logs=None):
+            # What a fix-time checkpoint needs: the model being trained and where it is.
+            try:
+                self.pulse._keras_model = self.model
+                self.pulse._keras_epoch = epoch
+                self.pulse._keras_epochs = (self.params or {}).get("epochs")
+            except Exception:
+                pass
+            if self._position_only:
+                return
+
             try:
                 self.pulse._record_keras_logs(
                     logs,
@@ -145,14 +196,6 @@ def _build_keras_tracker_class(callback_base):
                     except Exception:
                         pass
                 return
-
-            # What a fix-time checkpoint needs: the model being trained and where it is.
-            try:
-                self.pulse._keras_model = self.model
-                self.pulse._keras_epoch = epoch
-                self.pulse._keras_epochs = (self.params or {}).get("epochs")
-            except Exception:
-                pass
 
             # The epoch boundary is the correct point to run diagnosis.
             # We do NOT run the expensive detector on every batch.
@@ -196,7 +239,7 @@ def _build_keras_tracker_class(callback_base):
                     pass
 
         def on_train_end(self, logs=None):
-            if _PULSE_LOGGING:
+            if _PULSE_LOGGING and not self._position_only:
                 try:
                     histories = getattr(
                         self.pulse,
@@ -317,6 +360,17 @@ def _install_keras_fit_hook():
             instance._keras_fit_count = fit_index
         except Exception:
             pass
+        # Where a fix checkpoint taken from here on resumes: THIS fit's model, before its
+        # first epoch -- never the previous fit's model and last epoch (a fine-tune that
+        # crashed in its first epoch resumed at the pretrain's epoch and skipped most of its own).
+        try:
+            instance._keras_model = self
+            instance._keras_epoch = -1
+            instance._keras_epochs = _fit_epochs(args, kwargs)
+        except Exception:
+            pass
+        if os.environ.get(_RESUME_ENV):
+            args = _positional_tail_to_kwargs(original_fit, args, kwargs, "initial_epoch")
         _resume_from_fix_checkpoint(self, args, kwargs)
         # callbacks is fit()'s 6th positional parameter: fit(x, y, batch_size, epochs,
         # verbose, callbacks, ...). Merged where it was given, never passed twice.
@@ -325,9 +379,16 @@ def _install_keras_fit_hook():
 
         if callbacks is None:
             callbacks = []
-        else:
+        elif isinstance(callbacks, (list, tuple)):
             callbacks = list(callbacks)
+        elif isinstance(getattr(callbacks, "callbacks", None), list):
+            callbacks = list(callbacks.callbacks)       # a ready keras CallbackList
+        else:
+            callbacks = [callbacks]                     # one callback, not in a list
 
+        # First: the epoch position (see PulseKerasTracker); last: everything else, so the
+        # logs Pulse records are the ones the user's callbacks have finished with.
+        callbacks.insert(0, tracker_cls(instance, position_only=True))
         callbacks.append(
             tracker_cls(instance)
         )
@@ -367,6 +428,31 @@ def _fit_epochs(args, kwargs) -> Optional[int]:
         return kwargs["epochs"]
     # fit(x, y, batch_size, epochs, ...)
     return args[3] if len(args) > 3 else 1
+
+
+def _positional_tail_to_kwargs(func, args, kwargs, name):
+    """Pass `name` -- and every positional argument after it -- by keyword, so a resume can
+    set it without a 'multiple values for argument' TypeError. `func` is the unbound
+    method (its first parameter is self). Anything unusual is left exactly as given."""
+    try:
+        params = list(inspect.signature(func).parameters.values())[1:]
+    except (TypeError, ValueError):
+        return args
+    names = []
+    for p in params:
+        if p.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD:
+            break
+        names.append(p.name)
+    if name not in names:
+        return args
+    index = names.index(name)
+    if len(args) <= index or len(args) > len(names):
+        return args
+    tail = dict(zip(names[index:], args[index:]))
+    if any(key in kwargs for key in tail):
+        return args
+    kwargs.update(tail)
+    return args[:index]
 
 
 # fit() calls seen so far per checkpoint being resumed, to find the one it was taken in.
@@ -1810,7 +1896,7 @@ _PASS4_VERIFY_TMPL = (
     "addresses the diagnosed root cause, AND is no larger than necessary to do so."
 )
 _PASS6_CONFIRM_TMPL = (
-    "The fix below was applied and the program was then re-run from the start.\n\n"
+    "The fix below was applied and the program was then {rerun}.\n\n"
     "The fix:\n{fix_desc}\n\n"
     "What the problem was:\n{problem}\n\n"
     "What the re-run printed (its last {limit} characters):\n{output}\n\n"
@@ -7136,8 +7222,13 @@ class PulseCLI:
             crashed = result.returncode != 0 and (
                 result.returncode < 0 or "Traceback" in (result.stderr or ""))
             if not crashed:
+                # The judge is told when the re-run resumed from a checkpoint: its output
+                # then covers only the epochs after that point, not a run from the start.
+                self._rerun_resumed = bool(child_env.get(_RESUME_ENV))
                 resolved, reason = self._confirm_fix_did_its_job(result)
                 if resolved:
+                    if result.returncode == 0:
+                        self._remove_fix_checkpoints()
                     sys.exit(result.returncode)
                 if not streamed:
                     sys.stdout.write(result.stdout or "")
@@ -7286,10 +7377,14 @@ class PulseCLI:
         fix_desc = self._describe_fix(fix) if fix else "(no fix recorded)"
         problem = (self._last_problem_description or "(not recorded)")[:1500]
         output = ((result.stdout or "") + "\n" + (result.stderr or ""))[-_CONFIRM_OUTPUT_CHARS:]
+        rerun = ("re-run, resuming training from a checkpoint of the weights taken when the fix "
+                 "started (unless the fixed model no longer matched it) -- so its output may cover "
+                 "only the epochs after that point, not a whole run"
+                 if getattr(self, "_rerun_resumed", False) else "re-run from the start")
         try:
             with _Spinner("Checking the fix did its job"):
                 answer = self._call_model(
-                    _PASS6_CONFIRM_TMPL.format(fix_desc=fix_desc, problem=problem,
+                    _PASS6_CONFIRM_TMPL.format(rerun=rerun, fix_desc=fix_desc, problem=problem,
                                                limit=_CONFIRM_OUTPUT_CHARS, output=output),
                     max_tokens=_AGENT_MAX_TOKENS,
                 )
@@ -9774,13 +9869,22 @@ class PulseCLI:
         restart trains from the beginning, as it always did. Each checkpoint is a full copy of
         the weights, so the one it replaces is deleted and only the newest few are kept."""
         previous = getattr(self, "_fix_checkpoint", None)
-        self._fix_checkpoint = None
-        self._resume_after_fix = True
         model = getattr(self, "_keras_model", None)
+        # Where training is: a crash or escalation saves, then asks the agent, which saves
+        # again at the start of the fix -- the same weights twice, a full copy each time.
+        position = (id(model), getattr(self, "_keras_fit_count", 0),
+                    getattr(self, "_keras_epoch", -1), getattr(self, "_keras_steps", 0))
+        if (model is not None and previous and os.path.exists(previous)
+                and getattr(self, "_fix_checkpoint_position", None) == position):
+            self._resume_after_fix = True
+            return
+        self._fix_checkpoint = None
+        self._fix_checkpoint_position = None
+        self._resume_after_fix = True
         if model is None or not self.script_path:
             return
         try:
-            folder = os.path.join(os.path.dirname(os.path.abspath(self.script_path)), ".pulse_checkpoints")
+            folder = self._fix_checkpoint_folder()
             os.makedirs(folder, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             weights = os.path.join(folder, f"fix-{stamp}.weights.h5")
@@ -9794,12 +9898,32 @@ class PulseCLI:
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(meta, f)
             self._fix_checkpoint = meta_path
+            self._fix_checkpoint_position = position
             self._prune_fix_checkpoints(folder, previous)
             _agent_log_event(f"CHECKPOINT SAVED before fixing (after epoch {meta['epoch'] + 1})",
                              f"{weights}\nweights finite: {finite}")
         except Exception as exc:
             _agent_log_event("CHECKPOINT FAILED -- a restart will train from the beginning",
                              f"{type(exc).__name__}: {exc}")
+
+    def _fix_checkpoint_folder(self) -> str:
+        return os.path.join(os.path.dirname(os.path.abspath(self.script_path)), ".pulse_checkpoints")
+
+    def _remove_fix_checkpoints(self) -> None:
+        """The fixed run finished and did its job: nothing will resume from the fix
+        checkpoints any more, and each is a full copy of the weights (gigabytes for a large
+        model). Delete them, and the folder once it is empty."""
+        if not getattr(self, "script_path", None):
+            return
+        folder = self._fix_checkpoint_folder()
+        try:
+            for name in os.listdir(folder):
+                if name.startswith("fix-") and (name.endswith(".json") or name.endswith(".weights.h5")):
+                    os.remove(os.path.join(folder, name))
+            if not os.listdir(folder):
+                os.rmdir(folder)
+        except OSError:
+            pass
 
     _FIX_CHECKPOINTS_KEPT = 3
 
@@ -10493,6 +10617,11 @@ class PulseCLI:
             if _depth == 0:
                 self._last_applied_fix = None
                 self._last_problem_description = question
+                # A fix from here restarts the run, which resumes from the weights as they are
+                # NOW -- not an older escalation's checkpoint, or from scratch.
+                if (self.agent_provider and self.agent_key
+                        and threading.current_thread() is threading.main_thread()):
+                    self._save_fix_checkpoint()
             answer = self._ask_agent_impl(question, include_code=include_code, _depth=_depth)
             if _depth == 0:
                 if self._last_call_failed_transiently:
@@ -13170,7 +13299,7 @@ class PulseCLI:
             hist.append(value)
 
             if len(hist) > 2000:
-                del hist[:-2000]
+                self._trim_epoch_history(name, hist)
 
             recorded[name] = value
 
@@ -13191,7 +13320,7 @@ class PulseCLI:
                 hist.append(value)
 
                 if len(hist) > 2000:
-                    del hist[:-2000]
+                    self._trim_epoch_history("train_loss", hist)
 
                 recorded["train_loss"] = value
 
@@ -13227,6 +13356,15 @@ class PulseCLI:
             except Exception:
                 pass
 
+
+    def _trim_epoch_history(self, name, hist):
+        """Cap an epoch history at 2,000 readings, keeping the current fit()'s segment start
+        (see PulseKerasTracker.on_train_begin) pointing at the same reading."""
+        excess = len(hist) - 2000
+        del hist[:excess]
+        starts = getattr(self, "_keras_segment_start", None)
+        if starts and name in starts:
+            starts[name] = max(0, starts[name] - excess)
 
     def _record_keras_batch_logs(self, logs=None):
         """
@@ -13300,14 +13438,17 @@ class PulseCLI:
         scalar_histories, where a value that never changes never grows.
         """
         epoch_histories = getattr(self, "epoch_scalar_histories", {})
+        # Only the current model.fit()'s epochs: a second fit() (the next CV fold, a new
+        # hyperparameter trial) is a new series, not a continuation of the last one.
+        starts = getattr(self, "_keras_segment_start", None) or {}
 
         if name in epoch_histories and epoch_histories[name]:
-            return epoch_histories[name]
+            return epoch_histories[name][starts.get(name, 0):]
 
         if name == "train_loss":
             loss_hist = epoch_histories.get("loss")
             if loss_hist:
-                return loss_hist
+                return loss_hist[starts.get("loss", 0):]
 
         sampled = (getattr(self, "_detector_scalar_histories", {}) or {}).get(name)
         if sampled:
@@ -13351,7 +13492,11 @@ class PulseCLI:
             the caller's loss-change fallback decides;
           - the increase is within _LOOP_VAR_MAX_STEP_JUMP, so a variable that happens to
             jump by a huge amount (it's actually a sample count, not a step count) doesn't
-            get reported as hundreds of steps in one tick.
+            get reported as hundreds of steps in one tick;
+          - a strided counter (`for i in range(0, len(X), batch_size)`) moves by its stride
+            per step: each counter's stride is learned as the gcd of its advances and the
+            advance is divided by it. update() runs on a timer, so a plain counter's
+            advances vary tick to tick and its gcd drops to 1 within a few ticks.
 
         Returns None (not zero) only when no recognized loop-counter name has enough history
         yet to judge -- callers should fall through to their own fallback in that case only.
@@ -13361,6 +13506,7 @@ class PulseCLI:
         """
         locals_map = getattr(self, "watch_locals", None) or {}
         last_seen = self._loop_var_last_seen
+        strides = self.__dict__.setdefault("_loop_var_strides", {})
         for name in self._LOOP_VAR_CANDIDATES:
             if name not in locals_map:
                 continue
@@ -13372,10 +13518,16 @@ class PulseCLI:
             if prev is None:
                 continue  # first sighting -- nothing to diff against yet, try the next candidate
             delta = raw - prev
-            if delta < 0:
-                delta = raw + 1  # wrapped: iterations 0..raw of the loop's next pass ran
             if delta > self._LOOP_VAR_MAX_STEP_JUMP:
                 continue  # implausible jump for one tick -- probably not a step counter after all
+            if delta > 0:
+                stride = strides[name] = math.gcd(strides.get(name, 0), delta)
+                delta //= stride
+            elif delta < 0:
+                # wrapped: iterations 0..raw of the loop's next pass ran
+                delta = raw // (strides.get(name) or 1) + 1
+                if delta > self._LOOP_VAR_MAX_STEP_JUMP:
+                    continue
             if delta == 0 and name in self._COARSE_LOOP_VARS:
                 return None  # an epoch counter standing still is no evidence either way
             return delta  # first (finest-grained) match wins, including a confident 0
@@ -13588,6 +13740,10 @@ class PulseCLI:
             )
         )
 
+        # A newly GPU-tracked variable gets its first look right away -- but only one the
+        # loop below will actually consider (tracked, and with a value in scope). One that
+        # is never copied (not in scope yet, CPU-resident, or with a CPU mirror) must not
+        # keep this True: every other GPU-tracked tensor was then copied on every update.
         gpu_probed = self.__dict__.setdefault("_gpu_probed_vars", set())
         probe_gpu = bool(gpu_vars) and (
             (
@@ -13595,6 +13751,8 @@ class PulseCLI:
             ) >= getattr(self, "gpu_probe_interval", 600.0)
             or any(
                 v not in gpu_probed
+                and v in self.tracked_vars
+                and self.watch_locals.get(v) is not None
                 for v in gpu_vars
             )
         )
@@ -13631,6 +13789,8 @@ class PulseCLI:
 
             var_state = self._state_of(var_name)
             gpu_copy = False
+            if var_name in gpu_vars and raw_local is not None:
+                gpu_probed.add(var_name)        # considered: copied below or never copyable
 
             if (
                 var_name in gpu_vars
