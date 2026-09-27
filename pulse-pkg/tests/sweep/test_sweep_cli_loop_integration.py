@@ -1038,6 +1038,9 @@ def test_ok_restart_passes_script_args(make_cli, tmp_path, monkeypatch):
     cli = _with_agent(make_cli(), tmp_path)
     _stub_restart_side_effects(cli, monkeypatch)
     monkeypatch.setattr(sys, "argv", [cli.script_path, "--epochs", "3"])
+    # No interpreter options of the test runner's own (an xdist worker runs `python -u -c ...`):
+    # those are passed on to the restarted script too.
+    monkeypatch.setattr(sys, "orig_argv", [sys.executable, cli.script_path, "--epochs", "3"], raising=False)
     seen = {}
 
     def fake_run(argv, **kw):
