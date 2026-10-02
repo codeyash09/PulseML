@@ -144,6 +144,24 @@ def wrap(text: str, width: int, indent: str = "") -> List[str]:
     return lines
 
 
+def cut(text: str, width: int) -> str:
+    """At most `width` columns, no ellipsis: what a frame row can be written as."""
+    if visible_len(text) <= width:
+        return text
+    out: List[str] = []
+    cols = 0
+    for token in _tokens(text):
+        if _is_sgr(token):
+            out.append(token)
+            continue
+        w = _ui._char_width(token)
+        if cols + w > width:
+            break
+        out.append(token)
+        cols += w
+    return "".join(out)
+
+
 def pad(text: str, width: int) -> str:
     """Exactly `width` columns: clipped or space-filled, colours closed."""
     clipped = _ui._clip(text, width)
@@ -342,7 +360,7 @@ class View:
     """Everything a frame shows. The app mutates this; compose() only reads it."""
 
     def __init__(self) -> None:
-        self.area = "CODE"                      # PULSE / <AREA> in the top bar
+        self.area = ""                          # PULSE / <AREA> in the top bar; "" at home
         self.context = ""                       # project folder, or the run
         self.agent = ""                         # the model in use, or how to set one
         self.entries: List[Entry] = []
@@ -424,9 +442,12 @@ def _field(prompt: str, text: str, pos: int, width: int, secret: bool) -> Tuple[
 def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
     """One frame: `height` lines of at most `width` columns, and where the cursor goes
     (row, column, zero-based)."""
-    width, height = max(20, width), max(8, height)
+    # The last row of the terminal is left alone: on some terminals writing into it (or
+    # into the bottom-right cell) scrolls the whole screen up a line, and the input line
+    # was the one that vanished. The frame is drawn one row shorter than the screen.
+    width, height = max(20, width), max(8, height) - 1
     rule = s(g("rule") * width, "dim")
-    title = s("PULSE", "bold", "accent") + s(" / ", "dim") + s(view.area.upper(), "bold")
+    title = s("PULSE", "bold", "accent") + (s(" / ", "dim") + s(view.area.upper(), "bold") if view.area else "")
     if view.context:
         title += s("   " + view.context, "dim")
     agent = s(view.agent, "dim") if view.agent else ""
@@ -570,7 +591,8 @@ class Screen:
             out.append("\033[2J")
         for row, line in enumerate(lines):
             if row >= len(self._shown) or self._shown[row] != line:
-                out.append(f"\033[{row + 1};1H{line}\033[0m\033[K")
+                # never the last column: a terminal may wrap there and scroll everything
+                out.append(f"\033[{row + 1};1H{cut(line.rstrip(' '), size[0] - 1)}\033[0m\033[K")
         self._shown = list(lines)
         out.append(f"\033[{cursor_row + 1};{cursor_col + 1}H\033[?25h")
         self.write("".join(out))

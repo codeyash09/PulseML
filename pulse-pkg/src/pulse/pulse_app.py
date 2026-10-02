@@ -897,7 +897,7 @@ class App:
             view.context = f"{os.path.basename(self.session.get('script') or '?')}  ·  {short(self.console.workdir)}"
             view.commands = DEBUG_COMMANDS + HOME_COMMANDS
         else:
-            view.area = "CODE"
+            view.area = ""
             view.context = short(getattr(cli, "_project_root", None) or self.home_root)
             view.commands = HOME_COMMANDS
         view.agent = f"agent: {cli.agent_provider}" if cli.agent_provider else "no agent -- /agent"

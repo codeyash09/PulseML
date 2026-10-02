@@ -172,11 +172,13 @@ def demo_view():
 
 
 @pytest.mark.parametrize("width, height", [(100, 22), (120, 40), (84, 12), (60, 24), (40, 12)])
-def test_a_frame_is_exactly_the_terminal_size(width, height):
+def test_a_frame_fills_the_terminal_but_its_last_row(width, height):
+    """One row shorter than the screen: some terminals scroll when the last row is written
+    to, and the input line was what disappeared."""
     view = demo_view()
     view.side = ["train.py  live", "step 10", "loss 0.5"]
     frame, row, col = tui.compose(view, width, height)
-    assert len(frame) == height
+    assert len(frame) == height - 1
     assert all(tui.visible_len(line) <= width for line in frame)
     assert 0 <= row < height and 0 <= col < width
     assert plain(frame[row]).rstrip().endswith("❯")              # the cursor sits on the input line
@@ -227,6 +229,20 @@ def test_a_question_and_a_list_take_over_the_input_block():
     frame = [plain(line) for line in tui.compose(view, 90, 24)[0]]
     chosen = next(line for line in frame if "eval.py" in line)
     assert chosen.strip().startswith("›") and any("train.py" in line and "›" not in line for line in frame)
+
+
+def test_the_home_bar_says_pulse_and_a_run_says_debug():
+    view = demo_view()
+    top = plain(tui.compose(view, 80, 24)[0][0])
+    assert top.startswith(" PULSE   ~/proj") and "/" not in top.split("~/proj")[0]
+    view.area = "DEBUG"
+    assert plain(tui.compose(view, 80, 24)[0][0]).startswith(" PULSE / DEBUG")
+
+
+def test_a_row_is_never_written_into_the_last_column():
+    assert tui.cut("─" * 80, 79) == "─" * 79
+    assert tui.cut("\033[1mabcdef\033[0m", 3) == "\033[1mabc"
+    assert tui.cut("short", 10) == "short"
 
 
 def test_scrolling_back_shows_older_lines_and_says_so():
@@ -695,7 +711,7 @@ def test_opening_a_run_splits_the_screen_and_aims_the_agent_at_its_project(real_
     assert all("│" in line for line in frame[2:])
 
     real_app._close_run()
-    assert view.area == "CODE" and view.side is None and real_app.console is None
+    assert view.area == "" and view.side is None and real_app.console is None
     assert real_app.cli._project_root == home and os.path.realpath(os.getcwd()) == os.path.realpath(home)
     assert real_app.cli._system_prompt_override == pulse_code.CODE_SYSTEM_PROMPT
 
@@ -725,7 +741,7 @@ def test_esc_closes_the_run(real_app, tmp_path):
     real_app._open_run(make_run(tmp_path))
     press(real_app, "esc")
     assert wait_for(lambda: real_app.console is None and not real_app.view.busy, 10)
-    assert real_app.view.area == "CODE"
+    assert real_app.view.area == ""
 
 
 def test_the_picker_lists_runs_live_first_and_opens_the_one_chosen(real_app, tmp_path, monkeypatch):
