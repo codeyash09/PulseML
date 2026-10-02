@@ -4347,6 +4347,25 @@ def _chat_panel_class():
                     os.environ[env_var] = saved
             return bool(os.environ.get(env_var) or self.session_keys.get(provider_name))
 
+        def _offer_openrouter_instead(self):
+            """No key for the chosen provider: offer an OpenRouter model, with a sign-in."""
+            name = next((n for n, info in PROVIDERS.items()
+                         if info.get("env_key") == "OPENROUTER_API_KEY" and info.get("model")), None)
+            if name is None or not messagebox.askyesno(
+                    "No API key",
+                    "Sign in to OpenRouter -- or create an account -- and use one of its models "
+                    f"instead?\n\nPulse will switch to {name}; you can pick another OpenRouter "
+                    "model from the list afterwards.",
+                    parent=self):
+                return None
+            self.provider_var.set(name)
+            if self._has_active_key(name):          # already signed in on this machine
+                self._update_status_indicator()
+                self._append("Pulse", f"Switched to {name} with your OpenRouter sign-in. "
+                                      "Send your message again.")
+                return None
+            return self._openrouter_sign_in(name)
+
         def _openrouter_sign_in(self, provider_name):
             """Sign in to OpenRouter -- or create an account -- in the browser, off the UI
             thread, and keep the key. The chat says what happened either way."""
@@ -4506,10 +4525,14 @@ def _chat_panel_class():
                         return
                 api_key = simpledialog.askstring(
                     prov_info.get("prompt_title", "API Key Required"),
-                    prov_info.get("prompt_msg", f"Enter the API key for {env_var}:"),
+                    prov_info.get("prompt_msg", f"Enter the API key for {env_var}:")
+                    + ("" if env_var == "OPENROUTER_API_KEY" else
+                       "\n\nNo key? Leave this empty: Pulse can sign you in to OpenRouter instead."),
                     parent=self, show='*'
                 )
                 if not api_key or not api_key.strip():
+                    if env_var != "OPENROUTER_API_KEY":
+                        self._offer_openrouter_instead()
                     return
                 clean_key = api_key.strip()
                 self.session_keys[current_provider] = clean_key

@@ -63,7 +63,11 @@ a key for you:
 pulse openrouter            # sign in, or create an account, in your browser
 ```
 
-or pick any OpenRouter model at Pulse's agent prompt and press Enter at the key question.
+or just press Enter at any API key question. Pulse asks for a key in `pulse run`,
+`auto_track()`, `pulse code` and when you switch agents, and every one of those offers the
+sign-in: for an OpenRouter model Enter starts it directly, and for any other provider Enter
+offers to sign you in and switch to an OpenRouter model. The dashboard asks the same thing
+in a dialog, and `pulse --model openrouter/<model>` offers it when there is no key.
 Your browser opens on OpenRouter; sign in or sign up, click Authorize, and Pulse receives
 an API key made for it. Over SSH or in a container there is no browser to open, so Pulse
 prints a link to open on any device and asks you to paste the code OpenRouter shows.

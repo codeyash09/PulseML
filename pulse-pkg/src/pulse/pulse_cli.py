@@ -1342,7 +1342,9 @@ def _ui_pick_agent(names: List[str], cached_provider: Optional[str], current: Op
             if info.get("custom"):
                 detail = "type any provider/model string"
             elif info.get("openrouter"):
-                detail = "type any OpenRouter model"
+                detail = "type any OpenRouter model  ·  no key needed: sign in"
+            elif info.get("env_key") == _openrouter.ENV_KEY:
+                detail = f"{info.get('model') or ''}  ·  no key needed: sign in".strip()
             elif info.get("local"):
                 detail = "local -- no data leaves this machine"
             else:
@@ -1368,7 +1370,15 @@ def _ui_key_screen(chosen: str, openrouter: bool = False) -> None:
         _ui.note("A key you paste is used only to call the model and is never written to disk.")
     else:
         _ui.note("Used only to call the model you selected. Pulse never writes it to disk.")
+        _ui.note("No key? Press Enter: Pulse can sign you in to OpenRouter and use one of its "
+                 "models instead.")
     _ui._emit()
+
+
+# The key question for every provider but OpenRouter (which has its own: sign in or paste).
+_KEY_PROMPT = ("API key (paste one -- or press Enter if you have none: Pulse can sign you in to "
+               "OpenRouter instead) > ")
+_KEY_LABEL = "API key  (none? Enter = sign in with OpenRouter instead)"
 
 
 def _ui_code_version(sha: Optional[str], cwd: Optional[str]) -> None:
@@ -6892,7 +6902,8 @@ class PulseCLI:
             cprint(
                 "[Pulse] Non-interactive mode and no usable provider found in the environment -- "
                 "AI agent disabled for this run. Set PULSE_PROVIDER and either its matching *_API_KEY, "
-                "or PULSE_LOCAL_MODEL for a local provider, to enable it."
+                "or PULSE_LOCAL_MODEL for a local provider, to enable it. No API key? Run "
+                "`pulse openrouter` once to sign in, then set PULSE_PROVIDER=openrouter/<model>."
             )
             self.agent_provider = None
             return False
@@ -6905,8 +6916,10 @@ class PulseCLI:
                 local_tag = "  [local -- no data leaves this machine]" if PROVIDERS[name].get("local") else ""
                 if PROVIDERS[name].get("custom"):
                     local_tag = "  [type any provider/model string]"
+                if PROVIDERS[name].get("env_key") == _openrouter.ENV_KEY:
+                    local_tag = "  [no key needed: sign in with OpenRouter]"
                 if PROVIDERS[name].get("openrouter"):
-                    local_tag = "  [type any OpenRouter model]"
+                    local_tag = "  [type any OpenRouter model -- no key needed: sign in]"
                 marker = "  (current)" if name == self.agent_provider else ("  (last used)" if name == cached_provider else "")
                 print(f"  {i}) {name}{local_tag}{marker}")
 
@@ -6951,6 +6964,12 @@ class PulseCLI:
                 if initial:
                     self.agent_provider = None
                 return False
+            if model_string.lower().startswith("openrouter/"):
+                # Typed here or picked from the list, an OpenRouter model gets the same key
+                # question: sign in, or paste a key.
+                chosen = register_openrouter_model(model_string)
+                info = PROVIDERS[chosen]
+        if info.get("custom"):
             env_var = _prompt_text("Env var name for the API key (optional, Enter to skip) > ", label="Env var for the API key", placeholder="optional -- Enter to skip").strip() or None
             key = "local"
             if env_var:
@@ -7030,9 +7049,16 @@ class PulseCLI:
             if use_existing in ("", "y", "yes"):
                 key = existing
             else:
-                key = _prompt_text("API key > ", label="API key", secret=True, validate=lambda t: _ui.key_hint_for(t, env_var)).strip()
+                key = _prompt_text(_KEY_PROMPT, label=_KEY_LABEL, secret=True, validate=lambda t: _ui.key_hint_for(t, env_var)).strip()
         else:
-            key = _prompt_text("API key > ", label="API key", secret=True, validate=lambda t: _ui.key_hint_for(t, env_var)).strip()
+            key = _prompt_text(_KEY_PROMPT, label=_KEY_LABEL, secret=True, validate=lambda t: _ui.key_hint_for(t, env_var)).strip()
+
+        if not key and env_var != _openrouter.ENV_KEY:
+            # No key for this provider: an OpenRouter sign-in gets one for its models.
+            instead = self._openrouter_instead()
+            if instead:
+                chosen, key = instead
+                env_var = _openrouter.ENV_KEY
 
         if not key:
             cprint("[Pulse CLI] No API key entered. Agent unchanged.")
@@ -7064,6 +7090,45 @@ class PulseCLI:
         # waiting for the next update() call (which could be an epoch away).
         self._prime_with_agent_if_needed()
         return True
+
+    def _openrouter_instead(self) -> Optional[Tuple[str, str]]:
+        """The person has no key for the provider they picked. Offer what needs none: an
+        OpenRouter model, with a sign-in (or sign-up) in the browser. Returns (provider
+        label, key), or None when they decline or it does not work out."""
+        _flush_stdin()
+        answer = _prompt_text(
+            "No API key entered. Sign in to OpenRouter -- or create an account -- and use one of "
+            "its models instead? (y/N) > ",
+            label="No key. Sign in with OpenRouter and use one of its models instead?  (y/N)",
+        ).strip().lower()
+        if answer not in ("y", "yes"):
+            return None
+        names = [n for n, info in PROVIDERS.items()
+                 if info.get("env_key") == _openrouter.ENV_KEY and not info.get("custom")]
+        if not names:
+            return None
+        cprint("\nOpenRouter models:")
+        for i, name in enumerate(names, 1):
+            cprint(f"  {i}) {name}")
+        _flush_stdin()
+        raw = _prompt_text("Model number (Enter = 1) > ", label="OpenRouter model number  (Enter = 1)").strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(names):
+            picked = names[int(raw) - 1]
+        else:
+            matches = [n for n in names if raw and raw.lower() in n.lower()]
+            picked = matches[0] if len(matches) == 1 else names[0]
+        info = PROVIDERS[picked]
+        if info.get("openrouter"):
+            _flush_stdin()
+            slug = _prompt_text(f"Model ({info['model_hint']}) > ", label=f"Model ({info['model_hint']})").strip()
+            if not slug:
+                return None
+            picked = register_openrouter_model(slug)
+        key = self._openrouter_key(os.environ.get(_openrouter.ENV_KEY, "").strip())
+        if not key:
+            return None
+        _say_plain("Agent model", picked, f"✓ Agent selected: {picked}")
+        return picked, key
 
     def _openrouter_key(self, existing: str) -> str:
         """The key for an OpenRouter model, in an interactive session: the one already in

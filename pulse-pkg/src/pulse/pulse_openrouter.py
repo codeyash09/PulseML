@@ -384,6 +384,43 @@ def key_for(model: Optional[str]) -> Optional[str]:
     return os.environ.get(ENV_KEY, "").strip() or saved_key()
 
 
+def offer_sign_in_for(model: Optional[str], *, ask: Optional[Callable[[str], str]] = None,
+                      say: Callable[[str], None] = print) -> Optional[str]:
+    """An OpenRouter model was asked for and there is no key anywhere: offer the sign-in.
+    Returns the key now available (None for other providers' models, when the person
+    declines, or with no terminal to ask on -- then only says how to sign in)."""
+    if not str(model or "").lower().startswith("openrouter/"):
+        return None
+    key = key_for(model)
+    if key:
+        return key
+    interactive = ask is not None or (sys.stdin is not None and sys.stdin.isatty())
+    if not interactive:
+        say(f"No OpenRouter key on this machine for {model}: run `pulse openrouter` to sign in "
+            f"(or set {ENV_KEY}).")
+        return None
+    ask = ask or (lambda prompt: input(prompt + " > "))
+    try:
+        answer = ask(f"No OpenRouter key on this machine for {model}. Sign in, or create an "
+                     "account, now? (Y/n)").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if answer not in ("", "y", "yes"):
+        return None
+    try:
+        key = sign_in(ask=ask, say=say)
+    except SignInError as error:
+        say(f"OpenRouter sign-in did not finish: {error}")
+        return None
+    kept = save_key(key)
+    say(f"Signed in to OpenRouter (key {tail(key)})"
+        + (" -- saved on this machine; `pulse openrouter logout` removes it." if kept
+           else " -- for this session only (it could not be saved)."))
+    if not kept:
+        os.environ[ENV_KEY] = key
+    return key
+
+
 def tail(key: str) -> str:
     """A key, shown safely: its last four characters."""
     return "…" + key[-4:] if key and len(key) > 8 else "…"

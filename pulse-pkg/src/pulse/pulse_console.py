@@ -737,7 +737,9 @@ class Console:
 
     def ask(self, question: str) -> None:
         if self.agent is None:
-            print("\n  No model configured. Start with --model, or set PULSE_MODEL.\n")
+            print("\n  No model configured. Start with --model, or set PULSE_MODEL.")
+            print("  No API key? `pulse openrouter` signs you in to OpenRouter (or creates an "
+                  "account);\n  then `--model openrouter/<model>` works without one.\n")
             return
         pack = self.brain.evidence(include_code=True)
         prompt = (
@@ -1416,6 +1418,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif not argument.startswith("-") and wanted is None:
             wanted = argument
     model = model or os.environ.get("PULSE_MODEL", "")
+    if model and command != "sessions":
+        # An OpenRouter model and no key on this machine: offer the sign-in before attaching.
+        from . import pulse_openrouter
+        pulse_openrouter.offer_sign_in_for(model)
 
     if "--pid" in argv:
         index = argv.index("--pid")

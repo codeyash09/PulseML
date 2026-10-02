@@ -410,7 +410,100 @@ def test_other_providers_are_asked_for_a_key_as_before(cli, monkeypatch):
     shown = scripted(monkeypatch, ["some-key"])
     monkeypatch.setattr(orr, "sign_in", lambda **k: pytest.fail("not an OpenRouter model"))
     assert cli._select_agent_provider_and_key(initial=True)
-    assert cli.agent_key == "some-key" and shown == ["API key > "]
+    assert cli.agent_key == "some-key" and shown == [pc._KEY_PROMPT]
+    assert "OpenRouter" in pc._KEY_PROMPT and "Enter" in pc._KEY_PROMPT
+
+
+# ---- the sign-in is offered wherever a key is asked for ------------------------------------
+
+def other_provider(monkeypatch):
+    name = next(n for n, info in pc.PROVIDERS.items()
+                if info.get("env_key") and info["env_key"] != orr.ENV_KEY and not info.get("local"))
+    monkeypatch.delenv(pc.PROVIDERS[name]["env_key"], raising=False)
+    return name
+
+
+def openrouter_names():
+    return [n for n, info in pc.PROVIDERS.items() if info.get("env_key") == orr.ENV_KEY]
+
+
+def test_no_key_for_another_provider_offers_openrouter_instead(cli, monkeypatch):
+    fake_openrouter(monkeypatch)
+    pick(monkeypatch, other_provider(monkeypatch))
+    # no key -> yes, sign in with OpenRouter -> first model -> Enter = sign in
+    shown = scripted(monkeypatch, ["", "y", "", ""])
+    monkeypatch.setattr(orr, "sign_in", lambda **k: KEY)
+    assert cli._select_agent_provider_and_key(initial=True)
+    assert cli.agent_provider == openrouter_names()[0] and cli.agent_key == KEY
+    assert os.environ[orr.ENV_KEY] == KEY and orr.saved_key() == KEY
+    assert "Sign in to OpenRouter" in shown[1]
+
+
+def test_declining_the_offer_leaves_the_agent_off_as_before(cli, monkeypatch, capsys):
+    pick(monkeypatch, other_provider(monkeypatch))
+    scripted(monkeypatch, ["", ""])                       # no key, then Enter = no
+    monkeypatch.setattr(orr, "sign_in", lambda **k: pytest.fail("declined"))
+    assert cli._select_agent_provider_and_key(initial=True) is False
+    assert cli.agent_provider is None and "No API key entered" in capsys.readouterr().out
+
+
+def test_the_offer_can_pick_any_openrouter_model_and_take_a_pasted_key(cli, monkeypatch):
+    pick(monkeypatch, other_provider(monkeypatch))
+    names = openrouter_names()
+    any_model = str(1 + next(i for i, n in enumerate(names) if pc.PROVIDERS[n].get("openrouter")))
+    scripted(monkeypatch, ["", "y", any_model, "qwen/qwen-9", "sk-or-v1-pasted"])
+    assert cli._select_agent_provider_and_key(initial=True)
+    assert cli.agent_provider == "OpenRouter: qwen/qwen-9" and cli.agent_key == "sk-or-v1-pasted"
+    assert orr.saved_key() is None
+
+
+def test_an_openrouter_model_typed_as_a_custom_model_gets_the_sign_in(cli, monkeypatch):
+    fake_openrouter(monkeypatch)
+    custom = next(n for n, info in pc.PROVIDERS.items() if info.get("custom"))
+    pick(monkeypatch, custom)
+    shown = scripted(monkeypatch, ["openrouter/qwen/qwen-9", ""])
+    monkeypatch.setattr(orr, "sign_in", lambda **k: KEY)
+    assert cli._select_agent_provider_and_key(initial=True)
+    assert cli.agent_provider == "OpenRouter: qwen/qwen-9" and cli.agent_key == KEY
+    assert "sign in" in shown[1]
+
+
+def test_the_agent_list_says_openrouter_needs_no_key(cli, monkeypatch, capsys):
+    pick(monkeypatch, "")                                 # Enter = skip the agent
+    assert cli._select_agent_provider_and_key(initial=True) is False
+    listed = [line for line in capsys.readouterr().out.splitlines() if "OpenRouter" in line]
+    assert listed and all("no key needed" in line for line in listed)
+
+
+def test_pulse_code_asks_the_same_key_question():
+    from pulse import pulse_code
+    assert pulse_code._CodeAgentCLI._select_agent_provider_and_key is PulseCLI._select_agent_provider_and_key
+    assert pulse_code._CodeAgentCLI._openrouter_key is PulseCLI._openrouter_key
+
+
+def test_console_offers_the_sign_in_for_an_openrouter_model_without_a_key(monkeypatch):
+    fake_openrouter(monkeypatch)
+    monkeypatch.setattr(orr, "sign_in", lambda **k: KEY)
+    said, asked = [], []
+
+    def ask(prompt):
+        asked.append(prompt)
+        return ""                                         # Enter = yes
+
+    assert orr.offer_sign_in_for("anthropic/claude-sonnet-5", ask=ask, say=said.append) is None
+    assert asked == []
+    assert orr.offer_sign_in_for("openrouter/qwen/qwen-9", ask=ask, say=said.append) == KEY
+    assert orr.saved_key() == KEY and len(asked) == 1 and KEY not in "\n".join(said)
+    assert orr.offer_sign_in_for("openrouter/qwen/qwen-9", ask=lambda p: pytest.fail("has a key")) == KEY
+
+
+def test_console_offer_declined_or_without_a_terminal(monkeypatch):
+    monkeypatch.setattr(orr, "sign_in", lambda **k: pytest.fail("not asked for"))
+    assert orr.offer_sign_in_for("openrouter/qwen/qwen-9", ask=lambda p: "n", say=lambda s: None) is None
+    said = []
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
+    assert orr.offer_sign_in_for("openrouter/qwen/qwen-9", say=said.append) is None
+    assert "pulse openrouter" in said[0]
 
 
 def test_unattended_run_uses_the_saved_sign_in_when_openrouter_is_asked_for(cli, monkeypatch):
@@ -502,3 +595,19 @@ def test_dashboard_sign_in_failure_is_shown(panel, monkeypatch):
     panel._openrouter_sign_in(dashboard_openrouter_provider()).join(10)
     assert panel.session_keys == {} and "did not finish" in "\n".join(panel.appended)
     assert panel._openrouter_signing_in is False
+
+
+def test_dashboard_no_key_for_another_provider_offers_openrouter(panel, monkeypatch):
+    monkeypatch.setattr(core, "messagebox", types.SimpleNamespace(askyesno=lambda *a, **k: True), raising=False)
+    chosen = []
+    panel.provider_var = types.SimpleNamespace(set=chosen.append)
+    monkeypatch.setattr(orr, "sign_in", lambda **k: KEY)
+    panel._offer_openrouter_instead().join(10)
+    assert core.PROVIDERS[chosen[0]]["env_key"] == orr.ENV_KEY
+    assert panel.session_keys[chosen[0]] == KEY and orr.saved_key() == KEY
+
+
+def test_dashboard_offer_declined_changes_nothing(panel, monkeypatch):
+    monkeypatch.setattr(core, "messagebox", types.SimpleNamespace(askyesno=lambda *a, **k: False), raising=False)
+    panel.provider_var = types.SimpleNamespace(set=lambda name: pytest.fail("declined"))
+    assert panel._offer_openrouter_instead() is None and panel.session_keys == {}
