@@ -34,7 +34,7 @@ import unicodedata
 __all__ = [
     "Unavailable", "enabled", "color_enabled", "header", "rule", "ok", "warn", "fail",
     "note", "kv", "subhead", "ask", "confirm", "choose", "Option", "Stage", "ready_block",
-    "elapsed_text", "commit_looks_valid", "key_hint_for",
+    "elapsed_text", "commit_looks_valid", "key_hint_for", "set_host", "host",
 ]
 
 
@@ -53,8 +53,27 @@ def _isatty(stream):
         return False
 
 
+# The Pulse app (pulse_app) runs the same setup and agent code inside its own full-screen
+# layout. While it does, it is the host: questions are answered in its input line, a
+# running stage is its spinner, and everything written to stdout lands in its transcript.
+# The callers of this module do not change -- they still call ask() / choose() / Stage.
+_HOST = None
+
+
+def set_host(host):
+    """Install (or, with None, remove) the object that draws for this module."""
+    global _HOST
+    _HOST = host
+
+
+def host():
+    return _HOST
+
+
 def enabled():
     """True only on a real interactive terminal, and never when explicitly opted out."""
+    if _HOST is not None:
+        return True
     if os.environ.get("PULSE_PLAIN", "").strip().lower() in ("1", "true", "yes", "on"):
         return False
     if os.environ.get("TERM", "").lower() == "dumb":
@@ -66,6 +85,8 @@ def color_enabled():
     # no-color.org: only a non-empty NO_COLOR disables colour; a dumb terminal can't show it.
     if os.environ.get("NO_COLOR") or os.environ.get("TERM", "").lower() == "dumb":
         return False
+    if _HOST is not None:
+        return True
     return _isatty(sys.stdout)
 
 
@@ -141,6 +162,11 @@ def _visible_len(text):
 
 
 def _width():
+    if _HOST is not None:
+        try:
+            return max(20, min(int(_HOST.width()), 100))
+        except Exception:
+            return 80
     try:
         # Never wider than the real terminal: a line clipped to more columns
         # than it has wraps and breaks the in-place redraw.
@@ -396,6 +422,8 @@ def ask(label, *, secret=False, placeholder=None, validate=None, footer="Enter C
     `validate(text)` may return a short status string to show under the field as you type
     (purely informational -- it never blocks submitting).
     """
+    if _HOST is not None:
+        return _HOST.ask(_ANSI_RE.sub("", label), secret=secret, placeholder=placeholder)
     if not enabled():
         raise Unavailable("not an interactive terminal")
 
@@ -505,6 +533,8 @@ def choose(options, *, initial=0, searchable=False, max_rows=None, footer=None,
     not rows to a token: pressing one returns that token (a str) instead of an index.
     Ctrl+C raises KeyboardInterrupt.
     """
+    if _HOST is not None:
+        return _HOST.choose(options, initial=initial, hotkeys=hotkeys) if options else None
     if not enabled():
         raise Unavailable("not an interactive terminal")
     if not options:
@@ -673,12 +703,20 @@ class Stage:
 
     def __enter__(self):
         self._started = time.monotonic()
+        self._hosted = _HOST
+        if self._hosted is not None:
+            self._hosted.stage_start(self.label)
+            return self
         self._stop.clear()
         self._thread = threading.Thread(target=self._spin, daemon=True)
         self._thread.start()
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        if getattr(self, "_hosted", None) is not None:
+            self._hosted.stage_end(self.label, exc_type is None, time.monotonic() - self._started)
+            self._hosted = None
+            return False
         self._stop.set()
         if self._thread:
             self._thread.join()

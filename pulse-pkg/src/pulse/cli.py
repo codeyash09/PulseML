@@ -42,7 +42,10 @@ import types
 USAGE = """\
 Pulse - a live ML training debugger.
 
-  pulse                          attach to the run on this machine (interactive)
+  pulse                          the Pulse app: setup, then the agent. /monitor lists the
+                                 runs on this machine and opens one beside the agent; /run
+                                 starts a script; /help has the rest (PULSE_CLASSIC=1 keeps
+                                 the old line-by-line screens)
   pulse watch [n|id|name]        attach to a particular run
   pulse sessions                 list the runs Pulse knows about
   pulse <script.py>              watch the run of that script that is already going
@@ -540,6 +543,16 @@ def run_code(paths, prompt=None, yes=False, cwd=None):
         if not os.path.isdir(root):
             print(f"Error: --cwd '{root}' is not a directory.")
             return 1
+    if prompt is None:
+        # An interactive session is the Pulse app (the same agent, the same setup, on the
+        # one screen that also monitors runs). -p is one request and out: no app.
+        from . import pulse_app
+        if pulse_app.usable():
+            from .pulse_ui import Unavailable
+            try:
+                return pulse_app.run(paths, yes=yes, root=root)
+            except Unavailable:
+                pass
     from .pulse_code import run as code_run
     return code_run(paths, prompt=prompt, yes=yes, root=root)
 
@@ -732,6 +745,16 @@ def main(argv=None):
 
     # Bare `pulse`, watch, attach, console, sessions -- and `pulse --model X` -- are the
     # console. Anything else that is not a command is a mistake worth showing usage for.
+    if not argv:
+        # Bare `pulse` on a terminal: the app -- setup, then the agent, with /monitor for
+        # the runs on this machine. Without a terminal it is still the run console.
+        from . import pulse_app
+        if pulse_app.usable():
+            from .pulse_ui import Unavailable
+            try:
+                return pulse_app.run()
+            except Unavailable:
+                pass
     if not argv or argv[0] in console_commands or argv[0].startswith("-"):
         from .pulse_console import main as console_main
         return console_main(argv)

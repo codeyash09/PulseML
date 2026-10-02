@@ -1272,10 +1272,26 @@ def pick_session(sessions: List[Dict[str, Any]], wanted: Optional[str]) -> Optio
     return None
 
 
+def _ui_unavailable():
+    from .pulse_ui import Unavailable
+    return Unavailable
+
+
 def run_console(session: Dict[str, Any], sessions: List[Dict[str, Any]],
                 agent: Optional[Callable[[str], str]] = None,
                 sensitivity: float = 0.3) -> int:
-    """The prompt. Returns an exit code."""
+    """The prompt. Returns an exit code.
+
+    On a real terminal this is the Pulse app opened on the run (the run on one side, the
+    agent on the other -- see pulse_app). The line-by-line console below is what runs when
+    there is no such terminal, or with PULSE_CLASSIC=1."""
+    from . import pulse_app
+    if pulse_app.usable():
+        try:
+            # the model the caller built its agent from (--model / PULSE_MODEL), if any
+            return pulse_app.open_run(session, model=getattr(agent, "model", "") or "")
+        except _ui_unavailable():
+            pass
     try:
         import readline  # noqa: F401   line editing and history, when the platform has it
     except ImportError:

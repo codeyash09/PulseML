@@ -621,14 +621,50 @@ def describe_changes(cli, fix, changes):
 _NO_CHANGES_RE = re.compile(r"(?m)^\s*NO_CHANGES\s*$")
 
 
+_TOOL_CALL_RE = re.compile(r"(?m)^[ \t]*([A-Z][A-Z_]{2,}):[ \t]*(.*)$")
+
+
+def tool_calls_in(answer):
+    """The tool lines of a model answer ("GREP: loss", "TERMINAL: pytest -q"), in order --
+    only names that really are tools, so prose like "NOTE: ..." is not one."""
+    names = {"GREP", "VIEW", "CALC"} | {k.upper() for k in PulseCLI._NEW_DIRECTIVE_RES}
+    return [f"{name}: {arg.strip()}" if arg.strip() else name
+            for name, arg in _TOOL_CALL_RE.findall(answer or "") if name in names]
+
+
+def _show_tools(answer, notes, label="tool results"):
+    """What the agent just ran and what came back. Inside the Pulse app this is an entry in
+    the transcript (the calls, with the output folded under them); otherwise it is printed."""
+    host = _ui.host()
+    if host is not None and hasattr(host, "tool"):
+        # what the agent said before reaching for its tools, then the tools
+        names = {"GREP", "VIEW", "CALC"} | {k.upper() for k in PulseCLI._NEW_DIRECTIVE_RES}
+        said = _TOOL_CALL_RE.sub(lambda m: "" if m.group(1) in names else m.group(0), answer or "").strip()
+        if said and len(said) < 2000 and not said.lstrip().startswith("{"):
+            print(said)
+        host.tool(tool_calls_in(answer), notes)
+        return
+    print(f"\n[{label}]\n{notes}\n")
+
+
+def _service(cli, answer):
+    """Run the tools `answer` asked for. Inside the Pulse app their own progress lines are
+    held back -- the transcript shows the calls as one entry (see _show_tools)."""
+    host = _ui.host()
+    if host is not None and hasattr(host, "hush"):
+        with host.hush():
+            return cli._service_tool_requests(answer)
+    return cli._service_tool_requests(answer)
+
+
 def _tool_rounds(cli, answer, instruction):
     """If `answer` asked for tools, run them and re-ask -- a bounded number of times.
     Returns the final answer (which may still contain nothing further to service)."""
     for _round in range(_MAX_TOOL_ROUNDS):
-        notes = cli._service_tool_requests(answer)
+        notes = _service(cli, answer)
         if not notes:
             return answer
-        print(f"\n[tool results]\n{notes}\n")
+        _show_tools(answer, notes)
         cli.agent_history.append({"role": "assistant", "content": answer})
         cli.agent_history.append({"role": "user", "content": notes})
         with _Spinner("Reading"):
@@ -643,12 +679,17 @@ def _plain_text(answer):
     return _NO_CHANGES_RE.sub("", cleaned).strip()
 
 
-def run_turn(cli, request):
-    """One request, start to finish. Returns "applied", "answered", "declined" or "failed"."""
+def run_turn(cli, request, evidence=None):
+    """One request, start to finish. Returns "applied", "answered", "declined" or "failed".
+
+    `evidence` is extra context for this turn only -- the Pulse app passes what a live run
+    is doing (metrics, findings) when the request is about that run."""
     cli.reload()
     cli._last_applied_fix = None
     cli._fix_applied_this_turn = False
     context = build_context(cli)
+    if evidence:
+        context = f"{context}\n\n{evidence}"
     marker = {"role": "user", "content": f"{context}\n\nRequest: {request}"}
     cli.agent_history.append(marker)
     outcome, summary = "failed", ""
@@ -689,10 +730,10 @@ def _run_turn_passes(cli, request):
     for _round in range(_MAX_TOOL_ROUNDS):
         if fix is not None:
             break
-        notes = cli._service_tool_requests(raw)
+        notes = _service(cli, raw)
         cli.agent_history.append({"role": "assistant", "content": raw})
         if notes:
-            print(f"\n[tool results]\n{notes}\n")
+            _show_tools(raw, notes)
             cli.agent_history.append({"role": "user", "content": notes})
         else:
             cli.agent_history.append({"role": "user", "content": _NO_TOOLS_NOTE})
@@ -779,7 +820,7 @@ def _run_verification_pass(cli, fix, changes):
                 color = _GREEN if passed else _RED
                 cprint(f"[4] Verification {icon}{(': ' + reason) if reason else ''}", color=color)
                 return passed, reason
-            notes = cli._service_tool_requests(answer)
+            notes = _service(cli, answer)
             if not notes:
                 # Neither a verdict nor a tool request -- nudge once more rather than looping
                 # forever on an unparsable reply.
@@ -788,7 +829,7 @@ def _run_verification_pass(cli, fix, changes):
                 with _Spinner("Verifying"):
                     answer = cli._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS)
                 continue
-            print(f"\n[verify tool results]\n{notes}\n")
+            _show_tools(answer, notes, label="verify tool results")
             cli.agent_history.append({"role": "assistant", "content": answer})
             cli.agent_history.append({"role": "user", "content": notes})
             with _Spinner("Verifying"):
@@ -874,7 +915,16 @@ def _confirm_and_apply(cli, request, plan, fix, changes):
     if not fix.get("explanation"):
         fix["explanation"] = f"Pulse Code: {request[:80]}"
     cli._last_apply_skipped = []
-    cli._apply_code_fix(fix)
+    host = _ui.host()
+    if host is not None and hasattr(host, "hush"):
+        # In the Pulse app the applier's step-by-step report folds under one EDIT entry.
+        with host.hush() as report:
+            cli._apply_code_fix(fix)
+        labels = [cli._label_for_path.get(path) or os.path.relpath(path, cli._project_root).replace(os.sep, "/")
+                  for path in changes]
+        host.tool([f"EDIT: {label}" for label in labels] or ["EDIT"], "".join(report))
+    else:
+        cli._apply_code_fix(fix)
     applied_ok = (cli._fix_applied_this_turn and not cli._last_apply_skipped
                   and not getattr(cli, "_last_apply_lint_failed", []))
     if not applied_ok:

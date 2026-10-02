@@ -489,6 +489,62 @@ non-interactive run). Every decision is printed, and recorded with `--agent-log`
 
 ---
 
+## The Pulse app
+
+Type `pulse` in a terminal and Pulse opens as one full-screen app:
+
+```text
+ PULSE / DEBUG   train.py · ~/experiments                    agent: OpenRouter (DeepSeek V4 Flash)
+ ───────────────────────────────────────────────────────────────────────────────────────────────
+  train.py                    ● live │ ❯ why did the loss stop moving?
+  ~/experiments                      │
+  step 4,120 · 19.8/s · 3m 28s       │ ✻ Thinking  (47 words · ctrl+o to expand)
+                                     │ ● GREP(lr)
+  loss      0.5001 █▅▃▂▁▁▁▁▁▁▁▁      │ ● VIEW(train.py:1-12)
+  grad_norm 2.4e-5 █▆▄▂▁▁▁▁▁▁▁▁      │   ⎿ 23 lines  (ctrl+o to expand)
+                                     │ The loss is flat at 0.5 because of the `+ 0.5` on line 12 ...
+  Findings  2                        │ ────────────────────────────────────────────────────────────
+  ▲ loss stopped improving at 0.5    │ ❯
+                                     │ Enter send · / commands · Ctrl+O details · PgUp/PgDn scroll
+```
+
+1. **Setup** comes first, the same as ever: account, workspace, agent model, key (or the
+   OpenRouter sign-in).
+2. **Home is the agent.** Type what you want built, fixed or explained; it plans, reads the
+   project with its tools, shows a diff and asks before applying it. This is `pulse code`
+   -- `pulse code [paths]` opens the same app with those files in focus.
+3. **`/monitor`** (or `/runs`) lists every run on this machine -- live ones first, then
+   finished ones, then Python processes that were started outside Pulse -- and opens the
+   one you pick. **`/run train.py`** starts a script under Pulse and opens it.
+4. **Debugging is a split screen.** The run is on the left: status, step and speed, every
+   tracked value with its curve, the detectors' findings, tensors, and when the agent will
+   next audit the run. The agent is on the right, and what you ask it goes with the run's
+   evidence. Its reasoning and every tool call are in the transcript, folded to a line
+   each; **Ctrl+O** unfolds them. A fix is a diff you confirm; `/restart` then stops the
+   run and starts it again with the change (for runs started with `/run`).
+
+| Key | What it does |
+|---|---|
+| Enter | send the request, or answer a question Pulse asked |
+| `/` | commands; typing shows the ones that match, Tab completes |
+| Ctrl+O | fold / unfold the agent's thinking and tool output |
+| PgUp / PgDn | scroll the transcript |
+| Ctrl+C | cancel what is running; twice at an empty prompt leaves |
+| Esc | close the open run and go back to the agent |
+
+Commands on an open run: `/findings`, `/curve <name>`, `/vars`, `/audit`, `/audits on|off`,
+`/trace <var>`, `/source`, `/pause`, `/resume`, `/stop`, `/restart`, `/output`,
+`/interval <sec>`, `/quiet`, `/back`. Everywhere: `/monitor`, `/run`, `/agent`, `/files`,
+`/add`, `/drop`, `/review`, `/undo`, `/log`, `/cloud`, `/help`, `/exit`.
+
+`pulse watch <run>`, `pulse <script.py>` and `pulse attach --pid N` open the same app
+directly on that run. Without a real terminal (a pipe, CI), on a very small one, on
+Windows for now, or with `PULSE_CLASSIC=1`, Pulse keeps the line-by-line screens described
+below. `pulse run train.py` -- training with Pulse inside the script's own terminal -- is
+unchanged.
+
+---
+
 ## The `pulse` command
 
 Pulse does not have to be written into a script. Installing it puts a `pulse` command on
@@ -496,7 +552,7 @@ the path, which starts runs and attaches to ones already going.
 
 ```bash
 pulse run --stream train.py      # start train.py under Pulse, unmodified
-pulse                            # attach to the run on this machine
+pulse                            # the app; without a terminal, attach to the run on this machine
 pulse train.py                   # attach to the run of that script
 pulse sessions                   # list the runs Pulse knows about
 ```

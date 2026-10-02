@@ -1145,6 +1145,8 @@ def _flush_stdin() -> None:
     right before every input() so each prompt always starts from a clean,
     empty line.
     """
+    if _ui.host() is not None:
+        return  # the app reads the keyboard itself; what is typed ahead is the next input
     try:
         if os.name == "nt":
             import msvcrt
@@ -1882,6 +1884,43 @@ def _safe_eval_math(expr: str):
         return _calc_eval_node(ast.parse(expr.strip(), mode="eval"))
     except Exception as exc:
         return f"(calc error: {exc})"
+
+
+# Something that wants to watch the agent work -- the Pulse app shows the model's reasoning
+# in its transcript. One observer, called as observer(event, **data); it must never be
+# able to break a model call, so every failure in it is swallowed.
+_AGENT_OBSERVER = None
+
+
+def set_agent_observer(observer) -> None:
+    global _AGENT_OBSERVER
+    _AGENT_OBSERVER = observer
+
+
+def _notify_agent_observer(event: str, **data) -> None:
+    observer = _AGENT_OBSERVER
+    if observer is None:
+        return
+    try:
+        observer(event, **data)
+    except Exception:
+        pass
+
+
+def _reasoning_of(response) -> str:
+    """The reasoning a model returned next to its answer, when the provider sends it back
+    (litellm puts it in `reasoning_content`; OpenRouter's own field is `reasoning`)."""
+    try:
+        message = response.choices[0].message
+    except Exception:
+        return ""
+    for name in ("reasoning_content", "reasoning"):
+        value = getattr(message, name, None)
+        if value is None and isinstance(message, dict):
+            value = message.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 
 class _Spinner:
@@ -8279,6 +8318,7 @@ class PulseCLI:
                     self._record_usage(response)
                     raise _EmptyModelResponse("the provider returned an empty response")
                 self._record_usage(response)
+                _notify_agent_observer("reasoning", text=_reasoning_of(response))
                 _agent_log_reply(call_no, content, time.monotonic() - started, getattr(response, "usage", None))
                 return content
             except AgentRequestFailed:

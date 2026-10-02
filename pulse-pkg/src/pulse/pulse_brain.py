@@ -629,6 +629,7 @@ def build_litellm_agent(model: str, api_key: Optional[str] = None, api_base: Opt
             **({"api_base": api_base} if api_base else {}),
         )
         return (response.choices[0].message.content or "").strip()
+    ask.model = model                # what this agent thinks with, for whoever is handed it
     return ask
 
 
