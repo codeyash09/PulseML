@@ -4338,7 +4338,55 @@ def _chat_panel_class():
             env_var = PROVIDERS[provider_name]["env_key"]
             if env_var is None:
                 return True
+            if env_var == "OPENROUTER_API_KEY" and not os.environ.get(env_var):
+                # Signed in to OpenRouter earlier (here, or with `pulse openrouter`): the
+                # saved key is the key.
+                from pulse import pulse_openrouter
+                saved = pulse_openrouter.saved_key()
+                if saved:
+                    os.environ[env_var] = saved
             return bool(os.environ.get(env_var) or self.session_keys.get(provider_name))
+
+        def _openrouter_sign_in(self, provider_name):
+            """Sign in to OpenRouter -- or create an account -- in the browser, off the UI
+            thread, and keep the key. The chat says what happened either way."""
+            if getattr(self, "_openrouter_signing_in", False):
+                return None
+            self._openrouter_signing_in = True
+            from pulse import pulse_openrouter
+
+            def tell(message):
+                self.after(0, lambda m=message: self._append("Pulse", m))
+
+            def say(line):
+                if line.strip().startswith("http"):      # the link, in case no browser opened
+                    tell("Sign in to OpenRouter, or create an account, then click Authorize. "
+                         "If your browser did not open, use this link:\n" + line.strip())
+
+            def finish(key):
+                self.session_keys[provider_name] = key
+                os.environ["OPENROUTER_API_KEY"] = key
+                self._update_status_indicator()
+
+            def work():
+                try:
+                    key = pulse_openrouter.sign_in(ask=None, say=say, browser=True)
+                except pulse_openrouter.SignInError as exc:
+                    tell(f"OpenRouter sign-in did not finish: {exc}. Send your message again to "
+                         "retry, or paste an API key instead.")
+                    return
+                finally:
+                    self._openrouter_signing_in = False
+                kept = pulse_openrouter.save_key(key)
+                self.after(0, lambda: finish(key))
+                tell("Signed in to OpenRouter"
+                     + (" -- the key is saved on this machine, so you stay signed in"
+                        if kept else " for this session")
+                     + ". Send your message again.")
+
+            worker = threading.Thread(target=work, daemon=True, name="pulse-openrouter-sign-in")
+            worker.start()
+            return worker
 
         def _update_status_indicator(self):
             has_key = self._has_active_key(self.provider_var.get())
@@ -4444,6 +4492,18 @@ def _chat_panel_class():
             env_var = prov_info.get("env_key")
 
             if not self._has_active_key(current_provider):
+                if env_var == "OPENROUTER_API_KEY":
+                    choice = messagebox.askyesnocancel(
+                        "OpenRouter",
+                        "Sign in to OpenRouter -- or create an account -- in your browser?\n\n"
+                        "Yes: open the browser. Pulse keeps the key, so you stay signed in.\n"
+                        "No: paste an API key instead.",
+                        parent=self)
+                    if choice is None:
+                        return
+                    if choice:
+                        self._openrouter_sign_in(current_provider)
+                        return
                 api_key = simpledialog.askstring(
                     prov_info.get("prompt_title", "API Key Required"),
                     prov_info.get("prompt_msg", f"Enter the API key for {env_var}:"),

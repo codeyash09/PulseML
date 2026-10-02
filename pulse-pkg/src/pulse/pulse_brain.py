@@ -612,6 +612,12 @@ def parse_decision(answer: str) -> Dict[str, Any]:
 def build_litellm_agent(model: str, api_key: Optional[str] = None, api_base: Optional[str] = None,
                         max_tokens: int = 4000, timeout: float = 300.0) -> Callable[[str], str]:
     """An agent callable backed by litellm, for running the brain standalone."""
+    if not api_key:
+        # An openrouter/ model with no key given: the environment's, else the key from
+        # `pulse openrouter` (litellm itself only knows about the environment).
+        from . import pulse_openrouter
+        api_key = pulse_openrouter.key_for(model)
+
     def ask(prompt: str) -> str:
         import litellm
         response = litellm.completion(

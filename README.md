@@ -16,7 +16,7 @@ Pulse is available on PyPI.
 
 - Python 3.9+
 - A supported backend: NumPy, PyTorch, TensorFlow, CuPy, or JAX
-- An API key for an AI provider if you want to use the AI debugging agent
+- A model for the AI debugging agent: sign in to OpenRouter from Pulse (no key to handle, free models available), or bring an API key for any supported provider
 
 ### Install
 
@@ -53,6 +53,32 @@ Once the process is running, Pulse discovers numeric variables available to the 
 ### AI provider configuration
 
 Pulse supports cloud and local AI providers.
+
+#### No API key yet? Sign in with OpenRouter
+
+OpenRouter serves every major model behind one account and has free models. Pulse can get
+a key for you:
+
+```bash
+pulse openrouter            # sign in, or create an account, in your browser
+```
+
+or pick any OpenRouter model at Pulse's agent prompt and press Enter at the key question.
+Your browser opens on OpenRouter; sign in or sign up, click Authorize, and Pulse receives
+an API key made for it. Over SSH or in a container there is no browser to open, so Pulse
+prints a link to open on any device and asks you to paste the code OpenRouter shows.
+
+- The key from a sign-in is saved on your machine (`~/.pulse/openrouter.json`, readable
+  only by you), so you stay signed in. `pulse openrouter logout` removes it;
+  `pulse openrouter status` shows what it has used.
+- A new account can use the free models straight away. Paid models need credits, bought
+  on openrouter.ai.
+- Unattended runs use the saved sign-in when you ask for an OpenRouter model
+  (`PULSE_PROVIDER=openrouter/<model>`); a saved sign-in alone never switches the agent on.
+- You can still paste an API key instead, or set `OPENROUTER_API_KEY`. A pasted key is
+  never written to disk.
+
+#### Bring your own key
 
 Common provider environment variables include:
 

@@ -51,6 +51,7 @@ from pulse import pulse_supabase as cloud
 from pulse import pulse_ui as _ui
 from pulse import pulse_terminal as _terminal
 from pulse import pulse_approver as _approver
+from pulse import pulse_openrouter as _openrouter
 from pulse import pulse_trace as _pulse_trace
 
 
@@ -1356,12 +1357,17 @@ def _ui_pick_agent(names: List[str], cached_provider: Optional[str], current: Op
     return "" if picked is None else names[picked]
 
 
-def _ui_key_screen(chosen: str) -> None:
+def _ui_key_screen(chosen: str, openrouter: bool = False) -> None:
     if not _ui.enabled():
         return
     _ui.header("API key", "Connect your agent model")
     _ui.kv("Model", chosen, indent=0)
-    _ui.note("Used only to call the model you selected. Pulse never writes it to disk.")
+    if openrouter:
+        _ui.note("No key yet? Press Enter to sign in to OpenRouter -- or create an account -- in "
+                 "your browser; Pulse keeps that key so you stay signed in.")
+        _ui.note("A key you paste is used only to call the model and is never written to disk.")
+    else:
+        _ui.note("Used only to call the model you selected. Pulse never writes it to disk.")
     _ui._emit()
 
 
@@ -6865,13 +6871,21 @@ class PulseCLI:
                     info = PROVIDERS[match]
                 env_var = info["env_key"]
                 key = self._config_text("api_key", "key") or os.environ.get(env_var, "").strip()
+                via = env_var
+                if not key and want and env_var == _openrouter.ENV_KEY:
+                    # An OpenRouter agent was asked for by name and no key was given: use
+                    # the key from `pulse openrouter` (a sign-in done ahead of the run).
+                    # Never when no agent was asked for -- a saved sign-in alone must not
+                    # switch the agent on in an unattended run.
+                    key = _openrouter.saved_key() or ""
+                    via = "your saved OpenRouter sign-in"
                 if key:
                     self.agent_provider = match
                     self.agent_key = key
                     self.agent_model_string = None
                     self.agent_api_base = None
                     self.agent_history = []
-                    cprint(f"[Pulse] Non-interactive mode -- agent set to {match} (via {env_var}).")
+                    cprint(f"[Pulse] Non-interactive mode -- agent set to {match} (via {via}).")
                     os.environ[env_var] = key
                     cloud.save_cached_profile(agent_provider=match, agent_env_key=env_var)
                     return True
@@ -7004,8 +7018,10 @@ class PulseCLI:
         existing = os.environ.get(env_var, "").strip()
 
         _say_plain("Agent model", chosen, f"\n✓ Agent selected: {chosen}")
-        _ui_key_screen(chosen)
-        if existing:
+        _ui_key_screen(chosen, openrouter=(env_var == _openrouter.ENV_KEY))
+        if env_var == _openrouter.ENV_KEY:
+            key = self._openrouter_key(existing)
+        elif existing:
             _flush_stdin()
             use_existing = _prompt_text(
                 f"An {env_var} is already set. Use it? (Y/n) > ",
@@ -7048,6 +7064,72 @@ class PulseCLI:
         # waiting for the next update() call (which could be an epoch away).
         self._prime_with_agent_if_needed()
         return True
+
+    def _openrouter_key(self, existing: str) -> str:
+        """The key for an OpenRouter model, in an interactive session: the one already in
+        the environment, the saved sign-in, a key pasted now, or -- on Enter -- a sign-in
+        (or sign-up) in the browser, whose key is saved so the person stays signed in.
+        "" when none of them produced a key."""
+        env_var = _openrouter.ENV_KEY
+        saved = _openrouter.saved_key()
+        if existing and existing != saved:
+            _flush_stdin()
+            answer = _prompt_text(
+                f"An {env_var} is already set. Use it? (Y/n) > ",
+                label=f"{env_var} is already set. Use it?  (Y/n)",
+            ).strip().lower()
+            if answer in ("", "y", "yes"):
+                return existing
+        if saved:
+            _flush_stdin()
+            answer = _prompt_text(
+                f"You are signed in to OpenRouter (key {_openrouter.tail(saved)}). Use it? (Y/n) > ",
+                label=f"Signed in to OpenRouter (key {_openrouter.tail(saved)}). Use it?  (Y/n)",
+            ).strip().lower()
+            if answer in ("", "y", "yes"):
+                if not _openrouter.key_is_rejected(saved):
+                    return saved
+                cprint("[Pulse] OpenRouter no longer accepts that key (deleted from the account?) "
+                       "-- sign in again or paste a key.", color=_YELLOW)
+                _openrouter.forget_key()
+        _flush_stdin()
+        typed = _prompt_text(
+            "API key (paste one, or press Enter to sign in / sign up with OpenRouter in your browser) > ",
+            label="API key  (Enter = sign in or sign up with OpenRouter)", secret=True,
+            validate=lambda t: _ui.key_hint_for(t, env_var)).strip()
+        if typed:
+            return typed
+
+        def ask(prompt: str) -> str:
+            _flush_stdin()
+            return _prompt_text(prompt + " > ", label=prompt)
+
+        # Ctrl+C while waiting for the browser means "let me paste the code". Pulse's own
+        # Ctrl+C handler steps aside when it delivers an interrupt at a prompt; put it back
+        # afterwards so a later Ctrl+C still pauses training.
+        on_main = threading.current_thread() is threading.main_thread()
+        handler = signal.getsignal(signal.SIGINT) if on_main else None
+        try:
+            key = _openrouter.sign_in(ask=ask, say=cprint)
+        except _openrouter.SignInError as exc:
+            cprint(f"[Pulse] OpenRouter sign-in did not finish: {exc}", color=_YELLOW)
+            return ""
+        finally:
+            if on_main and handler is not None and signal.getsignal(signal.SIGINT) is not handler:
+                try:
+                    signal.signal(signal.SIGINT, handler)
+                except (ValueError, TypeError):
+                    pass
+        kept = _openrouter.save_key(key)
+        _say(f"✓ Signed in to OpenRouter (key {_openrouter.tail(key)})"
+             + (" -- saved on this machine, so you stay signed in; `pulse openrouter logout` removes it."
+                if kept else " -- for this session only (it could not be saved)."),
+             "OpenRouter", f"signed in  (key {_openrouter.tail(key)})")
+        info = _openrouter.key_info(key)
+        if info and info.get("is_free_tier"):
+            cprint("[Pulse] This account has no credits yet: the free models work now; paid models "
+                   f"need credits ({_openrouter.CREDITS_PAGE}).")
+        return key
 
     def _set_local_agent(self, provider_name: str, api_base: str, model_name: str) -> None:
         """Wire up a local/self-hosted provider: compose the litellm model

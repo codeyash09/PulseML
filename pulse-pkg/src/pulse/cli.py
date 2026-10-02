@@ -54,6 +54,10 @@ Pulse - a live ML training debugger.
   pulse code [options] [paths...]
                                  a general coding agent: point it at files (or just open it in
                                  a project) and ask for features, fixes and changes
+  pulse openrouter [status|logout]
+                                 sign in to OpenRouter -- or create an account -- in the browser
+                                 and keep the API key, so Pulse's agent has a model to use
+                                 without you handling a key (free models need no credits)
 
 options for `pulse run` (before the script; everything after it is the script's):
   --stream                       stream to a separate brain instead of tracking in-process
@@ -664,6 +668,10 @@ def main(argv=None):
         from . import __version__
         print(f"pulse {__version__}")
         return 0
+
+    if argv and argv[0] == "openrouter":
+        from .pulse_openrouter import main as openrouter_main
+        return openrouter_main(argv[1:])
 
     console_commands = ("watch", "attach", "console", "sessions", "install-sudo")
     launch_options = ("--stream", "--cwd", "--again", "--agent-log", "--approver")
