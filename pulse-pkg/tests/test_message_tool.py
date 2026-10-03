@@ -232,3 +232,125 @@ def test_the_dashboard_puts_a_message_in_the_chat(monkeypatch):
     assert panel._apply_new_directives({"message": ["the batch looks wrong"]}) == ""
     assert panel.appended == [("Pulse", "the batch looks wrong")]
     core._CHAT_PANEL_CLS = None
+
+
+# ---- live thinking: the model's reasoning as it streams ------------------------------------
+
+def chunk(content=None, reasoning=None):
+    delta = types.SimpleNamespace(content=content, reasoning_content=reasoning)
+    return types.SimpleNamespace(choices=[types.SimpleNamespace(delta=delta)])
+
+
+def streaming_model(monkeypatch, pieces, final_text, final_reasoning):
+    """A provider that streams `pieces` (reasoning or text deltas) when asked to."""
+    calls = []
+
+    def completion(**kw):
+        calls.append(kw)
+        if kw.get("stream"):
+            return iter(pieces)
+        return reply(final_text, final_reasoning)
+
+    def builder(chunks, messages=None):
+        return reply(final_text, final_reasoning)
+
+    monkeypatch.setattr(pc.litellm, "completion", completion)
+    monkeypatch.setattr(pc.litellm, "stream_chunk_builder", builder)
+    return calls
+
+
+def test_reasoning_streams_into_a_live_thinking_entry(cli, monkeypatch):
+    pieces = [chunk(reasoning="The floor "), chunk(reasoning="is 0.5."), chunk(content="The loss "),
+              chunk(content="is flat.")]
+    calls = streaming_model(monkeypatch, pieces, "The loss is flat.", "The floor is 0.5.")
+    app = appmod.App(cli, cli._project_root)
+    seen = []
+    app.install()
+    try:
+        original = app._observe
+
+        def spy(event, **data):
+            seen.append((event, data.get("text"), [ (e.kind, e.live, e.text) for e in app.view.entries]))
+            original(event, **data)
+
+        pc.set_agent_observer(spy)
+        answer = cli._call_model("why?")
+    finally:
+        app.uninstall()
+    assert answer == "The loss is flat."
+    assert calls[0]["stream"] is True
+    events = [e for e, _t, _s in seen]
+    assert events == ["stream_start", "reasoning_delta", "reasoning_delta", "content_delta", "content_delta",
+                      "stream_end"]
+    # while streaming, the thinking entry was live and growing; the answer was a live line
+    _e, _t, during = seen[4]
+    assert ("thinking", True, "The floor is 0.5.") in during and ("text", True, "The loss ") in during
+    # afterwards: the thinking is a normal (folded) entry and the live answer line is gone
+    kinds = [(e.kind, e.live, e.text) for e in app.view.entries]
+    assert kinds == [("thinking", False, "The floor is 0.5.")]
+
+
+def test_a_live_thinking_entry_shows_its_last_lines_while_folded():
+    entry = tui.Entry("thinking", "one\ntwo\nthree\nfour\nfive\nsix", live=True)
+    lines = [PLAIN.sub("", line) for line in tui.entry_lines(entry, 40, False)]
+    assert lines[0].startswith("✻ Thinking") and lines[1:] == ["  three", "  four", "  five", "  six"]
+    entry.live = False
+    entry.touch()
+    assert len(tui.entry_lines(entry, 40, False)) == 1
+
+
+def test_streaming_is_only_used_when_something_is_watching(cli, monkeypatch):
+    calls = streaming_model(monkeypatch, [], "answer", None)
+    assert cli._call_model("plain") == "answer"
+    assert "stream" not in calls[0]                      # no observer: a plain call
+    monkeypatch.setenv("PULSE_STREAMING", "0")
+    app = appmod.App(cli, cli._project_root)
+    app.install()
+    try:
+        assert cli._call_model("plain") == "answer"
+    finally:
+        app.uninstall()
+    assert "stream" not in calls[1]
+
+
+def test_a_provider_that_answers_in_full_when_asked_to_stream_is_fine(cli, monkeypatch):
+    monkeypatch.setattr(pc.litellm, "completion", lambda **k: reply("whole", "thought"))
+    app = appmod.App(cli, cli._project_root)
+    app.install()
+    try:
+        assert cli._call_model("q") == "whole"
+    finally:
+        app.uninstall()
+    assert [(e.kind, e.text) for e in app.view.entries] == [("thinking", "thought")]
+
+
+def test_the_native_loop_streams_through_the_same_path(cli, monkeypatch):
+    sent = []
+
+    def completion(**kw):
+        sent.append(kw)
+        if kw.get("stream"):
+            return iter([chunk(reasoning="Reading the loop."), chunk(content="lr is 0.3.")])
+        return native_reply("lr is 0.3.")
+
+    monkeypatch.setattr(native.litellm, "completion", completion)
+    monkeypatch.setattr(native.litellm, "stream_chunk_builder", lambda chunks, messages=None: native_reply("lr is 0.3."))
+    app = appmod.App(cli, cli._project_root)
+    app.install()
+    try:
+        assert native.run_native_turn(cli, "where is lr?") == "answered"
+    finally:
+        app.uninstall()
+    assert sent[0]["stream"] is True and sent[0]["tools"]
+    assert [e.kind for e in app.view.entries][:1] == ["thinking"]
+    assert app.view.entries[0].text == "Reading the loop."
+
+
+def test_the_app_is_allowed_on_windows_when_the_console_can_draw(monkeypatch):
+    monkeypatch.setattr(ui, "enabled", lambda: True)
+    monkeypatch.setattr(os, "get_terminal_size", lambda fd: os.terminal_size((120, 40)))
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(tui, "windows_console_ready", lambda: False)
+    assert appmod.usable() is False
+    monkeypatch.setattr(tui, "windows_console_ready", lambda: True)
+    assert appmod.usable() is True

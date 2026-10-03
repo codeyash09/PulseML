@@ -1911,6 +1911,67 @@ def _notify_agent_observer(event: str, **data) -> None:
         pass
 
 
+def _delta_text(delta, *names: str) -> str:
+    """A field of a streamed delta, whichever spelling the provider uses."""
+    for name in names:
+        value = getattr(delta, name, None)
+        if value is None and isinstance(delta, dict):
+            value = delta.get(name)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _streaming_wanted() -> bool:
+    return os.environ.get("PULSE_STREAMING", "1").strip().lower() not in ("0", "off", "false", "no")
+
+
+def _complete(**kwargs):
+    """litellm.completion, streamed: the model's reasoning and answer are handed to the
+    agent observer as they arrive (the Pulse app shows them live), and the full response
+    is rebuilt from the chunks -- usage, tool calls and all -- so callers see exactly what
+    a non-streamed call returns. PULSE_STREAMING=0, or a provider that cannot stream,
+    means a plain call."""
+    if not _streaming_wanted() or _AGENT_OBSERVER is None:
+        return _told(litellm.completion(**kwargs))
+    try:
+        stream = litellm.completion(stream=True, stream_options={"include_usage": True}, **kwargs)
+    except Exception:
+        try:
+            stream = litellm.completion(stream=True, **kwargs)
+        except Exception:
+            return _told(litellm.completion(**kwargs))
+    choices = getattr(stream, "choices", None)
+    if choices and hasattr(choices[0], "message"):
+        return _told(stream)          # a whole response came back instead of a stream
+    chunks = []
+    _notify_agent_observer("stream_start")
+    try:
+        for chunk in stream:
+            chunks.append(chunk)
+            choices = getattr(chunk, "choices", None) or []
+            delta = getattr(choices[0], "delta", None) if choices else None
+            if delta is None:
+                continue
+            reasoning = _delta_text(delta, "reasoning_content", "reasoning")
+            if reasoning:
+                _notify_agent_observer("reasoning_delta", text=reasoning)
+            content = _delta_text(delta, "content")
+            if content:
+                _notify_agent_observer("content_delta", text=content)
+    finally:
+        _notify_agent_observer("stream_end")
+    if not chunks:
+        raise _EmptyModelResponse("the provider streamed nothing back")
+    return litellm.stream_chunk_builder(chunks, messages=kwargs.get("messages"))
+
+
+def _told(response):
+    """A response that did not stream: its reasoning, if any, is reported in one piece."""
+    _notify_agent_observer("reasoning", text=_reasoning_of(response))
+    return response
+
+
 def _reasoning_of(response) -> str:
     """The reasoning a model returned next to its answer, when the provider sends it back
     (litellm puts it in `reasoning_content`; OpenRouter's own field is `reasoning`)."""
@@ -8306,7 +8367,7 @@ class PulseCLI:
         for attempt in range(1, max_attempts + 1):
             started = time.monotonic()
             try:
-                response = litellm.completion(
+                response = _complete(
                     model=model,
                     messages=messages,
                     max_tokens=max_tokens,
@@ -8322,7 +8383,6 @@ class PulseCLI:
                     self._record_usage(response)
                     raise _EmptyModelResponse("the provider returned an empty response")
                 self._record_usage(response)
-                _notify_agent_observer("reasoning", text=_reasoning_of(response))
                 _agent_log_reply(call_no, content, time.monotonic() - started, getattr(response, "usage", None))
                 return content
             except AgentRequestFailed:

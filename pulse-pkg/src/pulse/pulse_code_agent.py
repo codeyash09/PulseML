@@ -43,6 +43,7 @@ from .pulse_cli import (
     _Spinner,
     _YELLOW,
     _clamp_output_tokens,
+    _complete,
     _find_fuzzy_snippet_span,
     _prompt_text,
     _reindent_like,
@@ -884,7 +885,7 @@ def _chat(cli, messages):
     last_exc = None
     for attempt in range(1, 5):
         try:
-            response = litellm.completion(
+            response = _complete(
                 model=model, messages=payload, tools=TOOLS, tool_choice="auto", max_tokens=max_tokens,
                 timeout=_AGENT_TIMEOUT_SECONDS, api_base=cli.agent_api_base,
                 api_key=(cli.agent_key if cli.agent_key and cli.agent_key != "local" else None))

@@ -188,15 +188,16 @@ class Entry:
     note      a quiet line from Pulse itself     text
     error     something failed                   text
     """
-    __slots__ = ("kind", "text", "calls", "output", "severity", "_cache")
+    __slots__ = ("kind", "text", "calls", "output", "severity", "live", "_cache")
 
     def __init__(self, kind: str, text: str = "", calls: Optional[List[str]] = None,
-                 output: str = "", severity: str = "") -> None:
+                 output: str = "", severity: str = "", live: bool = False) -> None:
         self.kind = kind
         self.text = text
         self.calls = list(calls or [])
         self.output = output
         self.severity = severity
+        self.live = live                # still being streamed in: shown as it grows
         self._cache: Dict[Tuple[int, bool], List[str]] = {}
 
     def touch(self) -> None:
@@ -227,7 +228,14 @@ def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
     elif kind == "thinking":
         body = [ln for ln in entry.text.strip().split("\n")]
         head = s("✻ " if _ui._unicode() else "* ", "accent") + s("Thinking", "dim")
-        if not expanded:
+        if entry.live and not expanded:
+            # streaming in: the head, then the last few lines as they arrive
+            out.append(head + s("…", "dim"))
+            tail: List[str] = []
+            for part in body:
+                tail.extend(wrap(part, width - 2))
+            out.extend("  " + s(piece, "dim") for piece in tail[-4:])
+        elif not expanded:
             out.append(head + s(f"  ({_count(len(entry.text.split()), 'word')} · {EXPAND_HINT})", "dim"))
         else:
             out.append(head)
@@ -276,7 +284,8 @@ def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
             # a wrapped line keeps the indentation it started with (lists, code, diffs)
             bare = _SGR_RE.sub("", part)
             lead = min(len(bare) - len(bare.lstrip(" ")), width // 2)
-            out.extend(wrap(part, width, indent=" " * lead))
+            pieces = wrap(part, width, indent=" " * lead)
+            out.extend(s(piece, "dim") if entry.live else piece for piece in pieces)
     entry._cache = {key: out}       # one frame size at a time is all that is ever asked for
     return out
 
@@ -552,6 +561,84 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
 # The terminal
 # ---------------------------------------------------------------------------------------
 
+class _WindowsConsole:
+    """What a Windows console needs before it can show this: escape sequences switched on
+    for output, UTF-8 for the glyphs, and input handed over raw (no line editing, no echo,
+    and Ctrl+C as a key rather than a signal). Everything is put back on exit. Harmless
+    anywhere else: every call is a no-op when there is no such console."""
+
+    _VT_OUTPUT = 0x0004
+    _LINE_INPUT, _ECHO_INPUT, _PROCESSED_INPUT = 0x0002, 0x0004, 0x0001
+    _STD_INPUT, _STD_OUTPUT = -10, -11
+
+    def __init__(self) -> None:
+        self._saved: List[Tuple[Any, int]] = []
+        self._codepage: Optional[int] = None
+        self._k32 = None
+        if os.name == "nt":
+            try:
+                import ctypes
+                self._k32 = ctypes.windll.kernel32            # type: ignore[attr-defined]
+            except Exception:
+                self._k32 = None
+
+    def _mode(self, which: int) -> Tuple[Any, Optional[int]]:
+        import ctypes
+        handle = self._k32.GetStdHandle(which)
+        mode = ctypes.c_uint()
+        if not self._k32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return handle, None
+        return handle, mode.value
+
+    def enter(self, output: bool = True, keys: bool = True) -> bool:
+        """True when the console is ready (or there is nothing to do)."""
+        if self._k32 is None:
+            return os.name != "nt"
+        try:
+            if output:
+                handle, mode = self._mode(self._STD_OUTPUT)
+                if mode is None or not self._k32.SetConsoleMode(handle, mode | self._VT_OUTPUT):
+                    return False
+                self._saved.append((handle, mode))
+                self._codepage = self._k32.GetConsoleOutputCP()
+                self._k32.SetConsoleOutputCP(65001)
+            if keys:
+                handle, mode = self._mode(self._STD_INPUT)
+                if mode is not None:
+                    raw = mode & ~(self._LINE_INPUT | self._ECHO_INPUT | self._PROCESSED_INPUT)
+                    if self._k32.SetConsoleMode(handle, raw):
+                        self._saved.append((handle, mode))
+            return True
+        except Exception:
+            self.exit()
+            return False
+
+    def exit(self) -> None:
+        if self._k32 is None:
+            return
+        for handle, mode in reversed(self._saved):
+            try:
+                self._k32.SetConsoleMode(handle, mode)
+            except Exception:
+                pass
+        self._saved = []
+        if self._codepage:
+            try:
+                self._k32.SetConsoleOutputCP(self._codepage)
+            except Exception:
+                pass
+            self._codepage = None
+
+
+def windows_console_ready() -> bool:
+    """Can a Windows console show the app? Tried for real (and put back) -- a console that
+    refuses escape sequences, such as a very old conhost, says no."""
+    console = _WindowsConsole()
+    ok = console.enter(output=True, keys=False)
+    console.exit()
+    return ok
+
+
 class Screen:
     """The alternate screen, redrawn by rewriting only the rows that changed. Writes go
     straight to the terminal's file descriptor: sys.stdout belongs to the app while it
@@ -562,6 +649,7 @@ class Screen:
         self._shown: List[str] = []
         self._size = (0, 0)
         self._active = False
+        self._console = _WindowsConsole()
 
     def write(self, data: str) -> None:
         raw = data.encode("utf-8", "replace")
@@ -580,6 +668,8 @@ class Screen:
         return size.columns, size.lines
 
     def __enter__(self) -> "Screen":
+        if not self._console.enter(output=True, keys=False):
+            raise _ui.Unavailable("this console cannot show escape sequences")
         # alternate screen, cursor home, bracketed paste on
         self.write("\033[?1049h\033[H\033[2J\033[?2004h")
         self._active = True
@@ -589,6 +679,7 @@ class Screen:
         if self._active:
             self.write("\033[?2004l\033[0m\033[?25h\033[?1049l")
             self._active = False
+        self._console.exit()
 
     def draw(self, lines: List[str], cursor_row: int, cursor_col: int) -> None:
         size = self.size()
@@ -674,6 +765,8 @@ class KeyReader:
 
     def __enter__(self) -> "KeyReader":
         if not self._posix:
+            self._console = _WindowsConsole()
+            self._console.enter(output=False, keys=True)
             return self
         try:
             import termios
@@ -691,7 +784,12 @@ class KeyReader:
         return self
 
     def __exit__(self, *exc: Any) -> None:
-        if self._posix and self._saved is not None:
+        if not self._posix:
+            console = getattr(self, "_console", None)
+            if console is not None:
+                console.exit()
+            return
+        if self._saved is not None:
             try:
                 import termios
                 termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved)
@@ -738,4 +836,7 @@ class KeyReader:
                     "S": "delete", "I": "pgup", "Q": "pgdn"}.get(msvcrt.getwch())
         if ch == "\x1b":
             return "esc"
+        if ch in ("\r", "\n") and msvcrt.kbhit():
+            # more is already waiting behind this newline: a paste, not the Enter key
+            return "paste:\n"
         return _CTRL_KEYS.get(ch) or (ch if ch >= " " else None)

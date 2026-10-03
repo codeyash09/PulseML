@@ -152,6 +152,9 @@ class App:
         self._question: Optional[_Question] = None
         self._draft = ""
         self._hushed: Dict[int, List[str]] = {}      # thread id -> what it printed while hushed
+        self._live_thinking: Optional[tui.Entry] = None
+        self._live_answer: Optional[tui.Entry] = None
+        self._streamed_reasoning = False
         self._job: Optional[threading.Thread] = None
         self._last_ctrl_c = 0.0
         self._ui_thread = threading.current_thread()
@@ -315,8 +318,41 @@ class App:
         self._add(tui.Entry("tool", calls=calls or ["tools"], output=output))
 
     def _observe(self, event: str, **data: Any) -> None:
-        if event == "reasoning" and data.get("text"):
-            self._add(tui.Entry("thinking", data["text"]))
+        """What the model is doing, as it does it (see pulse_cli._complete): its reasoning
+        grows in a live Thinking entry, its answer in a live line that goes away once the
+        pipeline prints the real thing."""
+        with self.lock:
+            if event == "stream_start":
+                self._live_thinking = self._live_answer = None
+                self._streamed_reasoning = False
+            elif event == "reasoning_delta" and data.get("text"):
+                self._flush_partial()
+                if self._live_thinking is None:
+                    self._live_thinking = tui.Entry("thinking", "", live=True)
+                    self.view.entries.append(self._live_thinking)
+                self._live_thinking.text += data["text"]
+                self._live_thinking.touch()
+                self._streamed_reasoning = True
+            elif event == "content_delta" and data.get("text"):
+                self._flush_partial()
+                if self._live_answer is None:
+                    self._live_answer = tui.Entry("text", "", live=True)
+                    self.view.entries.append(self._live_answer)
+                self._live_answer.text += data["text"]
+                self._live_answer.touch()
+            elif event == "stream_end":
+                if self._live_thinking is not None:
+                    self._live_thinking.live = False
+                    self._live_thinking.touch()
+                if self._live_answer is not None and self._live_answer in self.view.entries:
+                    self.view.entries.remove(self._live_answer)   # the pipeline prints the answer
+                self._live_thinking = self._live_answer = None
+            elif event == "reasoning" and data.get("text") and not self._streamed_reasoning:
+                self.view.entries.append(tui.Entry("thinking", data["text"]))
+            else:
+                return
+            self._last_blank = False
+            self.dirty = True
 
     def _input(self, prompt: Any = "") -> str:
         """builtins.input while the app is up: the prompt is the question."""
@@ -820,10 +856,14 @@ class App:
         with _ui.Stage(f"Starting {os.path.basename(script)}"):
             log = open(log_path, "ab", buffering=0)
             try:
+                detach: Dict[str, Any] = {"start_new_session": True}
+                if os.name == "nt":            # its own console group: it outlives the app
+                    detach = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                              | getattr(subprocess, "DETACHED_PROCESS", 0)}
                 process = subprocess.Popen(
                     [sys.executable, "-m", "pulse", "run", "--stream", "--again", *argv],
                     cwd=cwd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                    env=env, start_new_session=True)
+                    env=env, **detach)
             finally:
                 log.close()
             session = None
@@ -1154,8 +1194,8 @@ def usable() -> bool:
     opted out (PULSE_CLASSIC=1 keeps the line-by-line screens)."""
     if os.environ.get("PULSE_CLASSIC", "").strip().lower() in ("1", "true", "yes", "on"):
         return False
-    if os.name == "nt" and os.environ.get("PULSE_APP", "").strip().lower() not in ("1", "true", "yes", "on"):
-        return False            # not tried on a Windows console yet: PULSE_APP=1 opts in
+    if os.name == "nt" and not tui.windows_console_ready():
+        return False            # a console that cannot show escape sequences
     if _ui.host() is not None or not _ui.enabled():
         return False
     try:

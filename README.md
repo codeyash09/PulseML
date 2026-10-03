@@ -519,8 +519,9 @@ Type `pulse` in a terminal and Pulse opens as one full-screen app:
 4. **Debugging is a split screen.** The run is on the left: status, step and speed, every
    tracked value with its curve, the detectors' findings, tensors, and when the agent will
    next audit the run. The agent is on the right, and what you ask it goes with the run's
-   evidence. Its reasoning and every tool call are in the transcript, folded to a line
-   each; **Ctrl+O** unfolds them. The agent can also talk to you while it works -- a
+   evidence. Its reasoning streams in as the model thinks; afterwards it and every tool
+   call sit in the transcript folded to a line each, and **Ctrl+O** unfolds them. The
+   agent can also talk to you while it works -- a
    message beside its tool calls, shown with a bar down its side -- so you see what it
    found and what it is about to check without waiting for the end of its turn. A fix is a diff you confirm; `/restart` then stops the
    run and starts it again with the change (for runs started with `/run`).
@@ -540,10 +541,12 @@ Commands on an open run: `/findings`, `/curve <name>`, `/vars`, `/audit`, `/audi
 `/add`, `/drop`, `/review`, `/undo`, `/log`, `/cloud`, `/help`, `/exit`.
 
 `pulse watch <run>`, `pulse <script.py>` and `pulse attach --pid N` open the same app
-directly on that run. Without a real terminal (a pipe, CI), on a very small one, on
-Windows for now, or with `PULSE_CLASSIC=1`, Pulse keeps the line-by-line screens described
-below. `pulse run train.py` -- training with Pulse inside the script's own terminal -- is
-unchanged.
+directly on that run. On Windows it needs a console that understands escape sequences
+(Windows Terminal, or the console of Windows 10 and later). Without a real terminal (a
+pipe, CI), on a very small one, or with `PULSE_CLASSIC=1`, Pulse keeps the line-by-line
+screens described below. `PULSE_STREAMING=0` turns off the streaming of the model's
+replies. `pulse run train.py` -- training with Pulse inside the script's own terminal --
+is unchanged.
 
 ---
 
