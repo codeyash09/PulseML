@@ -89,7 +89,8 @@ DEBUG_COMMANDS: List[Tuple[str, str]] = [
     ("/output", "the last lines the run printed (runs started with /run)"),
     ("/interval", "sample faster or slower: /interval 0.5"),
     ("/quiet", "stop announcing findings (/loud resumes)"),
-    ("/back", "close the run and return to the code agent"),
+    ("/back", "return to the agent; the run stays open in the background"),
+    ("/close", "stop watching the open run"),
 ]
 
 _STATUS_STYLE = {"live": "green", "stalled": "amber", "crashed": "red"}
@@ -161,6 +162,7 @@ class App:
         # the run that is open (DEBUG), if any
         self.console: Any = None
         self.session: Optional[Dict[str, Any]] = None
+        self.background = False                      # the run is watched, its pane is not shown
         self._monitor: Any = None                    # a py-spy sampler this app started
         self.audits = True
         self.launched: Dict[str, Dict[str, Any]] = {}    # session id -> what /run started
@@ -313,6 +315,59 @@ class App:
         """The agent speaking to the person mid-turn (see pulse_ui.message)."""
         self._add(tui.Entry("say", text))
 
+    # ------------------------------------------------------------------ what the agent may do with runs
+
+    def run_actions(self) -> Dict[str, Callable[..., str]]:
+        """Run control for the agent (its start_run / stop_run / restart_run / run_status tools,
+        and the RUN:/STOP:/RESTART:/RUNSTATUS: directives). Each returns text for the model."""
+        return {"start_run": self._agent_start_run, "stop_run": self._agent_stop_run,
+                "restart_run": self._agent_restart_run, "run_status": self._agent_run_status}
+
+    def _agent_start_run(self, script: str = "", args: str = "") -> str:
+        script = str(script or "").strip()
+        if not script:
+            return "start_run needs the script to run, e.g. train.py (and its arguments, if any)."
+        before = (self.session or {}).get("session_id")
+        self._launch(f"{script} {str(args or '').strip()}".strip())
+        session = self.session or {}
+        if self.console is None or session.get("session_id") in (None, before):
+            return (f"The run did not start, or Pulse saw no training step from it; the lines above "
+                    f"say what happened. (Run it with run_command only to see an error quickly: a "
+                    f"training run started that way is killed at the command timeout.)")
+        return (f"Started {os.path.basename(session.get('script') or script)} under Pulse (session "
+                f"{session.get('session_id')}). It is now open beside you: run_status gives its latest "
+                f"numbers and findings, and the person sees it on their screen. It keeps running after "
+                f"this turn ends.")
+
+    def _agent_stop_run(self) -> str:
+        if self.console is None:
+            return "No run is open. Nothing was stopped."
+        from . import pulse_stream as stream
+        name = os.path.basename((self.session or {}).get("script") or "the run")
+        if not _ui.confirm(f"The agent wants to stop {name}. Stop it?", default=False):
+            return "The person did not allow stopping the run."
+        self.console.send_control(stream.CONTROL_STOP, reason="asked by the agent")
+        return f"Asked {name} to stop."
+
+    def _agent_restart_run(self) -> str:
+        session = self.session or {}
+        if self.console is None:
+            return "No run is open. start_run starts one."
+        if session.get("session_id") not in self.launched:
+            return ("This run was not started from here, so it cannot be restarted from here: tell the "
+                    "person to stop it (/stop) and start it again the way they started it.")
+        before = session.get("session_id")
+        self._restart()
+        after = (self.session or {}).get("session_id")
+        if after and after != before:
+            return f"Restarted: the new run (session {after}) is open beside you. run_status shows it."
+        return "The restart did not produce a new run; the lines above say what happened."
+
+    def _agent_run_status(self) -> str:
+        if self.console is None:
+            return "No run is open. /monitor (the person) or start_run (you) opens one."
+        return self._evidence()
+
     def tool(self, calls: List[str], output: str) -> None:
         output = tui.clean(output).replace("\r", "")
         self._add(tui.Entry("tool", calls=calls or ["tools"], output=output))
@@ -444,6 +499,11 @@ class App:
                 page = max(3, self._height // 2)
                 view.scroll = max(0, view.scroll + (page if key == "pgup" else -page))
                 return
+            if key in ("up", "down") and not view.editor.text and question is None:
+                # an empty input line: the arrows (and a mouse wheel, which most terminals turn
+                # into arrows on this screen) scroll the transcript
+                view.scroll = max(0, view.scroll + (3 if key == "up" else -3))
+                return
             if key == "end" and view.scroll:
                 view.scroll = 0
                 return
@@ -478,8 +538,12 @@ class App:
                 if hints:
                     view.editor.set(hints[0][0] + " ")
             elif key == "esc":
-                if self.console is not None and not view.busy and not view.editor.text:
-                    self._start(self._close_run)
+                if view.editor.text:
+                    view.editor.take(remember=False)           # Esc clears what was typed
+                elif self.console is not None and not view.busy:
+                    self._start(self._foreground_run if self.background else self._background_run)
+                elif self.console is not None:
+                    view.status = "finish or cancel (Ctrl+C) what is running first"
             elif key == "ctrl+d":
                 if not view.editor.text and not view.busy:
                     self.done = True
@@ -560,6 +624,8 @@ class App:
             self._launch(rest)
         elif self.console is not None and self._run_command(word, rest):
             pass
+        elif word == "/close":
+            self.note("No run is open.")
         elif word in ("/back", "/home"):
             self.note("No run is open. /monitor picks one.")
         elif not pulse_code._handle_command(self.cli, line):
@@ -588,10 +654,17 @@ class App:
         from . import pulse_console as con
         sessions = con.discover()
         idle = con.unmonitored_python_processes()
+        current = (self.session or {}).get("session_id")
+        if not wanted and self.background and current:
+            self._foreground_run()                   # /monitor alone: the run that is already watched
+            return
         if wanted:
             chosen = con.pick_session(sessions, wanted)
             if chosen is not None:
-                self._open_run(chosen)
+                if chosen.get("session_id") == current:
+                    self._foreground_run()
+                else:
+                    self._open_run(chosen)
                 return
             outside = [p for p in idle if os.path.basename(p["script"]) == os.path.basename(wanted)
                        or str(p["pid"]) == wanted]
@@ -612,6 +685,8 @@ class App:
             when = session["status"] if session["status"] in ("live", "stalled") else \
                 f"{session['status']} {con.ago(session.get('last_seen'))}"
             bits.append(os.path.dirname(session.get("script") or "") or session["session_id"])
+            if session.get("session_id") == current:
+                when = "watched" if self.background else "open"
             options.append(_ui.Option(script, " · ".join(bits), tag=when))
             targets.append(("session", session))
         for process in idle[:8]:
@@ -629,7 +704,9 @@ class App:
         if not isinstance(picked, int):
             return
         kind, target = targets[picked]
-        if kind == "session":
+        if kind == "session" and target.get("session_id") == current:
+            self._foreground_run()
+        elif kind == "session":
             self._open_run(target)
         else:
             self._attach_outside(target)
@@ -703,6 +780,7 @@ class App:
             self._refresh_side(force=True)
 
     def _close_run(self, quiet: bool = False) -> None:
+        """Stop watching the open run (it keeps running) and aim the agent at home again."""
         console = self.console
         if console is None:
             return
@@ -711,15 +789,40 @@ class App:
         with self.lock:
             self.console = self.session = self._monitor = None
             self.view.side, self.view.side_brief = None, []
+            self.background = False
         if monitor is not None:
             try:
                 monitor.stop()
             except Exception:
                 pass
         self._point(self.home_root, self.home_focus)
+        from . import pulse_code
+        self.cli._system_prompt_override = pulse_code.CODE_SYSTEM_PROMPT
         self._refresh_header()
         if not quiet:
-            self.note("Closed the run. It keeps going; /monitor opens it again.")
+            self.note("Stopped watching the run. It keeps going; /monitor opens it again.")
+
+    def _background_run(self) -> None:
+        """Back to the agent at home, with the run still watched: its pane goes, findings are
+        still announced, and /monitor (or Esc) brings it back. The agent stays pointed at the
+        run's project, so a fix for it can still be asked for from home."""
+        if self.console is None:
+            return
+        with self.lock:
+            self.background = True
+            self.view.side, self.view.side_brief = None, []
+        self._refresh_header()
+        name = os.path.basename((self.session or {}).get("script") or "the run")
+        self.note(f"{name} is still watched in the background: findings show up here, /monitor "
+                  "brings it back, /close stops watching it.")
+
+    def _foreground_run(self) -> None:
+        if self.console is None or not self.background:
+            return
+        with self.lock:
+            self.background = False
+        self._refresh_header()
+        self._refresh_side(force=True)
 
     def _point(self, root: str, focus: List[str]) -> None:
         """Aim the code agent at a project: its files, its working directory, its history."""
@@ -750,6 +853,8 @@ class App:
         from . import pulse_stream as stream
         console = self.console
         if word in ("/back", "/home"):
+            self._background_run()
+        elif word == "/close":
             self._close_run()
         elif word == "/findings":
             console.show_findings()
@@ -936,9 +1041,14 @@ class App:
         def short(path: str) -> str:
             return "~" + path[len(home):] if path.startswith(home + os.sep) or path == home else path
 
-        if self.console is not None and self.session is not None:
+        if self.console is not None and self.session is not None and not self.background:
             view.area = "DEBUG"
             view.context = f"{os.path.basename(self.session.get('script') or '?')}  ·  {short(self.console.workdir)}"
+            view.commands = DEBUG_COMMANDS + HOME_COMMANDS
+        elif self.console is not None and self.session is not None:
+            view.area = ""
+            view.context = (f"{short(self.console.workdir)}   watching "
+                            f"{os.path.basename(self.session.get('script') or '?')} ({self._status}) -- /monitor")
             view.commands = DEBUG_COMMANDS + HOME_COMMANDS
         else:
             view.area = ""
@@ -954,6 +1064,19 @@ class App:
             return
         now = time.monotonic()
         if not force and now - self._side_at < 0.5:
+            return
+        if self.background:
+            if now - self._status_at > 2.0:
+                from . import pulse_console as con
+                self._status_at = now
+                described = con._describe_session((self.session or {}).get("directory", ""))
+                if described and described["status"] != self._status:
+                    self._status = described["status"]
+                    self._refresh_header()
+                    if self._status not in ("live", "stalled"):
+                        self.note(f"{os.path.basename((self.session or {}).get('script') or 'the run')} "
+                                  f"has {self._status}.")
+            self._side_at = now
             return
         from . import pulse_console as con
         self._side_at = now

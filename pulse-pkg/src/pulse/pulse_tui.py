@@ -380,6 +380,7 @@ class View:
         self.entries: List[Entry] = []
         self.expanded = False                   # ctrl+o: thinking and tool output in full
         self.scroll = 0                         # lines up from the newest
+        self.only_last = True                   # unscrolled: just the latest exchange, not the whole log
         self.live = ""                          # what is running right now ("Planning")
         self.live_since = 0.0
         self.partial = ""                       # an unfinished output line (no newline yet)
@@ -406,10 +407,18 @@ def side_width(width: int) -> int:
     return min(46, max(32, width * 36 // 100))
 
 
-def transcript_lines(view: View, width: int) -> List[str]:
+def transcript_lines(view: View, width: int, only_last: bool = False) -> List[str]:
+    """The transcript as screen lines. With `only_last`, just the latest exchange: from the
+    last thing the person typed onward (everything before it is reached by scrolling)."""
+    entries = view.entries
+    if only_last:
+        for index in range(len(entries) - 1, -1, -1):
+            if entries[index].kind == "user":
+                entries = entries[index:]
+                break
     lines: List[str] = []
     previous = None
-    for entry in view.entries:
+    for entry in entries:
         block = entry_lines(entry, width, view.expanded)
         if not block:
             continue
@@ -475,7 +484,8 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
     if view.side is not None and not split:
         strip = [pad(" " + ln, width) for ln in (view.side_brief or view.side[:3])] + [rule]
     left_w = side_width(width) if split else 0
-    right_x = left_w + 3 if split else 1
+    # the right column starts after the pane (left_w + 1), a space, the bar and a space
+    right_x = left_w + 4 if split else 1
     right_w = width - right_x - 1
 
     # ---- the input block, built bottom-up
@@ -517,14 +527,14 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
         if view.question:
             footer = "Enter answer · Esc cancel"
         elif view.busy:
-            footer = "working · Ctrl+C cancel · Ctrl+O details · PgUp/PgDn scroll"
+            footer = "working · Ctrl+C cancel · Ctrl+O details · ↑↓ scroll"
         else:
-            footer = "Enter send · / commands · Ctrl+O details · PgUp/PgDn scroll" + (
-                " · Esc closes the run" if view.side is not None else "")
+            footer = "Enter send · / commands · Ctrl+O details · ↑↓ scroll" + (
+                " · Esc back to the agent" if view.side is not None else "")
     if view.status:
         footer = view.status
     if view.scroll:
-        footer = f"{g('up')} scrolled back {view.scroll} lines · PgDn / End to return · " + footer
+        footer = f"{g('up')} scrolled back {view.scroll} lines · End returns · " + footer
     # the field sits between two rules, the key hints under the lower one
     block.append(s(g("rule") * right_w, "dim"))
     block.append(s(_ui._clip(footer, right_w), "dim"))
@@ -533,7 +543,9 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
 
     # ---- the transcript above it
     room = body_h - len(strip) - len(block) - 1          # -1: the rule over the input
-    lines = transcript_lines(view, right_w)
+    lines = transcript_lines(view, right_w, only_last=view.only_last and view.scroll == 0)
+    if view.scroll:
+        lines = transcript_lines(view, right_w)           # scrolled: the whole conversation
     limit = max(0, len(lines) - room)
     view.scroll = max(0, min(view.scroll, limit))
     end = len(lines) - view.scroll
@@ -670,14 +682,15 @@ class Screen:
     def __enter__(self) -> "Screen":
         if not self._console.enter(output=True, keys=False):
             raise _ui.Unavailable("this console cannot show escape sequences")
-        # alternate screen, cursor home, bracketed paste on
-        self.write("\033[?1049h\033[H\033[2J\033[?2004h")
+        # alternate screen, cursor home, bracketed paste on, and the cursor as an orange bar
+        # (Pulse's accent) -- terminals that cannot recolour it keep their own
+        self.write("\033[?1049h\033[H\033[2J\033[?2004h\033]12;#ff8700\007\033[5 q")
         self._active = True
         return self
 
     def __exit__(self, *exc: Any) -> None:
         if self._active:
-            self.write("\033[?2004l\033[0m\033[?25h\033[?1049l")
+            self.write("\033[?2004l\033[0m\033[?25h\033]112\007\033[0 q\033[?1049l")
             self._active = False
         self._console.exit()
 

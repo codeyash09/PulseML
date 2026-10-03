@@ -413,7 +413,8 @@ def test_ok_every_tool_the_checkin_prompt_advertises_is_serviced():
 
 def test_ok_every_tool_the_code_agent_prompt_advertises_is_allowed():
     from pulse import pulse_code
-    allowed = {n.upper() for n in pulse_code._ALLOWED_TOOLS} | {"GREP", "VIEW"}
+    # run control (RUN:/RUNSTATUS:/RESTART:/STOP:) is serviced by pulse_code itself, not the debugger's table
+    allowed = {n.upper() for n in pulse_code._ALLOWED_TOOLS} | {"GREP", "VIEW"} | set(pulse_code._RUN_ACTIONS)
     missing = _advertised(pulse_code.CODE_SYSTEM_PROMPT) - allowed
     assert not missing, f"offered to Pulse Code but filtered out: {sorted(missing)}"
 

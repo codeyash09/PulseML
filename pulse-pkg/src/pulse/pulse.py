@@ -291,6 +291,7 @@ def _default_var_state(name, shape):
 
 # CALC: one AST-whitelisted evaluator, shared with the CLI.
 from pulse.pulse_cli import _safe_eval_math  # noqa: E402
+from pulse.pulse_cli import _MAX_ANALYZE_TOOL_ROUNDS  # noqa: E402
 
 
 def _flush_stdin() -> None:
@@ -2123,6 +2124,25 @@ _PASS2_ANALYZE_TMPL = (
     "sentence, the specific root cause) and the Reasoning behind it (grounded in the actual "
     "numbers/image/code you were given, with real math, referencing line numbers). Do not "
     "implement the fix yet."
+)
+_USER_REQUEST_TMPL = (
+    "The person watching the run just asked:\n{request}\n\n"
+    "Do what they asked -- that, not a general diagnosis of the run. Check facts before answering: "
+    "CALC:, GREP:, VIEW: and the analysis tools, each on its own line, then stop; you get the results "
+    "and continue. When you have what you need: if it is a question, answer it plainly with the real "
+    "numbers. If it asks for a change to the code (a fix, a feature, an edit), describe in a short "
+    "paragraph exactly what you will change and where, and end with a line containing only "
+    "CHANGE_NEEDED -- Pulse will then ask you for the edit. If it needs no change and is not a "
+    "question, say what you did or found."
+)
+_PASS3_REQUEST_IMPLEMENT_TMPL = (
+    "The person asked for this change:\n{request}\n\nYour plan:\n{plan}\n\n"
+    "IMPLEMENT: Make exactly the change they asked for, as planned -- not a general fix of the run, "
+    "and nothing beyond the request: no reformatting, renaming, refactoring or 'while I am here' "
+    "improvements. Default to the smallest edit that fully does it. Respond with ONLY the code-fix JSON "
+    "object described in your instructions (old/new/explanation) -- no prose, no markdown fences. If "
+    "the change turns out to be unnecessary or impossible as asked, respond with ONLY "
+    '{{"no_change": true, "reason": "one sentence"}} and nothing will be written.'
 )
 _PASS3_FIX_TEXT_TMPL = (
     "Your analysis so far:\n{diagnosis}\n\n"
@@ -4549,7 +4569,8 @@ def _chat_panel_class():
             self.entry.delete(0, tk.END)
             self._append("You  (+ code)" if include_code else "You", question)
 
-            threading.Thread(target=self._ask_and_maybe_retry, args=(question, include_code, current_provider), daemon=True).start()
+            threading.Thread(target=self._ask_and_maybe_retry, args=(question, include_code, current_provider),
+                             kwargs={"from_user": True}, daemon=True).start()
 
         def _build_file_labels(self, extra_files):
             """Give every file a short, unique display label (usually just its
@@ -5727,7 +5748,44 @@ def _chat_panel_class():
             self.after(0, lambda: self._append("Pulse", "(6) Following the established format for the additional issue(s)..."))
             self._ask(f"Please also fix this: {summary}", include_code, provider_name, _depth=_depth + 1)
 
-        def _ask(self, question, include_code, provider_name, _depth=0):
+        def _user_request_turn(self, model_name, base_text, question, images):
+            """What the person typed is the task -- a question, a change, a check -- handled
+            with the tools, not run through the locate/diagnose passes meant for a problem
+            Pulse found. Returns (what the agent said, whether it wants to change code)."""
+            self.after(0, lambda: self._set_stage("Working on your request"))
+            prompt = f"{base_text}\n\n{_USER_REQUEST_TMPL.format(request=question)}"
+            answer = self._call_model(model_name, prompt, images, max_tokens=_AGENT_MAX_TOKENS)
+            self.history.append({"role": "user", "content": [{"type": "text", "text": base_text}]})
+            for _round in range(_MAX_ANALYZE_TOOL_ROUNDS):
+                cleaned, calc_exprs, promote_names, grep_patterns, view_requests = _extract_directives(answer)
+                cleaned, new_requests = _extract_new_directives(cleaned)
+                notes = []
+                if calc_exprs or promote_names or grep_patterns or view_requests:
+                    note, _calc_lines, promoted = self._apply_directives(calc_exprs, promote_names, grep_patterns, view_requests)
+                    for target in promoted:
+                        self.after(0, lambda t=target: self.promote_fn(t))
+                    notes.append(note)
+                if new_requests:
+                    notes.append(self._apply_new_directives(new_requests))
+                notes = [n for n in notes if n]
+                if not notes:
+                    break
+                joined = "\n\n".join(notes)
+                self.after(0, lambda n=joined: self._append("Pulse (tool results)", n))
+                self.history.append({"role": "assistant", "content": answer})
+                self.history.append({"role": "user", "content": [{"type": "text", "text": joined}]})
+                answer = self._call_model(
+                    model_name, _USER_REQUEST_TMPL.format(request=question)
+                    + "\n\n(The results of what you checked are above. Continue, or answer.)",
+                    max_tokens=_AGENT_MAX_TOKENS)
+            change = bool(re.search(r"(?m)^\s*CHANGE_NEEDED\s*$", answer))
+            cleaned, *_rest = _extract_directives(answer)
+            cleaned, _requests = _extract_new_directives(cleaned)
+            text = re.sub(r"(?m)^\s*CHANGE_NEEDED\s*$", "", cleaned).strip()
+            self.after(0, lambda t=text: self._append("Pulse", t or "(no answer)"))
+            return text, change
+
+        def _ask(self, question, include_code, provider_name, _depth=0, from_user=False):
             """Runs the question through an adaptive multi-pass pipeline
             instead of a fixed number of calls -- how many passes actually run
             depends on whether a code fix was asked for, whether it verifies
@@ -5755,64 +5813,79 @@ def _chat_panel_class():
                 images = self._image_payloads()
 
                 wants_implementation = include_code and _wants_implementation(question)
+                implement_prompt = None
+
+                if from_user:
+                    # The person's own words are the task (a question is answered; a change they
+                    # asked for goes on to the implement/verify passes with their request as the
+                    # brief, not a bug diagnosis).
+                    full_answer, change = self._user_request_turn(model_name, base_text, question, images)
+                    if not change:
+                        self.after(0, lambda: self._set_stage(None))
+                        self.history.append({"role": "assistant", "content": full_answer})
+                        return
+                    wants_implementation = True
+                    implement_prompt = _PASS3_REQUEST_IMPLEMENT_TMPL.format(request=question, plan=full_answer)
+                    regions = analysis = ""
 
                 # Pass 1: locate the region(s) of the error. The context and
                 # images go in this call's own message only; history gets a
                 # text-only copy afterwards, so later passes keep the context
                 # without re-uploading every image (and pass 1 doesn't carry
                 # the context twice).
-                self.after(0, lambda: self._set_stage("Reading for region of error"))
-                regions = self._call_model(model_name, f"{base_text}\n\n{_PASS1_LOCATE}", images, max_tokens=_AGENT_MAX_TOKENS)
-                self.history.append({"role": "user", "content": [{"type": "text", "text": base_text}]})
-                self.after(0, lambda: self._append("Pulse (1 · Region of error)", regions))
+                if not from_user:
+                    self.after(0, lambda: self._set_stage("Reading for region of error"))
+                    regions = self._call_model(model_name, f"{base_text}\n\n{_PASS1_LOCATE}", images, max_tokens=_AGENT_MAX_TOKENS)
+                    self.history.append({"role": "user", "content": [{"type": "text", "text": base_text}]})
+                    self.after(0, lambda: self._append("Pulse (1 · Region of error)", regions))
 
-                # Pass 2: focused second read + diagnosis/reasoning.
-                self.after(0, lambda: self._set_stage("Analyzing"))
-                raw_analysis = self._call_model(model_name, _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=_AGENT_MAX_TOKENS)
-                analysis, calc_exprs, promote_names, grep_patterns, view_requests = _extract_directives(raw_analysis)
-                analysis, new_requests = _extract_new_directives(analysis)
-                self.after(0, lambda: self._append("Pulse (2 · Diagnosis & reasoning)", analysis))
+                if not from_user:
+                    # Pass 2: focused second read + diagnosis/reasoning.
+                    self.after(0, lambda: self._set_stage("Analyzing"))
+                    raw_analysis = self._call_model(model_name, _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=_AGENT_MAX_TOKENS)
+                    analysis, calc_exprs, promote_names, grep_patterns, view_requests = _extract_directives(raw_analysis)
+                    analysis, new_requests = _extract_new_directives(analysis)
+                    self.after(0, lambda: self._append("Pulse (2 · Diagnosis & reasoning)", analysis))
 
-                directive_note = ""
-                if calc_exprs or promote_names or grep_patterns or view_requests:
-                    directive_note, calc_lines, promoted = self._apply_directives(
-                        calc_exprs, promote_names, grep_patterns, view_requests
-                    )
-                    if calc_lines:
-                        self.after(0, lambda: self._append("Pulse (verified calculations)", calc_lines))
-                    for target in promoted:
-                        self.after(0, lambda t=target: self.promote_fn(t))
-                    if promoted:
-                        promoted_str = ", ".join(promoted)
-                        self.after(0, lambda s=promoted_str: self._append("Pulse", f"⚙ Promoted to full tracking (agent request): {s}"))
-                    if directive_note:
-                        self.history.append({"role": "user", "content": [{"type": "text", "text": directive_note}]})
+                    directive_note = ""
+                    if calc_exprs or promote_names or grep_patterns or view_requests:
+                        directive_note, calc_lines, promoted = self._apply_directives(
+                            calc_exprs, promote_names, grep_patterns, view_requests
+                        )
+                        if calc_lines:
+                            self.after(0, lambda: self._append("Pulse (verified calculations)", calc_lines))
+                        for target in promoted:
+                            self.after(0, lambda t=target: self.promote_fn(t))
+                        if promoted:
+                            promoted_str = ", ".join(promoted)
+                            self.after(0, lambda s=promoted_str: self._append("Pulse", f"⚙ Promoted to full tracking (agent request): {s}"))
+                        if directive_note:
+                            self.history.append({"role": "user", "content": [{"type": "text", "text": directive_note}]})
 
-                if new_requests:
-                    new_note = self._apply_new_directives(new_requests)
-                    if new_note:
-                        self.after(0, lambda n=new_note: self._append("Pulse (tool results)", n))
-                        self.history.append({"role": "user", "content": [{"type": "text", "text": new_note}]})
+                    if new_requests:
+                        new_note = self._apply_new_directives(new_requests)
+                        if new_note:
+                            self.after(0, lambda n=new_note: self._append("Pulse (tool results)", n))
+                            self.history.append({"role": "user", "content": [{"type": "text", "text": new_note}]})
 
-                full_answer = f"{regions}\n\n{analysis}"
+                    full_answer = f"{regions}\n\n{analysis}"
 
-                if not wants_implementation:
-                    self.after(0, lambda: self._set_stage("Developing fix"))
-                    fix_text = self._call_model(
-                        model_name, _PASS3_FIX_TEXT_TMPL.format(diagnosis=full_answer), max_tokens=_AGENT_MAX_TOKENS
-                    )
-                    self.after(0, lambda: self._set_stage(None))
-                    full_answer += f"\n\n{fix_text}"
-                    self.after(0, lambda: self._append("Pulse (3 · Fix)", fix_text))
-                    self.history.append({"role": "assistant", "content": full_answer})
-                    return
+                    if not wants_implementation:
+                        self.after(0, lambda: self._set_stage("Developing fix"))
+                        fix_text = self._call_model(
+                            model_name, _PASS3_FIX_TEXT_TMPL.format(diagnosis=full_answer), max_tokens=_AGENT_MAX_TOKENS
+                        )
+                        self.after(0, lambda: self._set_stage(None))
+                        full_answer += f"\n\n{fix_text}"
+                        self.after(0, lambda: self._append("Pulse (3 · Fix)", fix_text))
+                        self.history.append({"role": "assistant", "content": full_answer})
+                        return
+                    implement_prompt = _PASS3_IMPLEMENT_TMPL.format(diagnosis=full_answer)
 
                 # Pass 3: develop and implement the fix, with passes 1-2's
                 # findings handed over (otherwise it re-derives them from scratch).
                 self.after(0, lambda: self._set_stage("Developing & implementing fix"))
-                fix_answer = self._call_model(
-                    model_name, _PASS3_IMPLEMENT_TMPL.format(diagnosis=full_answer), max_tokens=_AGENT_MAX_TOKENS
-                )
+                fix_answer = self._call_model(model_name, implement_prompt, max_tokens=_AGENT_MAX_TOKENS)
                 fix = self._parse_code_fix(fix_answer)
                 if fix is None:
                     self.after(0, lambda: self._set_stage(None))
@@ -5889,14 +5962,14 @@ def _chat_panel_class():
                 elif _depth == 0:
                     self._last_call_failed_transiently = True
 
-        def _ask_and_maybe_retry(self, question, include_code, provider_name, _depth=0):
+        def _ask_and_maybe_retry(self, question, include_code, provider_name, _depth=0, from_user=False):
             """Thin wrapper around _ask -- every _ask spawn site calls this
             instead, so a transient failure gets queued for a background
             retry (see _queue_agent_retry) rather than just printed and
             dropped. Recursive sweep-pass calls (_depth > 0) are invoked
             directly by _ask itself via _run_sweep_and_maybe_recurse, not
             through here, so only top-level asks are ever queued."""
-            self._ask(question, include_code, provider_name, _depth)
+            self._ask(question, include_code, provider_name, _depth, from_user=from_user)
             if _depth == 0:
                 if self._last_call_failed_transiently:
                     self._queue_agent_retry(question, include_code, provider_name)

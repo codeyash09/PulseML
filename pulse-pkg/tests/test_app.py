@@ -735,14 +735,20 @@ def test_run_commands_print_into_the_transcript(real_app, tmp_path):
         assert wait_for(lambda: not real_app.view.busy, 10)
         assert expected in text_of(real_app)
     run_line(real_app, "/back")
+    assert wait_for(lambda: real_app.background and not real_app.view.busy, 10)
+    assert real_app.console is not None                       # still watched, just not shown
+    run_line(real_app, "/close")
     assert wait_for(lambda: real_app.console is None, 10)
 
 
-def test_esc_closes_the_run(real_app, tmp_path):
+def test_esc_puts_the_run_in_the_background_and_brings_it_back(real_app, tmp_path):
     real_app._open_run(make_run(tmp_path))
     press(real_app, "esc")
-    assert wait_for(lambda: real_app.console is None and not real_app.view.busy, 10)
-    assert real_app.view.area == ""
+    assert wait_for(lambda: real_app.background and not real_app.view.busy, 10)
+    assert real_app.view.area == "" and real_app.view.side is None and real_app.console is not None
+    press(real_app, "esc")
+    assert wait_for(lambda: not real_app.background and not real_app.view.busy, 10)
+    assert real_app.view.area == "DEBUG" and real_app.view.side is not None
 
 
 def test_the_picker_lists_runs_live_first_and_opens_the_one_chosen(real_app, tmp_path, monkeypatch):

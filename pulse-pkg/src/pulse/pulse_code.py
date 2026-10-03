@@ -143,6 +143,9 @@ CODE_SYSTEM_PROMPT = (
     "If you notice a second, unrelated bug while you're in a file, do not fix it -- mention it in "
     "your explanation as worth a separate look, and leave that code untouched.\n"
     "- If the request is a question, or needs no change, just answer it.\n"
+    "- Do what the request says, not the nearest thing you know how to do: 'run it' means RUN:, 'why is "
+    "X' means an answer with the real numbers, 'add Y' means a change. Describing what you would do is "
+    "not doing it.\n"
     "- You have a real terminal (TERMINAL:, below). Never say you ran or tested something unless you "
     "actually did and are reporting the real exit code/output you got back -- not what you expect it "
     "to say.\n\n"
@@ -158,6 +161,12 @@ CODE_SYSTEM_PROMPT = (
     "real assignment chain, not a guess. self.<attr> works too.\n"
     "  DOCLOOKUP: <library>.<symbol>  the real signature/docstring of an installed library function\n"
     "  CHANGELOG:                 what has changed in the project files since the session started\n"
+    "  RUN: <script> [args]       start a training script under Pulse (inside the Pulse app): it runs in the "
+    "background, Pulse watches it and shows it to the user. When the user says run / start / train / try it, "
+    "this is the directive -- a training run started with TERMINAL is killed at the command timeout.\n"
+    "  RUNSTATUS:                 the watched run's numbers and findings right now\n"
+    "  RESTART:                   stop the watched run and start it again (after a change to its code)\n"
+    "  STOP:                      stop the watched run (the user is asked first)\n"
     "  MESSAGE: <one line>        say something to the user right now, while you keep working -- what "
     "you found, what you are about to do. Not a tool: nothing comes back and it does not end your turn, "
     "so put it beside the directives you issue in the same reply. Text around directives is not shown "
@@ -765,7 +774,8 @@ _TOOL_CALL_RE = re.compile(r"(?m)^[ \t]*([A-Z][A-Z_]{2,}):[ \t]*(.*)$")
 def tool_calls_in(answer):
     """The tool lines of a model answer ("GREP: loss", "TERMINAL: pytest -q"), in order --
     only names that really are tools, so prose like "NOTE: ..." is not one."""
-    names = ({"GREP", "VIEW", "CALC"} | {k.upper() for k in PulseCLI._NEW_DIRECTIVE_RES}) - {"MESSAGE"}
+    names = ({"GREP", "VIEW", "CALC"} | {k.upper() for k in PulseCLI._NEW_DIRECTIVE_RES}
+             | set(_RUN_ACTIONS)) - {"MESSAGE"}
     return [f"{name}: {arg.strip()}" if arg.strip() else name
             for name, arg in _TOOL_CALL_RE.findall(answer or "") if name in names]
 
@@ -776,7 +786,7 @@ def _show_tools(answer, notes, label="tool results"):
     host = _ui.host()
     if host is not None and hasattr(host, "tool"):
         # what the agent said before reaching for its tools, then the tools
-        names = {"GREP", "VIEW", "CALC"} | {k.upper() for k in PulseCLI._NEW_DIRECTIVE_RES}
+        names = {"GREP", "VIEW", "CALC"} | {k.upper() for k in PulseCLI._NEW_DIRECTIVE_RES} | set(_RUN_ACTIONS)
         said = _TOOL_CALL_RE.sub(lambda m: "" if m.group(1) in names else m.group(0), answer or "").strip()
         if said and len(said) < 2000 and not said.lstrip().startswith("{"):
             print(said)
@@ -785,14 +795,47 @@ def _show_tools(answer, notes, label="tool results"):
     print(f"\n[{label}]\n{notes}\n")
 
 
+_RUN_DIRECTIVE_RE = re.compile(r"(?m)^[ \t]*(RUN|RUNSTATUS|RESTART|STOP):[ \t]*(.*)$")
+_RUN_ACTIONS = {"RUN": "start_run", "RUNSTATUS": "run_status", "RESTART": "restart_run", "STOP": "stop_run"}
+
+
+def _service_run_directives(answer):
+    """RUN: <script> [args] / RUNSTATUS: / RESTART: / STOP: -- run control, which the Pulse
+    app provides (it owns the runs on screen). Returns the notes for the model."""
+    found = _RUN_DIRECTIVE_RE.findall(answer or "")
+    if not found:
+        return []
+    host = _ui.host()
+    actions = host.run_actions() if host is not None and hasattr(host, "run_actions") else {}
+    notes = []
+    for name, arg in found:
+        action = actions.get(_RUN_ACTIONS[name])
+        if action is None:
+            notes.append(f"{name}: only available inside the Pulse app (`pulse`), which watches runs. Here, "
+                         "tell the user to start the run themselves (`pulse run --stream <script>`).")
+            continue
+        try:
+            if name == "RUN":
+                parts = arg.strip().split(None, 1)
+                notes.append(action(script=parts[0] if parts else "", args=parts[1] if len(parts) > 1 else ""))
+            else:
+                notes.append(action())
+        except Exception as exc:                    # the run control must never end the turn
+            notes.append(f"{name} failed: {type(exc).__name__}: {exc}")
+    return notes
+
+
 def _service(cli, answer):
     """Run the tools `answer` asked for. Inside the Pulse app their own progress lines are
     held back -- the transcript shows the calls as one entry (see _show_tools)."""
+    notes = _service_run_directives(answer)
     host = _ui.host()
     if host is not None and hasattr(host, "hush"):
         with host.hush():
-            return cli._service_tool_requests(answer)
-    return cli._service_tool_requests(answer)
+            notes.append(cli._service_tool_requests(answer))
+    else:
+        notes.append(cli._service_tool_requests(answer))
+    return "\n\n".join(n for n in notes if n)
 
 
 def _tool_rounds(cli, answer, instruction):
@@ -820,7 +863,8 @@ def _tool_rounds(cli, answer, instruction):
 def _plain_text(answer):
     """The model's answer with tool directive lines removed, for showing to a person."""
     cleaned, _ = PulseCLI._extract_new_directives(answer)
-    cleaned = re.sub(r"(?m)^\s*(GREP|VIEW|DEFOF|CALLERS|DEPGRAPH|DOCLOOKUP|CHANGELOG|MESSAGE):.*$", "", cleaned)
+    cleaned = re.sub(r"(?m)^\s*(GREP|VIEW|DEFOF|CALLERS|DEPGRAPH|DOCLOOKUP|CHANGELOG|MESSAGE|RUN|RUNSTATUS|RESTART|STOP):.*$",
+                     "", cleaned)
     return _NO_CHANGES_RE.sub("", cleaned).strip()
 
 

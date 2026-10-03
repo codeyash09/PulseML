@@ -88,6 +88,7 @@ SYSTEM_PROMPT = """You are Pulse Code, an autonomous coding agent working in the
 - If a tool fails, read the error, adjust, and try again; a failed edit or command is information, not the end of the task. Don't repeat the identical call hoping for a different result.
 - Talk to the user while you work with message_user: what you found, what you are about to do, a heads-up about something you noticed. It does not end your turn and it gets no reply, so put it in the same reply as the tool calls you are making. Plain text next to tool calls is not shown to the user by every provider; message_user always is.
 - If the request is a question, answer it from the code; make no edits.
+- Do what the request says, not the nearest thing you know how to do: "run it" means start_run, "why is X" means an answer with the real numbers, "add Y" means edits. A reply that describes what you are going to do, without doing it, is not an answer: do it, in that same reply, with the tools.
 
 # Use the code structure, not just text search
 This is Pulse's advantage. For Python code prefer the AST tools over grep:
@@ -99,7 +100,10 @@ This is Pulse's advantage. For Python code prefer the AST tools over grep:
 - After an edit that changes a function's signature, the tool result lists the call sites that may now be wrong. Fix them.
 
 # Running things
-run_command runs a real command in the project directory and returns the real stdout/stderr/exit code. Use it for tests, linters, builds, git, and small repro scripts. Commands that delete files, rewrite git history, reach outside the project, start background processes or overwrite files via redirects pause for the user's confirmation; ordinary read/run/test commands do not.
+run_command runs a real command in the project directory and returns the real stdout/stderr/exit code. Use it for tests, linters, builds, git, and small repro scripts. Commands that delete files, rewrite git history, reach outside the project, start background processes or overwrite files via redirects pause for the user's confirmation; ordinary read/run/test commands do not. A command is killed at its timeout (two minutes unless you pass one), so run_command is NOT how a training run is started.
+
+# Training runs
+start_run starts a script under Pulse: it runs in the background, Pulse watches it (step, every metric's curve, the detectors' findings) and shows it to the user. When the user asks to run, start, launch or train, or to try the change, that is the tool -- not run_command. run_status returns the run's current numbers and findings; restart_run stops the run and starts it again (after a fix); stop_run stops it (the user is asked first).
 
 # Finishing
 When the work is done and verified, reply with a short summary: what you changed, how you checked it, and anything the user should know. No tool call in a reply means you are finished, so only reply without one when you are.
@@ -167,6 +171,17 @@ TOOLS = [
         "Run a shell command in the project directory and get back real stdout, stderr, exit code and duration. "
         "Optional timeout in seconds.",
         {"command": _S, "timeout": _I}, ["command"]),
+    _fn("start_run",
+        "Start a script under Pulse: it runs in the background, Pulse watches it and shows it to the user, and "
+        "run_status can read its numbers. This -- not run_command -- is how a training run is started. "
+        "`args` is the script's command line, if any.",
+        {"script": _S, "args": _S}, ["script"]),
+    _fn("run_status",
+        "The watched run right now: step, every tracked value's curve, the detectors' findings, recent events.",
+        {}),
+    _fn("restart_run",
+        "Stop the watched run and start it again with the same command (after a change to its code).", {}),
+    _fn("stop_run", "Stop the watched training run. The user is asked to confirm.", {}),
     _fn("message_user",
         "Show the user a message right now, while you keep working: progress, a finding, a heads-up. It is "
         "not a question -- it gets no reply and does not end your turn. Use it in the same reply as your "
@@ -224,6 +239,7 @@ class _State:
         self.last_call = None
         self.repeats = 0
         self.edits_declined = 0
+        self.calls_made = 0          # tool calls executed in this request
 
     @property
     def root(self):
@@ -651,6 +667,10 @@ def _t_run_command(state, a):
     result = state.cli._run_terminal(arg)
     if re.search(r"(?m)^Exit code: 0$", result):
         state.dirty = False                  # something ran cleanly since the last edit
+    if re.search(r"timed out|timeout", result, re.I) and re.search(r"\bpython[0-9.]*\b.*\.py\b", command):
+        result += ("\n\nThis looks like a training script, and it was killed at the timeout. A run is "
+                   "started with start_run, which keeps it running and lets Pulse watch it; use "
+                   "run_command only for short checks.")
     return result
 
 
@@ -671,6 +691,34 @@ def _t_todo_write(state, a):
     return "Todo list updated:\n" + "\n".join(f"{_STATUS_MARK[t['status']]} {t['content']}" for t in clean)
 
 
+def _run_action(name, **args):
+    """Run control lives in the Pulse app (it owns the runs on screen); elsewhere the tool says so."""
+    host = _ui.host()
+    actions = host.run_actions() if host is not None and hasattr(host, "run_actions") else {}
+    action = actions.get(name)
+    if action is None:
+        return (f"{name} is only available inside the Pulse app (`pulse`), which watches runs. Here, "
+                "tell the user to start the run themselves (`pulse run --stream <script>`), or use "
+                "run_command for a short, bounded check.")
+    return action(**args)
+
+
+def _t_start_run(state, a):
+    return _run_action("start_run", script=str(a.get("script") or ""), args=str(a.get("args") or ""))
+
+
+def _t_run_status(state, a):
+    return _run_action("run_status")
+
+
+def _t_restart_run(state, a):
+    return _run_action("restart_run")
+
+
+def _t_stop_run(state, a):
+    return _run_action("stop_run")
+
+
 def _t_message_user(state, args):
     text = str(args.get("message") or "").strip()
     if not text:
@@ -681,6 +729,8 @@ def _t_message_user(state, args):
 
 _HANDLERS = {
     "message_user": _t_message_user,
+    "start_run": _t_start_run, "run_status": _t_run_status, "restart_run": _t_restart_run,
+    "stop_run": _t_stop_run,
     "read_file": _t_read_file, "list_files": _t_list_files, "grep": _t_grep, "outline": _t_outline,
     "find_definition": _t_find_definition, "find_references": _t_find_references,
     "dep_graph": _t_dep_graph, "trace_variable": _t_trace_variable, "doc_lookup": _t_doc_lookup,
@@ -688,6 +738,7 @@ _HANDLERS = {
     "run_command": _t_run_command, "todo_write": _t_todo_write,
 }
 _WRITERS = {"edit_file", "replace_symbol", "write_file"}
+_LOUD = {"run_command", "message_user", "start_run", "restart_run", "stop_run"}   # their output is for the person
 
 
 def _brief(name, args):
@@ -695,8 +746,10 @@ def _brief(name, args):
     key = {"read_file": "path", "outline": "path", "edit_file": "path", "replace_symbol": "path",
            "write_file": "path", "grep": "pattern", "find_definition": "symbol", "find_references": "symbol",
            "trace_variable": "target", "doc_lookup": "name", "run_command": "command",
-           "list_files": "pattern"}.get(name)
+           "list_files": "pattern", "start_run": "script"}.get(name)
     detail = str(args.get(key, "")) if key else ""
+    if name == "start_run" and args.get("args"):
+        detail += f" {args['args']}"
     if name == "read_file" and args.get("start_line"):
         detail += f":{args.get('start_line')}-{args.get('end_line') or ''}"
     if name == "replace_symbol":
@@ -746,10 +799,10 @@ def _execute(state, call):
     signature = (name, raw)
     state.repeats = state.repeats + 1 if signature == state.last_call else 1
     state.last_call = signature
+    state.calls_made += 1
     host = _ui.host()
     try:
-        if host is not None and hasattr(host, "hush") and name not in _WRITERS \
-                and name not in ("run_command", "message_user"):
+        if host is not None and hasattr(host, "hush") and name not in _WRITERS and name not in _LOUD:
             with host.hush():
                 result = handler(state, args)
         else:
@@ -934,8 +987,19 @@ def _assistant_message(reply):
 # ---------------------------------------------------------------------------------------
 
 
-def _nudge(state):
+_INTENT_RE = re.compile(
+    r"(?i)\b(?:let me|let's|i(?:'ll| will| am going to| can| should| need to| would)|next,? i|first,? i|"
+    r"i'?m going to|now i|going to|i will now|we need to|the next step|i(?:'ll| will) (?:start|begin|now))\b")
+
+
+def _nudge(state, reply_text=""):
     """A reason the agent should not stop yet, or None."""
+    if (reply_text and not state.calls_made and not state.changes
+            and _INTENT_RE.search(reply_text) and len(reply_text) < 1500):
+        # It announced what it would do and stopped (the tools were not called). Doing is the job.
+        return ("You described what you would do but did not do it. Do it now, in this reply, with the "
+                "tools (read, grep, edit, run_command, start_run...). If the request needs no action, say "
+                "so plainly instead.")
     open_items = [t for t in state.todos if t["status"] != "completed"]
     if open_items:
         return ("You stopped, but your todo list still has unfinished items:\n"
@@ -996,7 +1060,7 @@ def run_native_turn(cli, request, evidence=None):
                 if reply.finish == "length":
                     messages.append({"role": "user", "content": "Your reply was cut off. Continue where you left off."})
                     continue
-                reason = _nudge(state) if state.nudges < _MAX_NUDGES else None
+                reason = _nudge(state, reply.text) if state.nudges < _MAX_NUDGES else None
                 if reason:
                     state.nudges += 1
                     cprint("[Pulse Code] Not finished yet -- continuing.", color=_YELLOW)

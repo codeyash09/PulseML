@@ -2116,6 +2116,25 @@ _PASS3_FIX_TEXT_TMPL = (
     "sentences. Describe the smallest change that fixes the root cause -- a changed value, argument, "
     "or line -- not a broader rewrite."
 )
+_USER_REQUEST_TMPL = (
+    "The person at the paused run just asked:\n{request}\n\n"
+    "Do what they asked -- that, not a general diagnosis of the run. Check facts before answering: "
+    "CALC:, GREP:, VIEW:, TERMINAL: and the analysis tools, each on its own line, then stop; you get "
+    "the results and continue. When you have what you need: if it is a question, answer it plainly "
+    "with the real numbers. If it asks for a change to the code (a fix, a feature, an edit), describe "
+    "in a short paragraph exactly what you will change and where, and end with a line containing only "
+    "CHANGE_NEEDED -- Pulse will then ask you for the edit. If it needs no change and is not a "
+    "question, say what you did or found."
+)
+_PASS3_REQUEST_IMPLEMENT_TMPL = (
+    "The person asked for this change:\n{request}\n\nYour plan:\n{plan}\n\n"
+    "IMPLEMENT: Make exactly the change they asked for, as planned -- not a general fix of the run, "
+    "and nothing beyond the request: no reformatting, renaming, refactoring or 'while I am here' "
+    "improvements. Default to the smallest edit that fully does it. Respond with ONLY the code-fix JSON "
+    "object described in your instructions (old/new/explanation) -- no prose, no markdown fences. If "
+    "the change turns out to be unnecessary or impossible as asked, respond with ONLY "
+    '{{"no_change": true, "reason": "one sentence"}} and nothing will be written.'
+)
 _PASS3_IMPLEMENT_TMPL = (
     "Your analysis so far:\n{diagnosis}\n\n"
     "PASS 3 -- DEVELOP & IMPLEMENT: You are fixing a bug in someone's training run, nothing else. "
@@ -11208,7 +11227,7 @@ class PulseCLI:
 
     def ask_agent(
         self, question: str, include_code: bool = False, _depth: int = 0,
-        traceback_signature: Optional[str] = None,
+        traceback_signature: Optional[str] = None, from_user: bool = False,
     ) -> str:
         """Thin wrapper around `_ask_agent_impl` that syncs the resulting
         Q&A turn to Debug_Sessions.agent_logs (cloud) once the top-level
@@ -11231,7 +11250,8 @@ class PulseCLI:
                 if (self.agent_provider and self.agent_key
                         and threading.current_thread() is threading.main_thread()):
                     self._save_fix_checkpoint()
-            answer = self._ask_agent_impl(question, include_code=include_code, _depth=_depth)
+            answer = self._ask_agent_impl(question, include_code=include_code, _depth=_depth,
+                                          **({"from_user": True} if from_user else {}))
             if _depth == 0:
                 if self._last_call_failed_transiently:
                     self._queue_agent_retry(question, include_code, traceback_signature)
@@ -11250,7 +11270,33 @@ class PulseCLI:
                     self._resolved_signatures.add(traceback_signature)
             return answer
 
-    def _ask_agent_impl(self, question: str, include_code: bool = False, _depth: int = 0) -> str:
+    def _user_request_turn(self, question: str) -> Tuple[str, bool]:
+        """A request typed by the person is handled as what it is -- a question, a change to
+        make, something to check -- with the tools, instead of being run through the
+        locate/diagnose passes meant for a problem Pulse found. Returns (what the agent
+        said, whether it wants to make a code change next)."""
+        prompt = _USER_REQUEST_TMPL.format(request=question)
+        answer = ""
+        for _round in range(_MAX_ANALYZE_TOOL_ROUNDS + 1):
+            with _Spinner("Working on your request"):
+                answer = self._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS)
+            notes = self._service_tool_requests(answer)
+            if not notes:
+                break
+            print(f"[tool results]\n{notes}\n")
+            self.agent_history.append({"role": "assistant", "content": answer})
+            self.agent_history.append({"role": "user", "content": notes})
+            prompt = (_USER_REQUEST_TMPL.format(request=question)
+                      + "\n\n(The results of what you checked are above. Continue, or answer.)")
+        change = bool(re.search(r"(?m)^\s*CHANGE_NEEDED\s*$", answer))
+        cleaned, *_rest = self._extract_directives(answer)
+        cleaned, _requests = self._extract_new_directives(cleaned)
+        text = re.sub(r"(?m)^\s*CHANGE_NEEDED\s*$", "", cleaned).strip()
+        print(f"\n{text}\n" if text else "")
+        return text, change
+
+    def _ask_agent_impl(self, question: str, include_code: bool = False, _depth: int = 0,
+                        from_user: bool = False) -> str:
         """Runs the question through an adaptive multi-pass pipeline
         instead of a fixed number of calls -- how many passes actually run
         depends on whether a code fix was asked for, whether it verifies
@@ -11303,89 +11349,100 @@ class PulseCLI:
         wants_implementation = include_code and bool(_IMPLEMENT_RE.search(question))
 
         try:
-            # Pass 1: locate the region(s) of the error. May itself investigate first via
-            # GREP:/VIEW:/TERMINAL:/etc. instead of guessing -- serviced and looped the same
-            # way PASS 3's fix loop already is, bounded so it can't stall forever.
-            with _Spinner("Reading for region of error"):
-                regions = self._call_model(_PASS1_LOCATE, max_tokens=_AGENT_MAX_TOKENS)
-            for _round in range(_MAX_LOCATE_TOOL_ROUNDS):
-                note = self._service_tool_requests(regions)
-                if not note:
-                    break
-                print(f"[tool results]\n{note}\n")
-                self.agent_history.append({"role": "assistant", "content": regions})
-                self.agent_history.append({"role": "user", "content": note})
+            implement_prompt = ""
+            if from_user:
+                # The person's own words are the task. A question is answered; a change they
+                # asked for goes on to the implement/verify passes with their request, not a
+                # bug diagnosis, as the brief.
+                full_answer, change = self._user_request_turn(question)
+                if not change:
+                    self.agent_history.append({"role": "assistant", "content": full_answer})
+                    return full_answer
+                wants_implementation = True
+                implement_prompt = _PASS3_REQUEST_IMPLEMENT_TMPL.format(request=question, plan=full_answer)
+            else:
+                # Pass 1: locate the region(s) of the error. May itself investigate first via
+                # GREP:/VIEW:/TERMINAL:/etc. instead of guessing -- serviced and looped the same
+                # way PASS 3's fix loop already is, bounded so it can't stall forever.
                 with _Spinner("Reading for region of error"):
                     regions = self._call_model(_PASS1_LOCATE, max_tokens=_AGENT_MAX_TOKENS)
-            print(f"\n[1] Region of error\n{regions}\n")
+                for _round in range(_MAX_LOCATE_TOOL_ROUNDS):
+                    note = self._service_tool_requests(regions)
+                    if not note:
+                        break
+                    print(f"[tool results]\n{note}\n")
+                    self.agent_history.append({"role": "assistant", "content": regions})
+                    self.agent_history.append({"role": "user", "content": note})
+                    with _Spinner("Reading for region of error"):
+                        regions = self._call_model(_PASS1_LOCATE, max_tokens=_AGENT_MAX_TOKENS)
+                print(f"\n[1] Region of error\n{regions}\n")
 
-            # Pass 2: focused second read + diagnosis/reasoning. Investigative directives
-            # (GREP:/VIEW:/TERMINAL:/etc.) are looped the same way, so the diagnosis below is
-            # written after seeing what they turned up, not before. CALC:/PROMOTE:/GPUTRACK:/
-            # GPUUNTRACK: are instrumentation side-effects, not investigation -- applied
-            # deterministically same-turn either way, no need to loop on those alone.
-            raw_analysis = analysis = ""
-            new_requests: Dict[str, List[str]] = {}
-            for _round in range(_MAX_ANALYZE_TOOL_ROUNDS + 1):
-                with _Spinner("Analyzing"):
-                    raw_analysis = self._call_model(
-                        _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=_AGENT_MAX_TOKENS
+                # Pass 2: focused second read + diagnosis/reasoning. Investigative directives
+                # (GREP:/VIEW:/TERMINAL:/etc.) are looped the same way, so the diagnosis below is
+                # written after seeing what they turned up, not before. CALC:/PROMOTE:/GPUTRACK:/
+                # GPUUNTRACK: are instrumentation side-effects, not investigation -- applied
+                # deterministically same-turn either way, no need to loop on those alone.
+                raw_analysis = analysis = ""
+                new_requests: Dict[str, List[str]] = {}
+                for _round in range(_MAX_ANALYZE_TOOL_ROUNDS + 1):
+                    with _Spinner("Analyzing"):
+                        raw_analysis = self._call_model(
+                            _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=_AGENT_MAX_TOKENS
+                        )
+                    (
+                        analysis, calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
+                        sensitivity_args, normal_start_args, grep_patterns, view_requests,
+                    ) = self._extract_directives(raw_analysis)
+                    analysis, new_requests = self._extract_new_directives(analysis)
+                    directive_note = self._apply_directives(
+                        calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
+                        sensitivity_args, normal_start_args, grep_patterns, view_requests,
                     )
-                (
-                    analysis, calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
-                    sensitivity_args, normal_start_args, grep_patterns, view_requests,
-                ) = self._extract_directives(raw_analysis)
-                analysis, new_requests = self._extract_new_directives(analysis)
-                directive_note = self._apply_directives(
-                    calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
-                    sensitivity_args, normal_start_args, grep_patterns, view_requests,
-                )
-                new_note = self._apply_new_directives(new_requests) if new_requests else ""
-                if new_note:
-                    print(f"[tool results]\n{new_note}\n")
-                combined_note = "\n\n".join(n for n in (directive_note, new_note) if n)
-                investigating = bool(grep_patterns or view_requests
-                                     or any(k != "message" for k in new_requests))   # a MESSAGE: is not a tool
-                if investigating and _round < _MAX_ANALYZE_TOOL_ROUNDS:
-                    # Still gathering evidence -- feed the results back and diagnose on a
-                    # later round, once there's actually something to diagnose from.
-                    self.agent_history.append({"role": "assistant", "content": raw_analysis})
+                    new_note = self._apply_new_directives(new_requests) if new_requests else ""
+                    if new_note:
+                        print(f"[tool results]\n{new_note}\n")
+                    combined_note = "\n\n".join(n for n in (directive_note, new_note) if n)
+                    investigating = bool(grep_patterns or view_requests
+                                         or any(k != "message" for k in new_requests))   # a MESSAGE: is not a tool
+                    if investigating and _round < _MAX_ANALYZE_TOOL_ROUNDS:
+                        # Still gathering evidence -- feed the results back and diagnose on a
+                        # later round, once there's actually something to diagnose from.
+                        self.agent_history.append({"role": "assistant", "content": raw_analysis})
+                        if combined_note:
+                            self.agent_history.append({"role": "user", "content": combined_note})
+                        continue
                     if combined_note:
                         self.agent_history.append({"role": "user", "content": combined_note})
-                    continue
-                if combined_note:
-                    self.agent_history.append({"role": "user", "content": combined_note})
-                if calc_exprs:
-                    # The diagnosis was written before these came back: carry Pulse's
-                    # exact values with it (printed and handed to the fix pass), so the
-                    # model's own arithmetic isn't the only number on record.
-                    analysis += "\n\nPulse-verified calculations:\n" + "\n".join(
-                        f"  {expr} = {_safe_eval_math(expr)}" for expr in calc_exprs)
-                break
-            print(f"[2] Diagnosis & reasoning\n{analysis}\n")
+                    if calc_exprs:
+                        # The diagnosis was written before these came back: carry Pulse's
+                        # exact values with it (printed and handed to the fix pass), so the
+                        # model's own arithmetic isn't the only number on record.
+                        analysis += "\n\nPulse-verified calculations:\n" + "\n".join(
+                            f"  {expr} = {_safe_eval_math(expr)}" for expr in calc_exprs)
+                    break
+                print(f"[2] Diagnosis & reasoning\n{analysis}\n")
 
-            full_answer = f"{regions}\n\n{analysis}"
+                full_answer = f"{regions}\n\n{analysis}"
 
-            if not wants_implementation:
-                # No code change requested -- pass 3 is just the concrete fix
-                # in text; nothing to verify or sweep.
-                with _Spinner("Developing fix"):
-                    fix_text = self._call_model(
-                        _PASS3_FIX_TEXT_TMPL.format(diagnosis=full_answer), max_tokens=_AGENT_MAX_TOKENS
-                    )
-                print(f"[3] Fix\n{fix_text}\n")
-                full_answer += f"\n\n{fix_text}"
-                self.agent_history.append({"role": "assistant", "content": full_answer})
-                return full_answer
+                if not wants_implementation:
+                    # No code change requested -- pass 3 is just the concrete fix
+                    # in text; nothing to verify or sweep.
+                    with _Spinner("Developing fix"):
+                        fix_text = self._call_model(
+                            _PASS3_FIX_TEXT_TMPL.format(diagnosis=full_answer), max_tokens=_AGENT_MAX_TOKENS
+                        )
+                    print(f"[3] Fix\n{fix_text}\n")
+                    full_answer += f"\n\n{fix_text}"
+                    self.agent_history.append({"role": "assistant", "content": full_answer})
+                    return full_answer
+                implement_prompt = _PASS3_IMPLEMENT_TMPL.format(diagnosis=full_answer)
 
             # Pass 3: develop and implement the fix. Passes 1-2's findings
             # are handed over explicitly -- otherwise this call sees only the
             # original code + traceback and has to re-derive the diagnosis
             # from scratch (tool results from pass 2 are already in history).
             with _Spinner("Developing & implementing fix"):
-                fix_answer = self._call_model(
-                    _PASS3_IMPLEMENT_TMPL.format(diagnosis=full_answer), max_tokens=_AGENT_MAX_TOKENS
-                )
+                fix_answer = self._call_model(implement_prompt, max_tokens=_AGENT_MAX_TOKENS)
             fix = self._parse_code_fix(fix_answer)
             no_change = self._parse_no_change(fix_answer, json_only=True) if fix is None else None
 
@@ -11426,7 +11483,7 @@ class PulseCLI:
                 try:
                     with _Spinner("Developing & implementing fix"):
                         fix_answer = self._call_model(
-                            _PASS3_IMPLEMENT_TMPL.format(diagnosis=full_answer),
+                            implement_prompt,
                             max_tokens=_AGENT_MAX_TOKENS,
                         )
                 except AgentRequestFailed:
@@ -15295,6 +15352,7 @@ class PulseCLI:
             self.ask_agent(
                 cmd,
                 include_code=self.include_code_default,
+                from_user=True,
             )
 
 

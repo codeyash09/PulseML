@@ -531,14 +531,21 @@ Type `pulse` in a terminal and Pulse opens as one full-screen app:
 | Enter | send the request, or answer a question Pulse asked |
 | `/` | commands; typing shows the ones that match, Tab completes |
 | Ctrl+O | fold / unfold the agent's thinking and tool output |
-| PgUp / PgDn | scroll the transcript |
+| ↑ / ↓ (empty line) | scroll back through the conversation; the screen otherwise shows the latest exchange |
 | Ctrl+C | cancel what is running; twice at an empty prompt leaves |
-| Esc | close the open run and go back to the agent |
+| Esc | leave the open run in the background and go back to the agent; Esc again brings it back |
 
 Commands on an open run: `/findings`, `/curve <name>`, `/vars`, `/audit`, `/audits on|off`,
 `/trace <var>`, `/source`, `/pause`, `/resume`, `/stop`, `/restart`, `/output`,
-`/interval <sec>`, `/quiet`, `/back`. Everywhere: `/monitor`, `/run`, `/agent`, `/files`,
-`/add`, `/drop`, `/review`, `/undo`, `/log`, `/cloud`, `/help`, `/exit`.
+`/interval <sec>`, `/quiet`, `/back` (keep watching it in the background), `/close` (stop
+watching). Everywhere: `/monitor`, `/run`, `/agent`, `/files`, `/add`, `/drop`, `/review`,
+`/undo`, `/log`, `/cloud`, `/help`, `/exit`.
+
+The agent can start, watch, restart and stop runs itself: "run it", "start training with
+--epochs 3", "restart it with the fix" are requests it carries out with its `start_run`,
+`run_status`, `restart_run` and `stop_run` tools (stopping asks you first). A request typed
+at a paused `pulse run` is likewise handled as what it is -- a question gets an answer, a
+change you asked for gets made -- instead of being read as a bug report to diagnose.
 
 `pulse watch <run>`, `pulse <script.py>` and `pulse attach --pid N` open the same app
 directly on that run. On Windows it needs a console that understands escape sequences

@@ -354,3 +354,279 @@ def test_the_app_is_allowed_on_windows_when_the_console_can_draw(monkeypatch):
     assert appmod.usable() is False
     monkeypatch.setattr(tui, "windows_console_ready", lambda: True)
     assert appmod.usable() is True
+
+
+# =========================================================================================
+# The agent acts on the request: run control, the request path, no stopping at a plan
+# =========================================================================================
+
+def test_the_agents_run_tools_are_the_apps_run_control(cli, monkeypatch):
+    app = appmod.App(cli, cli._project_root)
+    seen = []
+    app._launch = lambda arg: seen.append(("launch", arg)) or setattr(app, "console", object()) \
+        or setattr(app, "session", {"session_id": "s1", "script": "/p/train.py"})
+    state = native._State(cli, "run it")
+    app.install()
+    try:
+        out = native._execute(state, {"name": "start_run", "arguments": json.dumps({"script": "train.py", "args": "--epochs 2"})})
+    finally:
+        app.uninstall()
+    assert seen == [("launch", "train.py --epochs 2")]
+    assert "Started train.py under Pulse" in out and "run_status" in out
+    assert [e.kind for e in app.view.entries] == ["tool"] and app.view.entries[0].calls == ["START_RUN: train.py --epochs 2"]
+
+
+def test_run_tools_outside_the_app_say_so(cli):
+    state = native._State(cli, "run it")
+    out = native._execute(state, {"name": "start_run", "arguments": json.dumps({"script": "train.py"})})
+    assert "only available inside the Pulse app" in out and "pulse run --stream" in out
+    assert "only available inside the Pulse app" in native._execute(state, {"name": "run_status", "arguments": "{}"})
+
+
+def test_run_status_and_restart_go_through_the_open_run(cli, tmp_path, monkeypatch):
+    app = appmod.App(cli, cli._project_root)
+    assert "No run is open" in app._agent_run_status()
+    assert "No run is open" in app._agent_restart_run()
+    app.console = types.SimpleNamespace(brain=types.SimpleNamespace(
+        evidence=lambda include_code=False: {"x": 1}, render_evidence=lambda pack: "step 10, loss 0.5"))
+    app.session = {"session_id": "s9", "script": str(tmp_path / "train.py")}
+    assert "EVIDENCE FROM THE RUN (train.py" in app._agent_run_status() and "loss 0.5" in app._agent_run_status()
+    assert "not started from here" in app._agent_restart_run()
+
+
+def test_stop_run_asks_the_person_first(cli, monkeypatch):
+    app = appmod.App(cli, cli._project_root)
+    sent = []
+    app.console = types.SimpleNamespace(send_control=lambda action, **f: sent.append(action))
+    app.session = {"session_id": "s1", "script": "/p/train.py"}
+    monkeypatch.setattr(ui, "confirm", lambda *a, **k: False)
+    assert "did not allow" in app._agent_stop_run() and sent == []
+    monkeypatch.setattr(ui, "confirm", lambda *a, **k: True)
+    assert "Asked train.py to stop" in app._agent_stop_run() and sent == ["stop"]
+
+
+def test_a_training_command_that_times_out_points_at_start_run(cli, monkeypatch):
+    state = native._State(cli, "run it")
+    monkeypatch.setattr(cli, "_run_terminal", lambda arg, **k: "TERMINAL: python train.py\nTimed out after 120s\nExit code: -9")
+    out = native._execute(state, {"name": "run_command", "arguments": json.dumps({"command": "python train.py"})})
+    assert "start_run" in out
+    monkeypatch.setattr(cli, "_run_terminal", lambda arg, **k: "Exit code: 0\nok")
+    assert "start_run" not in native._execute(state, {"name": "run_command", "arguments": json.dumps({"command": "pytest -q"})})
+
+
+def test_the_text_pipeline_has_run_directives(cli, monkeypatch):
+    app = appmod.App(cli, cli._project_root)
+    launched = []
+    app._launch = lambda arg: launched.append(arg) or setattr(app, "console", object()) \
+        or setattr(app, "session", {"session_id": "s1", "script": "/p/train.py"})
+    app.install()
+    try:
+        notes = pulse_code._service(cli, "I will start it.\nRUN: train.py --lr 0.1")
+    finally:
+        app.uninstall()
+    assert launched == ["train.py --lr 0.1"] and "Started train.py under Pulse" in notes
+    assert pulse_code.tool_calls_in("RUN: train.py\nRUNSTATUS:") == ["RUN: train.py", "RUNSTATUS"]
+    assert "RUN:" not in pulse_code._plain_text("RUN: train.py\nStarting it.\nNO_CHANGES")
+    assert "only available inside the Pulse app" in pulse_code._service(cli, "RESTART:")
+    assert "RUN: <script>" in pulse_code.CODE_SYSTEM_PROMPT and "start_run" in native.SYSTEM_PROMPT
+
+
+def test_a_reply_that_only_announces_a_plan_is_nudged_to_act(cli, monkeypatch):
+    answers = iter([native_reply("I'll start by reading train.py and then make the change."),
+                    native_reply("", [call("read_file", {"path": "train.py"})]),
+                    native_reply("Done: lr is set on line 1; nothing to change.")])
+    sent = []
+
+    def completion(**kw):
+        sent.append(kw)
+        return next(answers)
+
+    monkeypatch.setattr(native.litellm, "completion", completion)
+    assert native.run_native_turn(cli, "check lr") == "answered"
+    nudge = sent[1]["messages"][-1]["content"]
+    assert "did not do it" in nudge and "tools" in nudge
+    assert len(sent) == 3
+
+
+def test_a_plain_answer_is_not_nudged(cli, monkeypatch):
+    sent = []
+
+    def completion(**kw):
+        sent.append(kw)
+        return native_reply("lr is 0.3, set on line 1.")
+
+    monkeypatch.setattr(native.litellm, "completion", completion)
+    assert native.run_native_turn(cli, "what is lr?") == "answered" and len(sent) == 1
+
+
+def test_the_debuggers_pause_prompt_handles_a_question_as_a_question(cli, monkeypatch):
+    """A person's own request is not run through the locate/diagnose passes."""
+    cli._native_off = True
+    sent = []
+
+    def completion(**kw):
+        sent.append(str(kw["messages"][-1]["content"]))
+        return reply("The learning rate is 0.3 (line 1).")
+
+    monkeypatch.setattr(pc.litellm, "completion", completion)
+    answer = cli.ask_agent("what is the learning rate?", include_code=True, from_user=True)
+    assert answer == "The learning rate is 0.3 (line 1)."
+    assert len(sent) == 1 and "what is the learning rate?" in sent[0] and "PASS 1" not in sent[0]
+    assert "Do what they asked" in sent[0]
+
+
+def test_the_debuggers_pause_prompt_implements_a_change_the_person_asked_for(cli, monkeypatch):
+    cli._native_off = True
+    cli.auto_intervene = True                 # no y/N: the pipeline applies the fix itself
+    cli._restart_process = lambda *a, **k: None
+    sent = []
+    fix = {"old": ["lr = 0.3"], "new": ["lr = 0.05"], "files": ["train.py"], "explanation": "lower lr"}
+
+    def completion(**kw):
+        last = str(kw["messages"][-1]["content"])
+        sent.append(last)
+        if "Do what they asked" in last:
+            return reply("I will change lr = 0.3 to lr = 0.05 on line 1.\nCHANGE_NEEDED")
+        if "IMPLEMENT: Make exactly the change" in last:
+            return reply(json.dumps(fix))
+        if '"passes"' in last or "VERIFY" in last.upper():
+            return reply('{"passes": true, "reason": "fine"}')
+        return reply('{"resolved": true, "reason": "ok"}')
+
+    monkeypatch.setattr(pc.litellm, "completion", completion)
+    cli.ask_agent("lower the learning rate to 0.05", include_code=True, from_user=True)
+    assert "lr = 0.05" in open(os.path.join(cli._project_root, "train.py")).read()
+    assert any("The person asked for this change" in m and "lower the learning rate" in m for m in sent)
+    assert not any("PASS 1 -- LOCATE" in m for m in sent)
+
+
+def test_pulses_own_problems_still_take_the_diagnose_path(cli, monkeypatch):
+    cli._native_off = True
+    sent = []
+
+    def completion(**kw):
+        sent.append(str(kw["messages"][-1]["content"]))
+        return reply("- train.py line 1")
+
+    monkeypatch.setattr(pc.litellm, "completion", completion)
+    cli.ask_agent("Pulse detected a problem: loss is NaN", include_code=True)
+    assert any("PASS 1 -- LOCATE" in m for m in sent)
+
+
+def test_the_dashboard_chat_handles_the_persons_request_as_asked(monkeypatch):
+    fake_tk = types.SimpleNamespace(Frame=type("Frame", (object,), {}), TclError=Exception)
+    monkeypatch.setattr(core, "tk", fake_tk)
+    monkeypatch.setattr(core, "HAS_TK", True)
+    monkeypatch.setattr(core, "_CHAT_PANEL_CLS", None)
+    cls = core._chat_panel_class()
+    panel = cls.__new__(cls)
+    panel.appended, panel.history = [], []
+    panel.after = lambda ms, fn=None: fn() if fn else None
+    panel._append = lambda who, text: panel.appended.append((who, text))
+    panel._set_stage = lambda label: None
+    panel.promote_fn = lambda name: None
+    panel._apply_directives = lambda *a, **k: ("", "", [])
+    panel._apply_new_directives = lambda requests: ""
+    sent = []
+    panel._call_model = lambda model, instruction, images=None, max_tokens=0: sent.append(instruction) or "lr is 0.3."
+    text, change = panel._user_request_turn("m", "context", "what is lr?", None)
+    assert text == "lr is 0.3." and change is False
+    assert "what is lr?" in sent[0] and "Do what they asked" in sent[0]
+    assert ("Pulse", "lr is 0.3.") in panel.appended
+    core._CHAT_PANEL_CLS = None
+
+
+# =========================================================================================
+# The screen: the latest exchange, the cursor, a run in the background
+# =========================================================================================
+
+def test_unscrolled_the_transcript_shows_only_the_latest_exchange():
+    view = tui.View()
+    for i in range(3):
+        view.entries += [tui.Entry("user", f"question {i}"), tui.Entry("text", f"answer {i}")]
+    shown = "\n".join(PLAIN.sub("", line) for line in tui.compose(view, 80, 24)[0])
+    assert "question 2" in shown and "answer 2" in shown and "question 1" not in shown
+    view.scroll = 3
+    scrolled = "\n".join(PLAIN.sub("", line) for line in tui.compose(view, 80, 24)[0])
+    assert "question 1" in scrolled or "question 0" in scrolled
+
+
+def test_arrows_scroll_when_nothing_is_typed(cli):
+    app = appmod.App(cli, cli._project_root)
+    app.view.entries = [tui.Entry("text", f"line {i}") for i in range(80)]
+    app.on_key("up")
+    assert app.view.scroll == 3
+    app.on_key("down")
+    assert app.view.scroll == 0
+    app.on_key("x")
+    app.on_key("up")                         # with text typed the arrows are the history
+    assert app.view.scroll == 0
+
+
+def test_the_cursor_sits_right_after_the_typed_text_in_the_split_view():
+    view = tui.View()
+    view.side = ["train.py  ● live", "step 10"]
+    view.editor.set("abc")
+    frame, row, col = tui.compose(view, 100, 24)
+    line = PLAIN.sub("", frame[row])
+    assert line[col - 3:col] == "abc" and line[col] == " "
+
+
+def test_the_screen_asks_for_an_orange_bar_cursor_and_puts_it_back(monkeypatch):
+    written = []
+    screen = tui.Screen(fd=1)
+    monkeypatch.setattr(screen, "write", written.append)
+    monkeypatch.setattr(screen._console, "enter", lambda **k: True)
+    with screen:
+        pass
+    assert "\033]12;#ff8700\007" in written[0] and "\033[5 q" in written[0]
+    assert "\033]112\007" in written[-1] and "\033[0 q" in written[-1]
+
+
+def test_a_run_can_be_left_watching_in_the_background(cli, tmp_path, monkeypatch):
+    from pulse import pulse_console as con
+    from pulse.pulse_monitor import Monitor
+    project = tmp_path / "runproj"
+    project.mkdir()
+    (project / "train.py").write_text("lr = 0.3\n")
+    directory = str(project / ".pulse_stream" / "run1")
+    monitor = Monitor(directory=directory, session_id="run1", script_path=str(project / "train.py"),
+                      interval=0.0, tensor_interval=0.0)
+    monitor.observe_locals({"loss": 0.5, "step": 3})
+    monitor.snapshot_state({})
+    monitor.writer.close()
+    session = con._describe_session(directory)
+    app = appmod.App(cli, cli._project_root)
+    app._open_run(session)
+    assert app.view.area == "DEBUG" and app.view.side is not None
+    app._background_run()
+    assert app.background and app.view.side is None and app.view.area == ""
+    assert "watching train.py" in app.view.context and app.console is not None
+    assert "EVIDENCE FROM THE RUN" in app._evidence()        # requests still carry the run
+    monkeypatch.setattr(con, "discover", lambda *a, **k: [session])
+    monkeypatch.setattr(con, "unmonitored_python_processes", lambda: [])
+    app._pick_run("")                                        # /monitor brings it back
+    assert not app.background and app.view.area == "DEBUG"
+    app._close_run(quiet=True)
+    assert app.console is None and app.cli._project_root == cli._project_root
+
+
+def test_esc_goes_to_the_background_and_back(cli, tmp_path):
+    app = appmod.App(cli, cli._project_root)
+    app.console = types.SimpleNamespace(workdir=str(tmp_path), stop=lambda join=False: None,
+                                        brain=types.SimpleNamespace(agent=None))
+    app.session = {"session_id": "s1", "script": str(tmp_path / "train.py")}
+    app.on_key("esc")
+    import time as _t
+    deadline = _t.time() + 5
+    while _t.time() < deadline and not app.background:
+        _t.sleep(0.02)
+    assert app.background
+    deadline = _t.time() + 5
+    while _t.time() < deadline and app.view.busy:
+        _t.sleep(0.02)
+    app.on_key("esc")
+    deadline = _t.time() + 5
+    while _t.time() < deadline and app.background:
+        _t.sleep(0.02)
+    assert not app.background
