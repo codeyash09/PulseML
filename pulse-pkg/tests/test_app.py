@@ -945,3 +945,139 @@ def test_a_project_scan_stops_once_it_has_enough(tmp_path, monkeypatch):
     monkeypatch.setattr(pulse_code, "_SCAN_MAX_DIRS", 5)
     monkeypatch.setattr(pulse_code.subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=1, stdout=b""))
     assert len(pulse_code.scan_project(str(tmp_path), limit=100)) <= 5
+
+
+# =========================================================================================
+# A watched run is logged to the dashboard
+# =========================================================================================
+
+class FakeCloud:
+    def __init__(self, monkeypatch):
+        self.created, self.patches = [], []
+        monkeypatch.setattr(cloud, "create_debug_session", self.create)
+        monkeypatch.setattr(cloud, "patch_debug_session", self.patch)
+        monkeypatch.setattr(cloud, "collect_environment_info", lambda: {"python": "3.12"})
+        monkeypatch.setattr(cloud, "current_git_commit_sha", lambda cwd=None: "abc123")
+
+    def create(self, project_id, user_id, git_commit_sha=None):
+        self.created.append((project_id, user_id, git_commit_sha))
+        return "row-1"
+
+    def patch(self, session_id, fields, timeout=5):
+        decoded = {k: ([cloud.decode_entry(e) for e in v] if isinstance(v, list) else v) for k, v in fields.items()}
+        self.patches.append((session_id, decoded))
+
+    def field(self, name):
+        for _sid, body in reversed(self.patches):
+            if name in body:
+                return body[name]
+        return None
+
+
+def settle(log):
+    worker = log._worker
+    if worker is not None:
+        worker.join(5)
+
+
+def finding(check, variable, severity, message):
+    return types.SimpleNamespace(check=check, variable=variable, severity=severity, message=message)
+
+
+def test_a_watched_run_gets_its_own_dashboard_row(monkeypatch):
+    fake = FakeCloud(monkeypatch)
+    cli = types.SimpleNamespace(user_id="u1", project_id="p1")
+    session = {"session_id": "run1", "script": "/p/train.py", "pid": 7, "started": time.time() - 100,
+               "last_seen": time.time()}
+    log = appmod.RunLog(cli, session, "/p")
+    log.start()
+    settle(log)
+    assert fake.created == [("p1", "u1", "abc123")]
+    first = fake.field("telemetry")[0]
+    assert first["script"] == "/p/train.py" and first["python"] == "3.12" and first["mode"] == "stream"
+
+    state = {"step": 40, "histories": {"loss": [1.0, 0.5], "lr": [0.1]},
+             "findings": [finding("plateau", "loss", "warning", "loss has barely moved")]}
+    log.tick(state, "live", [], session)
+    settle(log)
+    incidents = fake.field("incidents")
+    assert incidents[-1]["kind"] == "finding" and incidents[-1]["severity"] == "warning" and incidents[-1]["step"] == 40
+    snapshot = fake.field("telemetry")[-1]
+    assert snapshot["step"] == 40 and snapshot["loss"] == 0.5 and snapshot["lr"] == 0.1
+    assert 95 <= fake.field("uptime_seconds") <= 105
+
+    log.tick(state, "live", [], session)              # the same finding again: no new incident
+    settle(log)
+    assert sum(1 for i in fake.field("incidents") if i["kind"] == "finding") == 1
+
+    crash = {"event": "crash", "exception": "ZeroDivisionError: x", "traceback": "Traceback...\nZeroDivisionError: x"}
+    log.tick(state, "crashed", [crash], session)
+    settle(log)
+    assert fake.field("error_tracebacks") == ["Traceback...\nZeroDivisionError: x"]
+    kinds = [i["kind"] for i in fake.field("incidents")]
+    assert "crash" in kinds and "run_crashed" in kinds
+
+    log.agent_turn("why?", "because", fix_applied={"explanation": "lower lr", "files": ["train.py"]})
+    settle(log)
+    assert fake.field("agent_logs")[-1]["question"] == "why?"
+    assert fake.field("incidents")[-1]["kind"] == "fix_applied"
+    log.close()
+    assert all(sid == "row-1" for sid, _body in fake.patches)
+
+
+def test_without_a_signed_in_account_nothing_is_sent(monkeypatch):
+    fake = FakeCloud(monkeypatch)
+    log = appmod.RunLog(types.SimpleNamespace(user_id=None, project_id=None), {"session_id": "r"}, "/p")
+    log.start()
+    log.tick({"step": 1, "histories": {}, "findings": []}, "live", [], {})
+    log.agent_turn("q", "a")
+    log.close()
+    assert fake.created == [] and fake.patches == []
+
+
+def test_an_offline_moment_keeps_the_entries_for_the_next_send(monkeypatch):
+    fake = FakeCloud(monkeypatch)
+    calls = {"n": 0}
+
+    def flaky(session_id, fields, timeout=5):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise cloud.SupabaseError("offline")
+        fake.patch(session_id, fields)
+
+    monkeypatch.setattr(cloud, "patch_debug_session", flaky)
+    log = appmod.RunLog(types.SimpleNamespace(user_id="u1", project_id=None), {"session_id": "r", "script": "/p/t.py"}, "/p")
+    log.start()
+    settle(log)
+    assert fake.patches == []
+    log.incident("stopped", "x")
+    settle(log)
+    assert fake.field("telemetry") and fake.field("incidents")[-1]["kind"] == "stopped"
+
+
+def test_the_app_logs_the_open_run_and_its_agent_turns(real_app, tmp_path, monkeypatch):
+    fake = FakeCloud(monkeypatch)
+    real_app.cli.user_id, real_app.cli.project_id = "u1", "p1"
+    original = []
+    real_app.cli._sync_agent_turn = lambda q, a, traceback_signature=None, fix_applied=None: original.append(q)
+    real_app._open_run(make_run(tmp_path))
+    assert real_app.runlog is not None
+    settle(real_app.runlog)
+    assert fake.created and fake.field("telemetry")[0]["pulse_session"] == "train"
+    real_app.cli._sync_agent_turn("is it healthy?", "yes")
+    settle(real_app.runlog)
+    assert original == ["is it healthy?"]                 # the app's own session still gets it
+    assert fake.field("agent_logs")[-1]["question"] == "is it healthy?"    # and so does the run's row
+    log = real_app.runlog
+    real_app._close_run(quiet=True)
+    assert real_app.runlog is None and log._closed
+    real_app.cli._sync_agent_turn("later", "x")
+    assert original == ["is it healthy?", "later"] and fake.field("agent_logs")[-1]["question"] == "is it healthy?"
+
+
+def test_no_dashboard_row_when_not_signed_in(real_app, tmp_path, monkeypatch):
+    fake = FakeCloud(monkeypatch)
+    real_app.cli.user_id = None
+    real_app._open_run(make_run(tmp_path))
+    assert real_app.runlog is None and fake.created == []
+    real_app._close_run(quiet=True)

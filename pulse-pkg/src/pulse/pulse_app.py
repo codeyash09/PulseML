@@ -111,6 +111,179 @@ class _Question:
         self.done = threading.Event()
 
 
+class RunLog:
+    """One Debug_Sessions row for a run the app watches, so it shows on the web dashboard
+    like a run started with `pulse run`: a first telemetry entry about the environment,
+    metric snapshots, the detectors' findings and status changes as incidents, crashes as
+    error tracebacks, the agent's turns about the run, and uptime. Everything is sent in
+    the background and never blocks the screen; without a signed-in account there is
+    nothing to send and this is inert."""
+
+    TELEMETRY_EVERY = 60.0
+    FLUSH_EVERY = 60.0
+
+    def __init__(self, cli: Any, session: Dict[str, Any], workdir: str) -> None:
+        self.cli = cli
+        self.session = session
+        self.workdir = workdir
+        self.id: Optional[str] = None
+        self.enabled = bool(getattr(cli, "user_id", None))
+        self._lock = threading.Lock()
+        self._fields: Dict[str, Any] = {"agent_logs": [], "error_tracebacks": [], "telemetry": [],
+                                        "incidents": [], "uptime_seconds": 0}
+        self._dirty: set = set()
+        self._seen_findings: set = set()
+        self._seen_events = 0
+        self._status: Optional[str] = None
+        self._last_telemetry = 0.0
+        self._last_flush = time.monotonic()
+        self._worker: Optional[threading.Thread] = None
+        self._closed = False
+
+    # ------------------------------------------------------------------ what gets recorded
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        from . import pulse_supabase as cloud
+        first = {"t": time.time(), "mode": "stream", "script": self.session.get("script"),
+                 "pulse_session": self.session.get("session_id"), "pid": self.session.get("pid")}
+        try:
+            first.update(cloud.collect_environment_info() or {})
+        except Exception:
+            pass
+        with self._lock:
+            self._fields["telemetry"].append(first)
+            self._dirty.add("telemetry")
+        self._spawn(create=True)
+
+    def tick(self, state: Dict[str, Any], status: str, events: List[Dict[str, Any]], session: Dict[str, Any]) -> None:
+        """Called a few times a minute with the brain's current state."""
+        if not self.enabled or self._closed:
+            return
+        now = time.monotonic()
+        force = False
+        with self._lock:
+            if status != self._status:
+                if self._status is not None:
+                    self._incident(f"run_{status}", f"The run is {status}.", status=status)
+                    force = True
+                self._status = status
+            for finding in state.get("findings") or []:
+                key = (getattr(finding, "check", ""), getattr(finding, "variable", ""))
+                if key in self._seen_findings:
+                    continue
+                self._seen_findings.add(key)
+                severity = str(getattr(finding, "severity", "")).lower()
+                if severity in ("warning", "critical", "error"):
+                    self._incident("finding", getattr(finding, "message", str(finding)), severity=severity,
+                                   check=key[0], variable=key[1], step=state.get("step"))
+                    force = True
+            for event in events[self._seen_events:]:
+                if event.get("event") == "crash":
+                    trace = event.get("traceback") or event.get("exception") or "crash"
+                    self._fields["error_tracebacks"].append(str(trace)[-8000:])
+                    self._dirty.add("error_tracebacks")
+                    self._incident("crash", str(event.get("exception") or "the run crashed"))
+                    force = True
+                elif event.get("event") in ("stop_requested", "stopped"):
+                    self._incident("stopped", str(event.get("reason") or "the run was stopped"))
+                    force = True
+            self._seen_events = len(events)
+            if now - self._last_telemetry >= self.TELEMETRY_EVERY or not self._last_telemetry:
+                self._last_telemetry = now
+                snapshot: Dict[str, Any] = {"t": time.time(), "step": state.get("step") or 0}
+                for name, history in (state.get("histories") or {}).items():
+                    if history:
+                        snapshot[name] = history[-1]
+                self._fields["telemetry"].append(snapshot)
+                self._dirty.add("telemetry")
+            started = session.get("started")
+            if started:
+                try:
+                    end = time.time() if status in ("live", "stalled") else float(session.get("last_seen") or time.time())
+                    uptime = int(max(0.0, end - float(started)))
+                    if uptime != self._fields["uptime_seconds"]:
+                        self._fields["uptime_seconds"] = uptime
+                        self._dirty.add("uptime_seconds")
+                except (TypeError, ValueError):
+                    pass
+        if force or now - self._last_flush >= self.FLUSH_EVERY:
+            self._spawn()
+
+    def agent_turn(self, question: str, answer: str, fix_applied: Optional[Dict[str, Any]] = None) -> None:
+        if not self.enabled or self._closed:
+            return
+        with self._lock:
+            entry: Dict[str, Any] = {"t": time.time(), "question": question, "answer": answer}
+            if fix_applied:
+                entry["fix_applied"] = fix_applied
+                self._incident("fix_applied", str(fix_applied.get("explanation") or "code edited"),
+                               files=fix_applied.get("files"))
+            self._fields["agent_logs"].append(entry)
+            self._dirty.add("agent_logs")
+        self._spawn()
+
+    def incident(self, kind: str, summary: str, **extra: Any) -> None:
+        if not self.enabled or self._closed:
+            return
+        with self._lock:
+            self._incident(kind, summary, **extra)
+        self._spawn()
+
+    def _incident(self, kind: str, summary: str, **extra: Any) -> None:
+        entry: Dict[str, Any] = {"t": time.time(), "kind": kind, "summary": summary}
+        entry.update({k: v for k, v in extra.items() if v is not None})
+        self._fields["incidents"].append(entry)
+        self._dirty.add("incidents")
+
+    def close(self) -> None:
+        if not self.enabled or self._closed:
+            return
+        self._closed = True
+        self._spawn(wait=5.0)
+
+    # ------------------------------------------------------------------ sending
+
+    def _spawn(self, create: bool = False, wait: float = 0.0) -> None:
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            if wait:
+                worker.join(wait)
+            return
+        self._worker = threading.Thread(target=self._send, args=(create,), daemon=True, name="pulse-run-log")
+        self._worker.start()
+        if wait:
+            self._worker.join(wait)
+
+    def _send(self, create: bool) -> None:
+        from . import pulse_supabase as cloud
+        dirty: set = set()
+        try:
+            if create and self.id is None:
+                sha = None
+                try:
+                    sha = cloud.current_git_commit_sha(self.workdir)
+                except Exception:
+                    pass
+                self.id = cloud.create_debug_session(getattr(self.cli, "project_id", None),
+                                                     getattr(self.cli, "user_id", None), git_commit_sha=sha)
+            if not self.id:
+                return
+            with self._lock:
+                dirty, self._dirty = self._dirty, set()
+                body: Dict[str, Any] = {}
+                for name in dirty:
+                    value = self._fields[name]
+                    body[name] = ([cloud.encode_entry(e) for e in value] if isinstance(value, list) else value)
+            if body:
+                cloud.patch_debug_session(self.id, body)
+            self._last_flush = time.monotonic()
+        except Exception:                        # offline, a 5xx: kept, sent next time
+            with self._lock:
+                self._dirty |= dirty
+
+
 class _Capture(io.TextIOBase):
     """sys.stdout / sys.stderr while the app is up: what is written goes to the transcript."""
 
@@ -163,6 +336,8 @@ class App:
         self.console: Any = None
         self.session: Optional[Dict[str, Any]] = None
         self.background = False                      # the run is watched, its pane is not shown
+        self.runlog: Optional[RunLog] = None         # the run's row on the dashboard
+        self._orig_sync: Any = None
         self._monitor: Any = None                    # a py-spy sampler this app started
         self.audits = True
         self.launched: Dict[str, Dict[str, Any]] = {}    # session id -> what /run started
@@ -769,6 +944,7 @@ class App:
             self._point(workdir, [script] if script and os.path.isfile(script) else [])
         from . import pulse_code
         self.cli._system_prompt_override = pulse_code.CODE_SYSTEM_PROMPT + DEBUG_PROMPT
+        self._start_runlog(session, workdir)
         self._refresh_header()
         name = os.path.basename(script) or session.get("session_id") or "the run"
         over = "" if self._status in ("live", "stalled") else f" ({self._status})"
@@ -779,11 +955,40 @@ class App:
         with self.lock:
             self._refresh_side(force=True)
 
+    def _start_runlog(self, session: Dict[str, Any], workdir: str) -> None:
+        """The run's own row on the dashboard; the agent's turns about it go there too."""
+        self._stop_runlog()
+        log = RunLog(self.cli, session, workdir)
+        if not log.enabled:
+            return
+        self.runlog = log
+        log.start()
+        cli = self.cli
+        self._orig_sync = cli._sync_agent_turn
+
+        def sync(question: str, answer: str, traceback_signature: Optional[str] = None,
+                 fix_applied: Optional[Dict[str, Any]] = None) -> None:
+            try:
+                self._orig_sync(question, answer, traceback_signature=traceback_signature, fix_applied=fix_applied)
+            finally:
+                log.agent_turn(question, answer, fix_applied=fix_applied)
+
+        cli._sync_agent_turn = sync
+
+    def _stop_runlog(self) -> None:
+        log, self.runlog = self.runlog, None
+        if self._orig_sync is not None:
+            self.cli._sync_agent_turn = self._orig_sync
+            self._orig_sync = None
+        if log is not None:
+            log.close()
+
     def _close_run(self, quiet: bool = False) -> None:
         """Stop watching the open run (it keeps running) and aim the agent at home again."""
         console = self.console
         if console is None:
             return
+        self._stop_runlog()
         console.stop(join=True)
         monitor = self._monitor
         with self.lock:
@@ -1005,6 +1210,8 @@ class App:
                       "stop it (/stop) and start it again the way it was started.")
             return
         process = info["process"]
+        if self.runlog is not None:
+            self.runlog.incident("restart", "The run was stopped to start again with the current code.")
         if process.poll() is None:
             self.console.send_control(stream.CONTROL_STOP, reason="restart asked from the Pulse app")
             with _ui.Stage("Stopping the run"):
@@ -1065,6 +1272,12 @@ class App:
         now = time.monotonic()
         if not force and now - self._side_at < 0.5:
             return
+        if self.runlog is not None and (force or now - self._log_at >= 3.0):
+            self._log_at = now
+            try:
+                self.runlog.tick(console.snapshot(), self._status, list(console.brain.events), self.session or {})
+            except Exception:
+                pass
         if self.background:
             if now - self._status_at > 2.0:
                 from . import pulse_console as con
@@ -1102,6 +1315,7 @@ class App:
 
     _total_w = 100
     _status_at = 0.0
+    _log_at = 0.0
 
     # ================================================================== the loop
 
@@ -1148,6 +1362,7 @@ class App:
                 console = self.console
                 if console is not None:
                     try:
+                        self._stop_runlog()
                         console.stop()
                     except Exception:
                         pass

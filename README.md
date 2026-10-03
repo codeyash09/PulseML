@@ -541,6 +541,11 @@ Commands on an open run: `/findings`, `/curve <name>`, `/vars`, `/audit`, `/audi
 watching). Everywhere: `/monitor`, `/run`, `/agent`, `/files`, `/add`, `/drop`, `/review`,
 `/undo`, `/log`, `/cloud`, `/help`, `/exit`.
 
+A run opened in the app -- started with `/run`, picked with `/monitor`, or attached from
+outside -- gets its own session on the web dashboard, as a run started with `pulse run`
+does: its environment, metric snapshots, the detectors' findings and crashes as incidents,
+the agent's turns about it, and its uptime, synced in the background while it is watched.
+
 The agent can start, watch, restart and stop runs itself: "run it", "start training with
 --epochs 3", "restart it with the fix" are requests it carries out with its `start_run`,
 `run_status`, `restart_run` and `stop_run` tools (stopping asks you first). A request typed
