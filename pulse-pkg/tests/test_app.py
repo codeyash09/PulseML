@@ -528,6 +528,7 @@ def real_app(tmp_path, monkeypatch):
     cli_.agent_provider = next(n for n, info in pc.PROVIDERS.items() if info.get("model") and info.get("env_key"))
     cli_.agent_key = "sk-test"
     cli_._sync_agent_turn = lambda *a, **k: None
+    cli_._native_off = True     # these script the text pipeline; the native tool loop has its own tests
     # Nothing in these tests may reach a provider: any call a test did not script (a
     # scheduled audit, say) gets a harmless canned answer.
     monkeypatch.setattr(pc.litellm, "completion", lambda **k: reply(
@@ -911,3 +912,30 @@ def test_watching_a_run_opens_the_app_on_it(monkeypatch, tmp_path):
     assert con.run_console(session, [session], agent=build_litellm_agent("anthropic/x-y")) == 0
     assert con.run_console(session, [session]) == 0
     assert opened == [("train", "anthropic/x-y"), ("train", "")]
+
+
+# =========================================================================================
+# Starting up must stay quick
+# =========================================================================================
+
+def test_scanning_a_home_directory_never_asks_git_and_stays_bounded(tmp_path, monkeypatch):
+    """A home directory is quite often a git repository with everything untracked; listing
+    it with git walked the whole tree (seconds). It is not a project: walk a little, stop."""
+    home = tmp_path / "home"
+    for i in range(30):
+        (home / f"dir{i}").mkdir(parents=True)
+        (home / f"dir{i}" / "a.py").write_text("x = 1\n")
+    (home / ".git").mkdir()
+    monkeypatch.setattr(os.path, "expanduser", lambda p: str(home) if p == "~" else p)
+    monkeypatch.setattr(pulse_code.subprocess, "run", lambda *a, **k: pytest.fail("git must not list a home directory"))
+    files = pulse_code.scan_project(str(home), limit=10)
+    assert len(files) == 10 and all(f.endswith("a.py") for f in files)
+
+
+def test_a_project_scan_stops_once_it_has_enough(tmp_path, monkeypatch):
+    for i in range(50):
+        (tmp_path / f"d{i:02d}").mkdir()
+        (tmp_path / f"d{i:02d}" / "m.py").write_text("")
+    monkeypatch.setattr(pulse_code, "_SCAN_MAX_DIRS", 5)
+    monkeypatch.setattr(pulse_code.subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=1, stdout=b""))
+    assert len(pulse_code.scan_project(str(tmp_path), limit=100)) <= 5

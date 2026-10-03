@@ -465,21 +465,41 @@ def _looks_like_source(name):
     return base in _TEXT_NAMES or os.path.splitext(base)[1].lower() in _TEXT_EXTS
 
 
+_SCAN_MAX_DIRS = 2000                # a walk stops here: this is a project, not a disk
+
+
+def _is_somebodys_whole_disk(root):
+    """A home directory or a filesystem root is nobody's project: listing it with git (a home
+    directory is quite often a git repository, with everything untracked) means walking the
+    entire tree -- seconds, or minutes -- for a list that is cut to a few hundred files."""
+    real = os.path.realpath(root)
+    return real in (os.path.realpath(os.path.expanduser("~")), os.path.abspath(os.sep))
+
+
 def scan_project(root, limit=_MAX_PROJECT_FILES):
     """The project's text files: `git ls-files` (which honours .gitignore) when this is a git
-    repository, else a walk that skips the usual build/cache/venv directories."""
+    repository, else a walk that skips the usual build/cache/venv directories. Bounded both
+    ways: git gets a few seconds, the walk a few thousand directories, and both stop once
+    `limit` files are in hand -- the agent's index is a sample of a big project either way."""
     files = []
-    try:
-        out = subprocess.run(["git", "ls-files", "-co", "--exclude-standard", "-z"], cwd=root,
-                             capture_output=True, timeout=10)
-        if out.returncode == 0 and out.stdout:
-            for rel in out.stdout.decode("utf-8", "replace").split("\0"):
-                if rel and _looks_like_source(rel) and not any(p in _SKIP_DIRS for p in rel.split("/")[:-1]):
-                    files.append(os.path.join(root, rel))
-    except Exception:
-        files = []
+    if not _is_somebodys_whole_disk(root):
+        try:
+            out = subprocess.run(["git", "ls-files", "-co", "--exclude-standard", "-z"], cwd=root,
+                                 capture_output=True, timeout=3)
+            if out.returncode == 0 and out.stdout:
+                for rel in out.stdout.decode("utf-8", "replace").split("\0"):
+                    if rel and _looks_like_source(rel) and not any(p in _SKIP_DIRS for p in rel.split("/")[:-1]):
+                        files.append(os.path.join(root, rel))
+                        if len(files) >= limit * 2:
+                            break
+        except Exception:
+            files = []
     if not files:
+        visited = 0
         for dirpath, dirnames, filenames in os.walk(root):
+            visited += 1
+            if visited > _SCAN_MAX_DIRS or len(files) >= limit * 2:
+                break
             dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS and not d.startswith("."))
             for name in sorted(filenames):
                 if _looks_like_source(name):
