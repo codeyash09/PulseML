@@ -417,9 +417,14 @@ def _confirm(state, path, before, after, created):
     """Show the diff and, in review mode, ask. Returns True to go ahead."""
     from . import pulse_code as _pc
     cli = state.cli
-    print("\n" + _pc.render_diff(cli, {path: (before, after, created)}))
+    diff = _pc.render_diff(cli, {path: (before, after, created)})
+    print("\n" + diff)
     if not cli.review:
         return True
+    reviewed = cli._review_change_with_approver(state.request, f"{'create' if created else 'edit'} {_rel(state.root, path)}",
+                                                diff)
+    if reviewed is not None:
+        return reviewed
     try:
         answer = _prompt_text("Apply this change? (Y/n/a=apply all from now on) > ",
                               label="Apply this change?  (Y/n/a=always)").strip().lower()
@@ -466,8 +471,9 @@ def _write_checked(state, path, before, after, label, created=False):
         return "NOT APPLIED -- the new text is identical to the old text; nothing to change."
     if not _confirm(state, path, before, after, created):
         state.edits_declined += 1
-        return ("The user declined this change. Do not retry the same edit. Either take a different approach, "
-                "or stop and say what you were trying to do and ask how they would like to proceed.")
+        denial = getattr(cli, "_last_change_denial", "") or "the user declined this change"
+        return (f"NOT APPLIED -- {denial}. Do not retry the same edit. Either take a different approach, "
+                "or stop and say what you were trying to do and ask how to proceed.")
     _commit(state, path, after, label, before=before, created=created)
     n_add = sum(1 for l in difflib.ndiff(before.splitlines(), after.splitlines()) if l.startswith("+ "))
     n_del = sum(1 for l in difflib.ndiff(before.splitlines(), after.splitlines()) if l.startswith("- "))

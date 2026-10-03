@@ -178,3 +178,55 @@ def test_the_default_approver_does_not_see_the_agents_reasoning(monkeypatch, tmp
     assert asked == [] and seen[0]["model"] == "openrouter/deepseek/v4"
     sent = "\n".join(m["content"] for m in seen[0]["messages"])
     assert "SECRET-REASONING" not in sent and "rm -rf .cache" in sent
+
+
+# ---- auto mode for code changes: the reviewer model answers "apply this change?" ---------
+
+def test_review_change_fences_its_inputs_and_parses_the_verdict():
+    seen = {}
+
+    def completion(**kw):
+        seen.update(kw)
+        return reply("APPROVE: lowers the learning rate as asked")
+
+    s = ap.ApproverSettings(model="m", api_key="k")
+    d = ap.review_change(s, "lower the lr", "Lower lr to 0.05", "-lr = 0.3\n+lr = 0.05", "/proj", completion=completion)
+    assert d.approved and d.reason == "lowers the learning rate as asked"
+    prompt = seen["messages"][1]["content"]
+    assert "| lower the lr" in prompt and "| +lr = 0.05" in prompt and "/proj" in prompt
+    assert seen["messages"][0]["content"] == ap.CHANGE_SYSTEM_PROMPT and "undone" in ap.CHANGE_SYSTEM_PROMPT
+
+
+def test_review_change_fails_closed_on_an_unreadable_answer():
+    with pytest.raises(ap.ApproverUnavailable):
+        ap.review_change(ap.ApproverSettings(model="m"), "r", "e", "d", "/p", completion=lambda **k: reply("Looks fine to me"))
+
+
+def reviewing_cli(monkeypatch, tmp_path, verdict):
+    cli, seen, asked = cli_with_approver(monkeypatch, tmp_path, verdict)
+    cli._get_terminal_executor = lambda: type("E", (), {"default_cwd": str(tmp_path)})()
+    cli.non_interactive = False
+    return cli, seen, asked
+
+
+def test_the_reviewer_decides_a_change_instead_of_the_person(monkeypatch, tmp_path):
+    cli, seen, asked = reviewing_cli(monkeypatch, tmp_path, "APPROVE: as asked")
+    assert cli._review_change_with_approver("add a flag", "adds --resume", "+parser.add_argument('--resume')") is True
+    assert asked == [] and seen[0]["messages"][0]["content"] == ap.CHANGE_SYSTEM_PROMPT
+    cli, seen, asked = reviewing_cli(monkeypatch, tmp_path, "DENY: deletes the whole training loop")
+    assert cli._review_change_with_approver("add a flag", "rewrite", "-everything") is False
+    assert "deletes the whole training loop" in cli._last_change_denial
+
+
+def test_an_unreachable_reviewer_hands_the_change_to_the_person(monkeypatch, tmp_path):
+    cli, seen, asked = reviewing_cli(monkeypatch, tmp_path, ConnectionError("down"))
+    assert cli._review_change_with_approver("r", "e", "d") is None          # the caller asks the person
+    cli.non_interactive = True
+    assert cli._review_change_with_approver("r", "e", "d") is False        # nobody to ask: not applied
+    assert "no user to ask" in cli._last_change_denial
+
+
+def test_without_any_agent_there_is_no_reviewer(monkeypatch, tmp_path):
+    cli, seen, asked = reviewing_cli(monkeypatch, tmp_path, "APPROVE: x")
+    monkeypatch.delenv(ap.APPROVER_ENV)
+    assert cli._review_change_with_approver("r", "e", "d") is None and seen == []

@@ -630,3 +630,67 @@ def test_esc_goes_to_the_background_and_back(cli, tmp_path):
     while _t.time() < deadline and app.background:
         _t.sleep(0.02)
     assert not app.background
+
+
+# =========================================================================================
+# In auto mode the reviewer model, not the person, answers "apply this change?"
+# =========================================================================================
+
+def reviewer(monkeypatch, verdict):
+    seen = []
+
+    def review(settings, request, explanation, diff, cwd, completion=None):
+        seen.append((request, explanation, diff))
+        if isinstance(verdict, Exception):
+            raise verdict
+        return pc._approver.Decision(approved=verdict.startswith("APPROVE"), reason=verdict.split(":", 1)[1].strip())
+
+    monkeypatch.setattr(pc._approver, "review_change", review)
+    monkeypatch.setattr(pc._approver, "settings_from", lambda *a, **k: pc._approver.ApproverSettings(model="judge"))
+    return seen
+
+
+def test_the_native_loops_edit_is_reviewed_by_the_model_not_the_person(cli, monkeypatch):
+    seen = reviewer(monkeypatch, "APPROVE: does what was asked")
+    monkeypatch.setattr(pc, "_prompt_text", lambda *a, **k: pytest.fail("the person must not be asked"))
+    state = native._State(cli, "lower the lr")
+    native._execute(state, {"name": "read_file", "arguments": json.dumps({"path": "train.py"})})
+    out = native._execute(state, {"name": "edit_file", "arguments": json.dumps(
+        {"path": "train.py", "old_string": "lr = 0.3", "new_string": "lr = 0.05"})})
+    assert "NOT APPLIED" not in out and "lr = 0.05" in open(os.path.join(cli._project_root, "train.py")).read()
+    assert seen and seen[0][0] == "lower the lr" and "+lr = 0.05" in seen[0][2]
+
+
+def test_a_denied_edit_tells_the_agent_why(cli, monkeypatch):
+    reviewer(monkeypatch, "DENY: that rewrites the whole file")
+    monkeypatch.setattr(pc, "_prompt_text", lambda *a, **k: pytest.fail("the person must not be asked"))
+    state = native._State(cli, "lower the lr")
+    native._execute(state, {"name": "read_file", "arguments": json.dumps({"path": "train.py"})})
+    out = native._execute(state, {"name": "edit_file", "arguments": json.dumps(
+        {"path": "train.py", "old_string": "lr = 0.3", "new_string": "lr = 0.05"})})
+    assert "NOT APPLIED" in out and "rewrites the whole file" in out
+    assert "lr = 0.3" in open(os.path.join(cli._project_root, "train.py")).read()
+    assert state.edits_declined == 1
+
+
+def test_when_the_reviewer_cannot_answer_the_person_is_asked(cli, monkeypatch):
+    reviewer(monkeypatch, pc._approver.ApproverUnavailable("timeout"))
+    monkeypatch.setattr(pc, "_prompt_text", lambda *a, **k: "y")
+    state = native._State(cli, "lower the lr")
+    native._execute(state, {"name": "read_file", "arguments": json.dumps({"path": "train.py"})})
+    out = native._execute(state, {"name": "edit_file", "arguments": json.dumps(
+        {"path": "train.py", "old_string": "lr = 0.3", "new_string": "lr = 0.05"})})
+    assert "NOT APPLIED" not in out
+
+
+def test_the_text_pipeline_change_is_reviewed_too(cli, monkeypatch):
+    cli._native_off = True
+    seen = reviewer(monkeypatch, "APPROVE: fine")
+    monkeypatch.setattr(pc, "_prompt_text", lambda *a, **k: pytest.fail("the person must not be asked"))
+    fix = {"old": ["lr = 0.3"], "new": ["lr = 0.05"], "files": ["train.py"], "create": [], "explanation": "lower lr"}
+    answers = iter([reply("Plan: change lr."), reply(json.dumps(fix)), reply('{"passes": true, "reason": "ok"}'),
+                    reply('{"verified": true, "reason": "ok"}'), reply("Done.\nTASK_COMPLETE")])
+    monkeypatch.setattr(pc.litellm, "completion", lambda **k: next(answers))
+    assert pulse_code.run_turn(cli, "lower the learning rate") == "applied"
+    assert "lr = 0.05" in open(os.path.join(cli._project_root, "train.py")).read()
+    assert seen and seen[0][1] == "lower lr"

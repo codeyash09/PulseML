@@ -481,7 +481,9 @@ pulse run --approver openrouter/anthropic/claude-sonnet-5 train.py
 
 (or `PULSE_APPROVER=<model>`, or `"approver": "<model>"` in `pulse_config.json`). To be
 asked yourself instead, use `--approver off` (or `"approver": "off"`). The same commands
-are flagged either way; only who answers changes. The approver answers APPROVE or DENY
+are flagged either way; only who answers changes. The reviewer answers the other question
+the agent otherwise stops for, too -- "apply this change?" for each edit it proposes --
+judging the diff against your request; every applied change stays one `/undo` away. The approver answers APPROVE or DENY
 with a reason that goes back to the agent. It is told to deny anything that could destroy
 work that can't be regenerated, touch files outside the project, handle credentials or use
 sudo, and to deny when unsure. If it can't be reached, Pulse asks you (or declines, in a

@@ -56,7 +56,9 @@ DEBUG_PROMPT = (
     "the code with the tools, check what you suspect. A question about the run is a question -- "
     "answer it in words, with no code change. Change code only when asked to fix something, or "
     "when the person agrees to a fix you proposed. The run keeps executing the code it started "
-    "with: after an edit, say that the run has to be restarted (/restart) for it to take effect.\n"
+    "with: after an edit, restart it yourself with restart_run (RESTART: in the text protocol) "
+    "when it was started from here, or tell the person it has to be restarted. run_status "
+    "(RUNSTATUS:) gives the run's latest numbers whenever you need them again.\n"
 )
 
 HOME_COMMANDS: List[Tuple[str, str]] = [

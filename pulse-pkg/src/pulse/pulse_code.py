@@ -1202,9 +1202,15 @@ def _confirm_and_apply(cli, request, plan, fix, changes):
     if not changes:
         cprint("[Pulse Code] The change turned out to be empty; nothing was edited.", color=_YELLOW)
         return "answered", plan
-    print("\n" + render_diff(cli, changes))
+    diff = render_diff(cli, changes)
+    print("\n" + diff)
     n_files = len(changes)
-    if cli.review:
+    reviewed = cli._review_change_with_approver(request, str(fix.get("explanation") or plan or ""), diff) \
+        if cli.review else None
+    if reviewed is False:
+        cprint("[Pulse Code] Not applied.", color=_YELLOW)
+        return "declined", f"{plan}\n\n(Not applied: {getattr(cli, '_last_change_denial', '') or 'declined'}.)"
+    if cli.review and reviewed is None:
         try:
             answer = _prompt_text(
                 f"Apply these changes to {n_files} file{'s' if n_files != 1 else ''}? (Y/n/a=apply all from now on) > ",

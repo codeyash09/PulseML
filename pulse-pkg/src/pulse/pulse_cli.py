@@ -9184,6 +9184,37 @@ class PulseCLI:
             self._terminal_executor = executor
         return executor
 
+    def _review_change_with_approver(self, request: str, explanation: str, diff: str) -> Optional[bool]:
+        """Auto mode for code changes: the approver model reviews the diff, as it reviews a
+        flagged command. True/False is its decision (a denial's reason is left in
+        _last_change_denial for the agent); None means there is no approver, or it could
+        not answer -- the person is asked as before."""
+        settings = self._approver_settings()
+        if not settings:
+            return None
+        self._last_change_denial = ""
+        cwd = getattr(self._get_terminal_executor(), "default_cwd", None) or os.getcwd()
+        try:
+            with _Spinner(f"{settings.model} reviewing the change"):
+                decision = _approver.review_change(settings, request, explanation, diff, cwd)
+        except _approver.ApproverUnavailable as exc:
+            _agent_log_event("AUTO MODE: change reviewer unavailable", f"{explanation}\n{exc}")
+            if getattr(self, "non_interactive", False):
+                cprint(f"[Pulse] Auto mode: the reviewer ({settings.model}) could not answer ({exc}) "
+                       "-- not applied (non-interactive, nobody to ask).", color=_YELLOW)
+                self._last_change_denial = "the auto-mode reviewer could not answer and there is no user to ask"
+                return False
+            cprint(f"[Pulse] Auto mode: the reviewer ({settings.model}) could not answer ({exc}) "
+                   "-- asking you instead.", color=_YELLOW)
+            return None
+        verdict = "APPROVED" if decision.approved else "DENIED"
+        cprint(f"[Pulse] Auto mode: {settings.model} {verdict} the change -- {decision.reason}",
+               color=(_GREEN if decision.approved else _YELLOW))
+        _agent_log_event(f"AUTO MODE: change {verdict} by {settings.model}", f"{explanation}\nreason: {decision.reason}")
+        if not decision.approved:
+            self._last_change_denial = f"the auto-mode reviewer ({settings.model}) declined it: {decision.reason}"
+        return decision.approved
+
     def _terminal_needs_confirmation(self, command: str) -> Optional[Dict[str, bool]]:
         """None if the command can just run; otherwise the classification flags that
         triggered a confirmation prompt. `self.review` (set on Pulse Code sessions,
@@ -9249,7 +9280,8 @@ class PulseCLI:
                            or getattr(self, "_last_problem_description", None) or "")
             cwd = getattr(self._get_terminal_executor(), "default_cwd", None) or os.getcwd()
             try:
-                decision = _approver.ask(settings, command, why, cwd, str(purpose))
+                with _Spinner(f"{settings.model} reviewing the command"):
+                    decision = _approver.ask(settings, command, why, cwd, str(purpose))
             except _approver.ApproverUnavailable as exc:
                 _agent_log_event("AUTO MODE: approver unavailable", f"{command}\n{exc}")
                 if getattr(self, "non_interactive", False):
