@@ -520,7 +520,9 @@ Type `pulse` in a terminal and Pulse opens as one full-screen app:
    tracked value with its curve, the detectors' findings, tensors, and when the agent will
    next audit the run. The agent is on the right, and what you ask it goes with the run's
    evidence. Its reasoning and every tool call are in the transcript, folded to a line
-   each; **Ctrl+O** unfolds them. A fix is a diff you confirm; `/restart` then stops the
+   each; **Ctrl+O** unfolds them. The agent can also talk to you while it works -- a
+   message beside its tool calls, shown with a bar down its side -- so you see what it
+   found and what it is about to check without waiting for the end of its turn. A fix is a diff you confirm; `/restart` then stops the
    run and starts it again with the change (for runs started with `/run`).
 
 | Key | What it does |

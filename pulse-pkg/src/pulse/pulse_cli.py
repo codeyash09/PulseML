@@ -1533,6 +1533,10 @@ SYSTEM_PROMPT = (
     "among tracked variables that recomputes the current loss -- if none exists, Pulse will say so.\n"
     "    REPLAY: <n_steps> -- replay the last n_steps from an isolated checkpoint (with a zero-arg "
     "`train_step` callable you define) and report the resulting loss curve, then restore live state.\n"
+    "    MESSAGE: <one line> -- say something to the user right now, while you keep working: what you "
+    "found so far, what you are about to check, a heads-up. It is not a tool: it gets no result back and "
+    "does not end your turn, so put it in the same reply as the directives you are issuing. Text around "
+    "directives is not shown to the user; MESSAGE: always is.\n"
     "    TERMINAL: <shell command> -- run a REAL command in the project's working directory and get "
     "back its actual stdout, stderr, exit code and duration -- e.g. 'TERMINAL: pytest tests/test_model.py', "
     "'TERMINAL: python -m py_compile model.py', 'TERMINAL: git status', 'TERMINAL: grep -R \"loss_val\" .'. "
@@ -8524,6 +8528,7 @@ class PulseCLI:
         "repl": re.compile(r"^\s*REPL:[ \t]*(.+)$", re.MULTILINE),
         "replay": re.compile(r"^\s*REPLAY:[ \t]*(.+)$", re.MULTILINE),
         "terminal": re.compile(r"^\s*TERMINAL:[ \t]*(.+)$", re.MULTILINE),
+        "message": re.compile(r"^\s*MESSAGE:[ \t]*(.+)$", re.MULTILINE),
         "gradcheck": re.compile(r"^\s*GRADCHECK:[ \t]*(.+)$", re.MULTILINE),
         "shapetrace": re.compile(r"^\s*SHAPETRACE:[ \t]*(.*)$", re.MULTILINE),
         "gpustatus": re.compile(r"^\s*GPUSTATUS:[ \t]*(.*)$", re.MULTILINE),
@@ -9977,7 +9982,11 @@ class PulseCLI:
         blows up) becomes an error note for the model instead of an exception
         thrown out of the pipeline -- on an auto-intervention, into the user's
         training loop."""
-        self._echo_directives(requests)
+        # MESSAGE: is the agent talking to the person, not a tool: shown at once, no result
+        # back (so a reply that only carries a message is not a tool round), not echoed.
+        for text in requests.get("message", []):
+            _ui.message(text)
+        self._echo_directives({k: v for k, v in requests.items() if k != "message"})
         notes = []
         for symbol in requests.get("defof", []):
             notes.append(self._safe_tool("DEFOF", symbol, self._run_defof, symbol))
@@ -10198,6 +10207,9 @@ class PulseCLI:
         "  MLLINT:                      Pulse's static ML anti-pattern scan of the code\n"
         "  TRACE: <var>[:<file>[:<line>]]  what feeds a variable and what it feeds, across the code "
         "-- e.g. how a label or a scaled array reaches the model\n"
+        "  MESSAGE: <one line>          say something to the user right now, while you keep checking: "
+        "what you see so far, what you are about to look at. Not a tool -- nothing comes back and it "
+        "does not end your round -- so put it beside the directives you issue in the same reply.\n"
         "  TERMINAL: <shell command>    ONE line -- only the text after 'TERMINAL:' on that line is "
         "run, so a heredoc or a quoted script spread over several lines arrives cut off. For "
         "Python, join statements with ';' in one python3 -c \"...\" line. It runs in the project "
@@ -10267,7 +10279,7 @@ class PulseCLI:
     # call, so this caps a check-in's cost at MAX_ROUNDS + 1 calls.
     _CHECKIN_MAX_ROUNDS = int(os.environ.get("PULSE_CHECKIN_ROUNDS", "6") or 6)
     _CHECKIN_TOOL_NAMES = ("terminal", "trace", "corr", "outlier", "diffstats", "histogram", "mllint",
-                           "gputrack", "gpuuntrack")
+                           "gputrack", "gpuuntrack", "message")
 
     # Bounds on the agent-negotiated NEXTCHECK: interval -- keeps the cadence genuinely dynamic
     # (see _maybe_periodic_checkin and the NEXTCHECK: line added to _START_PRIME_PROMPT) without
@@ -10711,6 +10723,8 @@ class PulseCLI:
             "mllint": lambda _arg: self._run_mllint(),
             "gputrack": lambda _arg: queue_gpu("gputrack", gpu_track),
             "gpuuntrack": lambda _arg: queue_gpu("gpuuntrack", gpu_untrack),
+            # the agent talking to the person mid-check: shown now, nothing goes back
+            "message": lambda text: (_ui.message(text), "")[1],
         }
         _terminal_denial.checkin = True      # the approver is told this is a check-in
         try:
@@ -10746,6 +10760,8 @@ class PulseCLI:
                                       purpose=f"periodic check-in, round {round_no + 1}",
                                       timeout=_BACKGROUND_CALL_TIMEOUT_SECONDS)
             if self._checkin_verdict(answer)[0] is not None:
+                for text in self._NEW_DIRECTIVE_RES["message"].findall(answer):
+                    _ui.message(text)          # a message beside the verdict is still shown
                 break                               # answered -- any stray tool lines are ignored
             results, used = self._checkin_service_tools(answer)
             if not used:
@@ -11268,7 +11284,8 @@ class PulseCLI:
                 if new_note:
                     print(f"[tool results]\n{new_note}\n")
                 combined_note = "\n\n".join(n for n in (directive_note, new_note) if n)
-                investigating = bool(grep_patterns or view_requests or new_requests)
+                investigating = bool(grep_patterns or view_requests
+                                     or any(k != "message" for k in new_requests))   # a MESSAGE: is not a tool
                 if investigating and _round < _MAX_ANALYZE_TOOL_ROUNDS:
                     # Still gathering evidence -- feed the results back and diagnose on a
                     # later round, once there's actually something to diagnose from.
@@ -11505,7 +11522,7 @@ class PulseCLI:
             return None
         cleaned, *lists = cls._extract_directives(text)
         _c, new_requests = cls._extract_new_directives(cleaned)
-        if any(lists) or new_requests:
+        if any(lists) or any(k != "message" for k in new_requests):
             return None
         return text if cls._NO_CHANGE_PROSE_RE.search(text) else None
 

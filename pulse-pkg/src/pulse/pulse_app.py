@@ -306,6 +306,10 @@ class App:
         with self.lock:
             self.view.live, self.dirty = "", True
 
+    def say(self, text: str) -> None:
+        """The agent speaking to the person mid-turn (see pulse_ui.message)."""
+        self._add(tui.Entry("say", text))
+
     def tool(self, calls: List[str], output: str) -> None:
         output = tui.clean(output).replace("\r", "")
         self._add(tui.Entry("tool", calls=calls or ["tools"], output=output))

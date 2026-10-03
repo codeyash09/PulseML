@@ -123,7 +123,7 @@ _PROTECTED_PARTS = (".git", ".pulse_history")
 # which is exactly what a coding session needs for tests/linters/repro scripts and is
 # handled by the same shared executor + confirmation policy as the debugging agent's
 # TERMINAL: (see PulseCLI._run_terminal / pulse_terminal.py).
-_ALLOWED_TOOLS = {"defof", "callers", "depgraph", "trace", "doclookup", "changelog", "terminal"}
+_ALLOWED_TOOLS = {"defof", "callers", "depgraph", "trace", "doclookup", "changelog", "terminal", "message"}
 
 # ---------------------------------------------------------------------------------------
 # Prompts
@@ -158,6 +158,10 @@ CODE_SYSTEM_PROMPT = (
     "real assignment chain, not a guess. self.<attr> works too.\n"
     "  DOCLOOKUP: <library>.<symbol>  the real signature/docstring of an installed library function\n"
     "  CHANGELOG:                 what has changed in the project files since the session started\n"
+    "  MESSAGE: <one line>        say something to the user right now, while you keep working -- what "
+    "you found, what you are about to do. Not a tool: nothing comes back and it does not end your turn, "
+    "so put it beside the directives you issue in the same reply. Text around directives is not shown "
+    "to the user; MESSAGE: always is.\n"
     "  TERMINAL: <shell command>  run a REAL command in the project directory; get back the actual "
     "stdout, stderr, exit code and duration -- e.g. 'TERMINAL: pytest tests/test_model.py', "
     "'TERMINAL: python -m py_compile src/model.py', 'TERMINAL: git status', 'TERMINAL: python "
@@ -761,7 +765,7 @@ _TOOL_CALL_RE = re.compile(r"(?m)^[ \t]*([A-Z][A-Z_]{2,}):[ \t]*(.*)$")
 def tool_calls_in(answer):
     """The tool lines of a model answer ("GREP: loss", "TERMINAL: pytest -q"), in order --
     only names that really are tools, so prose like "NOTE: ..." is not one."""
-    names = {"GREP", "VIEW", "CALC"} | {k.upper() for k in PulseCLI._NEW_DIRECTIVE_RES}
+    names = ({"GREP", "VIEW", "CALC"} | {k.upper() for k in PulseCLI._NEW_DIRECTIVE_RES}) - {"MESSAGE"}
     return [f"{name}: {arg.strip()}" if arg.strip() else name
             for name, arg in _TOOL_CALL_RE.findall(answer or "") if name in names]
 
@@ -816,7 +820,7 @@ def _tool_rounds(cli, answer, instruction):
 def _plain_text(answer):
     """The model's answer with tool directive lines removed, for showing to a person."""
     cleaned, _ = PulseCLI._extract_new_directives(answer)
-    cleaned = re.sub(r"(?m)^\s*(GREP|VIEW|DEFOF|CALLERS|DEPGRAPH|DOCLOOKUP|CHANGELOG):.*$", "", cleaned)
+    cleaned = re.sub(r"(?m)^\s*(GREP|VIEW|DEFOF|CALLERS|DEPGRAPH|DOCLOOKUP|CHANGELOG|MESSAGE):.*$", "", cleaned)
     return _NO_CHANGES_RE.sub("", cleaned).strip()
 
 

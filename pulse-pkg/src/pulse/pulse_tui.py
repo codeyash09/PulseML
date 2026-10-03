@@ -184,6 +184,7 @@ class Entry:
     thinking  the model's reasoning              text -- collapsed to one line by default
     tool      tools the agent ran                calls (one line each), output (collapsed)
     finding   a detector finding                 text, severity
+    say       what the agent says while working   text (MESSAGE: / message_user)
     note      a quiet line from Pulse itself     text
     error     something failed                   text
     """
@@ -258,6 +259,10 @@ def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
         pieces = wrap(entry.text, max(1, width - visible_len(mark)), indent="")
         out.append(s(mark, style, "bold") + pieces[0])
         out.extend(" " * visible_len(mark) + p for p in pieces[1:])
+    elif kind == "say":
+        bar = s(g("bar") + " ", "accent")
+        for part in entry.text.strip("\n").split("\n"):
+            out.extend(bar + piece for piece in wrap(part, width - 2))
     elif kind == "note":
         for part in entry.text.split("\n"):
             out.extend(s(piece, "dim") for piece in wrap(part, width))

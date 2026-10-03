@@ -1843,6 +1843,9 @@ SYSTEM_PROMPT = (
     "    DIFFSTATS: <var> <index_a> <index_b> -- exact delta between two recorded points.\n"
     "    HISTOGRAM: <var> -- actual bucketed distribution counts.\n"
     "  Grounding (lookup beats memorized/stale recall):\n"
+    "    MESSAGE: <one line> -- say something to the user right now, while you keep working (what you found, "
+    "what you are about to check). Not a tool: nothing comes back and it does not end your turn, so put it "
+    "beside the directives you issue in the same reply.\n"
     "    DOCLOOKUP: <library>.<symbol> -- real signature/docstring for an installed library function.\n"
     "    CHANGELOG: -- diff of what's actually changed in tracked files since the last checkpoint.\n"
     "    PASTFIX: <symbol_or_region> -- search this project's own log of prior fixes for the same area.\n"
@@ -2226,6 +2229,7 @@ def _extract_directives(text):
 # function's existing positional-tuple call sites need to change shape.
 # ----------------------------------------------------------------------
 _NEW_DIRECTIVE_RES = {
+    "message": re.compile(r"^\s*MESSAGE:\s*(.+)$", re.MULTILINE),
     "defof": re.compile(r"^\s*DEFOF:\s*(.+)$", re.MULTILINE),
     "callers": re.compile(r"^\s*CALLERS:\s*(.+)$", re.MULTILINE),
     "depgraph": re.compile(r"^\s*DEPGRAPH:\s*(.*)$", re.MULTILINE),
@@ -5463,6 +5467,10 @@ def _chat_panel_class():
             CALC/PROMOTE/GREP/VIEW -- pure computation/file-reading/subprocess
             round-trip only, safe to run on the background request thread."""
             notes = []
+            # MESSAGE: is the agent talking to the person mid-turn: straight into the chat,
+            # nothing back to the model (a reply with only a message is not a tool round).
+            for text in requests.get("message", []):
+                self.after(0, lambda t=text: self._append("Pulse", t))
 
             # One directive's bug must not take the rest -- or the whole agent
             # pipeline thread, which only catches AgentRequestFailed -- with it.

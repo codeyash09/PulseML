@@ -85,6 +85,7 @@ SYSTEM_PROMPT = """You are Pulse Code, an autonomous coding agent working in the
 - Make the change the request needs, matching the surrounding style. Don't reformat, rename or "improve" unrelated code. If you notice a separate bug, mention it in your final answer instead of fixing it.
 - Prefer small, targeted edits (edit_file) or replace_symbol for rewriting a whole function/class. Use write_file for new files. Make independent tool calls in the same turn when you can.
 - If a tool fails, read the error, adjust, and try again; a failed edit or command is information, not the end of the task. Don't repeat the identical call hoping for a different result.
+- Talk to the user while you work with message_user: what you found, what you are about to do, a heads-up about something you noticed. It does not end your turn and it gets no reply, so put it in the same reply as the tool calls you are making. Plain text next to tool calls is not shown to the user by every provider; message_user always is.
 - If the request is a question, answer it from the code; make no edits.
 
 # Use the code structure, not just text search
@@ -165,6 +166,11 @@ TOOLS = [
         "Run a shell command in the project directory and get back real stdout, stderr, exit code and duration. "
         "Optional timeout in seconds.",
         {"command": _S, "timeout": _I}, ["command"]),
+    _fn("message_user",
+        "Show the user a message right now, while you keep working: progress, a finding, a heads-up. It is "
+        "not a question -- it gets no reply and does not end your turn. Use it in the same reply as your "
+        "other tool calls.",
+        {"message": _S}, ["message"]),
     _fn("todo_write",
         "Replace your todo list. Each item: {content, status} with status pending | in_progress | completed. "
         "Keep exactly one item in_progress.",
@@ -664,7 +670,16 @@ def _t_todo_write(state, a):
     return "Todo list updated:\n" + "\n".join(f"{_STATUS_MARK[t['status']]} {t['content']}" for t in clean)
 
 
+def _t_message_user(state, args):
+    text = str(args.get("message") or "").strip()
+    if not text:
+        return "Nothing shown: the message was empty."
+    _ui.message(text)
+    return "Shown to the user."
+
+
 _HANDLERS = {
+    "message_user": _t_message_user,
     "read_file": _t_read_file, "list_files": _t_list_files, "grep": _t_grep, "outline": _t_outline,
     "find_definition": _t_find_definition, "find_references": _t_find_references,
     "dep_graph": _t_dep_graph, "trace_variable": _t_trace_variable, "doc_lookup": _t_doc_lookup,
@@ -732,7 +747,8 @@ def _execute(state, call):
     state.last_call = signature
     host = _ui.host()
     try:
-        if host is not None and hasattr(host, "hush") and name not in _WRITERS and name != "run_command":
+        if host is not None and hasattr(host, "hush") and name not in _WRITERS \
+                and name not in ("run_command", "message_user"):
             with host.hush():
                 result = handler(state, args)
         else:
@@ -745,7 +761,8 @@ def _execute(state, call):
     if state.repeats >= _REPEAT_LIMIT:
         result += (f"\n\n(You have made this exact call {state.repeats} times in a row with the same result. "
                    "Change your approach.)")
-    _show(name, args, result)
+    if name != "message_user":          # the message itself is what the user sees
+        _show(name, args, result)
     return result
 
 

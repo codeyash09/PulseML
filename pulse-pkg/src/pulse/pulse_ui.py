@@ -33,7 +33,7 @@ import unicodedata
 
 __all__ = [
     "Unavailable", "enabled", "color_enabled", "header", "rule", "ok", "warn", "fail",
-    "note", "kv", "subhead", "ask", "confirm", "choose", "Option", "Stage", "ready_block",
+    "note", "kv", "subhead", "message", "ask", "confirm", "choose", "Option", "Stage", "ready_block",
     "elapsed_text", "commit_looks_valid", "key_hint_for", "set_host", "host",
 ]
 
@@ -260,6 +260,24 @@ def fail(text):
 
 def note(text):
     _emit(_s(text, "dim"))
+
+
+def message(text):
+    """Something the agent says to the person while it keeps working (the MESSAGE: directive,
+    the message_user tool). Inside the Pulse app it is an entry of its own; on a plain
+    terminal it is printed with a bar down its left side, so it reads as the agent's voice
+    and not as tool output."""
+    text = str(text or "").strip()
+    if not text:
+        return
+    host = _HOST
+    if host is not None and hasattr(host, "say"):
+        host.say(text)
+        return
+    bar = _s(_g("bar") + " ", "accent")
+    with _out_lock:
+        sys.stdout.write("\n" + "\n".join(bar + line for line in text.splitlines()) + "\n\n")
+        sys.stdout.flush()
 
 
 def kv(label, value, indent=2):
