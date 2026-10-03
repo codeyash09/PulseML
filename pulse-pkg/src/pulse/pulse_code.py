@@ -1,6 +1,12 @@
 """
 Pulse Code -- a general coding agent in the terminal.
 
+A request is worked until it is done: after each applied change the agent checks the result
+against the original request and carries on with the next step (`run_turn`, bounded by
+`_MAX_AUTONOMOUS_STEPS`). Between steps and turns it keeps context: a PULSE.md / AGENTS.md /
+CLAUDE.md in the project root is read into every step, and a long conversation is compacted
+into a summary instead of falling out of the window (`/context`, `/compact`, `/clear`).
+
     pulse code                       open the agent in this directory
     pulse code src/model.py utils/   ...pointed at some files or folders
     pulse code -p "add a --resume flag to train.py"      one request, then exit
@@ -52,6 +58,7 @@ import subprocess
 import sys
 import time
 
+from . import pulse_code_agent as _agent
 from . import pulse_ui as _ui
 from .pulse_cli import (
     AgentRequestFailed,
@@ -78,11 +85,21 @@ _MAX_FILE_BYTES = 200_000            # per file; bigger files are skipped, not t
 _MAX_PROJECT_FILES = 400             # known to the agent's tools
 _CONTEXT_BUDGET_CHARS = 240_000      # focus-file text sent on each pass (~60k tokens)
 _INDEX_MAX_LINES = 160               # entries in the project index shown to the model
-_MAX_TOOL_ROUNDS = 3
+_MAX_TOOL_ROUNDS = 12
 _MAX_REVISE_ROUNDS = 2
 _DIFF_MAX_LINES = 240
-_MAX_VERIFY_TOOL_ROUNDS = 5     # TERMINAL/GREP/VIEW rounds within one verification pass
-_MAX_VERIFY_FIX_CYCLES = 2      # additional change->verify loops if verification fails
+_MAX_VERIFY_TOOL_ROUNDS = 12    # TERMINAL/GREP/VIEW rounds within one verification pass
+_MAX_VERIFY_FIX_CYCLES = 3      # additional change->verify loops if verification fails
+_MAX_AUTONOMOUS_STEPS = 40      # plan->edit->verify steps one request may take before it stops
+_MAX_STEP_RETRIES = 3           # consecutive failed steps retried (with the failure fed back) before giving up
+
+# Context: what the agent remembers across steps and turns.
+_WINDOW_MESSAGES = 60           # most recent history messages sent on every call
+_KEEP_RECENT = 10               # messages kept verbatim when older history is compacted
+_COMPACT_AT_CHARS = 150_000     # history size (chars, ~37k tokens) that triggers compaction
+_SUMMARY_INPUT_CHARS = 120_000  # most of the old history handed to the summariser
+_PROJECT_NOTES_CHARS = 12_000   # cap on PULSE.md / AGENTS.md / CLAUDE.md text
+_NOTES_NAMES = ("PULSE.md", "AGENTS.md", "CLAUDE.md")
 
 _TEXT_EXTS = {
     ".py", ".pyi", ".md", ".rst", ".txt", ".toml", ".yaml", ".yml", ".json", ".cfg", ".ini",
@@ -231,6 +248,35 @@ _VERIFY_NO_TOOLS_NOTE = (
     'directive, or respond with ONLY {"verified": true or false, "reason": "..."}.'
 )
 
+_CONTINUE = (
+    "CHECK PROGRESS. The original request was:\n{request}\n\nThe files above are as they are on disk "
+    "now, including everything changed so far. Is the request FULLY done -- every part of it "
+    "implemented, wired together, and verified? If it is, reply with a one or two sentence summary "
+    "of what was done and end with a line containing only TASK_COMPLETE. If something remains, reply "
+    "with ONLY the next step, as a concrete instruction for yourself (which file, what to do). "
+    "Do not repeat work that is already in place. Do not start unrelated work."
+)
+
+_SUMMARIZE = (
+    "Summarise the conversation so far so work can continue without it. Keep: the user's goals and "
+    "requests, decisions made and why, files created or changed and what changed in them, commands "
+    "run and their real outcomes, failures hit, and anything still left to do. Drop pleasantries and "
+    "raw tool output. Plain prose or short bullets, under 600 words."
+)
+
+_AUTONOMY_NOTE = (
+    "\n\nWORKING STYLE\n"
+    "- You work until the request is actually done, not until you have made one edit. After each "
+    "change Pulse checks the result and hands you the next step, so do the work in sensible steps "
+    "-- you do not need to squeeze everything into one edit.\n"
+    "- Read before you write, run the project's own tests/linters to check your work, and fix what "
+    "the output shows. Stop only when the request is fully done or you are genuinely blocked "
+    "(then say exactly what blocks you).\n"
+    "- If the project has notes (PULSE.md / AGENTS.md / CLAUDE.md) they are shown to you as "
+    "'Project notes'; follow them.\n"
+)
+CODE_SYSTEM_PROMPT += _AUTONOMY_NOTE
+
 
 
 
@@ -273,6 +319,67 @@ class _CodeAgentCLI(PulseCLI):
         # Only GREP and VIEW; CALC / PROMOTE / GPUTRACK / SENSITIVITY are about a training run.
         return super()._apply_directives([], [], [], [], [], [], grep_patterns, view_requests)
 
+    # -- context: what the model is shown on every call ---------------------------------
+    def _context_history(self):
+        """A rolling summary of compacted history, then the most recent messages, with the
+        current step's request (which carries the file context) always kept."""
+        recent = self.agent_history[-_WINDOW_MESSAGES:]
+        pinned = getattr(self, "_turn_question_msg", None)
+        if pinned is not None and not any(m is pinned for m in recent) \
+                and any(m is pinned for m in self.agent_history):
+            recent = [pinned] + recent
+        summary = getattr(self, "_context_summary", "")
+        if summary:
+            recent = [{"role": "user", "content": f"Summary of the earlier conversation:\n{summary}"}] + recent
+        return recent
+
+    def _call_model(self, instruction, max_tokens=_AGENT_MAX_TOKENS, **kwargs):
+        if kwargs.get("history") is None and kwargs.get("system") is None:
+            kwargs["history"] = self._context_history()
+        return super()._call_model(instruction, max_tokens, **kwargs)
+
+    def history_chars(self):
+        native = _agent._messages_chars(getattr(self, "native_history", []))
+        return native + len(getattr(self, "_context_summary", "")) + sum(
+            len(str(m.get("content", ""))) for m in self.agent_history)
+
+    def compact_history(self, force=False):
+        """Fold everything but the last few messages into a summary. Returns True if it ran."""
+        if getattr(self, "native_history", None) and not getattr(self, "_native_off", False):
+            return _agent.compact(self, force=force)
+        history = self.agent_history
+        if len(history) <= _KEEP_RECENT or (not force and self.history_chars() < _COMPACT_AT_CHARS):
+            return False
+        old, keep = history[:-_KEEP_RECENT], history[-_KEEP_RECENT:]
+        transcript = "\n\n".join(f"[{m.get('role')}] {m.get('content', '')}" for m in old)
+        if len(transcript) > _SUMMARY_INPUT_CHARS:
+            transcript = "...(earlier part omitted)...\n" + transcript[-_SUMMARY_INPUT_CHARS:]
+        previous = getattr(self, "_context_summary", "")
+        if previous:
+            transcript = f"[earlier summary]\n{previous}\n\n{transcript}"
+        try:
+            with _Spinner("Compacting context"):
+                summary = self._call_model(f"{_SUMMARIZE}\n\n---\n{transcript}", max_tokens=_AGENT_MAX_TOKENS,
+                                           history=[])
+        except AgentRequestFailed:
+            return False                   # keep the full history; it is only a size problem
+        self._context_summary = summary.strip()
+        self.agent_history[:] = keep
+        return True
+
+    def project_notes(self):
+        """PULSE.md (or AGENTS.md / CLAUDE.md) at the project root: standing instructions and
+        facts about the project, read fresh each step so edits to it apply immediately."""
+        root = getattr(self, "_project_root", None)
+        for name in _NOTES_NAMES:
+            text = read_text(os.path.join(root, name)) if root else None
+            if text and text.strip():
+                text = text.strip()
+                if len(text) > _PROJECT_NOTES_CHARS:
+                    text = text[:_PROJECT_NOTES_CHARS] + "\n...(truncated)"
+                return name, text
+        return None, ""
+
     # -- labels are project-relative paths: unique by construction -----------------------
     def _build_file_labels(self):
         root = self._project_root
@@ -292,6 +399,8 @@ class _CodeAgentCLI(PulseCLI):
     # -- files ---------------------------------------------------------------------------
     def setup_code(self, root, focus, known):
         self._code_mode = True
+        self.native_history = []             # full tool-call conversation of the native loop
+        self._todos = []
         self._project_root = root
         self._system_prompt_override = CODE_SYSTEM_PROMPT
         self._suppress_auto_restart = True
@@ -426,6 +535,9 @@ def build_context(cli):
     cli._build_file_labels()
     root = cli._project_root
     lines = [f"Project root: {root}", ""]
+    notes_name, notes = cli.project_notes() if hasattr(cli, "project_notes") else (None, "")
+    if notes:
+        lines += [f"Project notes ({notes_name}):", notes, ""]
     focus_set = set(cli.focus)
     index = []
     for path in cli.known:
@@ -469,10 +581,12 @@ def parse_change(cli, answer):
         if text.lower().startswith("json"):
             text = text[4:]
         text = text.strip()
-    if not (text.startswith("{") and text.endswith("}")):
+    # Tolerate prose or fences around the object: decode the first JSON object in the text.
+    start = text.find("{")
+    if start < 0:
         return None
     try:
-        payload = json.loads(text)
+        payload, _end = json.JSONDecoder().raw_decode(text[start:])
     except (ValueError, TypeError):
         return None
     if not isinstance(payload, dict):
@@ -669,7 +783,14 @@ def _tool_rounds(cli, answer, instruction):
         cli.agent_history.append({"role": "user", "content": notes})
         with _Spinner("Reading"):
             answer = cli._call_model(instruction, max_tokens=_AGENT_MAX_TOKENS)
-    return answer
+    # Tool budget used up with the last answer still asking for tools: don't let that read as
+    # "no answer" and end the task -- make the model conclude with what it has.
+    cli.agent_history.append({"role": "assistant", "content": answer})
+    cli.agent_history.append({"role": "user", "content":
+                              "Tool budget for this step is used up. Do not use any tool directive. "
+                              "Respond now with what you have learned."})
+    with _Spinner("Concluding"):
+        return cli._call_model(instruction, max_tokens=_AGENT_MAX_TOKENS)
 
 
 def _plain_text(answer):
@@ -679,32 +800,139 @@ def _plain_text(answer):
     return _NO_CHANGES_RE.sub("", cleaned).strip()
 
 
-def run_turn(cli, request, evidence=None):
-    """One request, start to finish. Returns "applied", "answered", "declined" or "failed".
-
-    `evidence` is extra context for this turn only -- the Pulse app passes what a live run
-    is doing (metrics, findings) when the request is about that run."""
+def _run_step(cli, request, evidence=None):
+    """One plan -> edit -> verify pass over fresh file context. Returns (outcome, summary)."""
     cli.reload()
     cli._last_applied_fix = None
     cli._fix_applied_this_turn = False
+    cli._last_failure = ""
     context = build_context(cli)
     if evidence:
         context = f"{context}\n\n{evidence}"
     marker = {"role": "user", "content": f"{context}\n\nRequest: {request}"}
     cli.agent_history.append(marker)
+    cli._turn_question_msg = marker          # pinned: stays in the model's window however long the step runs
     outcome, summary = "failed", ""
     try:
         outcome, summary = _run_turn_passes(cli, request)
     except AgentRequestFailed as exc:
+        cli._last_failure = f"the agent request failed: {exc}"
         cprint(f"[Pulse Code] ⚠ The agent request failed: {exc}", color=_RED)
-    except Exception as exc:              # a bug in one turn must not end the session
+    except Exception as exc:              # a bug in one step must not end the session
+        cli._last_failure = f"unexpected error {type(exc).__name__}: {exc}"
         cprint(f"[Pulse Code] ⚠ Unexpected error ({type(exc).__name__}: {exc}); nothing further was changed.", color=_RED)
     finally:
         # The bulky file context is only needed while the passes run; keeping it in history would
-        # resend it -- once per turn -- for the rest of the session.
+        # resend it -- once per step -- for the rest of the session.
         marker["content"] = f"Request: {request}"
+        cli._turn_question_msg = None
         if summary:
             cli.agent_history.append({"role": "assistant", "content": summary})
+    return outcome, summary
+
+
+def _next_step(cli, request):
+    """After a change landed: ask whether the request is finished. Returns the next step as
+    text, or None when the agent says it is done (or the check itself could not be made)."""
+    cli.reload()
+    marker = {"role": "user", "content": f"{build_context(cli)}\n\nOriginal request: {request}"}
+    cli.agent_history.append(marker)
+    cli._turn_question_msg = marker
+    prompt = _CONTINUE.format(request=request)
+    answer, text = "", ""
+    try:
+        # An error or an empty reply is not "done": ask again before giving up.
+        for attempt in range(3):
+            try:
+                with _Spinner("Checking progress"):
+                    answer = cli._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS)
+                answer = _tool_rounds(cli, answer, prompt)
+            except AgentRequestFailed as exc:
+                cprint(f"[Pulse Code] ⚠ Could not check progress ({attempt + 1}/3): {exc}", color=_RED)
+                answer = ""
+                continue
+            text = _plain_text(answer)
+            if text or re.search(r"\bTASK_COMPLETE\b", answer or ""):
+                break
+            prompt = (_CONTINUE.format(request=request) +
+                      "\n\n(Your last reply was empty. Reply with a summary + TASK_COMPLETE, or the next step.)")
+        else:
+            cprint("[Pulse Code] ⚠ Could not tell whether the request is finished; stopping here. "
+                   "Say 'continue' to keep going.", color=_YELLOW)
+            return None
+    finally:
+        marker["content"] = f"Original request: {request}"
+        cli._turn_question_msg = None
+    if re.search(r"\bTASK_COMPLETE\b", answer or ""):
+        text = re.sub(r"\bTASK_COMPLETE\b", "", text).strip()
+        if text:
+            print(f"\n{text}\n")
+        return None
+    return text
+
+
+def run_turn(cli, request, evidence=None):
+    """One request, worked until it is done. Returns "applied", "answered", "declined" or "failed".
+
+    Models that support function calling run in the native tool loop (pulse_code_agent): the
+    agent reads, edits and runs commands continuously until it has nothing left to do. Models
+    that don't -- or PULSE_CODE_LEGACY=1 -- use the plan/edit/verify text pipeline below."""
+    if os.environ.get("PULSE_CODE_LEGACY") != "1" and not getattr(cli, "_native_off", False) \
+            and _agent.supported(cli):
+        try:
+            return _agent.run_native_turn(cli, request, evidence)
+        except _agent.ToolsUnsupported:
+            cli._native_off = True
+            cprint("[Pulse Code] This model doesn't support tool calling -- using the step-by-step pipeline.",
+                   color=_YELLOW)
+    return _run_turn_pipeline(cli, request, evidence)
+
+
+def _run_turn_pipeline(cli, request, evidence=None):
+    """The text pipeline: plan -> edit -> verify, step after step.
+
+    Each step is a plan -> edit -> verify pass. After an applied step the agent is asked whether
+    the request is finished; if not, it names the next step and the loop goes round again, up to
+    _MAX_AUTONOMOUS_STEPS. It stops early when a step is declined, fails, or changes nothing.
+
+    `evidence` is extra context for the first step only -- the Pulse app passes what a live run
+    is doing (metrics, findings) when the request is about that run."""
+    cli.compact_history()
+    step_request, outcome, summaries, applied_any = request, "failed", [], False
+    base_request, failures = request, 0
+    for step in range(1, _MAX_AUTONOMOUS_STEPS + 1):
+        if step > 1:
+            cprint(f"[Pulse Code] Step {step}/{_MAX_AUTONOMOUS_STEPS}: {base_request.splitlines()[0][:100]}", color=_BLUE)
+            cli.compact_history()
+        outcome, summary = _run_step(cli, step_request, evidence if not applied_any else None)
+        if summary:
+            summaries.append(summary)
+        if outcome == "failed" and failures < _MAX_STEP_RETRIES:
+            # A step that produced nothing is not the end of the task: try again, telling the
+            # agent what went wrong, instead of silently stopping.
+            failures += 1
+            reason = getattr(cli, "_last_failure", "") or "no usable change was produced"
+            cprint(f"[Pulse Code] Retrying ({failures}/{_MAX_STEP_RETRIES}) -- {reason[:160]}", color=_YELLOW)
+            step_request = (f"{base_request}\n\n(Your previous attempt at this did not work: {reason[:1500]}. "
+                            "Take a different, smaller, concrete approach -- one edit at a time. Re-read the "
+                            "exact code with VIEW/GREP before writing snippets.)")
+            continue
+        if outcome != "applied":
+            break
+        failures = 0
+        applied_any = True
+        if step == _MAX_AUTONOMOUS_STEPS:
+            cprint(f"[Pulse Code] Stopped after {_MAX_AUTONOMOUS_STEPS} steps; ask it to continue if there is more to do.",
+                   color=_YELLOW)
+            break
+        follow_up = _next_step(cli, request)
+        if follow_up is None:
+            break
+        base_request = follow_up
+        step_request = f"{follow_up}\n\n(This is a step toward the original request: {request})"
+    if applied_any and outcome in ("answered", "failed"):
+        outcome = "applied"                  # an earlier step did change files
+    summary = "\n\n".join(summaries)
     try:
         cli._sync_agent_turn(request, summary or "(no answer)", traceback_signature=None,
                              fix_applied=cli._last_applied_fix)
@@ -718,7 +946,11 @@ def _run_turn_passes(cli, request):
         answer = cli._call_model(_PLAN, max_tokens=_AGENT_MAX_TOKENS)
     answer = _tool_rounds(cli, answer, _PLAN)
     plan = _plain_text(answer)
-    if _NO_CHANGES_RE.search(answer) or not plan:
+    if not plan and not _NO_CHANGES_RE.search(answer):
+        cli._last_failure = "the planning reply was empty"
+        cprint("[Pulse Code] ⚠ Empty plan.", color=_YELLOW)
+        return "failed", ""
+    if _NO_CHANGES_RE.search(answer):
         print(f"\n{plan}\n" if plan else "\n(no answer)\n")
         return "answered", plan
     print(f"\n{plan}\n")
@@ -741,6 +973,8 @@ def _run_turn_passes(cli, request):
             raw = cli._call_model(implement, max_tokens=_AGENT_MAX_TOKENS)
         fix = parse_change(cli, raw)
     if fix is None:
+        cli._last_failure = ("the reply was not a valid JSON edit object (it may have been cut off -- "
+                             "split the work into smaller edits or create fewer/shorter files per step)")
         cprint("[Pulse Code] ⚠ Could not turn that into a concrete change; nothing was edited.", color=_RED)
         text = _plain_text(raw)
         if text:
@@ -887,6 +1121,8 @@ def _settle(cli, request, plan, fix, implement, applied=False):
         if revised is None:
             break
         fix = revised
+    cli._last_failure = "the edit did not apply cleanly: " + "; ".join(
+        f"[{label}] {reason}" for _snippet, label, reason in problems)
     cprint("[Pulse Code] ⚠ Could not produce a change that applies cleanly, so nothing was edited:", color=_RED)
     for snippet, label, reason in problems:
         first = str(snippet).splitlines()[0][:90] if str(snippet).strip() else ""
@@ -903,12 +1139,15 @@ def _confirm_and_apply(cli, request, plan, fix, changes):
     if cli.review:
         try:
             answer = _prompt_text(
-                f"Apply these changes to {n_files} file{'s' if n_files != 1 else ''}? (Y/n) > ",
-                label=f"Apply these changes to {n_files} file{'s' if n_files != 1 else ''}?  (Y/n)").strip().lower()
+                f"Apply these changes to {n_files} file{'s' if n_files != 1 else ''}? (Y/n/a=apply all from now on) > ",
+                label=f"Apply these changes to {n_files} file{'s' if n_files != 1 else ''}?  (Y/n/a=always)").strip().lower()
         except EOFError:
             answer = "n"
             cprint("[Pulse Code] No terminal to confirm on -- not applied (use -y to apply without asking).", color=_YELLOW)
-        if answer not in ("", "y", "yes"):
+        if answer in ("a", "all", "always"):
+            cli.review = False
+            cprint("[Pulse Code] Review is now OFF for this session (/review on to re-enable).", color=_YELLOW)
+        elif answer not in ("", "y", "yes"):
             cprint("[Pulse Code] Not applied.", color=_YELLOW)
             return "declined", f"{plan}\n\n(The user declined the proposed change.)"
 
@@ -930,6 +1169,7 @@ def _confirm_and_apply(cli, request, plan, fix, changes):
     if not applied_ok:
         # Something differed between the preview and the write (a file changed underneath us).
         # Never leave half a feature behind.
+        cli._last_failure = "the change could not be written (a file changed underneath, or lint failed on write)"
         if cli._fix_applied_this_turn and getattr(cli, "_last_commit_id", None):
             cprint("[Pulse Code] ⚠ Not every part was applied -- undoing the ones that were.", color=_RED)
             undo(cli, f"{cli._last_commit_id} force", quiet=True)
@@ -1044,6 +1284,11 @@ _HELP = [
         ("/review on|off", "show a diff and ask before applying (default on)"),
         ("/undo [id]", "undo the latest change (or a given one); leaves files you've edited since alone"),
     ]),
+    ("Context", [
+        ("/context", "how much conversation the agent is carrying, and whether PULSE.md is loaded"),
+        ("/compact", "summarise older conversation now (it also happens automatically when it grows)"),
+        ("/clear", "forget the conversation (files and /undo history are kept)"),
+    ]),
     ("Files", [
         ("/files", "what is in focus (shown to the agent in full) and how many files it can search"),
         ("/add <path…>", "put files or folders in focus (globs work)"),
@@ -1124,6 +1369,21 @@ def _handle_command(cli, line):
         cprint(f"[Pulse Code] Review before applying is {'ON' if cli.review else 'OFF'}.")
     elif word in ("/undo", "/revert"):
         undo(cli, rest)
+    elif word == "/context":
+        name, notes = cli.project_notes()
+        chars = cli.history_chars()
+        print(f"\n  Conversation  {len(cli.agent_history) + len(cli.native_history)} message(s), ~{chars // 4:,} tokens"
+              f"{' (plus a summary of earlier history)' if getattr(cli, '_context_summary', '') else ''}")
+        print(f"  Compacts at   ~{_COMPACT_AT_CHARS // 4:,} tokens  (/compact does it now)")
+        print(f"  Project notes {name + f' (~{len(notes) // 4:,} tokens)' if name else 'none -- add a PULSE.md to the project root'}\n")
+    elif word == "/compact":
+        cprint("[Pulse Code] ✓ Context compacted." if cli.compact_history(force=True)
+               else "[Pulse Code] Nothing to compact yet.")
+    elif word == "/clear":
+        cli.agent_history[:] = []
+        cli.native_history[:] = []
+        cli._context_summary = ""
+        cprint("[Pulse Code] ✓ Conversation memory cleared (files and change history are untouched).")
     elif word == "/log":
         cli._cmd_log("")
     elif lowered == "/agent":

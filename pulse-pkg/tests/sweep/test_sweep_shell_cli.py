@@ -87,7 +87,7 @@ def test_bug_sys_argv0_is_not_as_typed(sandbox):
     assert (sandbox / "argv0.txt").read_text() == "train.py"
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root can read anything")
+@pytest.mark.skipif((hasattr(os, "geteuid") and os.geteuid() == 0), reason="root can read anything")
 def test_bug_unreadable_script_crashes_with_traceback(sandbox):
     """A script that exists but cannot be read (permissions) raises PermissionError out
     of run_script -- only decode errors are caught -- so `pulse run` dies with a Python
