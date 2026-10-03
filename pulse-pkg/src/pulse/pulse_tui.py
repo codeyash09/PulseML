@@ -511,9 +511,11 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
         footer = view.status
     if view.scroll:
         footer = f"{g('up')} scrolled back {view.scroll} lines · PgDn / End to return · " + footer
+    # the field sits between two rules, the key hints under the lower one
+    block.append(s(g("rule") * right_w, "dim"))
     block.append(s(_ui._clip(footer, right_w), "dim"))
-    block = block[-max(2, body_h - len(strip) - 2):]
-    field_row_in_block = len(block) - 2
+    block = block[-max(3, body_h - len(strip) - 2):]
+    field_row_in_block = len(block) - 3
 
     # ---- the transcript above it
     room = body_h - len(strip) - len(block) - 1          # -1: the rule over the input
