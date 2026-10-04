@@ -40,12 +40,17 @@ python3 -m pulse
 
 or 
 
+Permanently make it so only the pulse command is needed:
 ```bash
 export PATH="$PATH:$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))')"
 pulse
 ```
 
+and for future uses after
 ```bash
+pulse
+```
+
 
 
 which will take you to the Pulse setup page
