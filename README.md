@@ -32,23 +32,13 @@ python -c "import pulse; print('Pulse installed successfully')"
 
 ### Start Pulse
 
-Import `auto_track` and call it immediately before your training loop:
+Use 
 
-```python
-from pulse import auto_track
-
-if __name__ == "__main__":
-    auto_track()
-
-    # Your training loop
-    for epoch in range(num_epochs):
-        # Training logic here
-        pass
+```bash
+pulse
 ```
 
-The `__main__` guard is particularly important in multiprocessing or process-spawning environments.
-
-Once the process is running, Pulse discovers numeric variables available to the training process and exposes them through the CLI.
+which will take you to the Pulse setup page
 
 ### AI provider configuration
 
