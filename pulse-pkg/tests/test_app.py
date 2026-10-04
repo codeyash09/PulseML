@@ -136,19 +136,25 @@ def test_editor_edits_one_line_and_remembers_history():
 def test_thinking_is_one_line_until_expanded():
     entry_ = tui.Entry("thinking", "the scheduler maybe\nsteps too often")
     folded = [plain(line) for line in tui.entry_lines(entry_, 60, False)]
-    assert len(folded) == 1 and "Thinking" in folded[0] and "ctrl+o" in folded[0]
+    assert folded == ["Thought (6 words)"]
+    entry_.seconds = 4.2
+    entry_.touch()
+    assert [plain(line) for line in tui.entry_lines(entry_, 60, False)] == ["Thought for 4.2s"]
     opened = [plain(line) for line in tui.entry_lines(entry_, 60, True)]
-    assert opened[0].strip().endswith("Thinking") and "the scheduler maybe" in opened[1]
+    assert opened[0] == "Thought for 4.2s" and "the scheduler maybe" in opened[1]
     assert "steps too often" in opened[2]
 
 
-def test_tool_calls_show_and_their_output_folds():
+def test_tool_calls_read_as_what_was_done_and_expand_to_the_output():
     entry_ = tui.Entry("tool", calls=["GREP: lr_scheduler", "VIEW: train.py:40-80"], output="a\nb\nc")
     folded = [plain(line) for line in tui.entry_lines(entry_, 60, False)]
-    assert folded[0] == "● GREP(lr_scheduler)" and folded[1] == "● VIEW(train.py:40-80)"
-    assert "3 lines" in folded[2] and "ctrl+o" in folded[2] and len(folded) == 3
+    assert folded == ["Searched for lr_scheduler · Read train.py:40-80  · 3 lines"]
     opened = [plain(line) for line in tui.entry_lines(entry_, 60, True)]
+    assert opened[0].startswith("Searched for lr_scheduler") and "GREP: lr_scheduler" in opened[0]
     assert [line.strip().lstrip("⎿ ").strip() for line in opened[2:]] == ["a", "b", "c"]
+    assert tui.describe_call("TERMINAL: pytest -q") == "Ran pytest -q"
+    assert tui.describe_call("EDIT_FILE: train.py") == "Edited train.py"
+    assert tui.describe_call("RUN_STATUS") == "Checked the run"
 
 
 def test_a_finding_keeps_its_severity_and_folds_under_it():
@@ -203,7 +209,7 @@ def test_the_screen_splits_only_when_a_run_is_open_and_there_is_room():
 def test_ctrl_o_state_changes_what_the_frame_shows():
     view = demo_view()
     folded = "\n".join(plain(line) for line in tui.compose(view, 90, 24)[0])
-    assert "maybe the scheduler" not in folded and "ctrl+o to expand" in folded
+    assert "maybe the scheduler" not in folded and "Thought" in folded
     view.expanded = True
     opened = "\n".join(plain(line) for line in tui.compose(view, 90, 24)[0])
     assert "maybe the scheduler" in opened
@@ -801,7 +807,7 @@ def fake_launches(monkeypatch, process_for):
     started = []
 
     def popen(argv, *args, **kw):
-        if isinstance(argv, (list, tuple)) and list(argv[1:4]) == ["-m", "pulse", "run"]:
+        if isinstance(argv, (list, tuple)) and len(argv) > 3 and argv[1] == "-c" and argv[3] == "run":
             started.append((list(argv), kw))
             return process_for()
         return REAL_POPEN(argv, *args, **kw)
@@ -833,7 +839,8 @@ def test_run_starts_the_script_under_pulse_and_opens_it(real_app, tmp_path, monk
     run_line(real_app, "/run train.py --epochs 3")
     assert wait_for(lambda: real_app.console is not None and not real_app.view.busy, 15)
     argv, kw = started[0]
-    assert argv[1:6] == ["-m", "pulse", "run", "--stream", "--again"] and argv[6:] == [script, "--epochs", "3"]
+    assert argv[1] == "-c" and "runpy.run_module('pulse'" in argv[2]
+    assert argv[3:6] == ["run", "--stream", "--again"] and argv[6:] == [script, "--epochs", "3"]
     assert kw["cwd"] == real_app.home_root and kw["start_new_session"] is True
     assert kw["env"]["PULSE_NONINTERACTIVE"] == "1"
     info = real_app.launched["train"]
@@ -1081,3 +1088,86 @@ def test_no_dashboard_row_when_not_signed_in(real_app, tmp_path, monkeypatch):
     real_app._open_run(make_run(tmp_path))
     assert real_app.runlog is None and fake.created == []
     real_app._close_run(quiet=True)
+
+
+
+# =========================================================================================
+# Clicking: folded entries open and shut with the mouse
+# =========================================================================================
+
+def test_mouse_reports_become_clicks_and_wheel_keys():
+    keys, rest = tui.parse_keys("\033[<0;12;5M\033[<0;12;5m\033[<64;3;3M\033[<65;3;3M")
+    assert keys == ["click:11:4", "wheel:up", "wheel:down"]      # a click counts on release
+    assert tui.parse_keys("\033[<0;12")[1] == "\033[<0;12"            # still arriving
+
+
+def test_a_click_on_a_folded_entry_opens_it_and_a_click_shuts_it(app):
+    tool = tui.Entry("tool", calls=["GREP: lr"], output="a\nb\nc")
+    app.view.entries = [tui.Entry("user", "q"), tool, tui.Entry("text", "answer")]
+    frame, _r, _c = tui.compose(app.view, 90, 24)
+    row = next(r for r, e in app.view.row_entries.items() if e is tool)
+    assert "3 lines" in PLAIN.sub("", frame[row])
+    app.on_key(f"click:5:{row}")
+    frame, _r, _c = tui.compose(app.view, 90, 24)
+    shown = [PLAIN.sub("", line).strip() for line in frame]
+    assert any(line.endswith("⎿ a") for line in shown) and tool.open is True
+    app.on_key(f"click:5:{row}")
+    assert tool.open is False and "3 lines" in "\n".join(PLAIN.sub("", l) for l in tui.compose(app.view, 90, 24)[0])
+    app.on_key("ctrl+o")                                   # Ctrl+O speaks for every entry again
+    assert tool.open is None and app.view.expanded
+
+
+def test_the_wheel_scrolls_the_transcript(app):
+    app.view.entries = [tui.Entry("text", f"line {i}") for i in range(80)]
+    app.on_key("wheel:up")
+    assert app.view.scroll == 3
+    app.on_key("wheel:down")
+    assert app.view.scroll == 0
+
+
+def test_a_long_pasted_request_folds_to_its_first_lines():
+    entry = tui.Entry("user", "\n".join(f"line {i}" for i in range(20)))
+    lines = [PLAIN.sub("", line) for line in tui.entry_lines(entry, 60, False)]
+    assert len(lines) == tui.USER_FOLD_LINES and "more lines" in lines[-1] and entry.foldable()
+    assert len(tui.entry_lines(entry, 60, True)) == 20
+
+
+def test_a_shut_tool_call_stays_on_one_line():
+    entry = tui.Entry("tool", calls=["TERMINAL: " + "x" * 200], output="")
+    assert len(tui.entry_lines(entry, 40, False)) == 1
+    assert len(tui.entry_lines(entry, 40, True)) > 1
+
+
+def test_the_agents_words_and_its_thinking_look_different(monkeypatch):
+    monkeypatch.setattr(ui, "color_enabled", lambda: True)
+    say = [PLAIN.sub("", l) for l in tui.entry_lines(tui.Entry("say", "The lr is 0.3."), 40, False)]
+    think = tui.entry_lines(tui.Entry("thinking", "maybe lr"), 40, True)
+    assert say == ["The lr is 0.3."]                                   # the agent's words: plain
+    assert PLAIN.sub("", think[0]).startswith("Thought") and "\033[3m" in think[0]   # thinking: dim italic
+    note = tui.entry_lines(tui.Entry("text", "[Pulse Code] applied"), 40, False)
+    assert "\033[2m" in note[0]                                        # Pulse's own output: quiet
+
+
+def test_an_opened_entry_stays_where_it_was_clicked(app):
+    tool = tui.Entry("tool", calls=["VIEW: train.py:1-40"], output="\n".join(f"line {i}" for i in range(30)))
+    app.view.entries = [tui.Entry("user", "q"), tool] + [tui.Entry("text", f"after {i}") for i in range(6)]
+    frame, _r, _c = tui.compose(app.view, 90, 24)
+    row = next(r for r, e in app.view.row_entries.items() if e is tool)
+    app.on_key(f"click:5:{row}")
+    frame, _r, _c = tui.compose(app.view, 90, 24)
+    assert app.view.row_entries.get(row) is tool                    # still on the same row
+    assert "Read train.py:1-40" in PLAIN.sub("", frame[row])
+
+
+def test_a_click_in_the_split_view_keeps_the_entry_on_its_row(app):
+    """The run pane takes columns; the re-scroll must wrap to the same width the frame did."""
+    tool = tui.Entry("tool", calls=["GREP: lr", "VIEW: train.py:1-12"], output="\n".join(f"line {i}" for i in range(25)))
+    app.view.side = [f"side {i}" for i in range(30)]
+    app.view.entries = [tui.Entry("user", "why is the loss flat"), tui.Entry("say", "I need to see how lr is used."), tool,
+                        tui.Entry("say", "x" * 66 + " " + "y" * 20), tui.Entry("text", "w" * 67)]
+    frame, _r, _c = tui.compose(app.view, 110, 22)
+    row = next(r for r, e in app.view.row_entries.items() if e is tool)
+    app.on_key(f"click:50:{row}")
+    frame, _r, _c = tui.compose(app.view, 110, 22)
+    assert app.view.row_entries.get(row) is tool
+    assert "Searched for lr" in PLAIN.sub("", frame[row])

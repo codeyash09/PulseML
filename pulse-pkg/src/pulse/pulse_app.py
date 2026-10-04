@@ -98,6 +98,19 @@ DEBUG_COMMANDS: List[Tuple[str, str]] = [
 _STATUS_STYLE = {"live": "green", "stalled": "amber", "crashed": "red"}
 _RUN_LOG_DIR = "app-runs"
 
+# How a run is launched: `python -m pulse` puts the working directory first on sys.path, so
+# a stray pulse.py there (a home folder is a likely place) shadows the package and the
+# launch dies at once. This boot drops the working directory from the path, then runs the
+# package the way -m would.
+_BOOT = ("import os, runpy, sys; cwd = os.getcwd(); "
+         "sys.path[:] = [p for p in sys.path if p not in ('', '.', cwd, os.path.abspath(cwd))]; "
+         "sys.argv[0] = 'pulse'; runpy.run_module('pulse', run_name='__main__', alter_sys=True)")
+
+
+def launch_argv(script_argv: List[str]) -> List[str]:
+    """The command that starts `script_argv` under Pulse, in stream mode, from any folder."""
+    return [sys.executable, "-c", _BOOT, "run", "--stream", "--again", *script_argv]
+
 
 class _Question:
     """Something a hosted pipeline asked; the job thread waits on it."""
@@ -330,6 +343,7 @@ class App:
         self._hushed: Dict[int, List[str]] = {}      # thread id -> what it printed while hushed
         self._live_thinking: Optional[tui.Entry] = None
         self._live_answer: Optional[tui.Entry] = None
+        self._think_started = 0.0
         self._streamed_reasoning = False
         self._job: Optional[threading.Thread] = None
         self._last_ctrl_c = 0.0
@@ -561,6 +575,7 @@ class App:
                 self._flush_partial()
                 if self._live_thinking is None:
                     self._live_thinking = tui.Entry("thinking", "", live=True)
+                    self._think_started = time.monotonic()
                     self.view.entries.append(self._live_thinking)
                 self._live_thinking.text += data["text"]
                 self._live_thinking.touch()
@@ -575,6 +590,7 @@ class App:
             elif event == "stream_end":
                 if self._live_thinking is not None:
                     self._live_thinking.live = False
+                    self._live_thinking.seconds = max(0.1, time.monotonic() - self._think_started)
                     self._live_thinking.touch()
                 if self._live_answer is not None and self._live_answer in self.view.entries:
                     self.view.entries.remove(self._live_answer)   # the pipeline prints the answer
@@ -671,10 +687,24 @@ class App:
             view.status = ""
             if key == "ctrl+o":
                 view.expanded = not view.expanded
+                for entry in view.entries:           # Ctrl+O speaks for every entry again
+                    if entry.open is not None:
+                        entry.open = None
+                        entry.touch()
                 return
             if key in ("pgup", "pgdn"):
                 page = max(3, self._height // 2)
                 view.scroll = max(0, view.scroll + (page if key == "pgup" else -page))
+                return
+            if key in ("wheel:up", "wheel:down"):
+                view.scroll = max(0, view.scroll + (3 if key == "wheel:up" else -3))
+                return
+            if key.startswith("click:"):
+                _x, row = key.split(":")[1:]
+                entry = view.row_entries.get(int(row))
+                if entry is not None and entry.foldable():
+                    entry.toggle(view.expanded)
+                    tui.keep_in_place(view, entry, int(row))
                 return
             if key in ("up", "down") and not view.editor.text and question is None:
                 # an empty input line: the arrows (and a mouse wheel, which most terminals turn
@@ -1163,7 +1193,10 @@ class App:
             self.error(f"Could not create {log_dir}: {exc}")
             return
         log_path = str(log_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.path.basename(script)}.log")
-        env = dict(os.environ, PULSE_NONINTERACTIVE="1", PYTHONUNBUFFERED="1")
+        # Ensure the real pulse package is found (not shadowed by a root pulse.py file)
+        pulse_pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = dict(os.environ, PULSE_NONINTERACTIVE="1", PYTHONUNBUFFERED="1",
+                   PYTHONPATH=f"{pulse_pkg_root}:{os.environ.get('PYTHONPATH', '')}")
         started = time.time()
         with _ui.Stage(f"Starting {os.path.basename(script)}"):
             log = open(log_path, "ab", buffering=0)
@@ -1173,7 +1206,7 @@ class App:
                     detach = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
                               | getattr(subprocess, "DETACHED_PROCESS", 0)}
                 process = subprocess.Popen(
-                    [sys.executable, "-m", "pulse", "run", "--stream", "--again", *argv],
+                    launch_argv(argv),
                     cwd=cwd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                     env=env, **detach)
             finally:
@@ -1341,7 +1374,7 @@ class App:
                                 self.view.frame += 1 if animating else 0
                                 lines, row, col = tui.compose(self.view, *size)
                                 split = self.view.side is not None and size[0] >= tui.SPLIT_MIN_WIDTH
-                                self._pane_w = size[0] - (tui.side_width(size[0]) + 3 if split else 1) - 1
+                                self._pane_w = tui.pane_width(size[0], split)
                                 self.dirty, last_frame = False, now
                             else:
                                 lines = None

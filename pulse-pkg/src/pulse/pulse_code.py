@@ -789,7 +789,7 @@ def _show_tools(answer, notes, label="tool results"):
         names = {"GREP", "VIEW", "CALC"} | {k.upper() for k in PulseCLI._NEW_DIRECTIVE_RES} | set(_RUN_ACTIONS)
         said = _TOOL_CALL_RE.sub(lambda m: "" if m.group(1) in names else m.group(0), answer or "").strip()
         if said and len(said) < 2000 and not said.lstrip().startswith("{"):
-            print(said)
+            _ui.answer(said)
         host.tool(tool_calls_in(answer), notes)
         return
     print(f"\n[{label}]\n{notes}\n")
@@ -1019,9 +1019,12 @@ def _run_turn_passes(cli, request):
         cprint("[Pulse Code] ⚠ Empty plan.", color=_YELLOW)
         return "failed", ""
     if _NO_CHANGES_RE.search(answer):
-        print(f"\n{plan}\n" if plan else "\n(no answer)\n")
+        if plan:
+            _ui.answer(plan)
+        else:
+            print("\n(no answer)\n")
         return "answered", plan
-    print(f"\n{plan}\n")
+    _ui.answer(plan)
 
     implement = _IMPLEMENT.format(plan=plan)
     with _Spinner("Implementing"):

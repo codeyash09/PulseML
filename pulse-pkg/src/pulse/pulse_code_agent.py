@@ -1061,7 +1061,7 @@ def run_native_turn(cli, request, evidence=None):
                 break
             messages.append(_assistant_message(reply))
             if reply.text:
-                print(f"\n{reply.text}\n" if not reply.calls else f"\n{reply.text}")
+                _ui.answer(reply.text)
             if not reply.calls:
                 if reply.finish == "length":
                     messages.append({"role": "user", "content": "Your reply was cut off. Continue where you left off."})

@@ -33,7 +33,7 @@ import unicodedata
 
 __all__ = [
     "Unavailable", "enabled", "color_enabled", "header", "rule", "ok", "warn", "fail",
-    "note", "kv", "subhead", "message", "ask", "confirm", "choose", "Option", "Stage", "ready_block",
+    "note", "kv", "subhead", "message", "answer", "ask", "confirm", "choose", "Option", "Stage", "ready_block",
     "elapsed_text", "commit_looks_valid", "key_hint_for", "set_host", "host",
 ]
 
@@ -130,6 +130,7 @@ _CODES = {
     "accent": "\033[38;5;208m",
     "bold": "\033[1m",
     "dim": "\033[2m",
+    "italic": "\033[3m",
     "green": "\033[32m",
     "amber": "\033[33m",
     "red": "\033[31m",
@@ -277,6 +278,22 @@ def message(text):
     bar = _s(_g("bar") + " ", "accent")
     with _out_lock:
         sys.stdout.write("\n" + "\n".join(bar + line for line in text.splitlines()) + "\n\n")
+        sys.stdout.flush()
+
+
+def answer(text):
+    """The agent's own words to the person -- an answer, a plan, a summary. Inside the Pulse
+    app it is shown as the agent speaking (like message()); on a plain terminal it is
+    printed as it always was."""
+    text = str(text or "")
+    if not text.strip():
+        return
+    host = _HOST
+    if host is not None and hasattr(host, "say"):
+        host.say(text.strip())
+        return
+    with _out_lock:
+        sys.stdout.write(f"\n{text.strip()}\n\n")
         sys.stdout.flush()
 
 

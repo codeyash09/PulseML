@@ -188,7 +188,7 @@ class Entry:
     note      a quiet line from Pulse itself     text
     error     something failed                   text
     """
-    __slots__ = ("kind", "text", "calls", "output", "severity", "live", "_cache")
+    __slots__ = ("kind", "text", "calls", "output", "severity", "live", "open", "seconds", "_cache")
 
     def __init__(self, kind: str, text: str = "", calls: Optional[List[str]] = None,
                  output: str = "", severity: str = "", live: bool = False) -> None:
@@ -198,22 +198,71 @@ class Entry:
         self.output = output
         self.severity = severity
         self.live = live                # still being streamed in: shown as it grows
+        self.open: Optional[bool] = None   # clicked open (True) or shut (False); None = as the screen says
+        self.seconds: Optional[float] = None   # how long the thinking took, when it streamed
         self._cache: Dict[Tuple[int, bool], List[str]] = {}
 
     def touch(self) -> None:
         self._cache = {}
 
+    def foldable(self) -> bool:
+        return self.kind in ("thinking", "tool") or (self.kind == "user" and self.text.count("\n") >= USER_FOLD_LINES)
+
+    def toggle(self, expanded: bool = False) -> None:
+        """A click: open what is shut, shut what is open (`expanded` is the screen-wide state)."""
+        self.open = not self.is_open(expanded)
+        self.touch()
+
+    def is_open(self, expanded: bool) -> bool:
+        return expanded if self.open is None else self.open
+
 
 _SEVERITY_STYLE = {"critical": "red", "error": "red", "warning": "amber", "info": "dim"}
-EXPAND_HINT = "ctrl+o to expand"
+EXPAND_HINT = "click or ctrl+o"
+USER_FOLD_LINES = 6                 # a pasted request longer than this folds to its first lines
 
 
 def _count(n: int, word: str) -> str:
     return f"{n:,} {word}{'' if n == 1 else 's'}"
 
 
+_CALL_WORDS = {
+    "GREP": "Searched for {}", "VIEW": "Read {}", "READ_FILE": "Read {}", "OUTLINE": "Outlined {}",
+    "LIST_FILES": "Listed the files {}", "FIND_DEFINITION": "Found where {} is defined", "DEFOF": "Found where {} is defined",
+    "FIND_REFERENCES": "Found the uses of {}", "CALLERS": "Found the callers of {}", "DEP_GRAPH": "Mapped the imports",
+    "DEPGRAPH": "Mapped the imports", "TRACE_VARIABLE": "Traced {}", "TRACE": "Traced {}",
+    "DOC_LOOKUP": "Looked up {}", "DOCLOOKUP": "Looked up {}", "CHANGELOG": "Checked what changed",
+    "TERMINAL": "Ran {}", "RUN_COMMAND": "Ran {}", "EDIT_FILE": "Edited {}", "EDIT": "Edited {}",
+    "REPLACE_SYMBOL": "Rewrote {}", "WRITE_FILE": "Wrote {}", "TODO_WRITE": "Updated the plan ({})",
+    "START_RUN": "Started {} under Pulse", "RUN": "Started {} under Pulse", "RUN_STATUS": "Checked the run",
+    "RUNSTATUS": "Checked the run", "RESTART_RUN": "Restarted the run", "RESTART": "Restarted the run",
+    "STOP_RUN": "Stopped the run", "STOP": "Stopped the run", "CALC": "Calculated {}", "CORR": "Correlated {}",
+    "OUTLIER": "Looked for outliers in {}", "HISTOGRAM": "Plotted {}", "DIFFSTATS": "Compared {}",
+    "MLLINT": "Ran the ML lint", "GPUSTATUS": "Checked the GPUs", "SHAPETRACE": "Traced the shapes",
+    "GRADCHECK": "Checked the gradients of {}", "REPLAY": "Replayed {} steps", "REPL": "Evaluated {}",
+    "DRYRUN": "Dry-ran {}", "PASTFIX": "Looked for past fixes ({})", "ROLLBACK": "Rolled back {}",
+    "LAYERSTATS": "Checked the layers", "HARDEXAMPLES": "Looked at the hard examples",
+    "AMPSTATUS": "Checked mixed precision", "SEEDCHECK": "Checked the seeds", "RANKDIVERGE": "Compared the ranks",
+    "RUNCOMPARE": "Compared the runs", "COST": "Checked the cost",
+}
+
+
+def describe_call(call: str) -> str:
+    """A tool call as a short sentence: "Ran pytest -q", "Read train.py:1-40"."""
+    name, sep, arg = call.partition(":")
+    name, arg = name.strip().upper(), arg.strip()
+    words = _CALL_WORDS.get(name)
+    if words is None:
+        return f"{name.lower().replace('_', ' ').capitalize()}{' ' + arg if arg else ''}"
+    if "{}" in words:
+        return words.format(arg) if arg else words.replace(" {}", "").replace("{}", "").strip()
+    return words
+
+
 def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
-    """The entry as finished screen lines, each at most `width` columns."""
+    """The entry as finished screen lines, each at most `width` columns. `expanded` is the
+    screen-wide Ctrl+O state; an entry that was clicked keeps its own."""
+    expanded = entry.is_open(expanded)
     key = (width, expanded)
     cached = entry._cache.get(key)
     if cached is not None:
@@ -222,55 +271,64 @@ def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
     kind = entry.kind
     if kind == "user":
         mark = s(g("cursor") + " ", "accent", "bold")
-        for i, part in enumerate(entry.text.split("\n")):
+        parts = entry.text.split("\n")
+        folded = len(parts) > USER_FOLD_LINES and not expanded
+        shown = parts[:USER_FOLD_LINES - 1] if folded else parts
+        for i, part in enumerate(shown):
             for j, piece in enumerate(wrap(part, width - 2)):
                 out.append((mark if i == 0 and j == 0 else "  ") + s(piece, "bold"))
+        if folded:
+            out.append("  " + s(f"… {len(parts) - len(shown)} more lines  ({EXPAND_HINT})", "dim"))
+    elif kind == "say":
+        # the agent speaking to the person: plain text, nothing in front of it
+        for part in entry.text.strip("\n").split("\n"):
+            out.extend(wrap(part, width))
     elif kind == "thinking":
         body = [ln for ln in entry.text.strip().split("\n")]
-        head = s("✻ " if _ui._unicode() else "* ", "accent") + s("Thinking", "dim")
         if entry.live and not expanded:
-            # streaming in: the head, then the last few lines as they arrive
-            out.append(head + s("…", "dim"))
+            # streaming in: "Thinking…", then the last two lines as they arrive
+            out.append(s("Thinking…", "dim", "italic"))
             tail: List[str] = []
             for part in body:
                 tail.extend(wrap(part, width - 2))
-            out.extend("  " + s(piece, "dim") for piece in tail[-4:])
+            out.extend("  " + s(piece, "dim", "italic") for piece in tail[-2:])
         elif not expanded:
-            out.append(head + s(f"  ({_count(len(entry.text.split()), 'word')} · {EXPAND_HINT})", "dim"))
+            took = f"Thought for {_ui.elapsed_text(entry.seconds)}" if entry.seconds else \
+                f"Thought ({_count(len(entry.text.split()), 'word')})"
+            out.append(s(took, "dim", "italic"))
         else:
-            out.append(head)
+            out.append(s("Thought" + (f" for {_ui.elapsed_text(entry.seconds)}" if entry.seconds else ""), "dim", "italic"))
             for part in body:
                 for piece in wrap(part, width - 2):
-                    out.append("  " + s(piece, "dim"))
+                    out.append("  " + s(piece, "dim", "italic"))
     elif kind == "tool":
-        for call in entry.calls:
-            name, sep, arg = call.partition(":")
-            label = s(name.strip(), "bold") + (s("(", "dim") + arg.strip() + s(")", "dim") if sep and arg.strip() else "")
-            pieces = wrap(label, width - 2, indent="  ")
-            out.append(s(g("now") + " ", "green") + pieces[0])
-            out.extend("  " + p for p in pieces[1:])
         result = entry.output.strip("\n")
-        if result:
-            rows = result.split("\n")
+        rows = result.split("\n") if result else []
+        if not expanded:
+            # one line: what was done, and how much came back -- click for the rest
+            said = [describe_call(c) for c in entry.calls]
+            line = " · ".join(said[:3]) + (f" +{len(said) - 3}" if len(said) > 3 else "")
+            tail = s(f"  · {_count(len(rows), 'line')}", "dim") if rows else ""
+            out.append(_ui._clip(s(line, "dim") + tail, width))
+        else:
+            for call in entry.calls:
+                name, sep, arg = call.partition(":")
+                label = s(describe_call(call), "dim") + (s("   " + name.strip() + ": " + arg.strip(), "dim")
+                                                       if sep and arg.strip() else "")
+                pieces = wrap(label, width, indent="  ")
+                out.extend(pieces)
             elbow = "⎿ " if _ui._unicode() else "L "
-            if not expanded:
-                out.append("  " + s(f"{elbow}{_count(len(rows), 'line')}  ({EXPAND_HINT})", "dim"))
-            else:
-                first = True
-                for row in rows:
-                    for piece in wrap(row, width - 4):
-                        out.append("  " + s(elbow if first else "  ", "dim") + s(piece, "dim"))
-                        first = False
+            first = True
+            for row in rows:
+                for piece in wrap(row, width - 4):
+                    out.append("  " + s(elbow if first else "  ", "dim") + s(piece, "dim"))
+                    first = False
     elif kind == "finding":
         style = _SEVERITY_STYLE.get(entry.severity.lower(), "amber")
         mark = ("▲ " if _ui._unicode() else "! ") + (entry.severity.upper() + " " if entry.severity else "")
         pieces = wrap(entry.text, max(1, width - visible_len(mark)), indent="")
         out.append(s(mark, style, "bold") + pieces[0])
         out.extend(" " * visible_len(mark) + p for p in pieces[1:])
-    elif kind == "say":
-        bar = s(g("bar") + " ", "accent")
-        for part in entry.text.strip("\n").split("\n"):
-            out.extend(bar + piece for piece in wrap(part, width - 2))
     elif kind == "note":
         for part in entry.text.split("\n"):
             out.extend(s(piece, "dim") for piece in wrap(part, width))
@@ -280,12 +338,14 @@ def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
             out.append(s(g("fail") + " ", "red") + s(pieces[0], "red"))
             out.extend("  " + s(p, "red") for p in pieces[1:])
     else:
+        # Pulse's own output (a diff, a note from the pipeline): quieter than the agent's
+        # words, unless the line brought its own colours
         for part in entry.text.strip("\n").split("\n"):
-            # a wrapped line keeps the indentation it started with (lists, code, diffs)
             bare = _SGR_RE.sub("", part)
             lead = min(len(bare) - len(bare.lstrip(" ")), width // 2)
             pieces = wrap(part, width, indent=" " * lead)
-            out.extend(s(piece, "dim") if entry.live else piece for piece in pieces)
+            coloured = "\033[" in part
+            out.extend(piece if coloured and not entry.live else s(piece, "dim") for piece in pieces)
     entry._cache = {key: out}       # one frame size at a time is all that is ever asked for
     return out
 
@@ -397,6 +457,11 @@ class View:
         self.status = ""                        # one transient line in the footer
         self.commands: List[Tuple[str, str]] = []   # (command, what it does), for hints
         self.frame = 0
+        self.row_entries: Dict[int, Entry] = {}    # screen row -> the entry drawn there (for clicks)
+        self.transcript_x = 1                      # column the transcript starts at
+        self.first_row = 2                         # screen row of the transcript's first line
+        self.room = 0                              # transcript rows on screen
+        self.pane_w = 0                            # columns the transcript was wrapped to
 
 
 SPLIT_MIN_WIDTH = 84
@@ -407,9 +472,21 @@ def side_width(width: int) -> int:
     return min(46, max(32, width * 36 // 100))
 
 
+def pane_width(width: int, split: bool) -> int:
+    """The columns the transcript gets: after the run pane, a space, the bar and a space
+    when split, else after the left margin; one column of right margin either way."""
+    return width - (side_width(width) + 4 if split else 1) - 1
+
+
 def transcript_lines(view: View, width: int, only_last: bool = False) -> List[str]:
-    """The transcript as screen lines. With `only_last`, just the latest exchange: from the
-    last thing the person typed onward (everything before it is reached by scrolling)."""
+    return transcript_rows(view, width, only_last)[0]
+
+
+def transcript_rows(view: View, width: int, only_last: bool = False) -> Tuple[List[str], List[Optional[Entry]]]:
+    """The transcript as screen lines, and for each line the entry it belongs to (None for
+    the air between entries and the live line). With `only_last`, just the latest exchange:
+    from the last thing the person typed onward (everything before it is reached by
+    scrolling)."""
     entries = view.entries
     if only_last:
         for index in range(len(entries) - 1, -1, -1):
@@ -417,6 +494,7 @@ def transcript_lines(view: View, width: int, only_last: bool = False) -> List[st
                 entries = entries[index:]
                 break
     lines: List[str] = []
+    owners: List[Optional[Entry]] = []
     previous = None
     for entry in entries:
         block = entry_lines(entry, width, view.expanded)
@@ -426,18 +504,45 @@ def transcript_lines(view: View, width: int, only_last: bool = False) -> List[st
         if previous is not None and (entry.kind == "user" or previous == "user"
                                      or (entry.kind != previous and "tool" not in (entry.kind, previous))):
             lines.append("")
+            owners.append(None)
         lines.extend(block)
+        owners.extend([entry] * len(block))
         previous = entry.kind
     if view.partial:
-        lines.extend(wrap(view.partial, width))
+        extra = wrap(view.partial, width)
+        lines.extend(extra)
+        owners.extend([None] * len(extra))
     if view.live:
         spin = _SPIN[view.frame % len(_SPIN)] if _ui._unicode() else "/-\\|"[view.frame % 4]
         took = _ui.elapsed_text(max(0.0, time.monotonic() - view.live_since)) if view.live_since else ""
         if lines and lines[-1] != "":
             lines.append("")
+            owners.append(None)
         lines.append(s(spin + " ", "accent") + s(view.live + "…", "bold")
                      + s(f"  {took} · ctrl+c to cancel" if took else "", "dim"))
-    return lines
+        owners.append(None)
+    return lines, owners
+
+
+def keep_in_place(view: View, entry: Entry, at_row: int) -> None:
+    """After an entry was opened or shut by a click, scroll so its first line is still on
+    the screen row it was clicked on -- the view does not jump to the bottom. Works from
+    the layout of the last compose (the same width, so the same wrapping)."""
+    width = view.pane_w or 80
+    for only_last in ((True, False) if view.only_last else (False,)):
+        lines, owners = transcript_rows(view, width, only_last=only_last)
+        if entry not in owners:
+            continue
+        index = owners.index(entry)
+        start = index - (at_row - view.first_row)
+        scroll = max(0, len(lines) - (start + view.room))
+        if scroll == 0 and only_last:
+            view.scroll = 0
+            return
+        if not only_last:
+            view.scroll = scroll
+            return
+    view.scroll = max(0, view.scroll)
 
 
 def _hints(view: View) -> List[Tuple[str, str]]:
@@ -486,7 +591,7 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
     left_w = side_width(width) if split else 0
     # the right column starts after the pane (left_w + 1), a space, the bar and a space
     right_x = left_w + 4 if split else 1
-    right_w = width - right_x - 1
+    right_w = pane_width(width, split)
 
     # ---- the input block, built bottom-up
     block: List[str] = []
@@ -518,8 +623,8 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
         footer = f"{g('up')}{g('down')} move · Enter select · type to filter · Esc cancel"
     else:
         if view.question:
-            block.extend(s(piece, "bold") for piece in wrap(view.question, right_w)[:4])
-        for command, what in _hints(view):
+            block.extend(s(piece, "bold") for piece in wrap(view.question, right_w)[:3])
+        for command, what in _hints(view)[:4]:
             block.append(_ui._clip(s(command.ljust(14), "accent") + s(what, "dim"), right_w))
         field, cursor_col = _field(s(g("cursor") + " ", "accent", "bold"), view.editor.text, view.editor.pos,
                                    right_w, view.secret)
@@ -527,9 +632,9 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
         if view.question:
             footer = "Enter answer · Esc cancel"
         elif view.busy:
-            footer = "working · Ctrl+C cancel · Ctrl+O details · ↑↓ scroll"
+            footer = "working · Ctrl+C cancel · click or Ctrl+O to expand · ↑↓ scroll"
         else:
-            footer = "Enter send · / commands · Ctrl+O details · ↑↓ scroll" + (
+            footer = "Enter send · / commands · click or Ctrl+O to expand · ↑↓ scroll" + (
                 " · Esc back to the agent" if view.side is not None else "")
     if view.status:
         footer = view.status
@@ -543,14 +648,20 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
 
     # ---- the transcript above it
     room = body_h - len(strip) - len(block) - 1          # -1: the rule over the input
-    lines = transcript_lines(view, right_w, only_last=view.only_last and view.scroll == 0)
+    lines, owners = transcript_rows(view, right_w, only_last=view.only_last and view.scroll == 0)
     if view.scroll:
-        lines = transcript_lines(view, right_w)           # scrolled: the whole conversation
+        lines, owners = transcript_rows(view, right_w)    # scrolled: the whole conversation
     limit = max(0, len(lines) - room)
     view.scroll = max(0, min(view.scroll, limit))
     end = len(lines) - view.scroll
-    visible = lines[max(0, end - room):end]
-    visible = [""] * (room - len(visible)) + visible if len(lines) >= room else visible + [""] * (room - len(visible))
+    start = max(0, end - room)
+    visible = lines[start:end]
+    shown_owners = owners[start:end]
+    top_pad = room - len(visible) if len(lines) >= room else 0
+    visible = [""] * top_pad + visible if len(lines) >= room else visible + [""] * (room - len(visible))
+    first_row = 2 + len(strip)
+    view.first_row, view.room, view.pane_w = first_row, room, right_w
+    view.row_entries = {first_row + top_pad + i: owner for i, owner in enumerate(shown_owners) if owner is not None}
     right = visible + [s(g("rule") * right_w, "dim")] + block
 
     # ---- put the columns together
@@ -565,6 +676,7 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
         for i in range(body_h - len(strip)):
             frame.append(" " + pad(right[i] if i < len(right) else "", right_w))
     frame = frame[:height]
+    view.transcript_x = right_x
     cursor_row = 2 + len(strip) + room + 1 + field_row_in_block
     return frame, min(cursor_row, height - 1), right_x + cursor_col
 
@@ -682,15 +794,16 @@ class Screen:
     def __enter__(self) -> "Screen":
         if not self._console.enter(output=True, keys=False):
             raise _ui.Unavailable("this console cannot show escape sequences")
-        # alternate screen, cursor home, bracketed paste on, and the cursor as an orange bar
-        # (Pulse's accent) -- terminals that cannot recolour it keep their own
-        self.write("\033[?1049h\033[H\033[2J\033[?2004h\033]12;#ff8700\007\033[5 q")
+        # alternate screen, cursor home, bracketed paste on, mouse clicks and wheel reported
+        # (SGR encoding), and the cursor as an orange bar (Pulse's accent) -- terminals that
+        # cannot recolour it keep their own
+        self.write("\033[?1049h\033[H\033[2J\033[?2004h\033[?1000h\033[?1006h\033]12;#ff8700\007\033[5 q")
         self._active = True
         return self
 
     def __exit__(self, *exc: Any) -> None:
         if self._active:
-            self.write("\033[?2004l\033[0m\033[?25h\033]112\007\033[0 q\033[?1049l")
+            self.write("\033[?1006l\033[?1000l\033[?2004l\033[0m\033[?25h\033]112\007\033[0 q\033[?1049l")
             self._active = False
         self._console.exit()
 
@@ -721,6 +834,17 @@ _CTRL_KEYS = {
     "\x15": "ctrl+u", "\x17": "ctrl+w", "\x04": "ctrl+d", "\x03": "ctrl+c", "\x12": "ctrl+r",
 }
 _PASTE_START, _PASTE_END = "\033[200~", "\033[201~"
+_MOUSE_RE = re.compile(r"\033\[<(\d+);(\d+);(\d+)([Mm])")
+
+
+def _mouse_key(button: int, x: int, y: int, release: bool) -> Optional[str]:
+    """SGR mouse report -> a key name: a click (on release, so a drag selects text), or the
+    wheel. x and y are 1-based from the terminal."""
+    if button & 64:
+        return "wheel:up" if button & 3 == 0 else "wheel:down"
+    if release and button & 3 == 0:
+        return f"click:{x - 1}:{y - 1}"
+    return None
 
 
 def parse_keys(data: str) -> Tuple[List[str], str]:
@@ -741,6 +865,15 @@ def parse_keys(data: str) -> Tuple[List[str], str]:
             if i + 1 >= len(data):
                 return keys, data[i:]            # alone so far: Esc, or the start of a sequence
             nxt = data[i + 1]
+            mouse = _MOUSE_RE.match(data, i) if nxt == "[" else None
+            if mouse:
+                name = _mouse_key(int(mouse.group(1)), int(mouse.group(2)), int(mouse.group(3)), mouse.group(4) == "m")
+                if name:
+                    keys.append(name)
+                i = mouse.end()
+                continue
+            if nxt == "[" and data.startswith("\033[<", i):
+                return keys, data[i:]            # a mouse report still arriving
             if nxt in "[O":
                 j = i + 2
                 while j < len(data) and not (data[j].isalpha() or data[j] == "~"):

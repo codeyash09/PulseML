@@ -521,11 +521,13 @@ Type `pulse` in a terminal and Pulse opens as one full-screen app:
 4. **Debugging is a split screen.** The run is on the left: status, step and speed, every
    tracked value with its curve, the detectors' findings, tensors, and when the agent will
    next audit the run. The agent is on the right, and what you ask it goes with the run's
-   evidence. Its reasoning streams in as the model thinks; afterwards it and every tool
-   call sit in the transcript folded to a line each, and **Ctrl+O** unfolds them. The
-   agent can also talk to you while it works -- a
-   message beside its tool calls, shown with a bar down its side -- so you see what it
-   found and what it is about to check without waiting for the end of its turn. A fix is a diff you confirm; `/restart` then stops the
+   evidence. Its reasoning streams in as the model thinks, then folds to `Thought for 4s`;
+   every tool call folds to a line that says what was done -- `Ran pytest -q`, `Read
+   train.py:40-80`, `Searched for lr` -- and a click on it, or **Ctrl+O**, opens the
+   output in place. What the agent says to you is plain text; the run's own output is
+   dim. The agent can also talk to you while it works -- a message beside its tool calls
+   -- so you see what it found and what it is about to check without waiting for the end
+   of its turn. A fix is a diff you confirm; `/restart` then stops the
    run and starts it again with the change (for runs started with `/run`).
 
 | Key | What it does |
@@ -533,6 +535,7 @@ Type `pulse` in a terminal and Pulse opens as one full-screen app:
 | Enter | send the request, or answer a question Pulse asked |
 | `/` | commands; typing shows the ones that match, Tab completes |
 | Ctrl+O | fold / unfold the agent's thinking and tool output |
+| mouse | a click on a folded line opens it where it is (and shuts it again); the wheel scrolls. The app reads the mouse, so hold Shift to select text |
 | ↑ / ↓ (empty line) | scroll back through the conversation; the screen otherwise shows the latest exchange |
 | Ctrl+C | cancel what is running; twice at an empty prompt leaves |
 | Esc | leave the open run in the background and go back to the agent; Esc again brings it back |

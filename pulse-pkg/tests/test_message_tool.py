@@ -76,7 +76,7 @@ def test_inside_the_app_a_message_is_its_own_entry(cli):
         app.uninstall()
     assert [e.kind for e in app.view.entries] == ["say"]
     lines = [PLAIN.sub("", line) for line in tui.entry_lines(app.view.entries[0], 40, False)]
-    assert lines == ["│ Checking lr now"]
+    assert lines == ["Checking lr now"]
 
 
 # ---- the debugger's directive -------------------------------------------------------------
@@ -293,7 +293,7 @@ def test_reasoning_streams_into_a_live_thinking_entry(cli, monkeypatch):
 def test_a_live_thinking_entry_shows_its_last_lines_while_folded():
     entry = tui.Entry("thinking", "one\ntwo\nthree\nfour\nfive\nsix", live=True)
     lines = [PLAIN.sub("", line) for line in tui.entry_lines(entry, 40, False)]
-    assert lines[0].startswith("✻ Thinking") and lines[1:] == ["  three", "  four", "  five", "  six"]
+    assert lines[0] == "Thinking…" and lines[1:] == ["  five", "  six"]
     entry.live = False
     entry.touch()
     assert len(tui.entry_lines(entry, 40, False)) == 1
