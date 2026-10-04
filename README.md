@@ -35,7 +35,7 @@ python -c "import pulse; print('Pulse installed successfully')"
 Use 
 
 ```bash
-pulse
+python3 -m pulse
 ```
 
 which will take you to the Pulse setup page
