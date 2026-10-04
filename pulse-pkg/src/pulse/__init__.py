@@ -12,7 +12,7 @@ only imported when auto_track() actually starts a session.
 import sys
 
 __version__ = "0.1.2"
-__all__ = ["auto_track", "shutdown"]
+__all__ = ["auto_track", "shutdown", "check_shape", "check_shapes"]
 
 
 def _in_multiprocessing_bootstrap(caller=None):
@@ -55,3 +55,22 @@ def shutdown():
     if core is None:
         return None
     return core.shutdown()
+
+
+def check_shape(value, expected=None, name=None, **kwargs):
+    """Describe a value's shape and, optionally, check it against an expectation.
+
+        pulse.check_shape(logits, "(B, 10)")                      # a name like B is any size, but one size
+        pulse.check_shape(x, "(B, 3, 224, 224)", raise_on_mismatch=True)
+
+    Returns a report (truthy when the shape matches; print it for the details). See
+    pulse.pulse_shapes.check_shape."""
+    from .pulse_shapes import check_shape as _check_shape
+    return _check_shape(value, expected, name, **kwargs)
+
+
+def check_shapes(checks, **kwargs):
+    """check_shapes({"x": (x, "(B, 784)"), "y": (y, "(B,)")}): every spec is checked against one
+    shared symbol table, so each B must be the same size. See pulse.pulse_shapes.check_shapes."""
+    from .pulse_shapes import check_shapes as _check_shapes
+    return _check_shapes(checks, **kwargs)
