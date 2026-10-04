@@ -7,13 +7,17 @@ seconds to minutes, so three quick retries all land inside the same window and f
 what happened next depended on which call in the pipeline happened to be the one that got the
 429. This module is the single answer instead:
 
-  * a rate limit is waited out, not retried a fixed number of times: the provider's own
-    Retry-After (header, or "retry in 34s" in the message) when it gives one, otherwise an
-    exponential wait with jitter;
-  * waiting is bounded by a total budget per request (PULSE_RATE_LIMIT_WAIT seconds, default
-    10 minutes; 0 means fail straight away), so nothing waits forever;
-  * a 429 that can never clear by waiting (out of credit, billing, exhausted quota) is not
-    waited on at all -- it is reported as what it is;
+  * a rate limit is waited out, not retried a fixed number of times. When the provider gives a
+    timer (a Retry-After header, or "retry in 34s" in the message) Pulse waits that long, in
+    full, whatever the budget below says -- the provider knows when its limit lifts and Pulse
+    does not. Without a timer it backs off exponentially with jitter;
+  * Pulse's own guessing is bounded by a budget per request (PULSE_RATE_LIMIT_WAIT seconds,
+    default 10 minutes; 0 means never wait). Provider timers are bounded only by a generous
+    ceiling (an hour of them in total), so a provider that keeps saying "retry in 30s" forever,
+    or asks for an hours-long reset, ends up parked and retried later instead of blocking;
+  * a 429 that plainly means "no credit" (and carries no retry hint) is not waited on at all --
+    it is reported as what it is. Quota-style limits that clear (per-minute, per-day) are
+    waited out like any other rate limit;
   * the wait is announced once, not once per second, and can be cut short.
 
 Deliberately stdlib-only: it is imported by modules that must stay cheap to import.
@@ -28,15 +32,20 @@ from typing import Any, Callable, Optional
 DEFAULT_MAX_WAIT_SECONDS = 600.0     # total time one request will spend waiting out rate limits
 BASE_WAIT_SECONDS = 5.0              # first wait when the provider gives no hint
 MAX_STEP_SECONDS = 60.0              # longest single wait chosen by us (a provider hint may exceed it)
+MAX_HINT_TOTAL_SECONDS = 3600.0      # most one request will spend waiting on timers the PROVIDER gave
 _SLICE_SECONDS = 0.5                 # granularity at which a wait notices it was cancelled
 
 _ENV_MAX_WAIT = "PULSE_RATE_LIMIT_WAIT"
 
-# A 429 with one of these in it is not "too many requests right now": the account itself
-# is out of something, and no amount of waiting changes that.
+# Wording that only ever means "this account has no credit": waiting cannot change it.
+# Deliberately narrow. "Quota" is NOT here: providers use it for limits that clear on their own
+# (Gemini's per-minute free tier says "You exceeded your current quota, please check your plan and
+# billing details" and, in the same message, "retry in 34s"), and so do per-day and per-minute
+# token quotas. When in doubt a limit is waited out -- the wait is bounded, and a request that is
+# still limited afterwards is parked and retried later, so being wrong costs minutes, not the run.
 _HARD_LIMIT_RE = re.compile(
-    r"insufficient[_ ]quota|exceeded your current quota|out of credits?|insufficient credits?"
-    r"|credit balance|billing|payment required|add (?:more )?credits|quota exceeded.{0,40}plan",
+    r"insufficient[_ ]quota|out of credits?|insufficient credits?|credit balance (?:is )?too low"
+    r"|payment required|add (?:more )?credits",
     re.IGNORECASE)
 
 _RATE_LIMIT_TEXT_RE = re.compile(
@@ -88,7 +97,12 @@ def is_rate_limited(exc: BaseException, rate_limit_class: Optional[type] = None)
 
 
 def is_hard_limit(exc: BaseException) -> bool:
-    """A rate-limit-shaped error that waiting cannot fix (no credit, quota gone for the plan)."""
+    """A rate-limit-shaped error that waiting cannot fix: the account has no credit.
+
+    Never true when the provider says when to retry (a Retry-After header, "retry in 34s"):
+    it is telling us the limit clears, whatever it calls it."""
+    if retry_after_seconds(exc) is not None:
+        return False
     return bool(_HARD_LIMIT_RE.search(str(exc) or ""))
 
 
@@ -149,6 +163,7 @@ class RateLimitWaiter:
         self.budget = max_wait_seconds() if budget is None else max(0.0, float(budget))
         self.waited = 0.0
         self.hits = 0
+        self.last_hint: Optional[float] = None       # the provider's timer behind the latest delay
 
     @property
     def remaining(self) -> float:
@@ -156,17 +171,25 @@ class RateLimitWaiter:
 
     def next_delay(self, exc: BaseException) -> Optional[float]:
         """Seconds to wait before retrying after `exc`, or None when this request should stop
-        waiting (the budget is spent, or the provider asked for longer than what is left)."""
+        waiting.
+
+        A timer the provider gave is honoured in full, even past the budget: the budget limits
+        how long Pulse guesses, not how long it takes the provider to lift its limit. It stops
+        only when waiting was switched off (budget 0) or the provider's timers have already
+        added up to MAX_HINT_TOTAL_SECONDS."""
         self.hits += 1
         hint = retry_after_seconds(exc)
+        self.last_hint = hint
         if hint is not None:
-            delay = hint + 0.5 + random.uniform(0.0, 1.0)          # just past the provider's own mark
-        else:
-            delay = min(MAX_STEP_SECONDS, BASE_WAIT_SECONDS * (2 ** (self.hits - 1)))
-            delay *= random.uniform(1.0, 1.25)                     # de-synchronise parallel callers
-        if delay > self.remaining:
-            return None
-        return delay
+            if self.budget <= 0:
+                return None                                         # waiting was switched off
+            delay = hint + 0.5 + random.uniform(0.0, 0.5)           # just past the provider's own mark
+            if self.waited + delay > max(self.budget, MAX_HINT_TOTAL_SECONDS):
+                return None
+            return delay
+        delay = min(MAX_STEP_SECONDS, BASE_WAIT_SECONDS * (2 ** (self.hits - 1)))
+        delay *= random.uniform(1.0, 1.25)                          # de-synchronise parallel callers
+        return delay if delay <= self.remaining else None
 
     def wait(self, delay: float, should_stop: Optional[Callable[[], bool]] = None) -> bool:
         """Sleep `delay` seconds in short slices. False if `should_stop()` ended the wait early.
@@ -185,7 +208,10 @@ class RateLimitWaiter:
 
 
 def describe_wait(delay: float, waiter: RateLimitWaiter) -> str:
-    """The one line printed when a wait starts -- says how long, and for how long it will keep trying."""
+    """The one line printed when a wait starts -- says how long, and why."""
+    if waiter.last_hint is not None:
+        return (f"rate limited by the provider -- it asked to retry in {waiter.last_hint:.0f}s; "
+                f"waiting {delay:.0f}s")
     left = int(round(waiter.remaining - delay))
     more = f"; will keep trying for up to {left}s more" if left > 0 else "; this is the last try"
     return f"rate limited by the provider -- waiting {delay:.0f}s before retrying{more}"

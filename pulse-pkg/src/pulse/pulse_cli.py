@@ -8373,8 +8373,8 @@ class PulseCLI:
         if _ratelimit.is_hard_limit(exc):
             _agent_log_event("AGENT REQUEST FAILED", f"{label}: out of quota/credit -- not waiting")
             raise AgentRequestFailed(
-                "the provider refused the request because the account is out of quota or credit "
-                "-- waiting will not fix that (check the plan/billing, or switch model with /agent)",
+                "the provider refused the request because the account is out of credit "
+                "-- waiting will not fix that (add credit, or switch model with /agent)",
                 transient=False) from exc
         delay = waiter.next_delay(exc)
         if delay is None:

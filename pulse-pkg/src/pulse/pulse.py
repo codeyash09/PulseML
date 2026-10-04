@@ -4747,8 +4747,8 @@ def _chat_panel_class():
                     if _ratelimit.is_rate_limited(exc, getattr(litellm, "RateLimitError", None)):
                         if _ratelimit.is_hard_limit(exc):
                             raise AgentRequestFailed(
-                                "the provider refused the request because the account is out of quota "
-                                "or credit -- waiting will not fix that (check the plan/billing)") from exc
+                                "the provider refused the request because the account is out of credit "
+                                "-- waiting will not fix that (add credit, or switch model)") from exc
                         delay = waiter.next_delay(exc)
                         if delay is None:
                             raise AgentRequestFailed(
