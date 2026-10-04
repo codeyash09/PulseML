@@ -38,6 +38,16 @@ Use
 python3 -m pulse
 ```
 
+or 
+
+```bash
+export PATH="$PATH:$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))')"
+pulse
+```
+
+```bash
+
+
 which will take you to the Pulse setup page
 
 ### AI provider configuration
