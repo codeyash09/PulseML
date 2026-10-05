@@ -546,7 +546,7 @@ Type `pulse` in a terminal and Pulse opens as one full-screen app:
    output in place. A change to your files is one line too, `Edited train.py · +3 −1`,
    with what became of it (reviewed, applied, declined) on the same line and the diff
    under it when opened. Three things are told apart at a glance: a command the agent ran
-   (a tool call, an edit) sits in an orange box, its thinking in a grey box, and what
+   (a tool call, an edit) is highlighted in light orange, its thinking in light grey, and what
    Pulse itself says -- the run's output, a note from a pipeline -- is plain grey text.
    What the agent says to you is plain text. One colour: Pulse's orange marks what is
    live, selected or worth a look (a finding, an added line), red marks what is wrong,

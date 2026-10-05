@@ -1146,9 +1146,9 @@ def test_the_agents_words_and_its_thinking_look_different(monkeypatch):
     think = tui.entry_lines(tui.Entry("thinking", "maybe lr"), 40, True)
     assert say == ["The lr is 0.3."]                                   # the agent's words: plain
     assert PLAIN.sub("", think[0]).startswith(" Thought") and "\033[3m" in think[0]   # thinking: a grey box, italic
-    assert "\033[48;5;237" in think[0]
+    assert "\033[48;5;250" in think[0]
     tool = tui.entry_lines(tui.Entry("tool", calls=["GREP: lr"], output=""), 40, False)
-    assert "\033[48;5;130" in tool[0]                                  # a command: an orange box
+    assert "\033[48;5;215" in tool[0]                                  # a command: a light orange box
     note = tui.entry_lines(tui.Entry("text", "[Pulse Code] applied"), 40, False)
     assert "\033[2m" in note[0]                                        # Pulse's own output: quiet
 
@@ -1269,7 +1269,7 @@ def test_machinery_lines_stack_and_paragraphs_breathe(app):
                         tui.Entry("note", "Verified"), tui.Entry("thinking", "c d"), tui.Entry("say", "Done")]
     lines = [plain(l) for l in tui.transcript_lines(app.view, 80)]
     assert lines == ["❯ q", "", " Thought (2 words) ", "", "Plan", " Edited t.py   · +1 −0", " Ran ls   · 1 line", "Verified",
-                     " Thought (2 words) ", "", "Done"]
+                     "", " Thought (2 words) ", "", "Done"]          # a thought opens a new step: air before it
 
 
 # ---------------------------------------------------------------- auto_track() opens the app

@@ -547,9 +547,11 @@ def transcript_rows(view: View, width: int, only_last: bool = False) -> Tuple[Li
         block = entry_lines(entry, width, view.expanded)
         if not block:
             continue
-        # air before a paragraph and around what the person typed; the one-line machinery
-        # (thinking, tool calls, edits, notes) stacks without any
-        if previous is not None and (entry.kind == "user" or previous == "user" or entry.kind not in _QUIET_KINDS):
+        # air before a paragraph, around what the person typed, and before a thought -- a
+        # thought starts a step of the agent's work (think, say, do); the one-line machinery
+        # under it (tool calls, edits, notes) stacks without any
+        if previous is not None and (entry.kind == "user" or previous == "user" or entry.kind not in _QUIET_KINDS
+                                     or entry.kind == "thinking"):
             lines.append("")
             owners.append(None)
         lines.extend(block)
