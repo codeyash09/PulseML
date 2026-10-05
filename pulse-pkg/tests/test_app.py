@@ -1313,8 +1313,9 @@ def test_auto_track_opens_the_app_beside_the_script(tmp_path, monkeypatch, capsy
     assert app_ is not None and app_.hosting is monitor
     assert os.getcwd() == cwd                                  # the script's working directory is its own
     assert app_.up.is_set() and ui.host() is app_              # the script goes on with its output captured
-    print("step 0  loss 1.0")                                  # what the script prints lands in the transcript
-    assert wait_for(lambda: "step 0  loss 1.0" in text_of(app_))
+    print("step 0  loss 1.0")                                  # what the script prints goes to the run pane
+    assert wait_for(lambda: "step 0  loss 1.0" in app_.run_output)
+    assert "step 0" not in text_of(app_)
     assert "train.py is running here" in text_of(app_)
 
     # the script ends: the run is marked finished, the app stays until the person leaves
@@ -1399,3 +1400,33 @@ def test_the_native_loop_keeps_its_words_with_the_first_call(app):
     agent._show("read_file", {"path": "train.py"}, "...", state)
     first, second = app.view.entries[-2:]
     assert first.text == "Let me look at the scheduler." and second.text == "" and state.said == ""
+
+
+# ---------------------------------------------------------------- the hosted run's output
+
+def test_the_hosted_runs_output_goes_under_its_figures_not_into_the_conversation(app, monkeypatch):
+    app.hosting = types.SimpleNamespace(session_id="s1")
+    app.session = {"session_id": "s1", "directory": ""}
+    app.console = types.SimpleNamespace(snapshot=lambda: {"step": 3, "histories": {}, "findings": [], "finished": False},
+                                        brain=types.SimpleNamespace(events=[]), workdir="/x")
+    app.feed("step 0  loss 1.0\nstep 10  loss 0.9\nstep 20")          # the script, on the main thread
+    assert list(app.run_output) == ["step 0  loss 1.0", "step 10  loss 0.9"] and app._run_partial == "step 20"
+    assert app.view.entries == []
+
+    def pulse_speaks():
+        app.feed("[Pulse] a finding\n")                               # Pulse's own threads: the conversation
+    worker = threading.Thread(target=pulse_speaks, name="pulse-app-job")
+    worker.start(); worker.join()
+    assert [e.text for e in app.view.entries] == ["[Pulse] a finding"]
+
+    monkeypatch.setattr(appmod, "side_lines", lambda *a, **k: ["train.py  ● live", "step 3", "", "Agent", "audits off"])
+    app._height, app._total_w = 16, 120
+    app._refresh_side(force=True)
+    side = [plain(l) for l in app.view.side]
+    assert side[5:] == ["", "Output", "step 0  loss 1.0", "step 10  loss 0.9", "step 20"]
+    for i in range(30):
+        app.feed(f"step {30 + i}\n")
+    app._side_at = 0
+    app._refresh_side(force=True)
+    side = [plain(l) for l in app.view.side]
+    assert side[6] == "Output" and len(side) == 16 - 2 and side[-1] == "step 59"   # as many lines as the pane has room for

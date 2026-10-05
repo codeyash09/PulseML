@@ -58,8 +58,8 @@ which will take you to the Pulse setup page
 Or put Pulse in the script itself -- `from pulse import auto_track; auto_track()` before
 the training loop -- and run the script as you always do. In a terminal, Pulse opens as
 the same full-screen app on that very run (see [The Pulse app](#the-pulse-app)): the
-run's state on the left, the agent on the right, your script's own output in the
-transcript, and the script goes on exactly as it would have. Leaving the app (Ctrl+C
+run's state on the left with your script's own output under it, the agent on the right,
+and the script goes on exactly as it would have. Leaving the app (Ctrl+C
 twice) gives you the terminal back while the training continues; when the script ends,
 the app stays until you leave it. Without a terminal (a notebook, `nohup`, a log file)
 Pulse keeps its line-by-line mode, and `auto_track(mode="cli")` or `PULSE_MODE=cli` asks
@@ -586,7 +586,7 @@ change you asked for gets made -- instead of being read as a bug report to diagn
 `pulse watch <run>`, `pulse <script.py>` and `pulse attach --pid N` open the same app
 directly on that run, and so does a script that calls `auto_track()` when it is run in a
 terminal: the app opens beside the training, in the same terminal, with the script's own
-output in the transcript (`mode="app"`, the default there; the agent is the one used last
+output under the run's figures in the left pane (`mode="app"`, the default there; the agent is the one used last
 time if its key is in the environment, else `/agent`). On Windows it needs a console that
 understands escape sequences (Windows Terminal, or the console of Windows 10 and later).
 Without a real terminal (a pipe, CI), on a very small one, or with `PULSE_CLASSIC=1`,

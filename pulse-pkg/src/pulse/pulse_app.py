@@ -31,6 +31,7 @@ question waiting for its answer -- runs on a job thread.
 from __future__ import annotations
 
 import builtins
+import collections
 import contextlib
 import ctypes
 import getpass
@@ -339,6 +340,8 @@ class App:
         self._pane_w = 80
         self._edit_pending: Optional[tui.Entry] = None   # the change whose fate is still being decided
         self.hosting: Any = None                  # the in-process run's monitor, under auto_track()
+        self.run_output: "collections.deque[str]" = collections.deque(maxlen=400)   # what that run printed
+        self._run_partial = ""
         self.up = threading.Event()               # set once the screen is up and output is captured
         self._height = 30
         self._question: Optional[_Question] = None
@@ -412,6 +415,18 @@ class App:
             held = self._hushed.get(threading.get_ident())
             if held is not None:
                 held.append(text)
+                return
+            if self.hosting is not None and not threading.current_thread().name.startswith("pulse-"):
+                # the run's own output (the script's threads, under auto_track()): it goes
+                # under the run's figures in the pane, not into the conversation
+                pieces = (self._run_partial + tui.clean(text)).split("\n")
+                for line in pieces[:-1]:
+                    line = tui._SGR_RE.sub("", line.rsplit("\r", 1)[-1]).rstrip()
+                    if line.strip():
+                        self.run_output.append(line)
+                rest = pieces[-1]
+                self._run_partial = rest.rsplit("\r", 1)[-1] if "\r" in rest else rest
+                self.dirty = True
                 return
             pieces = (self._partial + tui.clean(text)).split("\n")
             for line in pieces[:-1]:
@@ -1381,8 +1396,24 @@ class App:
                 self._rate = delta if self._rate is None else 0.7 * self._rate + 0.3 * delta
         self._rate_at = (now, step)
         width = tui.side_width(self._total_w) - 1 if self._total_w >= tui.SPLIT_MIN_WIDTH else self._total_w - 2
-        self.view.side = side_lines(state, session, self._status, console, self._rate, width,
-                                    self.launched.get(session.get("session_id", "")))
+        side = side_lines(state, session, self._status, console, self._rate, width)
+        # the run's output under its figures, in whatever room the pane has left
+        room = self._height - 2 - len(side) - 2
+        if room >= 2:
+            launched = self.launched.get(session.get("session_id", ""))
+            if self.hosting is not None and session.get("session_id") == getattr(self.hosting, "session_id", None):
+                tail = list(self.run_output)[-room:]
+                if self._run_partial.strip() and len(tail) < room:
+                    tail.append(self._run_partial)
+            elif launched is not None:
+                tail = _tail(launched["log"], room)
+            else:
+                tail = []
+            if tail:
+                side.append("")
+                side.append(_ui._s("Output", "bold"))
+                side.extend(_ui._s(_ui._clip(row, width), "dim") for row in tail)
+        self.view.side = side
         self.view.side_brief = side_brief(state, session, self._status, self._rate, self._total_w - 2)
         self.dirty = True
 
@@ -1509,7 +1540,8 @@ def side_brief(state: Dict[str, Any], session: Dict[str, Any], status: str,
 def side_lines(state: Dict[str, Any], session: Dict[str, Any], status: str, console: Any,
                rate: Optional[float], width: int, launched: Optional[Dict[str, Any]] = None) -> List[str]:
     """The run pane: what the run is, where it is, every value with its curve, what the
-    detectors believe. Pure: everything it shows is in its arguments."""
+    detectors believe. Pure: everything it shows is in its arguments. (The run's output
+    goes under this, sized to the screen -- see App._refresh_side.)"""
     from . import pulse_console as con
     from . import pulse_detect as detect
     s, g = _ui._s, _ui._g
@@ -1588,12 +1620,6 @@ def side_lines(state: Dict[str, Any], session: Dict[str, Any], status: str, cons
         lines.append(s(f"next audit in {minutes} min" if minutes else "audit due", "dim"))
     else:
         lines.append(s("audits off (/audits on)", "dim"))
-    if launched is not None:
-        tail = _tail(launched["log"], 4)
-        if tail:
-            lines.append("")
-            lines.append(s("Output", "bold"))
-            lines.extend(s(_ui._clip(row, width), "dim") for row in tail)
     return lines
 
 
