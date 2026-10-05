@@ -321,14 +321,12 @@ def test_bug_gui_replay_snapshots_taken_in_main_cannot_be_replayed():
     assert "replayed" in answer, answer + " | " + _line(r, "SNAPS")
 
 
-def test_bug_gui_restart_rolls_back_every_later_fix_after_giving_up():
+def test_bug_gui_restart_reports_a_failed_chain_once_and_still_tries_later_fixes():
     """GUI RESTART handler: restart_state['attempts'] is never reset. After the 5th
-    failed restart it rolls the chain back (new in sweep 1) -- but every LATER
-    RESTART (the agent's next fix, for this or another problem) finds attempts == 5,
-    never launches the fixed script, prints 'Giving up' again and calls the
-    rollback again, reverting the brand-new fix untried (the target is still
-    'before the first fix of the old chain'). Correct: one rollback per failed
-    chain; a later fix is at least tried."""
+    failed restart it gives up on the chain -- but every LATER RESTART (the agent's
+    next fix, for this or another problem) used to find attempts == 5, never launch
+    the fixed script, and give up again, so a brand-new fix was never even tried.
+    Correct: one report per failed chain; a later fix is at least tried."""
     code = f"""
     SRC = {SRC!r}
     {_indent(GUI_PRELUDE)}
@@ -341,7 +339,7 @@ def test_bug_gui_restart_rolls_back_every_later_fix_after_giving_up():
             self.stderr = io.StringIO("Traceback: boom\\n")
         def wait(self): return 1
     core.subprocess.Popen = FakePopen
-    core._auto_rollback_after_failed_restarts_gui = lambda path, cid: rollbacks.append(cid) or True
+    core._report_failed_fix_chain_gui = lambda path, cid: rollbacks.append(cid)
     core._load_fix_history = lambda p: [{{"id": "c1"}}]
     core._atomic_write_json = lambda *a, **k: None
 
@@ -364,7 +362,7 @@ def test_bug_gui_restart_rolls_back_every_later_fix_after_giving_up():
     launches = int(_line(r, "LAUNCHES").split()[1])
     rollbacks = int(_line(r, "ROLLBACKS").split()[1])
     assert launches >= 5, (launches, r.stdout[-2000:])
-    assert rollbacks <= 1, f"rolled back {rollbacks} times; later fixes launched {launches - 5} times"
+    assert rollbacks <= 1, f"reported {rollbacks} times; later fixes launched {launches - 5} times"
 
 
 # --- auto_track guards ---------------------------------------------------------

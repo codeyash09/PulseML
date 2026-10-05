@@ -332,7 +332,7 @@ def test_bug_ctrl_c_during_restarted_run_is_treated_as_a_crash_and_relaunched(ma
 
     cli._ask_agent_impl = agent
     cli._confirm_fix_did_its_job = lambda result: (True, "")
-    cli._auto_rollback_after_failed_restarts = lambda commit: False
+    cli._report_failed_fix_chain = lambda commit: None
     try:
         cli._restart_process()
     except (SystemExit, KeyboardInterrupt):
@@ -367,7 +367,7 @@ def test_bug_restart_from_retry_ticker_runs_beside_the_old_training(make_cli, tm
 
     monkeypatch.setattr(pc.subprocess, "run", fake_run)
     cli._ask_agent_impl = lambda q, include_code=False, _depth=0: None
-    cli._auto_rollback_after_failed_restarts = lambda commit: False
+    cli._report_failed_fix_chain = lambda commit: None
     cli._pending_restart_retry = {"next_attempt": 0.0, "backoff": 60.0}
     PulseCLI._ensure_retry_ticker(cli)
     overlapped = False
@@ -654,3 +654,113 @@ def test_ok_strided_counter_from_source_with_a_batch_size_variable(make_cli):
         watch["i"] = i
         cli.update()
     assert 60 <= cli.step - base <= 72, cli.step - base
+
+
+# ---- a failed fix chain is reported, never rolled back -----------------------------------
+
+def _crashing_child(monkeypatch, launches):
+    def fake_run(argv, **kw):
+        launches.append(argv)
+        return subprocess.CompletedProcess(argv, 1, "", "Traceback (most recent call last):\nValueError: boom\n")
+    monkeypatch.setattr(pc.subprocess, "run", fake_run)
+    monkeypatch.setattr(pc, "time", FakeTime(sleep=lambda s: None))
+
+
+def _no_rollback_allowed(cli):
+    def rolled_back(*a, **k):
+        raise AssertionError("the code was rolled back automatically")
+    cli._perform_revert = rolled_back
+
+
+def test_running_out_of_restart_attempts_leaves_the_last_fix_on_disk(make_cli, tmp_path, monkeypatch):
+    cli = _with_agent(make_cli(), tmp_path)
+    _stub_restart_side_effects(cli, monkeypatch)
+    _no_rollback_allowed(cli)
+    launches, reported = [], []
+    _crashing_child(monkeypatch, launches)
+
+    def agent(question, include_code=False, _depth=0):
+        cli._fix_applied_this_turn = True          # a "new fix" every time, and still broken
+
+    cli._ask_agent_impl = agent
+    cli._confirm_fix_did_its_job = lambda result: (True, "")
+    cli._report_failed_fix_chain = lambda commit: reported.append(commit)
+    cli._restart_process()
+    assert len(launches) == 5
+    assert len(reported) == 1
+
+
+def test_the_restart_attempt_cap_can_be_raised_or_lowered(make_cli, tmp_path, monkeypatch):
+    monkeypatch.setenv("PULSE_MAX_RESTART_ATTEMPTS", "2")
+    cli = _with_agent(make_cli(), tmp_path)
+    _stub_restart_side_effects(cli, monkeypatch)
+    _no_rollback_allowed(cli)
+    launches = []
+    _crashing_child(monkeypatch, launches)
+    cli._ask_agent_impl = lambda q, include_code=False, _depth=0: setattr(cli, "_fix_applied_this_turn", True)
+    cli._confirm_fix_did_its_job = lambda result: (True, "")
+    cli._report_failed_fix_chain = lambda commit: None
+    cli._restart_process()
+    assert len(launches) == 2
+
+
+@pytest.mark.parametrize("value,expected", [(None, 5), ("3", 3), ("0", 1), ("-4", 1), ("many", 5), ("", 5)])
+def test_restart_attempt_cap_parsing(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("PULSE_MAX_RESTART_ATTEMPTS", raising=False)
+    else:
+        monkeypatch.setenv("PULSE_MAX_RESTART_ATTEMPTS", value)
+    assert pc._max_restart_attempts() == expected
+
+
+def test_agent_unreachable_during_a_restart_pauses_instead_of_relaunching_the_same_crash(
+        make_cli, tmp_path, monkeypatch):
+    """A rate limit that outlasted its wait says nothing about the fix. The old loop relaunched the
+    identical crashing script for every attempt (a full run each), then rolled everything back."""
+    cli = _with_agent(make_cli(), tmp_path)
+    _stub_restart_side_effects(cli, monkeypatch)
+    _no_rollback_allowed(cli)
+    launches, queued, reported = [], [], []
+    _crashing_child(monkeypatch, launches)
+
+    def agent(question, include_code=False, _depth=0):
+        cli._last_call_failed_transiently = True        # what _ask_agent_impl sets when the agent is unreachable
+
+    cli._ask_agent_impl = agent
+    cli._confirm_fix_did_its_job = lambda result: (True, "")
+    cli._queue_agent_retry = lambda *a, **k: queued.append(a)
+    cli._report_failed_fix_chain = lambda commit: reported.append(commit)
+    cli._restart_process()
+    assert len(launches) == 1, f"the same crashing script was launched {len(launches)} times"
+    assert len(queued) == 1, "the request to repair the crash was not parked for a later retry"
+    assert reported == []
+
+
+def test_the_fixed_file_is_still_the_fixed_file_after_the_attempts_run_out(make_cli, tmp_path, monkeypatch):
+    """End to end with a real fix history: each fix applied and each still crashing. The old loop
+    then restored the script to its state before the first of them."""
+    cli = _with_agent(make_cli(), tmp_path, code="lr = 10.0\n")
+    cli._project_root = cli._repo_cwd = str(tmp_path)
+    cli.extra_files = {}
+    _stub_restart_side_effects(cli, monkeypatch)
+    launches = []
+    _crashing_child(monkeypatch, launches)
+    values = iter(["1.0", "0.5", "0.25", "0.1", "0.05"])
+    # The fix that triggers a restart is committed before the restart runs: that commit is where
+    # the old auto-rollback would have gone back to.
+    cli._apply_code_fix({"old": ["lr = 10.0"], "new": ["lr = 5.0"], "files": [None], "explanation": "first"})
+    current = ["5.0"]
+
+    def agent(question, include_code=False, _depth=0):
+        new = next(values)
+        cli._apply_code_fix({"old": [f"lr = {current[0]}"], "new": [f"lr = {new}"], "files": [None],
+                             "explanation": f"try {new}"})
+        current[0] = new
+        cli._fix_applied_this_turn = True
+
+    cli._ask_agent_impl = agent
+    cli._confirm_fix_did_its_job = lambda result: (True, "")
+    cli._restart_process()
+    assert len(launches) == 5            # the agent gets a turn after each crash but the last: four fixes
+    assert current[0] == "0.1"
+    assert (tmp_path / "train.py").read_text() == "lr = 0.1\n"       # the last fix, not the original "10.0"

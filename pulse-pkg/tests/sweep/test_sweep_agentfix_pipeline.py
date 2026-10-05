@@ -842,13 +842,29 @@ def test_ok_call_model_nonretryable_raises_agent_request_failed(tmp_path, monkey
         cli._call_model("hi")
 
 
-def test_ok_auto_rollback_restores_pre_chain_state(tmp_path):
+def test_ok_failed_fix_chain_is_reported_not_rolled_back(tmp_path, capsys):
+    """When the restart attempts run out, the code stays exactly as the last fix left it, and the
+    report names the commits of the chain and the /revert that undoes them."""
     cli = make_cli(tmp_path, "lr = 10.0\n")
     cli._apply_code_fix({"old": ["lr = 10.0"], "new": ["lr = 0.01"], "files": [None], "explanation": "a"})
-    first = cli._last_commit_id
+    before_chain = cli._last_commit_id
     cli._apply_code_fix({"old": ["lr = 0.01"], "new": ["lr = 0.02"], "files": [None], "explanation": "b"})
-    assert cli._auto_rollback_after_failed_restarts(first) is True
-    assert (tmp_path / "train.py").read_text() == "lr = 10.0\n"
+    chain_start = cli._last_commit_id
+    cli._apply_code_fix({"old": ["lr = 0.02"], "new": ["lr = 0.03"], "files": [None], "explanation": "c"})
+    cli._report_failed_fix_chain(chain_start)
+    assert (tmp_path / "train.py").read_text() == "lr = 0.03\n"          # nothing was touched
+    out = capsys.readouterr().out
+    assert "NOT rolled back" in out
+    assert "2 change(s)" in out
+    assert f"/revert {before_chain}" in out
+
+
+def test_ok_failed_fix_chain_report_without_a_known_start_still_says_how_to_undo(tmp_path, capsys):
+    cli = make_cli(tmp_path, "lr = 10.0\n")
+    cli._apply_code_fix({"old": ["lr = 10.0"], "new": ["lr = 0.01"], "files": [None], "explanation": "a"})
+    cli._report_failed_fix_chain(None)
+    assert (tmp_path / "train.py").read_text() == "lr = 0.01\n"
+    assert "/revert" in capsys.readouterr().out
 
 
 def test_ok_rollback_directive(tmp_path):
@@ -877,3 +893,84 @@ def test_ok_mllint_true_positives(tmp_path):
     assert "learning rate above 1.0" in msgs
     assert "dropout rate of 1.0" in msgs
     assert "regression loss" in msgs
+
+
+# ---- a rate limit mid-pipeline parks the whole request (never half of it) ------------------
+
+def _rate_limited_at(call_number, answers):
+    """_call_model replies: `answers` in order, but call number `call_number` (1-based) is rate limited."""
+    seen = []
+
+    def reply(instruction):
+        seen.append(instruction)
+        if len(seen) == call_number:
+            raise pc.AgentRequestFailed("still rate limited by the provider after waiting 600s", rate_limited=True)
+        return answers[min(len(seen), len(answers)) - 1]
+    return reply, seen
+
+
+def test_ok_rate_limit_during_verification_parks_the_request_instead_of_dropping_the_fix(tmp_path):
+    """Used to be swallowed inside the verification helper: the finished fix was thrown away and, since
+    nothing reached the caller, no retry was ever queued either -- the diagnosis was simply lost."""
+    fix = json.dumps({"old": ["lr = 10.0"], "new": ["lr = 0.01"], "explanation": "lower"})
+    reply, seen = _rate_limited_at(4, ["- train.py:1", "Diagnosis: lr too high.", fix, "unused"])
+    cli = make_cli(tmp_path, "lr = 10.0\n", replies=reply)
+    stub_context(cli)
+    cli._ask_agent_impl("please fix the exploding loss", include_code=True)
+    assert len(seen) == 4                                           # the verification request was the 4th
+    assert (tmp_path / "train.py").read_text() == "lr = 10.0\n"     # nothing half-applied
+    assert cli._fix_applied_this_turn is False
+    assert cli._last_call_failed_transiently is True                # so ask_agent queues it for a retry
+
+
+def test_ok_rate_limit_while_writing_the_fix_parks_the_request(tmp_path):
+    reply, seen = _rate_limited_at(3, ["- train.py:1", "Diagnosis: lr too high.", "unused"])
+    cli = make_cli(tmp_path, "lr = 10.0\n", replies=reply)
+    stub_context(cli)
+    cli._ask_agent_impl("please fix the exploding loss", include_code=True)
+    assert (tmp_path / "train.py").read_text() == "lr = 10.0\n"
+    assert cli._last_call_failed_transiently is True
+
+
+def test_ok_non_transient_verification_failure_still_does_not_apply_the_fix(tmp_path):
+    """Only transient failures are parked; a request the provider rejects outright is unchanged."""
+    fix = json.dumps({"old": ["lr = 10.0"], "new": ["lr = 0.01"], "explanation": "lower"})
+    seen = []
+
+    def reply(instruction):
+        seen.append(instruction)
+        if len(seen) == 4:
+            raise pc.AgentRequestFailed("authentication failed", transient=False)
+        return ["- train.py:1", "Diagnosis: lr too high.", fix][len(seen) - 1]
+
+    cli = make_cli(tmp_path, "lr = 10.0\n", replies=reply)
+    stub_context(cli)
+    cli._ask_agent_impl("please fix the exploding loss", include_code=True)
+    assert (tmp_path / "train.py").read_text() == "lr = 10.0\n"
+    assert cli._last_call_failed_transiently is False
+
+
+def test_ok_rate_limit_while_confirming_a_decline_parks_the_request(tmp_path):
+    """Pass 3 answered in prose that no change is needed, and the one request that asks for the JSON
+    form is rate limited. That used to end the pipeline quietly (nothing queued); now it is parked."""
+    seen = []
+
+    def reply(instr):
+        seen.append(instr)
+        if instr.startswith("PASS 1"):
+            return "- train.py:1"
+        if "PASS 2" in instr:
+            return "Diagnosis: lr = 10.0 diverges."
+        if "DEVELOP & IMPLEMENT" in instr:
+            return "No code change is needed."
+        if "reads as 'no code change needed'" in instr:
+            raise pc.AgentRequestFailed("still rate limited by the provider after waiting 600s",
+                                        rate_limited=True)
+        return "?"
+
+    cli = make_cli(tmp_path, "lr = 10.0\n", replies=reply)
+    stub_context(cli)
+    cli._ask_agent_impl("the loss is NaN, please fix it", include_code=True)
+    assert any("reads as 'no code change needed'" in c for c in seen)    # the confirm request was made
+    assert (tmp_path / "train.py").read_text() == "lr = 10.0\n"
+    assert cli._last_call_failed_transiently is True

@@ -412,7 +412,7 @@ def test_bug_restart_reruns_identical_script_after_clean_exit_with_no_new_fix(
         cli._fix_applied_this_turn = False
 
     cli._ask_agent_impl = agent_changes_nothing
-    cli._auto_rollback_after_failed_restarts = lambda commit: False
+    cli._report_failed_fix_chain = lambda commit: None
     cli._restart_process()
     assert len(runs) == 1, f"the unchanged script was re-run {len(runs)} times"
 
