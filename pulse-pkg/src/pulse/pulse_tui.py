@@ -252,6 +252,7 @@ _CALL_WORDS = {
     "LAYERSTATS": "Checked the layers", "HARDEXAMPLES": "Looked at the hard examples",
     "AMPSTATUS": "Checked mixed precision", "SEEDCHECK": "Checked the seeds", "RANKDIVERGE": "Compared the ranks",
     "RUNCOMPARE": "Compared the runs", "COST": "Checked the cost",
+    "CHECK_SHAPE": "Checked the shapes", "SMOKE_TEST": "Smoke-tested the change",
 }
 
 
