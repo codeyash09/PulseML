@@ -1148,7 +1148,7 @@ def test_the_agents_words_and_its_thinking_look_different(monkeypatch):
     assert PLAIN.sub("", think[0]).startswith("Thought") and "\033[3m" in think[0]   # thinking: orange italic
     assert "\033[38;5;208m" in think[0]
     tool = tui.entry_lines(tui.Entry("tool", calls=["GREP: lr"], output=""), 40, False)
-    assert tool[0].startswith("\033[1m")                               # a command: bold
+    assert tool[0].startswith("\033[38;5;248m\033[1m")               # a command: grey, bold
     note = tui.entry_lines(tui.Entry("text", "[Pulse Code] applied"), 40, False)
     assert "\033[2m" in note[0]                                        # Pulse's own output: quiet
 

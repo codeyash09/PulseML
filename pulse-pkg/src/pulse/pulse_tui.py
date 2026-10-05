@@ -222,8 +222,8 @@ class Entry:
 
 # One colour: Pulse's orange is for what is live, selected or worth a look; red is for what
 # is wrong; everything else is a shade of grey. Nothing green or yellow. In the transcript
-# the model's thinking is orange, a command it ran (a tool call, an edit) is bold, Pulse's
-# own output is dim, and the agent's words to the person are plain.
+# the model's thinking is orange, a command it ran (a tool call, an edit) is bold grey,
+# Pulse's own output is dim, and the agent's words to the person are plain.
 _SEVERITY_STYLE = {"critical": "red", "error": "red", "warning": "accent", "info": "dim"}
 _RED_SGR_RE = re.compile(r"\033\[(?:[0-9;]*;)?(?:31|91)(?:;[0-9;]*)?m")
 _QUIET_KINDS = {"thinking", "tool", "edit", "note"}
@@ -288,7 +288,7 @@ def _edit_head(entry: Entry) -> str:
     added, removed = diff_counts(entry.output)
     counts = f"  · +{added} \u2212{removed}" if _ui._unicode() else f"  · +{added} -{removed}"
     status = entry.text.split("\n", 1)[0]
-    return s(head, "bold") + s(counts + (f"  · {status}" if status else ""), "dim")
+    return s(head, "grey", "bold") + s(counts + (f"  · {status}" if status else ""), "dim")
 
 
 def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
@@ -341,11 +341,11 @@ def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
             said = [describe_call(c) for c in entry.calls]
             line = " · ".join(said[:3]) + (f" +{len(said) - 3}" if len(said) > 3 else "")
             tail = s(f"  · {_count(len(rows), 'line')}", "dim") if rows else ""
-            out.append(_ui._clip(s(line, "bold") + tail, width))
+            out.append(_ui._clip(s(line, "grey", "bold") + tail, width))
         else:
             for call in entry.calls:
                 name, sep, arg = call.partition(":")
-                label = s(describe_call(call), "bold") + (s("   " + name.strip() + ": " + arg.strip(), "dim")
+                label = s(describe_call(call), "grey", "bold") + (s("   " + name.strip() + ": " + arg.strip(), "dim")
                                                         if sep and arg.strip() else "")
                 out.extend(wrap(label, width, indent="  "))
             elbow = "⎿ " if _ui._unicode() else "L "

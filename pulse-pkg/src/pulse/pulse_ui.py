@@ -134,6 +134,7 @@ _CODES = {
     "green": "\033[32m",
     "amber": "\033[33m",
     "red": "\033[31m",
+    "grey": "\033[38;5;248m",      # a command in the app's transcript: grey, in bold
 }
 
 
