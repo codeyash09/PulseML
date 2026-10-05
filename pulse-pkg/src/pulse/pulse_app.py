@@ -58,8 +58,10 @@ DEBUG_PROMPT = (
     "the code with the tools, check what you suspect. A question about the run is a question -- "
     "answer it in words, with no code change. Change code only when asked to fix something, or "
     "when the person agrees to a fix you proposed. The run keeps executing the code it started "
-    "with: after an edit, restart it yourself with restart_run (RESTART: in the text protocol) "
-    "when it was started from here, or tell the person it has to be restarted. run_status "
+    "with. After an edit, decide whether to run it again with restart_run (RESTART: in the text "
+    "protocol): do when the fix only takes effect in a fresh run or you need to see it work (after "
+    "a crash, almost always); don't when the run is healthy and the change can wait for its next "
+    "start -- and say which you chose. run_status "
     "(RUNSTATUS:) gives the run's latest numbers whenever you need them again.\n"
 )
 
@@ -91,7 +93,7 @@ DEBUG_COMMANDS: List[Tuple[str, str]] = [
     ("/pause", "pause the run"),
     ("/resume", "resume a paused run"),
     ("/stop", "stop the training run"),
-    ("/restart", "stop and start the run again (runs started with /run)"),
+    ("/restart", "run the script again with the current code (stopping it first if it is still going)"),
     ("/output", "the last lines the run printed (runs started with /run)"),
     ("/interval", "sample faster or slower: /interval 0.5"),
     ("/quiet", "stop announcing findings (/loud resumes)"),
@@ -100,6 +102,7 @@ DEBUG_COMMANDS: List[Tuple[str, str]] = [
 ]
 
 _STATUS_STYLE = {"live": "accent", "stalled": "bold", "crashed": "red"}
+_AUTO_CRASH_TURNS = 3       # crashes in a row the agent starts on by itself, before the person is asked
 _RUN_LOG_DIR = "app-runs"
 
 # How a run is launched: `python -m pulse` puts the working directory first on sys.path, so
@@ -352,6 +355,7 @@ class App:
         self.run_output: "collections.deque[str]" = collections.deque(maxlen=400)   # what that run printed
         self._crashes_seen: set = set()            # sessions whose crash the agent was started on
         self._crash_pending: Optional[str] = None  # a crash that came while the agent was busy
+        self._auto_crash_turns = 0                 # crash turns started without the person typing
         self._run_partial = ""
         self.up = threading.Event()               # set once the screen is up and output is captured
         self._height = 30
@@ -579,15 +583,15 @@ class App:
         session = self.session or {}
         if self.console is None:
             return "No run is open. start_run starts one."
-        if session.get("session_id") not in self.launched:
-            return ("This run was not started from here, so it cannot be restarted from here: tell the "
-                    "person to stop it (/stop) and start it again the way they started it.")
         before = session.get("session_id")
-        self._restart()
+        refused = self._restart()
+        if refused:
+            return refused
         after = (self.session or {}).get("session_id")
         if after and after != before:
-            return f"Restarted: the new run (session {after}) is open beside you. run_status shows it."
-        return "The restart did not produce a new run; the lines above say what happened."
+            return (f"Restarted with the current code: the new run (session {after}) is open beside you. "
+                    "run_status shows how it is doing -- check it before you call the fix done.")
+        return "The restart did not produce a new run; the lines above say what happened (the log's last lines)."
 
     def _agent_run_status(self) -> str:
         if self.console is None:
@@ -806,6 +810,7 @@ class App:
                     self._flush_partial()
                     view.entries.append(tui.Entry("user", line))
                     self._last_blank = False
+                    self._auto_crash_turns = 0
                     self._start(self._handle, line)
             elif key == "tab":
                 hints = tui._hints(view)
@@ -873,8 +878,10 @@ class App:
             return
         from . import pulse_code
         evidence = self._evidence() if self.console is not None else None
+        before = (self.session or {}).get("session_id")
         outcome = pulse_code.run_turn(cli, line, evidence=evidence)
-        if outcome == "applied" and self.console is not None:
+        restarted = (self.session or {}).get("session_id") != before     # the agent ran it again itself
+        if outcome == "applied" and self.console is not None and not restarted:
             try:
                 self.console.brain.note_fix("code edited from the Pulse app")
             except Exception:
@@ -1180,6 +1187,13 @@ class App:
         self._crashes_seen.add(session_id)
         script = os.path.basename((self.session or {}).get("script") or "the run")
         what = self._crash_summary()
+        self._auto_crash_turns += 1
+        if self._auto_crash_turns > _AUTO_CRASH_TURNS:
+            # crash, fix, restart, crash again...: the person decides what next
+            self.error(f"{script} crashed again" + (f": {what}" if what else "") + ".")
+            self.note(f"That is {self._auto_crash_turns} crashes in a row; the agent is not starting on this one "
+                      "by itself. Tell it what to try next.")
+            return
         cli = self.cli
         if not cli.agent_provider or not cli.agent_key:
             self.error(f"{script} crashed" + (f": {what}" if what else "") + ".")
@@ -1195,7 +1209,9 @@ class App:
     def _start_crash_turn(self, script: str, what: str) -> None:
         self.error(f"{script} crashed" + (f": {what}" if what else "") + ".")
         request = (f"{script} just crashed" + (f" with {what}" if what else "") + ". The traceback is in the "
-                   "evidence. Find the cause in the code, explain it in a sentence or two, and fix it.")
+                   "evidence. Find the cause in the code, explain it in a sentence or two, and fix it. Then "
+                   "decide: run it again with the fix (restart_run, or a RESTART: line) to check it works, or "
+                   "leave it stopped if a run now would not tell anything (say why) -- and say which you did.")
         self.view.entries.append(tui.Entry("user", f"Why did {script} crash? Fix it."))
         self._last_blank = False
         self.dirty = True
@@ -1398,20 +1414,47 @@ class App:
         self.note(f"Started under Pulse. Its output goes to {log_path} (/output shows the end of it). "
                   "It keeps running if you leave Pulse.")
 
-    def _restart(self) -> None:
+    def _restart(self) -> Optional[str]:
+        """Stop the open run if it is still going, and start it again under Pulse with the
+        current code. A run started here (/run) restarts with its own command; the script that
+        opened this app (auto_track) with its arguments; a run started elsewhere only once it
+        is over (its arguments are not known here). Returns why it refused, or None."""
         from . import pulse_stream as stream
         session = self.session or {}
         info = self.launched.get(session.get("session_id", ""))
         hosted = self.hosting is not None and session.get("session_id") == getattr(self.hosting, "session_id", None)
-        if info is None and hosted and self._status not in ("live", "stalled") and session.get("script"):
-            # the script that opened this app is over: run it again, under Pulse, from here
-            script = session["script"]
-            self._launch("", replace={"argv": [script], "cwd": os.path.dirname(script) or self.home_root})
-            return
+        over = self._status not in ("live", "stalled")
+        script = session.get("script") or ""
         if info is None:
-            self.note("/restart works for runs started here with /run. This one was started elsewhere: "
-                      "stop it (/stop) and start it again the way it was started.")
-            return
+            if not script or not os.path.isfile(script):
+                why = "Pulse does not know which script this run is, so it cannot start it again."
+                self.note(why)
+                return why
+            if hosted:
+                if not over:
+                    # the script runs in this very process: stop it (its end leaves the app open)
+                    self.console.send_control(stream.CONTROL_STOP, reason="restart asked from the Pulse app")
+                    with _ui.Stage(f"Stopping {os.path.basename(script)}"):
+                        deadline = time.monotonic() + 30.0
+                        while self._status in ("live", "stalled") and time.monotonic() < deadline:
+                            time.sleep(0.25)
+                            self._poll_status()
+                    if self._status in ("live", "stalled"):
+                        why = f"{os.path.basename(script)} did not stop within 30 s, so it was not started again."
+                        self.error(why)
+                        return why
+                args = sys.argv[1:] if sys.argv and os.path.realpath(sys.argv[0]) == os.path.realpath(script) else []
+                self._launch("", replace={"argv": [script, *args], "cwd": os.getcwd()})
+                return None
+            if not over:
+                why = (f"{os.path.basename(script)} was started outside Pulse's app and is still running: stop it "
+                       "(/stop) and start it again the way it was started, or wait until it ends and /restart.")
+                self.note(why)
+                return why
+            self.note(f"Starting {os.path.basename(script)} again under Pulse (without the arguments it was "
+                      "first started with: Pulse does not know them).")
+            self._launch("", replace={"argv": [script], "cwd": os.path.dirname(script) or self.home_root})
+            return None
         process = info["process"]
         if self.runlog is not None:
             self.runlog.incident("restart", "The run was stopped to start again with the current code.")
@@ -1427,6 +1470,13 @@ class App:
                     except subprocess.TimeoutExpired:
                         process.kill()
         self._launch("", replace=info)
+        return None
+
+    def _poll_status(self) -> None:
+        from . import pulse_console as con
+        described = con._describe_session((self.session or {}).get("directory", ""))
+        if described:
+            self._status = described["status"]
 
     def _output(self) -> None:
         session = self.session or {}
@@ -1525,7 +1575,9 @@ class App:
                 if self._run_partial.strip() and len(tail) < room:
                     tail.append(self._run_partial)
             elif launched is not None:
-                tail = _tail(launched["log"], room)
+                # the run's own lines; Pulse's notes about where it streams are not output
+                tail = [line for line in _tail(launched["log"], room + 4)
+                        if not line.startswith("[Pulse] ")][-room:]
             else:
                 tail = []
             if tail:

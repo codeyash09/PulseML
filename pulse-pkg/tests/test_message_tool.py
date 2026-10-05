@@ -391,7 +391,7 @@ def test_run_status_and_restart_go_through_the_open_run(cli, tmp_path, monkeypat
         evidence=lambda include_code=False: {"x": 1}, render_evidence=lambda pack: "step 10, loss 0.5"))
     app.session = {"session_id": "s9", "script": str(tmp_path / "train.py")}
     assert "EVIDENCE FROM THE RUN (train.py" in app._agent_run_status() and "loss 0.5" in app._agent_run_status()
-    assert "not started from here" in app._agent_restart_run()
+    assert "does not know which script" in app._agent_restart_run()      # no such file here
 
 
 def test_stop_run_asks_the_person_first(cli, monkeypatch):

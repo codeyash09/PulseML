@@ -872,11 +872,12 @@ def test_run_with_a_missing_script_or_a_run_that_never_reports(real_app, monkeyp
     assert "exited with code 1" in text_of(real_app) and real_app.console is None
 
 
-def test_restart_is_only_for_runs_started_here(real_app, tmp_path):
+def test_restart_leaves_a_live_run_started_elsewhere_alone(real_app, tmp_path):
     real_app._open_run(make_run(tmp_path))
+    real_app._status = "live"
     run_line(real_app, "/restart")
     assert wait_for(lambda: not real_app.view.busy, 10)
-    assert "started elsewhere" in text_of(real_app)
+    assert "started outside Pulse's app and is still running" in text_of(real_app)
 
 
 # =========================================================================================
@@ -1552,3 +1553,71 @@ def test_copy_puts_the_agents_last_answer_on_the_clipboard(app, monkeypatch):
     app._command("/copy 2")
     assert app._screen.copied == ["Second answer.", "The loss is flat because of the + 0.5."]
     assert "Copied 14 characters" in text_of(app)
+
+
+# ---------------------------------------------------------------- restarting after a fix
+
+def _restart_app(app, monkeypatch, tmp_path, hosted, status):
+    script = tmp_path / "train.py"
+    script.write_text("print(1)\n")
+    app.session = {"session_id": "s1", "directory": "", "script": str(script)}
+    app.console = types.SimpleNamespace(workdir=str(tmp_path), brain=types.SimpleNamespace(events=[]),
+                                        send_control=lambda *a, **k: sent.append(a))
+    app.hosting = types.SimpleNamespace(session_id="s1") if hosted else None
+    app._status = status
+    sent, launches = [], []
+
+    def launch(arg, replace=None):
+        launches.append(replace)
+        app.session = {"session_id": "s2", "script": str(script)}
+    monkeypatch.setattr(app, "_launch", launch)
+    return script, sent, launches
+
+
+def test_restart_runs_a_crashed_auto_track_script_again(app, monkeypatch, tmp_path):
+    script, sent, launches = _restart_app(app, monkeypatch, tmp_path, hosted=True, status="crashed")
+    monkeypatch.setattr(sys, "argv", [str(script), "--epochs", "3"])
+    answer = app._agent_restart_run()
+    assert sent == [] and launches == [{"argv": [str(script), "--epochs", "3"], "cwd": os.getcwd()}]
+    assert answer.startswith("Restarted with the current code") and "s2" in answer
+
+
+def test_restart_stops_a_live_auto_track_script_first(app, monkeypatch, tmp_path):
+    script, sent, launches = _restart_app(app, monkeypatch, tmp_path, hosted=True, status="live")
+    monkeypatch.setattr(app, "_poll_status", lambda: setattr(app, "_status", "ended"))
+    assert app._agent_restart_run().startswith("Restarted")
+    assert len(sent) == 1 and launches and launches[0]["argv"][0] == str(script)
+
+
+def test_restart_of_a_run_started_elsewhere(app, monkeypatch, tmp_path):
+    script, sent, launches = _restart_app(app, monkeypatch, tmp_path, hosted=False, status="live")
+    answer = app._agent_restart_run()
+    assert "still running" in answer and launches == [] and sent == []      # not ours to stop and start
+    app._status = "crashed"
+    assert app._agent_restart_run().startswith("Restarted") and launches == [{"argv": [str(script)], "cwd": str(tmp_path)}]
+
+
+def test_the_agent_stops_starting_on_crashes_after_three_in_a_row(app):
+    started = _crashed_app(app)
+    for i in range(5):
+        app.session = dict(app.session, session_id=f"s{i}")
+        app._on_crash()
+    assert len(started) == 3 and "crashes in a row" in text_of(app)
+    app.view.editor.set("try a smaller lr")
+    app.on_key("enter")                                      # the person speaks: the count starts again
+    assert app._auto_crash_turns == 0
+
+
+def test_no_restart_reminder_after_the_agent_restarted_the_run_itself(app, monkeypatch):
+    from pulse import pulse_code
+    app.cli.agent_provider, app.cli.agent_key = "DeepSeek", "sk"
+    app.session = {"session_id": "s1", "script": "/p/train.py"}
+    app.console = types.SimpleNamespace(brain=types.SimpleNamespace(note_fix=lambda why: None))
+    app._evidence = lambda: "evidence"
+
+    def turn(cli, line, evidence=None):
+        app.session = {"session_id": "s2", "script": "/p/train.py"}      # restart_run inside the turn
+        return "applied"
+    monkeypatch.setattr(pulse_code, "run_turn", turn)
+    app._handle("fix it")
+    assert "still executing the code" not in text_of(app)

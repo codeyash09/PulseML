@@ -213,7 +213,10 @@ TOOLS = [
         "The watched run right now: step, every tracked value's curve, the detectors' findings, recent events.",
         {}),
     _fn("restart_run",
-        "Stop the watched run and start it again with the same command (after a change to its code).", {}),
+        "Run the watched script again with the code as it is now -- after you changed it. A run still going is "
+        "stopped first; one that crashed or ended is simply started again. Use it when the fix only takes effect "
+        "in a fresh run or you need to see that it works; leave the run alone when it is healthy and the change "
+        "can wait, and say so.", {}),
     _fn("stop_run", "Stop the watched training run. The user is asked to confirm.", {}),
     _fn("message_user",
         "Show the user a message right now, while you keep working: progress, a finding, a heads-up. It is "
