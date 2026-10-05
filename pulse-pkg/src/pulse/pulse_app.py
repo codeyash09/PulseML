@@ -75,6 +75,8 @@ HOME_COMMANDS: List[Tuple[str, str]] = [
     ("/undo", "undo the latest change"),
     ("/log", "the change history"),
     ("/cloud", "sign-in, workspace and sync status"),
+    ("/copy", "copy the agent's last answer to the clipboard (/copy 2: the one before)"),
+    ("/mouse", "clicks open folded lines; /mouse off gives the mouse back to select text"),
     ("/help", "every command"),
     ("/exit", "leave Pulse"),
 ]
@@ -341,6 +343,12 @@ class App:
         self._pane_w = 80
         self._edit_pending: Optional[tui.Entry] = None   # the change whose fate is still being decided
         self.hosting: Any = None                  # the in-process run's monitor, under auto_track()
+        self._screen: Any = None                  # the screen, while the loop runs
+        try:
+            from . import pulse_supabase as cloud
+            self.mouse = cloud.load_cached_profile().get("app_mouse", "on") != "off"
+        except Exception:
+            self.mouse = True
         self.run_output: "collections.deque[str]" = collections.deque(maxlen=400)   # what that run printed
         self._crashes_seen: set = set()            # sessions whose crash the agent was started on
         self._crash_pending: Optional[str] = None  # a crash that came while the agent was busy
@@ -895,6 +903,10 @@ class App:
             self._pick_run(rest)
         elif word == "/run":
             self._launch(rest)
+        elif word == "/mouse":
+            self._set_mouse(rest)
+        elif word == "/copy":
+            self._copy(rest)
         elif self.console is not None and self._run_command(word, rest):
             pass
         elif word == "/close":
@@ -903,6 +915,45 @@ class App:
             self.note("No run is open. /monitor picks one.")
         elif not pulse_code._handle_command(self.cli, line):
             self.done = True
+
+    # ------------------------------------------------------------------ the mouse, the clipboard
+
+    def _set_mouse(self, arg: str) -> None:
+        arg = arg.lower()
+        on = (not self.mouse) if arg not in ("on", "off") else arg == "on"
+        self.mouse = on
+        screen = self._screen
+        if screen is not None:
+            screen.set_mouse(on)
+        from . import pulse_supabase as cloud
+        cloud.save_cached_profile(app_mouse="on" if on else "off")
+        self.note("Mouse on: a click opens a folded line, the wheel scrolls (Shift+drag selects text in most "
+                  "terminals)." if on else
+                  "Mouse off: drag to select text as usual. Ctrl+O opens folded lines, the arrows scroll. "
+                  "/mouse on gives clicks back.")
+
+    def _copy(self, arg: str) -> None:
+        """The agent's last answer (or the n-th from the end) to the clipboard."""
+        words = [e.text for e in self.view.entries if e.kind == "say" and e.text.strip()]
+        try:
+            back = max(1, int(arg)) if arg else 1
+        except ValueError:
+            self.note("usage: /copy  (the agent's last answer), /copy 2 (the one before)")
+            return
+        if len(words) < back:
+            self.note("Nothing from the agent to copy yet." if not words
+                      else f"There are only {len(words)} answers to copy from.")
+            return
+        text = words[-back]
+        sent = []
+        if self._screen is not None:
+            self._screen.copy(text)
+            sent.append("the terminal")
+        if _copy_with_tool(text):
+            sent.append("the system clipboard")
+        first = text.strip().splitlines()[0]
+        self.note(f"Copied {len(text):,} characters (\u201c{first[:50]}{'…' if len(first) > 50 else ''}\u201d)"
+                  + (f" to {' and '.join(sent)}." if sent else "."))
 
     def _help(self) -> None:
         def section(title: str, rows: List[Tuple[str, str]]) -> None:
@@ -1492,7 +1543,9 @@ class App:
     # ================================================================== the loop
 
     def loop(self) -> int:
+        tui.Screen.mouse = self.mouse
         with tui.Screen() as screen, tui.KeyReader() as keys:
+            self._screen = screen
             self.install()
             self.up.set()
             try:
@@ -1545,6 +1598,7 @@ class App:
                     except Exception:
                         pass
                 self.uninstall()
+                self._screen = None
         return self.exit_code
 
 
@@ -1755,6 +1809,9 @@ def _welcome(app: App) -> None:
     from . import pulse_console as con
     cli = app.cli
     app.note("Pulse is ready. Describe what you want built or fixed, or open a run to debug it.")
+    if app.mouse:
+        app.note("A click opens a folded line. To select text hold Shift while you drag, or /mouse off; "
+                 "/copy copies the agent's last answer.")
     if not cli.agent_provider:
         app.note("No agent yet: /agent picks a model (OpenRouter models need no key -- you can sign in).")
     try:
@@ -1843,7 +1900,9 @@ def watch_in_process(monitor: Any, model: str = "") -> Optional[App]:
             try:
                 app._open_run(session)
                 app.note(f"{script} is running here, under Pulse. Ask about it any time; Ctrl+C twice "
-                         "leaves Pulse and the training goes on.")
+                         "leaves Pulse and the training goes on."
+                         + (" To select text hold Shift while you drag, or /mouse off; /copy copies the "
+                            "agent's last answer." if app.mouse else ""))
             finally:
                 app.uninstall()
             threading.Thread(target=sign_in, name="pulse-app-signin", daemon=True).start()
@@ -1900,11 +1959,67 @@ def watch_in_process(monitor: Any, model: str = "") -> Optional[App]:
             app.note(f"{script} stopped with an error. Ctrl+C twice (or /quit) leaves Pulse.")
         else:
             app.note(f"{script} has finished. Ctrl+C twice (or /quit) leaves Pulse.")
-        thread.join()
+        with _shutdown_held():
+            thread.join()
 
-    import atexit
-    atexit.register(at_exit)
+    _register_end_hook(at_exit)
     return app
+
+
+def _copy_with_tool(text: str) -> bool:
+    """The system clipboard through the platform's own tool, when there is one (the terminal
+    route, OSC 52, is not supported everywhere)."""
+    import shutil
+    if sys.platform == "darwin":
+        tools = [["pbcopy"]]
+    elif os.name == "nt":
+        tools = [["clip"]]
+    else:
+        tools = ([["wl-copy"]] if os.environ.get("WAYLAND_DISPLAY") else []) + (
+            [["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]] if os.environ.get("DISPLAY") else [])
+    for argv in tools:
+        if shutil.which(argv[0]) is None:
+            continue
+        try:
+            subprocess.run(argv, input=text.encode("utf-16-le" if argv[0] == "clip" else "utf-8"),
+                           timeout=5, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return False
+
+
+def _register_end_hook(hook: Callable[[], None]) -> None:
+    """Run `hook` when the script is over -- early in the interpreter's shutdown, while the
+    agent can still do its work. A plain atexit hook runs too late for that: by then Python
+    refuses new thread pools ("cannot schedule new futures after interpreter shutdown"), and
+    a library imported then fails with "can't register atexit after shutdown", so a model
+    call made after the script ended (the agent looking at a crash) failed. The hooks
+    threading runs before it joins threads come first; concurrent.futures registers its own
+    there on import, so it is imported before ours is added (they run in reverse order: ours
+    first, the pools still usable)."""
+    try:
+        import concurrent.futures.thread  # noqa: F401
+        register = threading._register_atexit          # type: ignore[attr-defined]
+    except (ImportError, AttributeError):
+        import atexit
+        atexit.register(hook)
+        return
+    register(hook)
+
+
+@contextlib.contextmanager
+def _shutdown_held():
+    """While the app outlives the script: a library imported now may still register its own
+    exit hook (threading refuses once its shutdown has begun)."""
+    was = getattr(threading, "_SHUTTING_DOWN", None)
+    if was:
+        threading._SHUTTING_DOWN = False                # type: ignore[attr-defined]
+    try:
+        yield
+    finally:
+        if was:
+            threading._SHUTTING_DOWN = was              # type: ignore[attr-defined]
 
 
 def _pick_agent_quietly(cli: Any, model: str = "") -> None:

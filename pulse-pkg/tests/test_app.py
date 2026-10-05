@@ -1296,7 +1296,7 @@ def test_auto_track_opens_the_app_beside_the_script(tmp_path, monkeypatch, capsy
     import atexit
     from pulse import pulse_monitor
     registered = []
-    monkeypatch.setattr(atexit, "register", lambda fn: registered.append(fn))
+    monkeypatch.setattr(appmod, "_register_end_hook", lambda fn: registered.append(fn))
     monkeypatch.setattr(appmod, "usable", lambda: True)
     monkeypatch.setattr(appmod, "_new_cli", lambda root, focus, review=True, chdir=True: FakeCli())
     monkeypatch.setattr(appmod, "_pick_agent_quietly", lambda cli, model="": None)
@@ -1330,7 +1330,7 @@ def test_auto_track_opens_the_app_beside_the_script(tmp_path, monkeypatch, capsy
 
 def test_leaving_the_app_gives_the_terminal_back_and_the_run_goes_on(tmp_path, monkeypatch, capsys):
     import atexit
-    monkeypatch.setattr(atexit, "register", lambda fn: None)
+    monkeypatch.setattr(appmod, "_register_end_hook", lambda fn: None)
     monkeypatch.setattr(appmod, "usable", lambda: True)
     monkeypatch.setattr(appmod, "_new_cli", lambda root, focus, review=True, chdir=True: FakeCli())
     monkeypatch.setattr(appmod, "_pick_agent_quietly", lambda cli, model="": None)
@@ -1476,3 +1476,79 @@ def test_a_crash_without_an_agent_says_how_to_get_one(app):
 def test_an_audit_shows_its_words_not_its_json(app):
     text = 'Some prose.\n```json\n{"status": "ok", "risk": "low", "findings": [], "next_check_minutes": 15}\n```\nThe loss is flat near 0.5.'
     assert appmod.audit_words(text) == "Some prose. The loss is flat near 0.5."
+
+
+
+def test_the_app_outlives_the_script_while_the_agent_can_still_work(tmp_path):
+    """The hook that keeps the app open after the script ends runs early in shutdown: a
+    model call from there (thread pools, a library imported late) must still work. A plain
+    atexit hook failed with "can't register atexit after shutdown"."""
+    import subprocess
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import sys, threading\n"
+        "from pulse import pulse_app\n"
+        "def end():\n"
+        "    with pulse_app._shutdown_held():\n"
+        "        def work():\n"
+        "            import concurrent.futures as cf\n"
+        "            with cf.ThreadPoolExecutor(1) as ex:\n"
+        "                print('pool', ex.submit(lambda: 42).result(), flush=True)\n"
+        "            threading._register_atexit(lambda: None)\n"
+        "            print('register ok', flush=True)\n"
+        "        t = threading.Thread(target=work, daemon=True); t.start(); t.join()\n"
+        "pulse_app._register_end_hook(end)\n"
+        "raise ValueError('the run crashed')\n")
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
+    r = subprocess.run([sys.executable, str(probe)], capture_output=True, text=True, timeout=120, env=env)
+    assert "pool 42" in r.stdout and "register ok" in r.stdout, r.stdout + r.stderr
+    assert "ValueError: the run crashed" in r.stderr
+
+
+# ---------------------------------------------------------------- selecting and copying
+
+class FakeScreen:
+    def __init__(self):
+        self.mouse, self.copied = True, []
+
+    def set_mouse(self, on):
+        self.mouse = on
+
+    def copy(self, text):
+        self.copied.append(text)
+
+
+def test_mouse_off_gives_the_mouse_back_and_is_remembered(app, monkeypatch):
+    saved = {}
+    monkeypatch.setattr(cloud, "save_cached_profile", lambda **k: saved.update(k))
+    app._screen = FakeScreen()
+    app._command("/mouse off")
+    assert app.mouse is False and app._screen.mouse is False and saved == {"app_mouse": "off"}
+    assert "drag to select" in text_of(app)
+    app._command("/mouse")                                   # toggles back
+    assert app.mouse is True and app._screen.mouse is True and saved == {"app_mouse": "on"}
+
+
+def test_the_screen_turns_mouse_reporting_on_and_off():
+    written = []
+    screen = tui.Screen.__new__(tui.Screen)
+    screen._active, screen.write = True, written.append
+    screen.set_mouse(False)
+    screen.set_mouse(True)
+    assert written == ["\033[?1006l\033[?1000l", "\033[?1000h\033[?1006h"]
+    screen.copy("hi")
+    assert written[-1] == "\033]52;c;aGk=\007"                   # OSC 52, base64
+
+
+def test_copy_puts_the_agents_last_answer_on_the_clipboard(app, monkeypatch):
+    monkeypatch.setattr(appmod, "_copy_with_tool", lambda text: False)
+    app._screen = FakeScreen()
+    app._command("/copy")
+    assert "Nothing from the agent" in text_of(app) and app._screen.copied == []
+    app.say("The loss is flat because of the + 0.5.")
+    app.note("Checked the run.")
+    app.say("Second answer.")
+    app._command("/copy")
+    app._command("/copy 2")
+    assert app._screen.copied == ["Second answer.", "The loss is flat because of the + 0.5."]
+    assert "Copied 14 characters" in text_of(app)

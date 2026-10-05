@@ -848,12 +848,29 @@ class Screen:
     def __enter__(self) -> "Screen":
         if not self._console.enter(output=True, keys=False):
             raise _ui.Unavailable("this console cannot show escape sequences")
-        # alternate screen, cursor home, bracketed paste on, mouse clicks and wheel reported
-        # (SGR encoding), and the cursor as an orange bar (Pulse's accent) -- terminals that
-        # cannot recolour it keep their own
-        self.write("\033[?1049h\033[H\033[2J\033[?2004h\033[?1000h\033[?1006h\033]12;#ff8700\007\033[5 q")
+        # alternate screen, cursor home, bracketed paste on, and the cursor as an orange bar
+        # (Pulse's accent) -- terminals that cannot recolour it keep their own
+        self.write("\033[?1049h\033[H\033[2J\033[?2004h\033]12;#ff8700\007\033[5 q")
         self._active = True
+        self.set_mouse(self.mouse)
         return self
+
+    mouse = True
+
+    def set_mouse(self, on: bool) -> None:
+        """Mouse clicks and the wheel reported to the app (SGR encoding) -- or left to the
+        terminal, so a drag selects text as usual (with it on, most terminals still select
+        with Shift held)."""
+        self.mouse = on
+        if self._active:
+            self.write("\033[?1000h\033[?1006h" if on else "\033[?1006l\033[?1000l")
+
+    def copy(self, text: str) -> None:
+        """Put `text` on the clipboard through the terminal (OSC 52): works over SSH, in
+        Windows Terminal, kitty, iTerm2, the ChromeOS terminal, tmux with set-clipboard."""
+        import base64
+        data = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        self.write(f"\033]52;c;{data}\007")
 
     def __exit__(self, *exc: Any) -> None:
         if self._active:
