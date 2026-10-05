@@ -347,6 +347,7 @@ class App:
         self._edit_pending: Optional[tui.Entry] = None   # the change whose fate is still being decided
         self.hosting: Any = None                  # the in-process run's monitor, under auto_track()
         self._screen: Any = None                  # the screen, while the loop runs
+        self._hovered: Optional[tui.Entry] = None # the entry under the mouse
         try:
             from . import pulse_supabase as cloud
             self.mouse = cloud.load_cached_profile().get("app_mouse", "on") != "off"
@@ -737,8 +738,23 @@ class App:
     def on_key(self, key: str) -> None:
         view = self.view
         with self.lock:
-            self.dirty = True
             question = self._question
+            if key.startswith("hover:"):
+                x, row = (int(v) for v in key.split(":")[1:])
+                entry = view.row_entries.get(row) if x >= view.transcript_x - 1 else None
+                entry = entry if entry is not None and entry.foldable() else None
+                current = self._hovered
+                if entry is not current:
+                    if current is not None:
+                        current.hover = False
+                        current.touch()
+                    if entry is not None:
+                        entry.hover = True
+                        entry.touch()
+                    self._hovered = entry
+                    self.dirty = True                # only a change needs a redraw
+                return
+            self.dirty = True
             if key == "ctrl+c":
                 if question is not None:
                     question.cancelled = True

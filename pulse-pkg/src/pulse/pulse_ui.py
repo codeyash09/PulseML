@@ -135,6 +135,8 @@ _CODES = {
     "amber": "\033[33m",
     "red": "\033[31m",
     "grey": "\033[38;5;248m",      # a command in the app's transcript: grey, in bold
+    "glow": "\033[38;5;255m",      # the same, under the mouse: it lights up
+    "glow_accent": "\033[38;5;214m",   # a thought under the mouse: a brighter orange
 }
 
 

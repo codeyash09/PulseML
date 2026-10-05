@@ -561,7 +561,7 @@ Type `pulse` in a terminal and Pulse opens as one full-screen app:
 | Enter | send the request, or answer a question Pulse asked |
 | `/` | commands; typing shows the ones that match, Tab completes |
 | Ctrl+O | fold / unfold the agent's thinking and tool output |
-| mouse | a click on a folded line opens it where it is (and shuts it again); the wheel scrolls. The app reads the mouse, so hold Shift to select text, or `/mouse off` to give the mouse back to the terminal (remembered); `/copy` puts the agent's last answer on the clipboard |
+| mouse | what can be clicked lights up under the pointer; a click on a folded line opens it where it is (and shuts it again); the wheel scrolls. The app reads the mouse, so hold Shift to select text, or `/mouse off` to give the mouse back to the terminal (remembered); `/copy` puts the agent's last answer on the clipboard |
 | ↑ / ↓ (empty line) | scroll back through the conversation; the screen otherwise shows the latest exchange |
 | Ctrl+C | cancel what is running; twice at an empty prompt leaves |
 | Esc | leave the open run in the background and go back to the agent; Esc again brings it back |

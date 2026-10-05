@@ -1536,7 +1536,7 @@ def test_the_screen_turns_mouse_reporting_on_and_off():
     screen._active, screen.write = True, written.append
     screen.set_mouse(False)
     screen.set_mouse(True)
-    assert written == ["\033[?1006l\033[?1000l", "\033[?1000h\033[?1006h"]
+    assert written == ["\033[?1006l\033[?1003l\033[?1000l", "\033[?1000h\033[?1003h\033[?1006h"]
     screen.copy("hi")
     assert written[-1] == "\033]52;c;aGk=\007"                   # OSC 52, base64
 
@@ -1621,3 +1621,40 @@ def test_no_restart_reminder_after_the_agent_restarted_the_run_itself(app, monke
     monkeypatch.setattr(pulse_code, "run_turn", turn)
     app._handle("fix it")
     assert "still executing the code" not in text_of(app)
+
+
+# ---------------------------------------------------------------- hover
+
+def test_movement_reports_become_hover_keys():
+    keys, _rest = tui.parse_keys("\033[<35;12;5M\033[<32;12;5M")
+    assert keys == ["hover:11:4"]                            # a drag (button held) is not a hover
+
+
+def test_the_clickable_line_under_the_mouse_lights_up(app, monkeypatch):
+    monkeypatch.setattr(ui, "color_enabled", lambda: True)
+    tool = tui.Entry("tool", calls=["GREP: lr"], output="a\nb")
+    think = tui.Entry("thinking", "maybe lr")
+    app.view.entries = [tui.Entry("user", "q"), think, tool, tui.Entry("say", "answer")]
+    tui.compose(app.view, 90, 20)
+    row = next(r for r, e in app.view.row_entries.items() if e is tool)
+    plain_line = tui.entry_lines(tool, 80, False)[0]
+    assert "\033[38;5;248m" in plain_line                    # grey at rest
+    app.dirty = False
+    app.on_key(f"hover:10:{row}")
+    assert tool.hover and app.dirty and "\033[38;5;255m" in tui.entry_lines(tool, 80, False)[0]
+    app.dirty = False
+    app.on_key(f"hover:20:{row}")                            # still on it: no redraw
+    assert app.dirty is False
+    trow = next(r for r, e in app.view.row_entries.items() if e is think)
+    app.on_key(f"hover:10:{trow}")                           # onto the thought
+    assert think.hover and not tool.hover
+    assert "\033[38;5;214m" in tui.entry_lines(think, 80, False)[0]
+    srow = next(r for r, e in app.view.row_entries.items() if e.kind == "say")
+    app.on_key(f"hover:10:{srow}")                           # the agent's words are not clickable
+    assert app._hovered is None and not think.hover
+
+
+def test_moving_the_mouse_keeps_the_status_line(app):
+    app.view.status = "Ctrl+C again to leave Pulse"
+    app.on_key("hover:1:1")
+    assert app.view.status == "Ctrl+C again to leave Pulse"

@@ -191,7 +191,7 @@ class Entry:
     note      a quiet line from Pulse itself     text
     error     something failed                   text
     """
-    __slots__ = ("kind", "text", "calls", "output", "severity", "live", "open", "seconds", "_cache")
+    __slots__ = ("kind", "text", "calls", "output", "severity", "live", "open", "seconds", "hover", "_cache")
 
     def __init__(self, kind: str, text: str = "", calls: Optional[List[str]] = None,
                  output: str = "", severity: str = "", live: bool = False) -> None:
@@ -203,6 +203,7 @@ class Entry:
         self.live = live                # still being streamed in: shown as it grows
         self.open: Optional[bool] = None   # clicked open (True) or shut (False); None = as the screen says
         self.seconds: Optional[float] = None   # how long the thinking took, when it streamed
+        self.hover = False              # the mouse is over it: its clickable line lights up
         self._cache: Dict[Tuple[int, bool], List[str]] = {}
 
     def touch(self) -> None:
@@ -282,20 +283,29 @@ def diff_counts(diff: str) -> Tuple[int, int]:
     return added, removed
 
 
+def _cmd(text: str, entry: Entry) -> str:
+    """A command's words: bold grey, bright under the mouse."""
+    return s(text, "glow" if entry.hover else "grey", "bold")
+
+
+def _thought(text: str, entry: Entry) -> str:
+    return s(text, "glow_accent", "bold", "italic") if entry.hover else s(text, "accent", "italic")
+
+
 def _edit_head(entry: Entry) -> str:
     said = [describe_call(c) for c in entry.calls]
     head = " · ".join(said[:3]) + (f" +{len(said) - 3}" if len(said) > 3 else "")
     added, removed = diff_counts(entry.output)
     counts = f"  · +{added} \u2212{removed}" if _ui._unicode() else f"  · +{added} -{removed}"
     status = entry.text.split("\n", 1)[0]
-    return s(head, "grey", "bold") + s(counts + (f"  · {status}" if status else ""), "dim")
+    return _cmd(head, entry) + s(counts + (f"  · {status}" if status else ""), "dim")
 
 
 def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
     """The entry as finished screen lines, each at most `width` columns. `expanded` is the
     screen-wide Ctrl+O state; an entry that was clicked keeps its own."""
     expanded = entry.is_open(expanded)
-    key = (width, expanded)
+    key = (width, expanded, entry.hover)
     cached = entry._cache.get(key)
     if cached is not None:
         return cached
@@ -310,7 +320,8 @@ def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
             for j, piece in enumerate(wrap(part, width - 2)):
                 out.append((mark if i == 0 and j == 0 else "  ") + s(piece, "bold"))
         if folded:
-            out.append("  " + s(f"… {len(parts) - len(shown)} more lines  ({EXPAND_HINT})", "dim"))
+            more = f"… {len(parts) - len(shown)} more lines  ({EXPAND_HINT})"
+            out.append("  " + (s(more, "glow") if entry.hover else s(more, "dim")))
     elif kind == "say":
         # the agent speaking to the person: plain text, nothing in front of it
         for part in entry.text.strip("\n").split("\n"):
@@ -327,9 +338,9 @@ def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
         elif not expanded:
             took = f"Thought for {_ui.elapsed_text(entry.seconds)}" if entry.seconds else \
                 f"Thought ({_count(len(entry.text.split()), 'word')})"
-            out.append(s(took, "accent", "italic"))
+            out.append(_thought(took, entry))
         else:
-            out.append(s("Thought" + (f" for {_ui.elapsed_text(entry.seconds)}" if entry.seconds else ""), "accent", "italic"))
+            out.append(_thought("Thought" + (f" for {_ui.elapsed_text(entry.seconds)}" if entry.seconds else ""), entry))
             for part in body:
                 for piece in wrap(part, width - 2):
                     out.append("  " + s(piece, "dim", "italic"))
@@ -341,11 +352,11 @@ def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
             said = [describe_call(c) for c in entry.calls]
             line = " · ".join(said[:3]) + (f" +{len(said) - 3}" if len(said) > 3 else "")
             tail = s(f"  · {_count(len(rows), 'line')}", "dim") if rows else ""
-            out.append(_ui._clip(s(line, "grey", "bold") + tail, width))
+            out.append(_ui._clip(_cmd(line, entry) + tail, width))
         else:
             for call in entry.calls:
                 name, sep, arg = call.partition(":")
-                label = s(describe_call(call), "grey", "bold") + (s("   " + name.strip() + ": " + arg.strip(), "dim")
+                label = _cmd(describe_call(call), entry) + (s("   " + name.strip() + ": " + arg.strip(), "dim")
                                                         if sep and arg.strip() else "")
                 out.extend(wrap(label, width, indent="  "))
             elbow = "⎿ " if _ui._unicode() else "L "
@@ -863,7 +874,8 @@ class Screen:
         with Shift held)."""
         self.mouse = on
         if self._active:
-            self.write("\033[?1000h\033[?1006h" if on else "\033[?1006l\033[?1000l")
+            # 1003: every movement too, so what can be clicked lights up under the pointer
+            self.write("\033[?1000h\033[?1003h\033[?1006h" if on else "\033[?1006l\033[?1003l\033[?1000l")
 
     def copy(self, text: str) -> None:
         """Put `text` on the clipboard through the terminal (OSC 52): works over SSH, in
@@ -874,7 +886,7 @@ class Screen:
 
     def __exit__(self, *exc: Any) -> None:
         if self._active:
-            self.write("\033[?1006l\033[?1000l\033[?2004l\033[0m\033[?25h\033]112\007\033[0 q\033[?1049l")
+            self.write("\033[?1006l\033[?1003l\033[?1000l\033[?2004l\033[0m\033[?25h\033]112\007\033[0 q\033[?1049l")
             self._active = False
         self._console.exit()
 
@@ -915,6 +927,8 @@ def _mouse_key(button: int, x: int, y: int, release: bool) -> Optional[str]:
         return "wheel:up" if button & 3 == 0 else "wheel:down"
     if release and button & 3 == 0:
         return f"click:{x - 1}:{y - 1}"
+    if button & 32 and button & 3 == 3:          # the pointer moved, no button held
+        return f"hover:{x - 1}:{y - 1}"
     return None
 
 
