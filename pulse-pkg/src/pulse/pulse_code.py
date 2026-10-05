@@ -788,9 +788,14 @@ def _show_tools(answer, notes, label="tool results"):
         # what the agent said before reaching for its tools, then the tools
         names = {"GREP", "VIEW", "CALC"} | {k.upper() for k in PulseCLI._NEW_DIRECTIVE_RES} | set(_RUN_ACTIONS)
         said = _TOOL_CALL_RE.sub(lambda m: "" if m.group(1) in names else m.group(0), answer or "").strip()
-        if said and len(said) < 2000 and not said.lstrip().startswith("{"):
-            _ui.answer(said)
-        host.tool(tool_calls_in(answer), notes)
+        if not (said and len(said) < 2000 and not said.lstrip().startswith("{")):
+            said = ""
+        try:
+            host.tool(tool_calls_in(answer), notes, said=said)
+        except TypeError:                       # an older host without `said`
+            if said:
+                _ui.answer(said)
+            host.tool(tool_calls_in(answer), notes)
         return
     print(f"\n[{label}]\n{notes}\n")
 

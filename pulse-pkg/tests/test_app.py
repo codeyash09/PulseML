@@ -136,21 +136,21 @@ def test_editor_edits_one_line_and_remembers_history():
 def test_thinking_is_one_line_until_expanded():
     entry_ = tui.Entry("thinking", "the scheduler maybe\nsteps too often")
     folded = [plain(line) for line in tui.entry_lines(entry_, 60, False)]
-    assert folded == [" Thought (6 words) "]                  # in its grey box
+    assert folded == ["Thought (6 words)"]
     entry_.seconds = 4.2
     entry_.touch()
-    assert [plain(line) for line in tui.entry_lines(entry_, 60, False)] == [" Thought for 4.2s "]
+    assert [plain(line) for line in tui.entry_lines(entry_, 60, False)] == ["Thought for 4.2s"]
     opened = [plain(line) for line in tui.entry_lines(entry_, 60, True)]
-    assert opened[0] == " Thought for 4.2s " and "the scheduler maybe" in opened[1]
+    assert opened[0] == "Thought for 4.2s" and "the scheduler maybe" in opened[1]
     assert "steps too often" in opened[2]
 
 
 def test_tool_calls_read_as_what_was_done_and_expand_to_the_output():
     entry_ = tui.Entry("tool", calls=["GREP: lr_scheduler", "VIEW: train.py:40-80"], output="a\nb\nc")
     folded = [plain(line) for line in tui.entry_lines(entry_, 60, False)]
-    assert folded == [" Searched for lr_scheduler · Read train.py:40-80   · 3 lines"]   # the box, then the count
+    assert folded == ["Searched for lr_scheduler · Read train.py:40-80  · 3 lines"]
     opened = [plain(line) for line in tui.entry_lines(entry_, 60, True)]
-    assert opened[0].startswith(" Searched for lr_scheduler ") and "GREP: lr_scheduler" in opened[0]
+    assert opened[0].startswith("Searched for lr_scheduler") and "GREP: lr_scheduler" in opened[0]
     assert [line.strip().lstrip("⎿ ").strip() for line in opened[2:]] == ["a", "b", "c"]
     assert tui.describe_call("TERMINAL: pytest -q") == "Ran pytest -q"
     assert tui.describe_call("EDIT_FILE: train.py") == "Edited train.py"
@@ -621,7 +621,7 @@ def test_a_fix_is_confirmed_in_the_input_line_and_applied(real_app, monkeypatch)
     assert wait_for(lambda: not real_app.view.busy, 20)
     assert "lr = 0.05" in open(path).read()
     assert edit.text.startswith("applied") and "/undo to revert" in edit.text
-    assert [plain(l) for l in tui.entry_lines(edit, 80, False)] == [" Edited train.py   · +1 −1  · applied"]
+    assert [plain(l) for l in tui.entry_lines(edit, 80, False)] == ["Edited train.py  · +1 −1  · applied"]
 
 
 def test_declining_the_diff_changes_nothing(real_app, monkeypatch):
@@ -1145,10 +1145,10 @@ def test_the_agents_words_and_its_thinking_look_different(monkeypatch):
     say = [PLAIN.sub("", l) for l in tui.entry_lines(tui.Entry("say", "The lr is 0.3."), 40, False)]
     think = tui.entry_lines(tui.Entry("thinking", "maybe lr"), 40, True)
     assert say == ["The lr is 0.3."]                                   # the agent's words: plain
-    assert PLAIN.sub("", think[0]).startswith(" Thought") and "\033[3m" in think[0]   # thinking: a grey box, italic
-    assert "\033[48;5;250" in think[0]
+    assert PLAIN.sub("", think[0]).startswith("Thought") and "\033[3m" in think[0]   # thinking: orange italic
+    assert "\033[38;5;208m" in think[0]
     tool = tui.entry_lines(tui.Entry("tool", calls=["GREP: lr"], output=""), 40, False)
-    assert "\033[48;5;215" in tool[0]                                  # a command: a light orange box
+    assert tool[0].startswith("\033[1m")                               # a command: bold
     note = tui.entry_lines(tui.Entry("text", "[Pulse Code] applied"), 40, False)
     assert "\033[2m" in note[0]                                        # Pulse's own output: quiet
 
@@ -1188,13 +1188,13 @@ def test_a_change_folds_to_one_line_and_opens_to_its_diff(app):
     app.edit(["EDIT: train.py"], DIFF)
     entry = app.view.entries[-1]
     assert entry.kind == "edit" and app._edit_pending is entry
-    assert [plain(l) for l in tui.entry_lines(entry, 80, False)] == [" Edited train.py   · +1 −1"]
+    assert [plain(l) for l in tui.entry_lines(entry, 80, False)] == ["Edited train.py  · +1 −1"]
     app.edit_status("approved by deepseek-chat", detail="deepseek/deepseek-chat: does what was asked")
     app.edit_status("applied", detail="/undo to revert (commit abc123)", final=True)
     assert app._edit_pending is None
-    assert [plain(l) for l in tui.entry_lines(entry, 80, False)] == [" Edited train.py   · +1 −1  · approved by deepseek-chat · applied"]
+    assert [plain(l) for l in tui.entry_lines(entry, 80, False)] == ["Edited train.py  · +1 −1  · approved by deepseek-chat · applied"]
     opened = [plain(l) for l in tui.entry_lines(entry, 80, True)]
-    assert opened[0].startswith(" Edited train.py ")
+    assert opened[0].startswith("Edited train.py")
     assert "  modified: train.py" in opened and "  -lr = 0.3" in opened and "  +lr = 0.05" in opened
     assert opened[-2:] == ["  deepseek/deepseek-chat: does what was asked", "  /undo to revert (commit abc123)"]
     assert entry.foldable()
@@ -1268,8 +1268,8 @@ def test_machinery_lines_stack_and_paragraphs_breathe(app):
                         tui.Entry("edit", calls=["EDIT: t.py"], output="+x"), tui.Entry("tool", calls=["TERMINAL: ls"], output="a"),
                         tui.Entry("note", "Verified"), tui.Entry("thinking", "c d"), tui.Entry("say", "Done")]
     lines = [plain(l) for l in tui.transcript_lines(app.view, 80)]
-    assert lines == ["❯ q", "", " Thought (2 words) ", "", "Plan", " Edited t.py   · +1 −0", " Ran ls   · 1 line", "Verified",
-                     "", " Thought (2 words) ", "", "Done"]          # a thought opens a new step: air before it
+    assert lines == ["❯ q", "", "Thought (2 words)", "", "Plan", "Edited t.py  · +1 −0", "Ran ls  · 1 line", "Verified",
+                     "", "Thought (2 words)", "", "Done"]          # a thought opens a new step: air before it
 
 
 # ---------------------------------------------------------------- auto_track() opens the app
@@ -1374,3 +1374,28 @@ def test_the_ctrl_c_hint_says_the_training_goes_on(app):
     assert "training goes on" in app.view.status and "/stop" in app.view.status
     app.on_key("ctrl+c")
     assert app.done
+
+
+def test_what_the_agent_says_beside_its_tools_is_kept_with_them(app):
+    """"I need to see how lr is used" is for the agent more than the person: it goes with
+    the calls, shown when the line is opened, after the output."""
+    from pulse import pulse_code
+    ui.set_host(app)
+    pulse_code._show_tools("I need to see how lr is used.\nGREP: lr\nVIEW: train.py:1-12", "3 matches")
+    entry = app.view.entries[-1]
+    assert entry.kind == "tool" and entry.text == "I need to see how lr is used."
+    assert [e.kind for e in app.view.entries] == ["tool"]                      # no separate paragraph
+    folded = [plain(l) for l in tui.entry_lines(entry, 80, False)]
+    assert folded == ["Searched for lr · Read train.py:1-12  · 1 line"]
+    opened = [plain(l) for l in tui.entry_lines(entry, 80, True)]
+    assert opened[-1] == "  I need to see how lr is used." and "  ⎿ 3 matches" in opened
+
+
+def test_the_native_loop_keeps_its_words_with_the_first_call(app):
+    from pulse import pulse_code_agent as agent
+    ui.set_host(app)
+    state = types.SimpleNamespace(said="Let me look at the scheduler.")
+    agent._show("grep", {"pattern": "lr"}, "3 matches", state)
+    agent._show("read_file", {"path": "train.py"}, "...", state)
+    first, second = app.view.entries[-2:]
+    assert first.text == "Let me look at the scheduler." and second.text == "" and state.said == ""

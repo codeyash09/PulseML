@@ -134,11 +134,6 @@ _CODES = {
     "green": "\033[32m",
     "amber": "\033[33m",
     "red": "\033[31m",
-    # the app's highlights, like a marker over the words: a command (a tool call, an edit)
-    # on light orange, the model's thinking on light grey, dark text on both so they read
-    # on a dark terminal and a light one alike -- what Pulse itself says is plain grey text
-    "box_tool": "\033[48;5;215;38;5;16m",
-    "box_think": "\033[48;5;250;38;5;16m",
 }
 
 

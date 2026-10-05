@@ -293,7 +293,7 @@ def test_reasoning_streams_into_a_live_thinking_entry(cli, monkeypatch):
 def test_a_live_thinking_entry_shows_its_last_lines_while_folded():
     entry = tui.Entry("thinking", "one\ntwo\nthree\nfour\nfive\nsix", live=True)
     lines = [PLAIN.sub("", line) for line in tui.entry_lines(entry, 40, False)]
-    assert lines[0] == " Thinking… " and lines[1:] == ["  five", "  six"]
+    assert lines[0] == "Thinking…" and lines[1:] == ["  five", "  six"]
     entry.live = False
     entry.touch()
     assert len(tui.entry_lines(entry, 40, False)) == 1

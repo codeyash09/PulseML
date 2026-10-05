@@ -182,7 +182,8 @@ class Entry:
     user      what the person typed              text
     text      output of the agent or a command   text (may be several lines, coloured)
     thinking  the model's reasoning              text -- collapsed to one line by default
-    tool      tools the agent ran                calls (one line each), output (collapsed)
+    tool      tools the agent ran                calls (one line each), output (collapsed),
+                                                 text (what it said as it reached for them)
     edit      a change to the project's files    calls (EDIT:/CREATE: label), output (the
                                                  diff, collapsed), text (its status)
     finding   a detector finding                 text, severity
@@ -220,9 +221,9 @@ class Entry:
 
 
 # One colour: Pulse's orange is for what is live, selected or worth a look; red is for what
-# is wrong; everything else is a shade of grey. Nothing green or yellow. Three things are
-# told apart by a box behind them: a command the agent ran (orange box), the model's
-# thinking (grey box), and Pulse's own output, which is plain grey text.
+# is wrong; everything else is a shade of grey. Nothing green or yellow. In the transcript
+# the model's thinking is orange, a command it ran (a tool call, an edit) is bold, Pulse's
+# own output is dim, and the agent's words to the person are plain.
 _SEVERITY_STYLE = {"critical": "red", "error": "red", "warning": "accent", "info": "dim"}
 _RED_SGR_RE = re.compile(r"\033\[(?:[0-9;]*;)?(?:31|91)(?:;[0-9;]*)?m")
 _QUIET_KINDS = {"thinking", "tool", "edit", "note"}
@@ -281,18 +282,13 @@ def diff_counts(diff: str) -> Tuple[int, int]:
     return added, removed
 
 
-def box(text: str, kind: str) -> str:
-    """`text` in its box: orange for a command ("tool"), grey for thinking ("think")."""
-    return s(f" {text} ", "box_tool") if kind == "tool" else s(f" {text} ", "box_think", "italic")
-
-
 def _edit_head(entry: Entry) -> str:
     said = [describe_call(c) for c in entry.calls]
     head = " · ".join(said[:3]) + (f" +{len(said) - 3}" if len(said) > 3 else "")
     added, removed = diff_counts(entry.output)
     counts = f"  · +{added} \u2212{removed}" if _ui._unicode() else f"  · +{added} -{removed}"
     status = entry.text.split("\n", 1)[0]
-    return box(head, "tool") + s(counts + (f"  · {status}" if status else ""), "dim")
+    return s(head, "bold") + s(counts + (f"  · {status}" if status else ""), "dim")
 
 
 def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
@@ -323,7 +319,7 @@ def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
         body = [ln for ln in entry.text.strip().split("\n")]
         if entry.live and not expanded:
             # streaming in: "Thinking…", then the last two lines as they arrive
-            out.append(box("Thinking…", "think"))
+            out.append(s("Thinking…", "accent", "italic"))
             tail: List[str] = []
             for part in body:
                 tail.extend(wrap(part, width - 2))
@@ -331,9 +327,9 @@ def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
         elif not expanded:
             took = f"Thought for {_ui.elapsed_text(entry.seconds)}" if entry.seconds else \
                 f"Thought ({_count(len(entry.text.split()), 'word')})"
-            out.append(box(took, "think"))
+            out.append(s(took, "accent", "italic"))
         else:
-            out.append(box("Thought" + (f" for {_ui.elapsed_text(entry.seconds)}" if entry.seconds else ""), "think"))
+            out.append(s("Thought" + (f" for {_ui.elapsed_text(entry.seconds)}" if entry.seconds else ""), "accent", "italic"))
             for part in body:
                 for piece in wrap(part, width - 2):
                     out.append("  " + s(piece, "dim", "italic"))
@@ -345,12 +341,12 @@ def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
             said = [describe_call(c) for c in entry.calls]
             line = " · ".join(said[:3]) + (f" +{len(said) - 3}" if len(said) > 3 else "")
             tail = s(f"  · {_count(len(rows), 'line')}", "dim") if rows else ""
-            out.append(_ui._clip(box(line, "tool") + tail, width))
+            out.append(_ui._clip(s(line, "bold") + tail, width))
         else:
             for call in entry.calls:
                 name, sep, arg = call.partition(":")
-                label = box(describe_call(call), "tool") + (s("   " + name.strip() + ": " + arg.strip(), "dim")
-                                                          if sep and arg.strip() else "")
+                label = s(describe_call(call), "bold") + (s("   " + name.strip() + ": " + arg.strip(), "dim")
+                                                        if sep and arg.strip() else "")
                 out.extend(wrap(label, width, indent="  "))
             elbow = "⎿ " if _ui._unicode() else "L "
             first = True
@@ -358,6 +354,10 @@ def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
                 for piece in wrap(row, width - 4):
                     out.append("  " + s(elbow if first else "  ", "dim") + s(piece, "dim"))
                     first = False
+            # what the agent said to itself as it reached for the tools ("I need to see how
+            # lr is used") -- for it more than for the person, so it sits last, in small print
+            for part in entry.text.strip("\n").split("\n") if entry.text.strip() else []:
+                out.extend("  " + s(piece, "dim", "italic") for piece in wrap(part, width - 2))
     elif kind == "edit":
         # a change to the files: one line saying what changed, the diff under it when open
         out.append(_ui._clip(_edit_head(entry), width))

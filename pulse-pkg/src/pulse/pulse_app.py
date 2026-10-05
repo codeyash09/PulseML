@@ -568,9 +568,11 @@ class App:
             return "No run is open. /monitor (the person) or start_run (you) opens one."
         return self._evidence()
 
-    def tool(self, calls: List[str], output: str) -> None:
+    def tool(self, calls: List[str], output: str, said: str = "") -> None:
+        """Tools the agent ran, as one folded line. `said` is what it said as it reached for
+        them ("I need to see how lr is used"): kept with the calls, shown when opened."""
         output = tui.clean(output).replace("\r", "")
-        self._add(tui.Entry("tool", calls=calls or ["tools"], output=output))
+        self._add(tui.Entry("tool", text=(said or "").strip(), calls=calls or ["tools"], output=output))
 
     def edit(self, labels: List[str], diff: str) -> None:
         """A change the agent wants to make: one folded line ("Edited train.py · +1 −1"),

@@ -269,6 +269,7 @@ class _State:
         self.todos = []
         self.dirty = False           # files changed since the last command that succeeded
         self.smoke_ok = None         # result of the last smoke_test (None: never run)
+        self.said = ""               # what the model said beside its tool calls, until shown
         self.nudges = 0
         self.last_call = None
         self.repeats = 0
@@ -1021,15 +1022,24 @@ def _brief(name, args):
     return f"{name}  {detail}".rstrip()[:160]
 
 
-def _show(name, args, result):
+def _show(name, args, result, state=None):
     """What the agent just did, in the Pulse app's transcript or as a compact terminal line."""
     host = _ui.host()
     if host is not None and hasattr(host, "tool"):
+        said = getattr(state, "said", "") if state is not None else ""
+        if state is not None:
+            state.said = ""
         if name in _WRITERS and getattr(host, "_edit_pending", None) is not None:
             # the diff is already in the transcript (show_change): say what became of it
-            host.edit_status("not applied" if result.startswith("NOT APPLIED") else "applied", final=True)
+            host.edit_status("not applied" if result.startswith("NOT APPLIED") else "applied",
+                             detail=said or None, final=True)
             return
-        host.tool([f"{name.upper()}: {_brief(name, args)[len(name):].strip()}"], result)
+        try:
+            host.tool([f"{name.upper()}: {_brief(name, args)[len(name):].strip()}"], result, said=said)
+        except TypeError:                   # an older host without `said`
+            if said:
+                _ui.answer(said)
+            host.tool([f"{name.upper()}: {_brief(name, args)[len(name):].strip()}"], result)
         return
     cprint(f"● {_brief(name, args)}", color=_BLUE)
     if name in ("edit_file", "replace_symbol", "write_file", "todo_write"):
@@ -1090,7 +1100,7 @@ def _execute(state, call):
         result += (f"\n\n(You have made this exact call {state.repeats} times in a row with the same result. "
                    "Change your approach.)")
     if name != "message_user":          # the message itself is what the user sees
-        _show(name, args, result)
+        _show(name, args, result, state)
     return result
 
 
@@ -1339,7 +1349,10 @@ def run_native_turn(cli, request, evidence=None):
                 break
             messages.append(_assistant_message(reply))
             if reply.text:
-                _ui.answer(reply.text)
+                if reply.calls and _ui.host() is not None and hasattr(_ui.host(), "tool"):
+                    state.said = reply.text          # goes with the first call's line (see _show)
+                else:
+                    _ui.answer(reply.text)
             if not reply.calls:
                 if reply.finish == "length":
                     messages.append({"role": "user", "content": "Your reply was cut off. Continue where you left off."})

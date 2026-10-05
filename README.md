@@ -545,10 +545,11 @@ Type `pulse` in a terminal and Pulse opens as one full-screen app:
    train.py:40-80`, `Searched for lr` -- and a click on it, or **Ctrl+O**, opens the
    output in place. A change to your files is one line too, `Edited train.py · +3 −1`,
    with what became of it (reviewed, applied, declined) on the same line and the diff
-   under it when opened. Three things are told apart at a glance: a command the agent ran
-   (a tool call, an edit) is highlighted in light orange, its thinking in light grey, and what
-   Pulse itself says -- the run's output, a note from a pipeline -- is plain grey text.
-   What the agent says to you is plain text. One colour: Pulse's orange marks what is
+   under it when opened. Three things are told apart at a glance: the agent's thinking is
+   orange, a command it ran (a tool call, an edit) is bold, and what Pulse itself says --
+   the run's output, a note from a pipeline -- is dim grey. What the agent says to you is
+   plain text; what it says to itself as it reaches for a tool ("I need to see how lr is
+   used") stays with that tool's line, shown when it is opened. One colour: Pulse's orange marks what is
    live, selected or worth a look (a finding, an added line), red marks what is wrong,
    and nothing else is coloured. The agent can also talk to you while it works -- a message beside its
    tool calls -- so you see what it found and what it is about to check without waiting
