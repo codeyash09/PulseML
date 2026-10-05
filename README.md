@@ -564,7 +564,8 @@ Type `pulse` in a terminal and Pulse opens as one full-screen app:
 | mouse | what can be clicked lights up under the pointer; a click on a folded line opens it where it is (and shuts it again); the wheel scrolls. The app reads the mouse, so hold Shift to select text, or `/mouse off` to give the mouse back to the terminal (remembered); `/copy` puts the agent's last answer on the clipboard |
 | ↑ / ↓ (empty line) | scroll back through the conversation; the screen otherwise shows the latest exchange |
 | Ctrl+C | cancel what is running; twice at an empty prompt leaves |
-| Esc | leave the open run in the background and go back to the agent; Esc again brings it back |
+| Esc, `/home` | back to the agent for anything else -- it works on your home project, without the run's data -- while the run stays watched (its findings and crashes still show up, and a crash still gets the agent); Esc or `/monitor` brings it back |
+| `/change [run]` | look at another run; the run you leave stays watched. Every run you opened is watched until `/close` (or `/close all`); a finding from one off screen carries its name |
 
 Commands on an open run: `/findings`, `/curve <name>`, `/vars`, `/audit`, `/audits on|off`,
 `/trace <var>`, `/source`, `/pause`, `/resume`, `/stop`, `/restart`, `/output`,

@@ -67,6 +67,7 @@ DEBUG_PROMPT = (
 
 HOME_COMMANDS: List[Tuple[str, str]] = [
     ("/monitor", "pick a run on this machine and open it beside the agent"),
+    ("/change", "the same, keeping every run already watched"),
     ("/runs", "the same list: every run on this machine"),
     ("/run", "start a script under Pulse and watch it: /run train.py --epochs 3"),
     ("/agent", "switch AI provider/model (or sign in with OpenRouter)"),
@@ -97,11 +98,14 @@ DEBUG_COMMANDS: List[Tuple[str, str]] = [
     ("/output", "the last lines the run printed (runs started with /run)"),
     ("/interval", "sample faster or slower: /interval 0.5"),
     ("/quiet", "stop announcing findings (/loud resumes)"),
-    ("/back", "return to the agent; the run stays open in the background"),
+    ("/home", "back to the agent for anything else; the run stays watched (findings, crashes)"),
+    ("/change", "look at another run; the one you leave stays watched"),
     ("/close", "stop watching the open run"),
 ]
 
 _STATUS_STYLE = {"live": "accent", "stalled": "bold", "crashed": "red"}
+# what makes up the run the app is looking at; a parked run keeps them in App.parked
+_WATCH_FIELDS = ("console", "session", "_monitor", "runlog", "_status", "_rate", "_rate_at")
 _AUTO_CRASH_TURNS = 3       # crashes in a row the agent starts on by itself, before the person is asked
 _RUN_LOG_DIR = "app-runs"
 
@@ -376,6 +380,9 @@ class App:
         self.background = False                      # the run is watched, its pane is not shown
         self.runlog: Optional[RunLog] = None         # the run's row on the dashboard
         self._orig_sync: Any = None
+        # runs still watched but not the open one: session id -> what _WATCH_FIELDS hold for it
+        self.parked: Dict[str, Dict[str, Any]] = {}
+        self._parked_at = 0.0
         self._monitor: Any = None                    # a py-spy sampler this app started
         self.audits = True
         self.launched: Dict[str, Dict[str, Any]] = {}    # session id -> what /run started
@@ -883,7 +890,7 @@ class App:
 
     # ================================================================== what was typed
 
-    def _handle(self, line: str) -> None:
+    def _handle(self, line: str, about_run: bool = False) -> None:
         if line.startswith("/") or line == "?":
             self._command(line)
             return
@@ -893,7 +900,7 @@ class App:
                       "(or signs you in to OpenRouter, which needs no key).")
             return
         from . import pulse_code
-        evidence = self._evidence() if self.console is not None else None
+        evidence = self._evidence() if self.console is not None and (not self.background or about_run) else None
         before = (self.session or {}).get("session_id")
         outcome = pulse_code.run_turn(cli, line, evidence=evidence)
         restarted = (self.session or {}).get("session_id") != before     # the agent ran it again itself
@@ -924,6 +931,8 @@ class App:
             self._help()
         elif word in ("/monitor", "/runs", "/watch", "/sessions", "/attach"):
             self._pick_run(rest)
+        elif word == "/change":
+            self._change(rest)
         elif word == "/run":
             self._launch(rest)
         elif word == "/mouse":
@@ -935,7 +944,8 @@ class App:
         elif word == "/close":
             self.note("No run is open.")
         elif word in ("/back", "/home"):
-            self.note("No run is open. /monitor picks one.")
+            self.note("You are home already. " + ("/change opens a watched run." if self.parked
+                                                   else "/monitor opens a run beside the agent."))
         elif not pulse_code._handle_command(self.cli, line):
             self.done = True
 
@@ -997,21 +1007,25 @@ class App:
 
     # ================================================================== runs on this machine
 
-    def _pick_run(self, wanted: str = "") -> None:
+    def _change(self, wanted: str = "") -> None:
+        """/change [run]: look at another run; every run already watched stays watched."""
+        if not wanted and not self.parked and self.console is None:
+            self._pick_run("")
+            return
+        self._pick_run(wanted, keep=True)
+
+    def _pick_run(self, wanted: str = "", keep: bool = False) -> None:
         from . import pulse_console as con
         sessions = con.discover()
         idle = con.unmonitored_python_processes()
         current = (self.session or {}).get("session_id")
-        if not wanted and self.background and current:
+        if not wanted and not keep and self.background and current:
             self._foreground_run()                   # /monitor alone: the run that is already watched
             return
         if wanted:
             chosen = con.pick_session(sessions, wanted)
             if chosen is not None:
-                if chosen.get("session_id") == current:
-                    self._foreground_run()
-                else:
-                    self._open_run(chosen)
+                self._switch_to(chosen)
                 return
             outside = [p for p in idle if os.path.basename(p["script"]) == os.path.basename(wanted)
                        or str(p["pid"]) == wanted]
@@ -1034,6 +1048,8 @@ class App:
             bits.append(os.path.dirname(session.get("script") or "") or session["session_id"])
             if session.get("session_id") == current:
                 when = "watched" if self.background else "open"
+            elif session.get("session_id") in self.parked:
+                when = "watched"
             options.append(_ui.Option(script, " · ".join(bits), tag=when))
             targets.append(("session", session))
         for process in idle[:8]:
@@ -1051,11 +1067,10 @@ class App:
         if not isinstance(picked, int):
             return
         kind, target = targets[picked]
-        if kind == "session" and target.get("session_id") == current:
-            self._foreground_run()
-        elif kind == "session":
-            self._open_run(target)
+        if kind == "session":
+            self._switch_to(target)
         else:
+            self._park()
             self._attach_outside(target)
 
     def _attach_outside(self, process: Dict[str, Any]) -> None:
@@ -1101,8 +1116,16 @@ class App:
         key = cli.agent_key if cli.agent_key != "local" else None
         return build_litellm_agent(model, api_key=key, api_base=getattr(cli, "agent_api_base", None))
 
-    def _open_run(self, session: Dict[str, Any], monitor: Any = None) -> None:
-        self._close_run(quiet=True)
+    def _open_run(self, session: Dict[str, Any], monitor: Any = None, replace: bool = False) -> None:
+        """Show `session` beside the agent. The run in view until now stays watched (parked),
+        unless `replace` (a restart: the old process is gone, its new one takes its place)."""
+        if session.get("session_id") in self.parked:
+            self._switch_to(session)
+            return
+        if replace:
+            self._close_run(quiet=True)
+        else:
+            self._park()
         console = _make_console(self, session, self._brain_agent())
         console.brain.poll_once()
         console.start()
@@ -1135,17 +1158,26 @@ class App:
             return
         self.runlog = log
         log.start()
+        self._wrap_sync(log)
+
+    def _wrap_sync(self, log: "RunLog") -> None:
+        """The agent's turns go on the open run's dashboard row too."""
         cli = self.cli
-        self._orig_sync = cli._sync_agent_turn
+        self._orig_sync = original = cli._sync_agent_turn
 
         def sync(question: str, answer: str, traceback_signature: Optional[str] = None,
                  fix_applied: Optional[Dict[str, Any]] = None) -> None:
             try:
-                self._orig_sync(question, answer, traceback_signature=traceback_signature, fix_applied=fix_applied)
+                original(question, answer, traceback_signature=traceback_signature, fix_applied=fix_applied)
             finally:
                 log.agent_turn(question, answer, fix_applied=fix_applied)
 
         cli._sync_agent_turn = sync
+
+    def _unwrap_sync(self) -> None:
+        if self._orig_sync is not None:
+            self.cli._sync_agent_turn = self._orig_sync
+            self._orig_sync = None
 
     def _stop_runlog(self) -> None:
         log, self.runlog = self.runlog, None
@@ -1154,6 +1186,13 @@ class App:
             self._orig_sync = None
         if log is not None:
             log.close()
+
+    def _close_all(self) -> None:
+        """Stop watching every run (they keep running): leaving the app, /close all."""
+        self._close_run(quiet=True)
+        while self.parked:
+            self._unpark_quietly(next(iter(self.parked)), background=True)
+            self._close_run(quiet=True)
 
     def _close_run(self, quiet: bool = False) -> None:
         """Stop watching the open run (it keeps running) and aim the agent at home again."""
@@ -1231,29 +1270,146 @@ class App:
         self.view.entries.append(tui.Entry("user", f"Why did {script} crash? Fix it."))
         self._last_blank = False
         self.dirty = True
-        self._start(self._handle, request)
+        self._start(self._crash_turn, request)
+
+    def _crash_turn(self, request: str) -> None:
+        """A crash is about the run even from home: the agent works on the run's project for
+        this turn, with its evidence, and goes back home after."""
+        home = self.background
+        if home:
+            self._aim_at_run()
+        try:
+            self._handle(request, about_run=True)
+        finally:
+            if home and self.background:
+                self._aim_home()
 
     def _background_run(self) -> None:
-        """Back to the agent at home, with the run still watched: its pane goes, findings are
-        still announced, and /monitor (or Esc) brings it back. The agent stays pointed at the
-        run's project, so a fix for it can still be asked for from home."""
+        """/home (and /back, Esc): back to the agent for anything at all -- it works on the home
+        project, without the run's evidence -- while the run stays watched: its findings are
+        still announced, a crash still gets the agent, and /monitor (or Esc) brings it back."""
         if self.console is None:
+            self.note("You are home already. /monitor opens a run beside the agent.")
             return
         with self.lock:
             self.background = True
             self.view.side, self.view.side_brief = None, []
+        self._aim_home()
         self._refresh_header()
-        name = os.path.basename((self.session or {}).get("script") or "the run")
-        self.note(f"{name} is still watched in the background: findings show up here, /monitor "
-                  "brings it back, /close stops watching it.")
+        watched = [os.path.basename((self.session or {}).get("script") or "the run")] + [
+            os.path.basename(state["session"].get("script") or "a run") for state in self.parked.values()]
+        self.note(f"Home. Still watched: {', '.join(watched)} -- findings and crashes show up here; "
+                  "/monitor brings the run back, /change picks another, /close stops watching.")
 
     def _foreground_run(self) -> None:
         if self.console is None or not self.background:
             return
         with self.lock:
             self.background = False
+        self._aim_at_run()
         self._refresh_header()
         self._refresh_side(force=True)
+
+    def _aim_home(self) -> None:
+        from . import pulse_code
+        self._point(self.home_root, self.home_focus)
+        self.cli._system_prompt_override = pulse_code.CODE_SYSTEM_PROMPT
+
+    def _aim_at_run(self) -> None:
+        from . import pulse_code
+        console, session = self.console, self.session or {}
+        if console is None:
+            return
+        script = session.get("script") or ""
+        if os.path.isdir(console.workdir):
+            self._point(console.workdir, [script] if script and os.path.isfile(script) else [])
+        self.cli._system_prompt_override = pulse_code.CODE_SYSTEM_PROMPT + DEBUG_PROMPT
+
+    def _park(self) -> None:
+        """Keep watching the open run, off screen: its console goes on reading the run (its
+        findings are announced with its name), its dashboard row goes on, and /change or
+        /monitor brings it back."""
+        session_id = (self.session or {}).get("session_id")
+        if self.console is None or not session_id:
+            return
+        self._unwrap_sync()
+        with self.lock:
+            self.parked[session_id] = {field: getattr(self, field) for field in _WATCH_FIELDS}
+            self.console = self.session = self._monitor = self.runlog = None
+            self.view.side, self.view.side_brief = None, []
+            self.background = False
+        self._aim_home()
+
+    def _unpark(self, session_id: str) -> None:
+        state = self.parked.pop(session_id)
+        with self.lock:
+            for field, value in state.items():
+                setattr(self, field, value)
+            self.background = False
+        if self.runlog is not None:
+            self._wrap_sync(self.runlog)
+        self._aim_at_run()
+        self._refresh_header()
+        name = os.path.basename((self.session or {}).get("script") or "the run")
+        self.note(f"Back on {name} ({self._status}).")
+        with self.lock:
+            self._refresh_side(force=True)
+
+    def _switch_to(self, session: Dict[str, Any]) -> None:
+        """Show `session`, keeping every run already watched (the one left included)."""
+        session_id = session.get("session_id")
+        if session_id == (self.session or {}).get("session_id"):
+            self._foreground_run()
+            return
+        self._park()
+        if session_id in self.parked:
+            self._unpark(session_id)
+        else:
+            self._open_run(session)
+
+    def _tick_parked(self, now: float) -> None:
+        """The runs watched off screen: their dashboard rows, and what became of them (a crash
+        is said at once; at home, the agent takes it on). With the lock held."""
+        if not self.parked or now - self._parked_at < 2.0:
+            return
+        self._parked_at = now
+        from . import pulse_console as con
+        for session_id, state in list(self.parked.items()):
+            console, session = state["console"], state["session"]
+            if state["runlog"] is not None:
+                try:
+                    state["runlog"].tick(console.snapshot(), state["_status"], list(console.brain.events), session)
+                except Exception:
+                    pass
+            described = con._describe_session(session.get("directory", ""))
+            if not described or described["status"] == state["_status"]:
+                continue
+            state["_status"] = described["status"]
+            name = os.path.basename(session.get("script") or "a run")
+            if described["status"] == "crashed" and session_id not in self._crashes_seen:
+                if self.console is None or self.background:
+                    # nobody is looking at another run: this one becomes the run in hand, so the
+                    # agent can take the crash on (the view stays home)
+                    home = self.console is None or self.background
+                    self._park()
+                    self._unpark_quietly(session_id, background=home)
+                    self._on_crash()
+                else:
+                    self.error(f"{name} (watched off screen) crashed. /change {name} opens it; the agent "
+                               "looks at it then.")
+            elif described["status"] not in ("live", "stalled"):
+                self.note(f"{name} (watched off screen) has {described['status']}.")
+
+    def _unpark_quietly(self, session_id: str, background: bool) -> None:
+        state = self.parked.pop(session_id)
+        for field, value in state.items():
+            setattr(self, field, value)
+        self.background = background
+        if self.runlog is not None:
+            self._wrap_sync(self.runlog)
+        if not background:
+            self._aim_at_run()
+        self._refresh_header()
 
     def _point(self, root: str, focus: List[str]) -> None:
         """Aim the code agent at a project: its files, its working directory, its history."""
@@ -1286,7 +1442,15 @@ class App:
         if word in ("/back", "/home"):
             self._background_run()
         elif word == "/close":
-            self._close_run()
+            if rest.lower() == "all":
+                self._close_all()
+                self.note("Stopped watching every run. They keep going; /monitor opens one again.")
+            else:
+                self._close_run()
+                if self.parked:
+                    names = ", ".join(os.path.basename(s["session"].get("script") or "a run")
+                                      for s in self.parked.values())
+                    self.note(f"Still watched: {names}. /change opens one; /close all stops them all.")
         elif word == "/findings":
             console.show_findings()
         elif word == "/status":
@@ -1426,7 +1590,7 @@ class App:
             self._print_tail(log_path, 25)
             return
         self.launched[session["session_id"]] = {"process": process, "argv": argv, "cwd": cwd, "log": log_path}
-        self._open_run(session)
+        self._open_run(session, replace=replace is not None)
         self.note(f"Started under Pulse. Its output goes to {log_path} (/output shows the end of it). "
                   "It keeps running if you leave Pulse.")
 
@@ -1521,11 +1685,15 @@ class App:
             view.area = "DEBUG"
             view.context = f"{os.path.basename(self.session.get('script') or '?')}  ·  {short(self.console.workdir)}"
             view.commands = DEBUG_COMMANDS + HOME_COMMANDS
-        elif self.console is not None and self.session is not None:
+        elif (self.console is not None and self.session is not None) or self.parked:
             view.area = ""
-            view.context = (f"{short(self.console.workdir)}   watching "
-                            f"{os.path.basename(self.session.get('script') or '?')} ({self._status}) -- /monitor")
-            view.commands = DEBUG_COMMANDS + HOME_COMMANDS
+            watched = ([(self.session or {}, self._status)] if self.console is not None else []) + [
+                (state["session"], state["_status"]) for state in self.parked.values()]
+            names = ", ".join(f"{os.path.basename(session.get('script') or '?')}"
+                              + ("" if status in ("live", "stalled") else f" ({status})")
+                              for session, status in watched)
+            view.context = f"{short(self.home_root)}   watching {names} -- /change"
+            view.commands = (DEBUG_COMMANDS if self.console is not None else []) + HOME_COMMANDS
         else:
             view.area = ""
             view.context = short(getattr(cli, "_project_root", None) or self.home_root)
@@ -1535,6 +1703,7 @@ class App:
 
     def _refresh_side(self, force: bool = False) -> None:
         """Rebuild the run pane from the brain's current state (cheap; a few times a second)."""
+        self._tick_parked(time.monotonic())
         console = self.console
         if console is None:
             return
@@ -1660,6 +1829,15 @@ class App:
                         console.stop()
                     except Exception:
                         pass
+                for state in list(self.parked.values()):     # the runs watched off screen
+                    for stop in (lambda: state["runlog"] and state["runlog"].close(),
+                                 lambda: state["console"].stop(),
+                                 lambda: state["_monitor"] and state["_monitor"].stop()):
+                        try:
+                            stop()
+                        except Exception:
+                            pass
+                self.parked.clear()
                 if self._monitor is not None:
                     try:
                         self._monitor.stop()
@@ -1682,8 +1860,12 @@ def _make_console(app: App, session: Dict[str, Any], agent: Optional[Callable[[s
         def _announce(self, findings: List[Any]) -> None:
             if self.quiet:
                 return
+            name = ""
+            if self is not app.console:          # a run watched off screen: say which one
+                name = os.path.basename((self.session or {}).get("script") or "") or "a watched run"
             for finding in findings:
-                app._add(tui.Entry("finding", finding.message, severity=finding.severity))
+                app._add(tui.Entry("finding", (f"{name}: " if name else "") + finding.message,
+                                   severity=finding.severity))
 
         def _report_audit(self, record: Optional[Dict[str, Any]]) -> None:
             """A scheduled look at the run: one quiet line in the model's words. The decision
@@ -1694,6 +1876,9 @@ def _make_console(app: App, session: Dict[str, Any], agent: Optional[Callable[[s
                 app.note(f"The scheduled check of the run failed: {record.get('error')}")
                 return
             text = audit_words(record.get("text") or "")
+            if self is not app.console:          # a run watched off screen: say which one
+                name = os.path.basename((self.session or {}).get("script") or "") or "a watched run"
+                text = f"{name}: {text}" if text else f"{name}."
             if record.get("status") == "problem":
                 found = "; ".join(str(f) for f in (record.get("findings") or [])[:3])
                 app.error("The agent's check found a problem" + (f": {found}" if found else "")

@@ -1658,3 +1658,101 @@ def test_moving_the_mouse_keeps_the_status_line(app):
     app.view.status = "Ctrl+C again to leave Pulse"
     app.on_key("hover:1:1")
     assert app.view.status == "Ctrl+C again to leave Pulse"
+
+
+# ---------------------------------------------------------------- /home and /change
+
+def test_home_frees_the_agent_and_keeps_the_run_watched(real_app, tmp_path, monkeypatch):
+    from pulse import pulse_code
+    real_app._open_run(make_run(tmp_path))
+    run_project = real_app.cli._project_root
+    run_line(real_app, "/home")
+    assert wait_for(lambda: real_app.background and not real_app.view.busy, 10)
+    assert real_app.console is not None and real_app.view.side is None          # still watched
+    assert real_app.cli._project_root == real_app.home_root != run_project       # the agent is home
+    assert "DEBUG" not in (real_app.cli._system_prompt_override or "") and "LIVE TRAINING RUN" not in (
+        real_app.cli._system_prompt_override or "")
+    seen = {}
+    monkeypatch.setattr(pulse_code, "run_turn", lambda cli, line, evidence=None: seen.setdefault("evidence", evidence))
+    run_line(real_app, "write a README for my other project")
+    assert wait_for(lambda: "evidence" in seen and not real_app.view.busy, 10)
+    assert seen["evidence"] is None                                            # no run evidence at home
+    run_line(real_app, "/monitor")                                             # the run comes back
+    assert wait_for(lambda: not real_app.background and not real_app.view.busy, 10)
+    assert real_app.cli._project_root == run_project and real_app.view.area == "DEBUG"
+
+
+def test_change_shows_another_run_and_keeps_watching_the_first(real_app, tmp_path, monkeypatch):
+    first = dict(make_run(tmp_path, "train"), status="live")
+    second = dict(make_run(tmp_path, "evalrun"), status="live")
+    monkeypatch.setattr(con, "discover", lambda *a, **k: [first, second])
+    monkeypatch.setattr(con, "unmonitored_python_processes", lambda: [])
+    real_app._open_run(first)
+    run_line(real_app, "/change evalrun")
+    assert wait_for(lambda: not real_app.view.busy, 10)
+    assert real_app.session["session_id"] == "evalrun" and list(real_app.parked) == ["train"]
+    assert real_app.parked["train"]["console"]._thread.is_alive()            # still reading the first run
+    assert "evalrun.py" in real_app.view.context
+    run_line(real_app, "/change")                                              # the picker marks it watched
+    assert wait_for(lambda: real_app.view.options is not None, 10)
+    tags = {label: tag for label, _d, tag in real_app.view.options}
+    assert tags == {"train.py": "watched", "evalrun.py": "open"}
+    for _ in range([label for label, _d, _t in real_app.view.options].index("train.py")):
+        press(real_app, "down")
+    press(real_app, "enter")                                                   # back to the first
+    assert wait_for(lambda: not real_app.view.busy and real_app.session["session_id"] == "train", 10)
+    assert list(real_app.parked) == ["evalrun"] and "Back on train.py" in text_of(real_app)
+    run_line(real_app, "/close all")
+    assert wait_for(lambda: not real_app.view.busy, 10)
+    assert real_app.console is None and real_app.parked == {}
+
+
+def test_a_finding_from_a_run_off_screen_says_which_run(real_app, tmp_path, monkeypatch):
+    first = make_run(tmp_path, "train")
+    second = make_run(tmp_path, "evalrun")
+    real_app._open_run(first)
+    real_app._switch_to(second)
+    parked = real_app.parked["train"]["console"]
+    parked._announce([types.SimpleNamespace(message="loss went NaN", severity="critical")])
+    real_app.console._announce([types.SimpleNamespace(message="grad norm high", severity="warning")])
+    found = [e.text for e in real_app.view.entries if e.kind == "finding"]
+    assert found[-2:] == ["train.py: loss went NaN", "grad norm high"]
+
+
+def test_a_run_off_screen_that_crashes_while_home_gets_the_agent(real_app, tmp_path, monkeypatch):
+    first = make_run(tmp_path, "train")
+    second = make_run(tmp_path, "evalrun")
+    real_app._open_run(first)
+    real_app._switch_to(second)
+    real_app._background_run()                                                 # home, both watched
+    crashes = []
+    monkeypatch.setattr(real_app, "_on_crash", lambda: crashes.append(real_app.session["session_id"]))
+    monkeypatch.setattr(con, "_describe_session",
+                        lambda d: {"status": "crashed" if d.endswith("train") else "live", "last_seen": 0})
+    with real_app.lock:
+        real_app._tick_parked(time.monotonic() + 10)
+    assert crashes == ["train"] and real_app.background                       # the view stays home
+    assert list(real_app.parked) == ["evalrun"]
+
+
+def test_a_run_off_screen_that_crashes_while_another_is_shown_is_announced(real_app, tmp_path, monkeypatch):
+    first = make_run(tmp_path, "train")
+    second = make_run(tmp_path, "evalrun")
+    real_app._open_run(first)
+    real_app._switch_to(second)
+    monkeypatch.setattr(con, "_describe_session",
+                        lambda d: {"status": "crashed" if d.endswith("train") else "live", "last_seen": 0})
+    with real_app.lock:
+        real_app._tick_parked(time.monotonic() + 10)
+    assert real_app.session["session_id"] == "evalrun"                        # the view is not taken
+    assert "train.py (watched off screen) crashed. /change train.py" in text_of(real_app)
+
+
+def test_the_top_bar_at_home_names_every_watched_run(real_app, tmp_path):
+    real_app._open_run(make_run(tmp_path, "train"))
+    real_app._switch_to(make_run(tmp_path, "evalrun"))
+    real_app._background_run()
+    context = real_app.view.context
+    assert context.startswith(os.path.basename(real_app.home_root)) or "~" in context or real_app.home_root in context
+    assert "evalrun.py" in context and "train.py" in context and "/change" in context
+    assert "evalrun_project" not in context                                   # home's folder, not the run's
