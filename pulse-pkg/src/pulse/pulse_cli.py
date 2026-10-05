@@ -53,6 +53,7 @@ from pulse import pulse_terminal as _terminal
 from pulse import pulse_approver as _approver
 from pulse import pulse_openrouter as _openrouter
 from pulse import pulse_trace as _pulse_trace
+from pulse import pulse_ratelimit as _ratelimit
 
 
 class _LazyLitellm:
@@ -1584,9 +1585,9 @@ SYSTEM_PROMPT = (
     "  Safety net:\n"
     "    ROLLBACK: <commit_id, or 'last'> -- deterministically revert the workspace to a prior state "
     "via Pulse's own persistent change log (see /log), instead of trying to manually reconstruct old "
-    "code from memory. Note: if a fix you just applied causes repeated restart failures, Pulse already "
-    "rolls back to the pre-fix state automatically -- you don't need to invoke this for that case, only "
-    "for a deliberate revert mid-conversation.\n"
+    "code from memory. Note: Pulse never rolls a fix back on its own. If a fix you applied makes the "
+    "restarted run fail, that failure is handed back to you to repair the CURRENT code; use this only "
+    "for a deliberate revert.\n"
     "  ML health/anti-patterns (heuristic -- worth double-checking, not guaranteed):\n"
     "    MLLINT: -- a handful of AST-detectable ML anti-patterns: metric/loss mismatches in either "
     "direction (e.g. 'accuracy' against a regression loss, or 'mae' against a classification loss), "
@@ -1681,11 +1682,15 @@ class AgentRequestFailed(Exception):
 
     `transient` says whether asking again later can succeed (a rate limit,
     a timeout, a provider outage) or not (a bad key, an unknown model, a
-    context too long): only transient failures are queued for retry."""
+    context too long): only transient failures are queued for retry.
 
-    def __init__(self, message: str = "", transient: bool = True):
+    `rate_limited` says the provider kept answering "slow down" for the request's whole
+    waiting budget (see pulse_ratelimit); such a failure is always transient too."""
+
+    def __init__(self, message: str = "", transient: bool = True, rate_limited: bool = False):
         super().__init__(message)
-        self.transient = transient
+        self.rate_limited = rate_limited
+        self.transient = transient or rate_limited
 
 
 PROVIDERS = {
@@ -2194,6 +2199,18 @@ _IMPLEMENT_RE = re.compile(
     r"\b(?:fix(?:es|ed|ing)?|edit(?:s|ed|ing)?|patch(?:es|ed|ing)?|change the code|"
     r"appl(?:y|ies|ied|ying)|implement(?:s|ed|ing)?)\b", re.IGNORECASE)
 _MAX_VERIFY_ATTEMPTS = 3
+# How long a rate limit may hold up a run that is paused waiting for the agent. Past this the
+# request is parked and retried in the background while training carries on.
+_STALLED_RATE_LIMIT_WAIT_SECONDS = 90.0
+
+
+def _max_restart_attempts() -> int:
+    """How many times a fix's re-run is retried (feeding each failure back to the agent) before
+    Pulse stops. PULSE_MAX_RESTART_ATTEMPTS, default 5, never below 1."""
+    try:
+        return max(1, int(os.environ.get("PULSE_MAX_RESTART_ATTEMPTS", "5")))
+    except ValueError:
+        return 5
 
 # How many times the fix pass may ask to see more code before giving up.
 _MAX_FIX_TOOL_ROUNDS = 3
@@ -3730,9 +3747,8 @@ class PulseCLI:
         self._replay_checkpoints: List[tuple] = []
         self._replay_step_counter = itertools.count()
         # id of the most recently recorded .pulse_history commit -- lets
-        # _restart_process() know exactly what to roll back to if the
-        # fix that triggered a restart keeps crashing (see
-        # _auto_rollback_after_failed_restarts).
+        # _restart_process() tell the user exactly which commits a failed fix chain
+        # made, and what to /revert to undo it (see _report_failed_fix_chain).
         self._last_commit_id: Optional[str] = None
         # (rank, local_rank, world_size, session_key) -- set by
         # _start_cli_tracker when running under a multi-GPU/multi-process
@@ -7461,8 +7477,8 @@ class PulseCLI:
 
         # Captured now (before the retry loop below can apply further
         # fixes of its own) -- this is "the fix that triggered this
-        # restart chain", i.e. what _auto_rollback_after_failed_restarts
-        # rolls back to if every retry in this chain still crashes.
+        # restart chain", i.e. where _report_failed_fix_chain points /revert
+        # if every retry in this chain still crashes.
         chain_start_commit_id = self._last_commit_id
         _agent_log_event("RESTARTING the training script to run the fixed code")
 
@@ -7672,9 +7688,12 @@ class PulseCLI:
         # agent's fix -- which is already saved to disk -- more chances to
         # actually take effect. Attempts are capped (not infinite) so a
         # deterministically-broken script can't spin forever burning
-        # compute/cost unattended; MAX_RESTART_ATTEMPTS is the one knob to
-        # raise if that cap is ever too low for a given job.
-        MAX_RESTART_ATTEMPTS = 5
+        # compute/cost unattended; PULSE_MAX_RESTART_ATTEMPTS is the one knob to
+        # raise if that cap is ever too low for a given job. Running out of attempts
+        # never touches the code: the last fix stays on disk (see
+        # _report_failed_fix_chain), because throwing away work the user can read and
+        # judge is not a decision to take for them.
+        MAX_RESTART_ATTEMPTS = _max_restart_attempts()
         RETRY_BACKOFF_SECONDS = 3  # multiplied by attempt number, capped below
 
         attempt = 0
@@ -7746,19 +7765,12 @@ class PulseCLI:
 
             if attempt >= MAX_RESTART_ATTEMPTS:
                 cprint(
-                    f"[Pulse] ⚠ {message}. Giving up after {MAX_RESTART_ATTEMPTS} attempts -- "
-                    "continuing current run with the old in-memory code.",
+                    f"[Pulse] ⚠ {message}. Stopping after {MAX_RESTART_ATTEMPTS} attempts -- "
+                    "continuing the current run with the old in-memory code.",
                     color=_RED,
                 )
                 self._log_incident("restart_failed", message)
-                # "Automatic rollback offered rather than requiring the
-                # model to reason its way to 'maybe I should revert'" --
-                # every retry in this chain still crashed, so restore the
-                # workspace to right before the fix that started it,
-                # using the same .pulse_history mechanism /revert uses.
-                # Nothing is destroyed: the failed chain stays fully
-                # recoverable afterward via /log + /revert.
-                self._auto_rollback_after_failed_restarts(chain_start_commit_id)
+                self._report_failed_fix_chain(chain_start_commit_id)
                 return
 
             # A nonzero exit almost always means the agent's own fix didn't
@@ -7798,13 +7810,25 @@ class PulseCLI:
                     self._ask_agent_impl(failure_question, include_code=True, _depth=0)
                 finally:
                     self._suppress_auto_restart = False
+                if self._last_call_failed_transiently:
+                    # The agent could not be reached (a rate limit that outlasted its wait, an
+                    # outage): that says nothing about the fix. Relaunching the script as it is
+                    # would just crash again and use up an attempt on nothing -- and the attempts
+                    # running out used to roll the code back. Keep the fix, park this request so
+                    # it is asked again when the provider recovers, and stop here.
+                    cprint(f"[Pulse] ⚠ {message}. The agent could not be reached to repair it, so the "
+                           "relaunch is paused (no attempt used). The fix stays on disk and this "
+                           "request will be retried automatically.", color=_YELLOW)
+                    self._log_incident("restart_paused", message + " -- agent unreachable")
+                    self._queue_agent_retry(failure_question, True, None)
+                    return
                 if not crashed and not self._fix_applied_this_turn:
                     # The re-run already finished cleanly; running the byte-identical
                     # script again (a full training run) cannot change the verdict.
                     cprint(f"[Pulse] ⚠ {message}. The agent made no further change -- not re-running "
                            "the same script.", color=_RED)
                     self._log_incident("restart_failed", message + " -- no further fix")
-                    self._auto_rollback_after_failed_restarts(chain_start_commit_id)
+                    self._report_failed_fix_chain(chain_start_commit_id)
                     return
                 child_env = _child_env()
             else:
@@ -8336,6 +8360,34 @@ class PulseCLI:
         # very long body (full request/response dump).
         return msg[:200] + ("…" if len(msg) > 200 else "")
 
+    def _is_rate_limited(self, exc: Exception) -> bool:
+        return _ratelimit.is_rate_limited(exc, getattr(litellm, "RateLimitError", None))
+
+    def _wait_out_rate_limit(self, exc: Exception, waiter: "_ratelimit.RateLimitWaiter",
+                             label: str = "") -> None:
+        """The provider said "slow down": wait as long as it asked (or, if it did not say, an
+        exponential while), then return so the caller retries the same request. Raises
+        AgentRequestFailed when it should stop waiting: a limit that waiting cannot clear
+        (no credit left), the waiting budget spent, or Ctrl+C pending. Every rate-limited call
+        in Pulse goes through here, so they all give up the same way."""
+        if _ratelimit.is_hard_limit(exc):
+            _agent_log_event("AGENT REQUEST FAILED", f"{label}: out of quota/credit -- not waiting")
+            raise AgentRequestFailed(
+                "the provider refused the request because the account is out of credit "
+                "-- waiting will not fix that (add credit, or switch model with /agent)",
+                transient=False) from exc
+        delay = waiter.next_delay(exc)
+        if delay is None:
+            waited = int(round(waiter.waited))
+            _agent_log_event("AGENT REQUEST FAILED", f"{label}: still rate limited after {waited}s")
+            raise AgentRequestFailed(
+                f"still rate limited by the provider after waiting {waited}s", rate_limited=True) from exc
+        cprint(f"[Pulse] ⚠ {_ratelimit.describe_wait(delay, waiter)}", color=_YELLOW)
+        if not waiter.wait(delay, should_stop=lambda: bool(getattr(self, "_stop_requested", False))):
+            # The user asked to stop: not a failure worth queueing a retry for.
+            raise AgentRequestFailed("stopped while waiting for the provider's rate limit to clear",
+                                     transient=False) from exc
+
     def _call_model(self, instruction: str, max_tokens: int = _AGENT_MAX_TOKENS, *,
                     system: Optional[str] = None,
                     history: Optional[List[Dict[str, str]]] = None,
@@ -8383,7 +8435,20 @@ class PulseCLI:
         last_exc: Optional[Exception] = None
         label = purpose or (instruction.strip().splitlines() or ["(empty)"])[0][:90]
         call_no = _agent_log_call(label, messages, model)
-        for attempt in range(1, max_attempts + 1):
+        # A rate limit is waited out against its own budget (see pulse_ratelimit), not counted
+        # against `max_attempts`: three retries a few seconds apart all fall inside the same
+        # rate-limit window, so they fail together and what happened next was down to luck.
+        # While a mid-run escalation has training paused on this very call, a long wait is
+        # idle GPUs: wait a little, then fail so the request is parked and retried in the
+        # background with training running (see ask_agent / _queue_agent_retry). Anywhere
+        # else -- a background call, a crashed script with nothing left to stall -- wait fully.
+        budget = None
+        if getattr(self, "_pending_agent_start_ts", None) is not None:
+            budget = min(_ratelimit.max_wait_seconds(), _STALLED_RATE_LIMIT_WAIT_SECONDS)
+        waiter = _ratelimit.RateLimitWaiter(budget=budget)
+        attempt = 0
+        while True:
+            attempt += 1
             started = time.monotonic()
             try:
                 response = _complete(
@@ -8408,21 +8473,28 @@ class PulseCLI:
                 raise
             except Exception as exc:
                 last_exc = exc
+                reason = self._classify_model_error(exc)
+                if self._is_rate_limited(exc):
+                    _agent_log_reply(call_no, None, time.monotonic() - started,
+                                     error=f"rate limited (hit {waiter.hits + 1}, waited {waiter.waited:.0f}s)")
+                    self._wait_out_rate_limit(exc, waiter, label)          # raises when it should give up
+                    attempt -= 1                                           # a wait is not an attempt
+                    continue
                 _agent_log_reply(call_no, None, time.monotonic() - started,
-                                 error=f"attempt {attempt}/{max_attempts}: {self._classify_model_error(exc)}")
+                                 error=f"attempt {attempt}/{max_attempts}: {reason}")
                 if attempt < max_attempts and (isinstance(exc, _EmptyModelResponse)
                                                or self._is_retryable_model_error(exc)):
                     backoff = 2 ** (attempt - 1)  # 1s, 2s, 4s
                     cprint(
                         f"[Pulse] ⚠ Agent request hit a transient error (attempt {attempt}/{max_attempts}), "
-                        f"retrying in {backoff}s: {self._classify_model_error(exc)}",
+                        f"retrying in {backoff}s: {reason}",
                         color=_RED,
                     )
                     time.sleep(backoff)
                     continue
-                _agent_log_event("AGENT REQUEST FAILED", f"{label}: {self._classify_model_error(exc)}")
+                _agent_log_event("AGENT REQUEST FAILED", f"{label}: {reason}")
                 transient = isinstance(exc, _EmptyModelResponse) or self._is_retryable_model_error(exc)
-                raise AgentRequestFailed(self._classify_model_error(exc), transient=transient) from exc
+                raise AgentRequestFailed(reason, transient=transient) from exc
         # Unreachable in practice (the loop above always returns or raises),
         # but keeps type-checkers happy and fails safe if that ever changes.
         raise AgentRequestFailed(self._classify_model_error(last_exc) if last_exc else "unknown error")
@@ -10022,9 +10094,9 @@ class PulseCLI:
         """Called when _restart_process gave up after MAX_RESTART_ATTEMPTS
         because it couldn't even LAUNCH the replacement process (an OS/
         environment-level failure, not the training script itself
-        crashing -- that second case already triggers an auto-rollback
-        instead, since it means the fix itself is the problem, and
-        retrying a demonstrably-broken fix forever isn't safe). A launch
+        crashing -- that second case stops and reports instead, see
+        _report_failed_fix_chain, since retrying a demonstrably-broken fix
+        forever isn't safe). A launch
         failure has nothing to do with whether the fix is good, so it's
         legitimately worth trying again later."""
         existing = self._pending_restart_retry or getattr(self, "_last_restart_retry", None)
@@ -11132,6 +11204,8 @@ class PulseCLI:
                         max_tokens=_AGENT_MAX_TOKENS,
                     )
             except AgentRequestFailed as exc:
+                if exc.transient:
+                    raise      # not a verdict: see _ask_agent_impl, which parks the whole request
                 return fix, False, f"(verification request failed: {exc})"
             verdict = self._parse_json_obj(verify_answer)
             if verdict is None:
@@ -11153,6 +11227,8 @@ class PulseCLI:
                                 max_tokens=_AGENT_MAX_TOKENS,
                             )
                     except AgentRequestFailed as exc:
+                        if exc.transient:
+                            raise
                         return fix, False, f"(verification request failed: {exc})"
                     verdict = self._parse_json_obj(verify_answer)
                     if verdict is not None:
@@ -11176,6 +11252,8 @@ class PulseCLI:
                         max_tokens=_AGENT_MAX_TOKENS,
                     )
             except AgentRequestFailed as exc:
+                if exc.transient:
+                    raise
                 return fix, False, f"(re-examination request failed: {exc})"
 
             decision_obj = self._parse_json_obj(recheck_answer) or {}
@@ -11499,7 +11577,9 @@ class PulseCLI:
                         with _Spinner("Developing & implementing fix"):
                             fix_answer = self._call_model(_PASS3_CONFIRM_NO_CHANGE_NOTE,
                                                           max_tokens=_AGENT_MAX_TOKENS)
-                    except AgentRequestFailed:
+                    except AgentRequestFailed as exc:
+                        if exc.transient:
+                            raise      # park the request; ending here would drop the diagnosis for good
                         break
                     fix = self._parse_code_fix(fix_answer)
                     no_change = self._parse_no_change(fix_answer, json_only=True) if fix is None else None
@@ -11520,7 +11600,9 @@ class PulseCLI:
                             implement_prompt,
                             max_tokens=_AGENT_MAX_TOKENS,
                         )
-                except AgentRequestFailed:
+                except AgentRequestFailed as exc:
+                    if exc.transient:
+                        raise
                     break
                 fix = self._parse_code_fix(fix_answer)
                 no_change = self._parse_no_change(fix_answer, json_only=True) if fix is None else None
@@ -11966,8 +12048,7 @@ class PulseCLI:
 
     def _perform_revert(self, entries: List[Dict[str, Any]], target_idx: int, target_label: str):
         """Core of /revert, factored out so it can also be invoked
-        automatically (see _auto_rollback_after_failed_restarts) without
-        going through interactive arg-parsing. Restores every file the
+        by the ROLLBACK: tool without going through interactive arg-parsing. Restores every file the
         changelog has ever touched to its state as of `target_idx`
         (`-1` meaning "before the very first recorded commit"), logs the
         revert itself as a new commit, and returns (restored_paths,
@@ -12078,62 +12159,34 @@ class PulseCLI:
         if not restored and not failed:
             cprint("[Pulse CLI] Workspace already matches that state -- nothing to revert.")
 
-    def _auto_rollback_after_failed_restarts(self, chain_start_commit_id: Optional[str]) -> bool:
-        """Automatic safety net for the auto-fix/auto-restart loop: called
-        when a restarted process keeps crashing until MAX_RESTART_ATTEMPTS
-        is exhausted (see _restart_process). Rather than leaving a
-        known-broken fix sitting on disk indefinitely and just telling a
-        possibly-nobody-is-watching unattended run to go run /revert
-        itself, this automatically restores the workspace to its state
-        right BEFORE the fix that started this failing chain -- using the
-        exact same persistent .pulse_history mechanism /revert uses, so
-        nothing is silently lost (the failed chain is still fully
-        recoverable via /log + /revert afterward). Returns True if
-        anything was actually restored.
-        """
+    def _report_failed_fix_chain(self, chain_start_commit_id: Optional[str]) -> None:
+        """Called when the fix's re-run kept failing until the attempts ran out.
+
+        This used to restore every file to its state before the fix chain, discarding the work
+        automatically. It no longer touches the code: the last fix stays on disk where the user
+        can read it, run it, or keep working on it, and what is said here is how to undo it if
+        they want that -- the same /log + /revert a rollback was done with, but their call."""
         entries = self._load_fix_log()
-        if not entries or not chain_start_commit_id:
-            cprint(
-                "[Pulse CLI] ⚠ Could not automatically roll back (no recorded pre-fix state found) -- "
-                "use /log and /revert <id> to inspect and restore manually.",
-                color=_RED,
-            )
-            return False
-
-        chain_start_idx = None
-        for i, e in enumerate(entries):
-            if e.get("id") == chain_start_commit_id:
-                chain_start_idx = i
-                break
-        if chain_start_idx is None:
-            cprint(
-                f"[Pulse CLI] ⚠ Could not find commit {chain_start_commit_id} in the change log to roll "
-                "back from -- use /log and /revert <id> to inspect and restore manually.",
-                color=_RED,
-            )
-            return False
-
-        target_idx = chain_start_idx - 1
-        target_label = f"before commit {chain_start_commit_id} (auto-rollback after repeated restart failures)"
-        restored, failed, new_commit = self._perform_revert(entries, target_idx, target_label)
-
-        if restored:
-            cprint(
-                f"[Pulse CLI] 🛟 Automatic rollback: the fix chain starting at commit "
-                f"{chain_start_commit_id} kept crashing after every retry, so Pulse restored "
-                f"{len(restored)} file(s) to their state right before that fix -- instead of leaving "
-                "known-broken code on disk for an unattended run.",
-                color=_YELLOW,
-            )
-            for p in restored:
-                print(f"    - {os.path.basename(p)}")
-            if new_commit:
-                cprint(f"[Pulse CLI] 📝 Logged as commit {new_commit}. Use /log + /revert to undo this rollback if it wasn't wanted.")
-        if failed:
-            cprint(f"[Pulse CLI] ⚠ Automatic rollback failed to restore {len(failed)} file(s):", color=_RED)
-            for p, err in failed:
-                print(f"    - {os.path.basename(p)}: {err}")
-        return bool(restored)
+        start = None
+        if entries and chain_start_commit_id:
+            for i, e in enumerate(entries):
+                if e.get("id") == chain_start_commit_id:
+                    start = i
+                    break
+        cprint("[Pulse] The code was NOT rolled back: the latest fix is still on disk, so a manual "
+               "run of the script will use it.", color=_YELLOW)
+        if start is None:
+            cprint("[Pulse] /log lists every change Pulse made; /revert <id> restores the state "
+                   "right after that change.", color=_YELLOW)
+            return
+        chain = entries[start:]
+        ids = ", ".join(str(e.get("id", "?")) for e in chain)
+        cprint(f"[Pulse] This attempt made {len(chain)} change(s): {ids}  (see /log).", color=_YELLOW)
+        if start > 0:
+            cprint(f"[Pulse] To undo all of them: /revert {entries[start - 1].get('id', '?')}", color=_YELLOW)
+        else:
+            cprint("[Pulse] To undo them, /revert (no id) undoes the most recent change; repeat for each.",
+                   color=_YELLOW)
 
     def _apply_code_fix(self, fix: Dict[str, Any]) -> str:
         """Apply an agent-proposed code fix to the file(s) it targets.

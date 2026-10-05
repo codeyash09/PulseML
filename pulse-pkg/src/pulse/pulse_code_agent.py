@@ -26,12 +26,20 @@ import ast
 import difflib
 import fnmatch
 import json
+import importlib.util
+import subprocess
+import tempfile
 import os
 import re
+import shlex
+import shutil
+import sys
 import textwrap
 import time
 
 from . import pulse_ui as _ui
+from . import pulse_ratelimit as _ratelimit
+from . import pulse_shapes as _shapes
 from .pulse_cli import (
     AgentRequestFailed,
     PROVIDERS,
@@ -105,6 +113,12 @@ run_command runs a real command in the project directory and returns the real st
 # Training runs
 start_run starts a script under Pulse: it runs in the background, Pulse watches it (step, every metric's curve, the detectors' findings) and shows it to the user. When the user asks to run, start, launch or train, or to try the change, that is the tool -- not run_command. run_status returns the run's current numbers and findings; restart_run stops the run and starts it again (after a fix); stop_run stops it (the user is asked first).
 
+# Checking your work (do this like a careful engineer, not as an afterthought)
+- smoke_test is the check to run after you change code. It runs, in order: a compile/undefined-name check of every file you changed, a tiny probe (if you give one), and the project's own test suite. It stops at the first stage that fails and tells you which. Run it before you finish, and again after fixing what it found.
+- A probe is a few lines of Python that build the thing you changed on tiny inputs and run it once: construct the model, make a small synthetic batch (batch size 2-4), run forward, the loss and backward. Torch layers are traced, so a shape mismatch is reported as the exact layer and the shape it received, not a traceback into library code. Pass `expect` to pin down the shapes you rely on, e.g. {"logits": "(B, 10)", "y": "(B,)"}: B must be the same size everywhere. Write a probe whenever your change touches a model, a data pipeline, a loss, or anything with a shape. Never run the full training script as a probe.
+- check_shape answers "what is the shape of X?" with the real value instead of your guess. Use it BEFORE you write code that depends on a shape (a Linear's in_features after a conv stack, what a DataLoader yields, what a function returns), and when a shape error leaves you unsure which side is wrong. It runs a snippet in the project and reports shape, dtype and device of the expressions you name.
+- Probes run on CPU-sized inputs. Do not load a full dataset or train in a probe. If building the model needs data you cannot fake, construct tensors of the shape the code expects.
+
 # Finishing
 When the work is done and verified, reply with a short summary: what you changed, how you checked it, and anything the user should know. No tool call in a reply means you are finished, so only reply without one when you are.
 """
@@ -171,6 +185,25 @@ TOOLS = [
         "Run a shell command in the project directory and get back real stdout, stderr, exit code and duration. "
         "Optional timeout in seconds.",
         {"command": _S, "timeout": _I}, ["command"]),
+    _fn("check_shape",
+        "Run a short Python snippet in the project and report the real shape, dtype and device of values -- so you "
+        "know a shape instead of guessing it. `code` runs first (imports, build a model, make a tiny batch); "
+        "`exprs` are the expressions to describe afterwards (e.g. [\"model(x)\", \"batch[0]\"]; default: every array, "
+        "module, list and dict the code left behind); `expect` maps an expression to a spec such as \"(B, 10)\" -- "
+        "numbers are exact, a name like B must be the same size everywhere, * is any size, ... is any number of dims. "
+        "Torch layers are traced, so a shape error names the layer that received the wrong shape. Variables are "
+        "described even if the code failed part-way.",
+        {"code": _S, "exprs": {"type": "array", "items": _S}, "expect": {"type": "object", "additionalProperties": _S},
+         "timeout": _I}),
+    _fn("smoke_test",
+        "Check the changes you made, cheaply, in three stages that stop at the first failure: (1) compile + "
+        "undefined-name check of every file you changed; (2) `probe`, a few lines of Python that build the changed "
+        "thing on a tiny input and run it once (model forward/loss/backward on a batch of 2-4) -- torch layers are "
+        "traced so a shape mismatch names the layer and the shape it received; `expect` pins shapes, e.g. "
+        "{\"logits\": \"(B, 10)\"}; (3) the project's own test suite (pytest or unittest, found automatically; "
+        "pass suite=false to skip). Run this after editing, before you finish.",
+        {"probe": _S, "expect": {"type": "object", "additionalProperties": _S}, "suite": {"type": "boolean"},
+         "timeout": _I}),
     _fn("start_run",
         "Start a script under Pulse: it runs in the background, Pulse watches it and shows it to the user, and "
         "run_status can read its numbers. This -- not run_command -- is how a training run is started. "
@@ -235,6 +268,7 @@ class _State:
         self.changes = {}            # path -> [text before the turn, latest text, created?]
         self.todos = []
         self.dirty = False           # files changed since the last command that succeeded
+        self.smoke_ok = None         # result of the last smoke_test (None: never run)
         self.nudges = 0
         self.last_call = None
         self.repeats = 0
@@ -680,6 +714,220 @@ def _t_run_command(state, a):
     return result
 
 
+# ---------------------------------------------------------------------------------------
+# Probes and smoke tests
+# ---------------------------------------------------------------------------------------
+
+_PROBE_TIMEOUT = 90                  # seconds a probe snippet may run
+_SUITE_TIMEOUT = 300                 # seconds the project's test suite may run
+_SKIP_DIRS = {".git", ".pulse_history", "node_modules", "__pycache__", ".venv", "venv", "env", "site-packages",
+              ".tox", "build", "dist"}
+
+
+def _quote(arg):
+    return subprocess.list2cmdline([arg]) if os.name == "nt" else shlex.quote(arg)
+
+
+def _run_probe(state, code, exprs, expect, timeout, purpose):
+    """Run `code` through pulse_shapes in the project directory. Returns (report dict, None) or
+    (None, why it produced none). The snippet is judged like a `python -c` command: one that deletes
+    files or reaches outside the project pauses for the user exactly as run_command does."""
+    cli = state.cli
+    pseudo = f"python -c {_quote(code)}" if code.strip() else ""
+    flags = cli._terminal_needs_confirmation(pseudo) if pseudo else None
+    if flags and not cli._confirm_terminal_command(pseudo, flags, purpose):
+        return None, f"NOT RUN -- {cli._terminal_denial_reason()}. Try a probe that does not do that."
+    from . import pulse_terminal as _terminal
+    workdir = tempfile.mkdtemp(prefix="pulse_probe_")
+    try:
+        request_path = os.path.join(workdir, "request.json")
+        report_path = os.path.join(workdir, "report.json")
+        with open(request_path, "w", encoding="utf-8") as handle:
+            json.dump({"code": code, "exprs": exprs, "expect": expect, "report_path": report_path}, handle)
+        command = f"{_quote(sys.executable)} {_quote(_shapes.__file__)} {_quote(request_path)}"
+        executor = cli._get_terminal_executor()
+        result = executor.run(_terminal.TerminalRequest(command=command, timeout=float(timeout)))
+        if os.path.exists(report_path):
+            with open(report_path, encoding="utf-8") as handle:
+                report = json.load(handle)
+            report["_output"] = ((result.stdout or "") + (("\n" + result.stderr) if result.stderr else "")).strip()
+            return report, None
+        if result.timed_out:
+            return None, (f"the probe was killed after {timeout}s. A probe must build the thing on a tiny input and "
+                          "run it once, not train or load a dataset.")
+        tail = _clip(((result.stderr or "") + "\n" + (result.stdout or "")).strip(), 2500)
+        return None, f"the probe process died before it could report (exit {result.exit_code}):\n{tail}"
+    except (OSError, ValueError) as exc:
+        return None, f"could not run the probe: {type(exc).__name__}: {exc}"
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _report_failed(report):
+    return bool(report.get("error")) or any(not c.get("ok") for c in report.get("expect") or [])
+
+
+def _printed_output(report, limit=1200):
+    out = report.get("_output") or ""
+    return "\n  the snippet printed:\n    " + _clip(out, limit).replace("\n", "\n    ") if out else ""
+
+
+def _as_exprs(value):
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list):
+        return [str(v) for v in value if str(v).strip()]
+    return []
+
+
+def _as_expect(value):
+    return {str(k): str(v) for k, v in value.items()} if isinstance(value, dict) else {}
+
+
+def _bad_specs(expect):
+    for expr, spec in expect.items():
+        try:
+            _shapes.parse_spec(spec)
+        except ValueError as exc:
+            return f"{expr}: {exc}"
+    return None
+
+
+def _t_check_shape(state, a):
+    code = a.get("code") if isinstance(a.get("code"), str) else ""
+    exprs, expect = _as_exprs(a.get("exprs")), _as_expect(a.get("expect"))
+    if not code.strip() and not exprs:
+        return "Nothing to check: give `code` to run and/or `exprs` to describe."
+    problem = _bad_specs(expect)
+    if problem:
+        return f"Not run -- a spec is not valid: {problem}"
+    try:
+        timeout = max(5, min(int(a.get("timeout") or _PROBE_TIMEOUT), 600))
+    except (TypeError, ValueError):
+        timeout = _PROBE_TIMEOUT
+    report, why = _run_probe(state, code, exprs, expect, timeout, "check the shape of values in the project")
+    if report is None:
+        return why
+    verdict = "FAIL" if _report_failed(report) else "ok"
+    return f"CHECK_SHAPE: {verdict}\n" + _shapes.render_report(report) + _printed_output(report)
+
+
+def _project_test_command(state):
+    """(command, label) for the project's own test suite, or (None, why not)."""
+    root = state.root
+    has_config = False
+    for name in ("pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml", "conftest.py"):
+        path = os.path.join(root, name)
+        if not os.path.isfile(path):
+            continue
+        if name in ("pytest.ini", "conftest.py"):
+            has_config = True
+        else:
+            try:
+                with open(path, encoding="utf-8", errors="replace") as handle:
+                    text = handle.read()
+                has_config = has_config or bool(re.search(r"\[(?:tool\.pytest|tool:pytest|pytest)", text))
+            except OSError:
+                pass
+    test_files = 0
+    for current, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS and not d.startswith(".")]
+        if os.path.relpath(current, root).count(os.sep) >= 3:
+            dirs[:] = []
+        test_files += sum(1 for f in files if f.endswith(".py") and (f.startswith("test_") or f.endswith("_test.py")))
+        if test_files >= 1 and has_config:
+            break
+    if not test_files and not has_config:
+        return None, "no tests found in the project"
+    py = _quote(sys.executable)
+    if importlib.util.find_spec("pytest") is not None:
+        return f"{py} -m pytest -q --maxfail=10 -p no:cacheprovider", "pytest"
+    if test_files:
+        return f"{py} -m unittest discover -q", "unittest"
+    return None, "the project has pytest settings but pytest is not installed in this Python"
+
+
+def _t_smoke_test(state, a):
+    cli = state.cli
+    probe = a.get("probe") if isinstance(a.get("probe"), str) else ""
+    expect = _as_expect(a.get("expect"))
+    run_suite = a.get("suite") is not False
+    problem = _bad_specs(expect)
+    if problem:
+        return f"Not run -- a spec is not valid: {problem}"
+    try:
+        timeout = max(5, min(int(a.get("timeout") or _SUITE_TIMEOUT), 1800))
+    except (TypeError, ValueError):
+        timeout = _SUITE_TIMEOUT
+    lines, failed = [], False
+
+    # 1. compile / undefined names in what this request changed
+    py_changes = {p: v for p, v in state.changes.items() if p.endswith(".py") and os.path.exists(p)}
+    broken = []
+    for path, (before, _after, created) in py_changes.items():
+        text = state.read(path)
+        if text is None:
+            continue
+        ok, messages = cli._lint_check(text, path, original=None if created else before)
+        if not ok:
+            broken.extend(f"{_rel(state.root, path)}: {m}" for m in messages[:6])
+    if broken:
+        failed = True
+        lines.append("[1/3] compile   FAILED")
+        lines.extend("      " + m for m in broken[:12])
+    else:
+        lines.append(f"[1/3] compile   ok ({len(py_changes)} changed Python file{'s' if len(py_changes) != 1 else ''})")
+
+    # 2. the probe
+    if failed:
+        lines.append("[2/3] probe     not run (fix the compile errors first)")
+    elif not probe.strip() and not expect:
+        lines.append("[2/3] probe     skipped (none given -- for a change to a model, data, loss or anything with a "
+                     "shape, pass `probe`)")
+    else:
+        report, why = _run_probe(state, probe, [], expect, _PROBE_TIMEOUT, "smoke-test the change with a tiny probe")
+        if report is None:
+            failed = True
+            lines += ["[2/3] probe     FAILED", "      " + why.replace("\n", "\n      ")]
+        elif _report_failed(report):
+            failed = True
+            lines.append("[2/3] probe     FAILED")
+            lines.append("      " + (_shapes.render_report(report) + _printed_output(report)).replace("\n", "\n      "))
+        else:
+            calls = (report.get("trace") or {}).get("module_calls")
+            extra = f", {calls} layer calls traced" if calls else ""
+            checks = len(report.get("expect") or [])
+            lines.append(f"[2/3] probe     ok ({checks} shape expectation{'s' if checks != 1 else ''} held{extra})")
+
+    # 3. the project's tests
+    if failed:
+        lines.append("[3/3] suite     not run (an earlier stage failed)")
+    elif not run_suite:
+        lines.append("[3/3] suite     skipped (suite=false)")
+    else:
+        command, label = _project_test_command(state)
+        if command is None:
+            lines.append(f"[3/3] suite     skipped ({label})")
+        else:
+            result = cli._run_terminal(f"{command} --timeout={timeout}", purpose="run the project's test suite")
+            exit_code = re.search(r"(?m)^Exit code: (\S+)$", result)
+            code = exit_code.group(1) if exit_code else "?"
+            if code == "0":
+                summary = next((l for l in reversed(result.splitlines()) if re.search(r"\b(passed|ok|OK)\b", l)), "")
+                lines.append(f"[3/3] suite     ok ({label}{': ' + summary.strip() if summary else ''})")
+            elif code == "5" and label == "pytest":
+                lines.append("[3/3] suite     skipped (pytest collected no tests)")
+            else:
+                failed = True
+                lines.append(f"[3/3] suite     FAILED ({label}, exit {code})")
+                lines.append("      " + _clip(result, 6000).replace("\n", "\n      "))
+    state.smoke_ok = not failed
+    if not failed:
+        state.dirty = False                      # the changes have now been checked
+    head = "SMOKE TEST: FAIL -- fix this and run smoke_test again." if failed else "SMOKE TEST: PASS"
+    return head + "\n" + "\n".join(lines)
+
+
 _STATUS_MARK = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]"}
 
 
@@ -742,9 +990,11 @@ _HANDLERS = {
     "dep_graph": _t_dep_graph, "trace_variable": _t_trace_variable, "doc_lookup": _t_doc_lookup,
     "edit_file": _t_edit_file, "replace_symbol": _t_replace_symbol, "write_file": _t_write_file,
     "run_command": _t_run_command, "todo_write": _t_todo_write,
+    "check_shape": _t_check_shape, "smoke_test": _t_smoke_test,
 }
 _WRITERS = {"edit_file", "replace_symbol", "write_file"}
-_LOUD = {"run_command", "message_user", "start_run", "restart_run", "stop_run"}   # their output is for the person
+# their output is for the person (or they may have to ask the person before they run)
+_LOUD = {"run_command", "message_user", "start_run", "restart_run", "stop_run", "check_shape", "smoke_test"}
 
 
 def _brief(name, args):
@@ -752,8 +1002,14 @@ def _brief(name, args):
     key = {"read_file": "path", "outline": "path", "edit_file": "path", "replace_symbol": "path",
            "write_file": "path", "grep": "pattern", "find_definition": "symbol", "find_references": "symbol",
            "trace_variable": "target", "doc_lookup": "name", "run_command": "command",
-           "list_files": "pattern", "start_run": "script"}.get(name)
+           "list_files": "pattern", "start_run": "script", "check_shape": "exprs"}.get(name)
     detail = str(args.get(key, "")) if key else ""
+    if name == "check_shape" and not args.get("exprs"):
+        detail = (str(args.get("code") or "").strip().splitlines() or [""])[0]
+    if name == "smoke_test":
+        detail = "compile, probe, suite" if args.get("probe") else "compile, suite"
+    if isinstance(args.get(key), list):
+        detail = ", ".join(str(v) for v in args[key])
     if name == "start_run" and args.get("args"):
         detail += f" {args['args']}"
     if name == "read_file" and args.get("start_line"):
@@ -787,6 +1043,14 @@ def _show(name, args, result):
     elif name == "run_command":
         tail = result.splitlines()[-12:]
         print(textwrap.indent("\n".join(tail), "    "))
+    elif name in ("smoke_test", "check_shape"):
+        shown = result.splitlines()[:24]
+        failing = result.startswith(("SMOKE TEST: FAIL", "CHECK_SHAPE: FAIL"))
+        text = textwrap.indent("\n".join(shown) + ("\n    ..." if len(result.splitlines()) > 24 else ""), "    ")
+        if name == "smoke_test":
+            cprint(text, color=_YELLOW if failing else _GREEN)
+        else:
+            print(text)
     else:
         first = (result.splitlines() or [""])[0]
         print(f"    {first[:140]}")
@@ -946,7 +1210,10 @@ def _chat(cli, messages):
     max_tokens = _clamp_output_tokens(model, _AGENT_MAX_TOKENS)
     payload = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
     last_exc = None
-    for attempt in range(1, 5):
+    waiter = _ratelimit.RateLimitWaiter()      # a rate limit is waited out, not counted as an attempt
+    attempt = 0
+    while attempt < 4:
+        attempt += 1
         try:
             response = _complete(
                 model=model, messages=payload, tools=TOOLS, tool_choice="auto", max_tokens=max_tokens,
@@ -967,6 +1234,10 @@ def _chat(cli, messages):
             raise
         except Exception as exc:
             last_exc = exc
+            if cli._is_rate_limited(exc):
+                cli._wait_out_rate_limit(exc, waiter, "pulse code")      # raises when it should give up
+                attempt -= 1
+                continue
             retryable = cli._is_retryable_model_error(exc) or isinstance(exc, RuntimeError)
             if attempt < 4 and retryable:
                 backoff = 2 ** (attempt - 1)
@@ -1016,9 +1287,12 @@ def _nudge(state, reply_text=""):
                 + "\n".join(f"- {t['content']} ({t['status']})" for t in open_items)
                 + "\nContinue with them, or update the list if they are no longer needed.")
     if state.dirty:
-        return ("You changed files but have not run anything to check the result. Run the project's tests/linter "
-                "or a quick script that exercises the change and fix any failure. If nothing can be run here, "
-                "say so plainly in your final answer.")
+        if state.smoke_ok is False:
+            return ("Your last smoke_test failed and you have not fixed it. Read what it reported, fix the cause, "
+                    "and run smoke_test again.")
+        return ("You changed files but have not checked the result. Run smoke_test now (with a `probe` that builds "
+                "what you changed on a tiny input if it touches a model, data, loss or any shape), and fix any "
+                "failure. If nothing can be run here, say so plainly in your final answer.")
     return None
 
 
@@ -1056,7 +1330,7 @@ def run_native_turn(cli, request, evidence=None):
                     reply = _chat(cli, messages)
             except AgentRequestFailed as exc:
                 detail = str(exc.__cause__ or exc)
-                if _i == 0 and re.search(r"\b(tools?|function[ _]call\w*)\b", detail, re.I):
+                if _i == 0 and not exc.rate_limited and re.search(r"\b(tools?|function[ _]call\w*)\b", detail, re.I):
                     messages.remove(marker)          # nothing happened; let the caller use the text pipeline
                     unsupported = True
                     break

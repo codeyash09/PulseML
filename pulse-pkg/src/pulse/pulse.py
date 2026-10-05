@@ -107,6 +107,7 @@ from pulse.pulse_backend import (
     statistics as backend_statistics, scalar_value,
 )
 from pulse import pulse_detect as _pulse_detect
+from pulse import pulse_ratelimit as _ratelimit
 from pulse.pulse_cli import _trackable_without_reading
 
 from pulse.pulse_cli import litellm      # lazy: the real module loads on first use
@@ -931,8 +932,14 @@ class AgentRequestFailed(Exception):
     downstream as if it were a real diagnosis/fix. Caught at exactly one
     place, ChatPanel._ask's top-level try/except, which stops the
     pipeline cleanly and queues the request for a later background retry
-    -- see _queue_agent_retry."""
-    pass
+    -- see _queue_agent_retry.
+
+    `rate_limited` is set when the provider kept saying "slow down" for the whole waiting
+    budget (see pulse_ratelimit); callers re-raise those rather than carry on without an answer."""
+
+    def __init__(self, message="", rate_limited=False):
+        super().__init__(message)
+        self.rate_limited = rate_limited
 
 
 def _mirror_name_candidates(name):
@@ -4095,43 +4102,24 @@ def _perform_fix_history_revert(script_path, entries, target_idx, target_label, 
     return restored, failed, new_commit
 
 
-def _auto_rollback_after_failed_restarts_gui(script_path, chain_start_commit_id):
-    """GUI-side counterpart of pulse_cli.py's
-    PulseCLI._auto_rollback_after_failed_restarts -- called from
-    persistent_tracer's RESTART handler once MAX_RESTART_ATTEMPTS is
-    exhausted, in the training process itself. Prints its own status
-    (there's no ChatPanel to hand a return string to here -- this
-    process's stdout is the only channel), and the training process is
-    continuing afterward either way, so a rolled-back script only takes
-    effect the NEXT time it's actually restarted (manually, or by a
-    future successful auto-fix).
-    """
-    if not chain_start_commit_id:
-        print("[PULSE] ⚠ Could not automatically roll back (no recorded pre-fix commit for this chain) -- inspect .pulse_history/changelog.jsonl manually.")
-        return False
+def _report_failed_fix_chain_gui(script_path, chain_start_commit_id):
+    """GUI-side counterpart of pulse_cli.py's PulseCLI._report_failed_fix_chain -- called from
+    persistent_tracer's RESTART handler once the restart attempts are exhausted. It does NOT
+    touch the code (it used to roll every file back): the latest fix stays on disk, and this
+    prints which changes the chain made and how to undo them if the user wants that."""
+    print("[PULSE] The code was NOT rolled back: the latest fix is still on disk, so a manual run "
+          "of the script will use it.")
     entries = _load_fix_history(script_path)
-    chain_start_idx = next((i for i, e in enumerate(entries) if e.get("id") == chain_start_commit_id), None)
-    if chain_start_idx is None:
-        print(f"[PULSE] ⚠ Could not find commit {chain_start_commit_id} in .pulse_history to roll back from.")
-        return False
-    target_idx = chain_start_idx - 1
-    target_label = f"before commit {chain_start_commit_id} (auto-rollback after repeated restart failures)"
-    restored, failed, new_commit = _perform_fix_history_revert(script_path, entries, target_idx, target_label)
-    if restored:
-        print(
-            f"[PULSE] 🛟 Automatic rollback: the fix chain starting at commit {chain_start_commit_id} kept "
-            f"crashing after every retry, so Pulse restored {len(restored)} file(s) to their state right "
-            "before that fix, instead of leaving known-broken code on disk for an unattended run."
-        )
-        for p in restored:
-            print(f"    - {os.path.basename(p)}")
-        if new_commit:
-            print(f"[PULSE] 📝 Logged as commit {new_commit} in .pulse_history/ -- inspect/undo it there if this wasn't wanted.")
-    if failed:
-        print(f"[PULSE] ⚠ Automatic rollback failed to restore {len(failed)} file(s):")
-        for p, err in failed:
-            print(f"    - {os.path.basename(p)}: {err}")
-    return bool(restored)
+    start = next((i for i, e in enumerate(entries) if e.get("id") == chain_start_commit_id), None) \
+        if chain_start_commit_id else None
+    if start is None:
+        print("[PULSE] .pulse_history/changelog.jsonl lists every change Pulse made.")
+        return
+    chain = entries[start:]
+    print(f"[PULSE] This attempt made {len(chain)} change(s): "
+          + ", ".join(str(e.get("id", "?")) for e in chain) + ".")
+    if start > 0:
+        print(f"[PULSE] To undo all of them: /revert {entries[start - 1].get('id', '?')} in `pulse watch`.")
 
 
 _CHAT_PANEL_CLS = None
@@ -4212,9 +4200,8 @@ def _chat_panel_class():
             self._pending_agent_retry = None
             self._retry_ticker_started = False
             # id of the most recently recorded .pulse_history commit -- lets
-            # Dashboard._restart_training know exactly what to roll back to
-            # if the fix that triggered a restart keeps crashing (see
-            # _auto_rollback_after_failed_restarts_gui).
+            # Dashboard._restart_training say which changes a failing fix chain
+            # made, and what to undo (see _report_failed_fix_chain_gui).
             self._last_commit_id = None
             self._label_for_path = {}
             self._path_for_label = {}
@@ -4734,7 +4721,12 @@ def _chat_panel_class():
             max_tokens = _clamp_output_tokens(model_name, max_tokens)
             max_attempts = 3
             last_exc = None
-            for attempt in range(1, max_attempts + 1):
+            # A rate limit is waited out against its own budget (pulse_ratelimit), not counted as
+            # one of the three attempts: retries a few seconds apart all land in the same window.
+            waiter = _ratelimit.RateLimitWaiter()
+            attempt = 0
+            while True:
+                attempt += 1
                 try:
                     response = litellm.completion(
                         model=model_name,
@@ -4751,15 +4743,29 @@ def _chat_panel_class():
                     raise
                 except Exception as exc:
                     last_exc = exc
+                    reason = self._classify_model_error(exc)
+                    if _ratelimit.is_rate_limited(exc, getattr(litellm, "RateLimitError", None)):
+                        if _ratelimit.is_hard_limit(exc):
+                            raise AgentRequestFailed(
+                                "the provider refused the request because the account is out of credit "
+                                "-- waiting will not fix that (add credit, or switch model)") from exc
+                        delay = waiter.next_delay(exc)
+                        if delay is None:
+                            raise AgentRequestFailed(
+                                f"still rate limited by the provider after waiting {waiter.waited:.0f}s",
+                                rate_limited=True) from exc
+                        note = _ratelimit.describe_wait(delay, waiter)
+                        self.after(0, lambda n=note: self._append("Pulse", f"⚠ {n}"))
+                        waiter.wait(delay)
+                        attempt -= 1
+                        continue
                     if attempt < max_attempts and self._is_retryable_model_error(exc):
                         backoff = 2 ** (attempt - 1)  # 1s, 2s, 4s
-                        reason = self._classify_model_error(exc)
                         self.after(0, lambda a=attempt, m=max_attempts, b=backoff, r=reason: self._append(
                             "Pulse", f"⚠ Agent request hit a transient error (attempt {a}/{m}), retrying in {b}s: {r}"))
                         time.sleep(backoff)
                         continue
-                    raise AgentRequestFailed(self._classify_model_error(exc)) from exc
-            raise AgentRequestFailed(self._classify_model_error(last_exc) if last_exc else "unknown error")
+                    raise AgentRequestFailed(reason) from exc
 
         def _record_usage(self, response):
             """Best-effort token/cost accounting for the COST directive --
@@ -5328,8 +5334,7 @@ def _chat_panel_class():
 
         def _run_rollback(self, arg):
             """ROLLBACK: <commit_id, or 'last'> -- deterministically revert
-            via the same .pulse_history mechanism the automatic
-            restart-failure rollback uses, instead of the agent trying to
+            via the .pulse_history change log, instead of the agent trying to
             manually reconstruct old code from memory of the conversation."""
             entries = _load_fix_history(self.script_path)
             if not entries:
@@ -5698,6 +5703,8 @@ def _chat_panel_class():
                         max_tokens=_AGENT_MAX_TOKENS,
                     )
                 except AgentRequestFailed as exc:
+                    if exc.rate_limited:
+                        raise      # not a verdict: _ask parks the whole request for a later retry
                     return fix, False, f"(verification request failed: {exc})"
                 verdict = self._parse_json_obj(verify_answer)
                 if verdict is None:
@@ -5716,7 +5723,9 @@ def _chat_panel_class():
                         model_name, _PASS4_REVISE_TMPL.format(diagnosis=diagnosis, fix_desc=fix_desc, reason=reason),
                         max_tokens=_AGENT_MAX_TOKENS,
                     )
-                except AgentRequestFailed:
+                except AgentRequestFailed as exc:
+                    if exc.rate_limited:
+                        raise
                     break
                 revised = self._parse_code_fix(revised_answer)
                 if revised is None:
@@ -8088,7 +8097,10 @@ def _auto_track_session(caller_frame, train_fn, throttle_interval, code_text, pr
         # lets a failed restart hand the failure back to the still-alive
         # agent (via restart_failure.json, picked up by Dashboard._poll ->
         # report_restart_failure) to fix the CURRENT code.
-        MAX_RESTART_ATTEMPTS = 5
+        try:
+            MAX_RESTART_ATTEMPTS = max(1, int(os.environ.get("PULSE_MAX_RESTART_ATTEMPTS", "5")))
+        except ValueError:
+            MAX_RESTART_ATTEMPTS = 5
         RETRY_BACKOFF_SECONDS = 3
 
         attempt = restart_state.get("attempts", 0)
@@ -8157,15 +8169,14 @@ def _auto_track_session(caller_frame, train_fn, throttle_interval, code_text, pr
             sys.exit(0)
 
         if attempt >= MAX_RESTART_ATTEMPTS:
-            print(f"[PULSE] ⚠ Giving up after {MAX_RESTART_ATTEMPTS} restart attempts -- continuing the current process (dashboard stays up).")
+            print(f"[PULSE] ⚠ Stopping after {MAX_RESTART_ATTEMPTS} restart attempts -- continuing the current process (dashboard stays up).")
             if entry_path:
                 try:
-                    _auto_rollback_after_failed_restarts_gui(entry_path, restart_state.get("chain_start"))
+                    _report_failed_fix_chain_gui(entry_path, restart_state.get("chain_start"))
                 except Exception as exc:
-                    print(f"[PULSE] ⚠ Automatic rollback failed ({type(exc).__name__}: {exc}).")
-            # That chain is over: one rollback for it. The agent's next fix
-            # starts a new chain with its own attempts -- the count used to
-            # stay at the cap, so every later fix was rolled back untried.
+                    print(f"[PULSE] ⚠ Could not describe the failed fix chain ({type(exc).__name__}: {exc}).")
+            # That chain is over, and the code is left as it is. The agent's next fix
+            # starts a new chain with its own attempts.
             restart_state["attempts"] = 0
             restart_state.pop("chain_start", None)
         elif restart_result is not None:

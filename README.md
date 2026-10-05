@@ -32,31 +32,38 @@ python -c "import pulse; print('Pulse installed successfully')"
 
 ### Start Pulse
 
-Import `auto_track` and call it immediately before your training loop:
+Use 
 
-```python
-from pulse import auto_track
-
-if __name__ == "__main__":
-    auto_track()
-
-    # Your training loop
-    for epoch in range(num_epochs):
-        # Training logic here
-        pass
+```bash
+python3 -m pulse
 ```
 
-The `__main__` guard is particularly important in multiprocessing or process-spawning environments.
+or 
 
-Run the script as you always do. In a terminal, Pulse opens as the full-screen app on that
-very run (see [The Pulse app](#the-pulse-app)): the run's state on the left, the agent on
-the right, your script's own output in the transcript, and the script goes on exactly as
-it would have. Leaving the app (Ctrl+C twice) gives you the terminal back while the
-training continues; when the script ends, the app stays until you leave it. Without a
-terminal (a notebook, `nohup`, a log file) Pulse keeps its line-by-line mode, and
-`auto_track(mode="cli")` or `PULSE_MODE=cli` asks for that mode anywhere.
+Permanently make it so only the pulse command is needed:
+```bash
+export PATH="$PATH:$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))')"
+pulse
+```
 
-Once the process is running, Pulse discovers numeric variables available to the training process and exposes them through the CLI.
+and for future uses after
+```bash
+pulse
+```
+
+
+
+which will take you to the Pulse setup page
+
+Or put Pulse in the script itself -- `from pulse import auto_track; auto_track()` before
+the training loop -- and run the script as you always do. In a terminal, Pulse opens as
+the same full-screen app on that very run (see [The Pulse app](#the-pulse-app)): the
+run's state on the left, the agent on the right, your script's own output in the
+transcript, and the script goes on exactly as it would have. Leaving the app (Ctrl+C
+twice) gives you the terminal back while the training continues; when the script ends,
+the app stays until you leave it. Without a terminal (a notebook, `nohup`, a log file)
+Pulse keeps its line-by-line mode, and `auto_track(mode="cli")` or `PULSE_MODE=cli` asks
+for that mode anywhere.
 
 ### AI provider configuration
 
