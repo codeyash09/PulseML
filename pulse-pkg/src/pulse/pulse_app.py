@@ -38,6 +38,7 @@ import getpass
 import io
 import math
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -341,6 +342,8 @@ class App:
         self._edit_pending: Optional[tui.Entry] = None   # the change whose fate is still being decided
         self.hosting: Any = None                  # the in-process run's monitor, under auto_track()
         self.run_output: "collections.deque[str]" = collections.deque(maxlen=400)   # what that run printed
+        self._crashes_seen: set = set()            # sessions whose crash the agent was started on
+        self._crash_pending: Optional[str] = None  # a crash that came while the agent was busy
         self._run_partial = ""
         self.up = threading.Event()               # set once the screen is up and output is captured
         self._height = 30
@@ -707,6 +710,9 @@ class App:
                 self._job = None
                 self._refresh_header()
                 self.dirty = True
+                pending, self._crash_pending = self._crash_pending, None
+                if pending and not self.done:
+                    self._start_crash_turn(pending, self._crash_summary())
 
     def _cancel_job(self) -> None:
         job = self._job
@@ -866,9 +872,16 @@ class App:
             except Exception:
                 pass
             launched = self.session is not None and self.session.get("session_id") in self.launched
-            self.note("The run is still executing the code it started with. "
-                      + ("/restart stops it and starts it again with the change."
-                         if launched else "Stop it (/stop) and start it again to apply the change."))
+            over = self._status not in ("live", "stalled")
+            hosted = self.hosting is not None and (self.session or {}).get("session_id") == getattr(
+                self.hosting, "session_id", None)
+            if over:
+                self.note("/restart runs it again with the change." if launched or hosted
+                          else "Start it again to try the change.")
+            else:
+                self.note("The run is still executing the code it started with. "
+                          + ("/restart stops it and starts it again with the change."
+                             if launched else "Stop it (/stop) and start it again to apply the change."))
 
     def _command(self, line: str) -> None:
         from . import pulse_code
@@ -1092,6 +1105,51 @@ class App:
         if not quiet:
             self.note("Stopped watching the run. It keeps going; /monitor opens it again.")
 
+    # ------------------------------------------------------------------ a crash
+
+    def _crash_summary(self) -> str:
+        """The exception the run died with ("ValueError: matmul: ..."), from its crash event."""
+        console = self.console
+        events = list(getattr(getattr(console, "brain", None), "events", []) or [])
+        for event in reversed(events):
+            if event.get("event") == "crash":
+                text = str(event.get("exception") or "").strip()
+                if not text and event.get("traceback"):
+                    text = str(event["traceback"]).rstrip().splitlines()[-1]
+                return text
+        return ""
+
+    def _on_crash(self) -> None:
+        """The open run crashed: the agent looks at it at once -- the traceback and the code
+        are its evidence, a fix is a change it proposes like any other. Once per run. Called
+        with the lock held, from the screen loop."""
+        session_id = (self.session or {}).get("session_id")
+        if session_id in self._crashes_seen:
+            return
+        self._crashes_seen.add(session_id)
+        script = os.path.basename((self.session or {}).get("script") or "the run")
+        what = self._crash_summary()
+        cli = self.cli
+        if not cli.agent_provider or not cli.agent_key:
+            self.error(f"{script} crashed" + (f": {what}" if what else "") + ".")
+            self.note("No agent is set up to look at it: /agent picks a model, then ask what went wrong.")
+            return
+        if self._job is not None or self.view.busy:
+            self._crash_pending = script     # the agent is busy: it looks once it is done
+            self.error(f"{script} crashed" + (f": {what}" if what else "")
+                       + ". The agent looks at it when it has finished what it is doing.")
+            return
+        self._start_crash_turn(script, what)
+
+    def _start_crash_turn(self, script: str, what: str) -> None:
+        self.error(f"{script} crashed" + (f": {what}" if what else "") + ".")
+        request = (f"{script} just crashed" + (f" with {what}" if what else "") + ". The traceback is in the "
+                   "evidence. Find the cause in the code, explain it in a sentence or two, and fix it.")
+        self.view.entries.append(tui.Entry("user", f"Why did {script} crash? Fix it."))
+        self._last_blank = False
+        self.dirty = True
+        self._start(self._handle, request)
+
     def _background_run(self) -> None:
         """Back to the agent at home, with the run still watched: its pane goes, findings are
         still announced, and /monitor (or Esc) brings it back. The agent stays pointed at the
@@ -1293,6 +1351,12 @@ class App:
         from . import pulse_stream as stream
         session = self.session or {}
         info = self.launched.get(session.get("session_id", ""))
+        hosted = self.hosting is not None and session.get("session_id") == getattr(self.hosting, "session_id", None)
+        if info is None and hosted and self._status not in ("live", "stalled") and session.get("script"):
+            # the script that opened this app is over: run it again, under Pulse, from here
+            script = session["script"]
+            self._launch("", replace={"argv": [script], "cwd": os.path.dirname(script) or self.home_root})
+            return
         if info is None:
             self.note("/restart works for runs started here with /run. This one was started elsewhere: "
                       "stop it (/stop) and start it again the way it was started.")
@@ -1374,7 +1438,9 @@ class App:
                 if described and described["status"] != self._status:
                     self._status = described["status"]
                     self._refresh_header()
-                    if self._status not in ("live", "stalled"):
+                    if self._status == "crashed":
+                        self._on_crash()
+                    elif self._status not in ("live", "stalled"):
                         self.note(f"{os.path.basename((self.session or {}).get('script') or 'the run')} "
                                   f"has {self._status}.")
             self._side_at = now
@@ -1389,6 +1455,8 @@ class App:
             if described:
                 self._status = described["status"]
                 session["last_seen"] = described.get("last_seen")
+                if self._status == "crashed":
+                    self._on_crash()
         step = int(state["step"] or 0)
         if self._rate_at is not None and now > self._rate_at[0]:
             delta = (step - self._rate_at[1]) / (now - self._rate_at[0])
@@ -1398,7 +1466,7 @@ class App:
         width = tui.side_width(self._total_w) - 1 if self._total_w >= tui.SPLIT_MIN_WIDTH else self._total_w - 2
         side = side_lines(state, session, self._status, console, self._rate, width)
         # the run's output under its figures, in whatever room the pane has left
-        room = self._height - 2 - len(side) - 2
+        room = tui.body_height(self._height) - len(side) - 2
         if room >= 2:
             launched = self.launched.get(session.get("session_id", ""))
             if self.hosting is not None and session.get("session_id") == getattr(self.hosting, "session_id", None):
@@ -1495,7 +1563,35 @@ def _make_console(app: App, session: Dict[str, Any], agent: Optional[Callable[[s
             for finding in findings:
                 app._add(tui.Entry("finding", finding.message, severity=finding.severity))
 
+        def _report_audit(self, record: Optional[Dict[str, Any]]) -> None:
+            """A scheduled look at the run: one quiet line in the model's words. The decision
+            JSON in its answer is for Pulse (when to look next), not for the person."""
+            if not record or record.get("status") in (None, "skipped", "busy"):
+                return
+            if record.get("status") == "error":
+                app.note(f"The scheduled check of the run failed: {record.get('error')}")
+                return
+            text = audit_words(record.get("text") or "")
+            if record.get("status") == "problem":
+                found = "; ".join(str(f) for f in (record.get("findings") or [])[:3])
+                app.error("The agent's check found a problem" + (f": {found}" if found else "")
+                          + ". Ask about it here, or /findings.")
+                if text:
+                    app.say(text)
+                return
+            app.note("Checked the run" + (f": {text}" if text else "."))
+
     return AppConsole(session, agent=agent)
+
+
+_DECISION_RE = re.compile(r"\{[^{}]*\"(?:next_check_minutes|status)\"[^{}]*\}", re.S)
+
+
+def audit_words(text: str) -> str:
+    """An audit answer without its decision JSON (and the code fence around it, if any)."""
+    text = _DECISION_RE.sub("", str(text))
+    text = re.sub(r"```(?:json)?\s*```", "", text)
+    return " ".join(text.split()).strip()
 
 
 def _tail(path: str, count: int) -> List[str]:
@@ -1799,7 +1895,11 @@ def watch_in_process(monitor: Any, model: str = "") -> Optional[App]:
             pulse_monitor.detach()
         except Exception:
             pass
-        app.note(f"{script} has finished. Ctrl+C twice (or /quit) leaves Pulse.")
+        error = getattr(sys, "last_value", None)
+        if error is not None and not isinstance(error, KeyboardInterrupt):
+            app.note(f"{script} stopped with an error. Ctrl+C twice (or /quit) leaves Pulse.")
+        else:
+            app.note(f"{script} has finished. Ctrl+C twice (or /quit) leaves Pulse.")
         thread.join()
 
     import atexit

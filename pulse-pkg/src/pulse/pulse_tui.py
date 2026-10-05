@@ -616,6 +616,11 @@ def _field(prompt: str, text: str, pos: int, width: int, secret: bool) -> Tuple[
     return line, visible_len(prompt) + (pos - start)
 
 
+def body_height(height: int) -> int:
+    """Rows under the title bar and its rule (the terminal's last row is left alone)."""
+    return max(8, height) - 1 - 2
+
+
 def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
     """One frame: `height` lines of at most `width` columns, and where the cursor goes
     (row, column, zero-based)."""

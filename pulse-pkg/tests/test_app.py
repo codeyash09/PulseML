@@ -1429,4 +1429,50 @@ def test_the_hosted_runs_output_goes_under_its_figures_not_into_the_conversation
     app._side_at = 0
     app._refresh_side(force=True)
     side = [plain(l) for l in app.view.side]
-    assert side[6] == "Output" and len(side) == 16 - 2 and side[-1] == "step 59"   # as many lines as the pane has room for
+    assert side[6] == "Output" and len(side) == tui.body_height(16) and side[-1] == "step 59"   # all the pane has room for
+    frame, _r, _c = tui.compose(app.view, 120, 16)
+    assert "step 59" in plain(frame[-1])                               # the newest line is on screen
+
+
+
+# ---------------------------------------------------------------- a crash
+
+def _crashed_app(app, agent=True):
+    app.session = {"session_id": "s1", "directory": "", "script": "/p/train.py"}
+    app.console = types.SimpleNamespace(workdir="/p", brain=types.SimpleNamespace(events=[
+        {"event": "crash", "exception": "ValueError: matmul mismatch", "traceback": "Traceback...\nValueError: matmul mismatch"}]))
+    app.cli.agent_provider, app.cli.agent_key = ("DeepSeek", "sk") if agent else (None, None)
+    started = []
+    app._start = lambda work, *args: started.append(args)
+    return started
+
+
+def test_a_crash_starts_the_agent_on_it_once(app):
+    started = _crashed_app(app)
+    app._on_crash()
+    app._on_crash()                                              # the next screen refresh: not again
+    assert len(started) == 1 and "crashed with ValueError: matmul mismatch" in started[0][0]
+    kinds = [(e.kind, plain(e.text)) for e in app.view.entries]
+    assert kinds == [("error", "train.py crashed: ValueError: matmul mismatch."),
+                     ("user", "Why did train.py crash? Fix it.")]
+
+
+def test_a_crash_while_the_agent_is_busy_waits_for_it(app):
+    started = _crashed_app(app)
+    app.view.busy = True
+    app._on_crash()
+    assert started == [] and app._crash_pending == "train.py"
+    app.view.busy = False
+    app._run_job(lambda: None, ())                               # the job that was running ends
+    assert len(started) == 1 and app._crash_pending is None
+
+
+def test_a_crash_without_an_agent_says_how_to_get_one(app):
+    started = _crashed_app(app, agent=False)
+    app._on_crash()
+    assert started == [] and "/agent" in text_of(app) and "ValueError" in text_of(app)
+
+
+def test_an_audit_shows_its_words_not_its_json(app):
+    text = 'Some prose.\n```json\n{"status": "ok", "risk": "low", "findings": [], "next_check_minutes": 15}\n```\nThe loss is flat near 0.5.'
+    assert appmod.audit_words(text) == "Some prose. The loss is flat near 0.5."
