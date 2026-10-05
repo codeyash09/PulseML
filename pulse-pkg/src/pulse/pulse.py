@@ -7411,7 +7411,36 @@ def _stream_mode_requested(mode):
         os.environ.get("PULSE_MODE", "").strip().lower() == "stream"
 
 
-def _start_stream_monitor(caller_frame, throttle_interval):
+def _app_mode_requested(mode):
+    return str(mode or "").strip().lower() == "app" or \
+        os.environ.get("PULSE_MODE", "").strip().lower() == "app"
+
+
+def _default_mode():
+    """No mode asked for: the Pulse app when this is a terminal that can show it."""
+    try:
+        from . import pulse_app
+        return "app" if pulse_app.usable() and threading.current_thread() is threading.main_thread() else "cli"
+    except Exception:
+        return "cli"
+
+
+def _start_app(caller_frame, throttle_interval):
+    """"app" mode: the light monitor of stream mode, and the Pulse app opened on this run
+    in the same terminal (see pulse_app.watch_in_process). Falls back to the line-by-line
+    cli mode when the terminal cannot show the app."""
+    from . import pulse_app
+    if not pulse_app.usable() or threading.current_thread() is not threading.main_thread():
+        return None
+    monitor = _start_stream_monitor(caller_frame, throttle_interval, quiet=True)
+    app = pulse_app.watch_in_process(monitor, model=os.environ.get("PULSE_MODEL", "").strip())
+    if app is None:
+        print(f"[Pulse] Monitoring this run into {monitor.directory}")
+        print(f"[Pulse] Watch it with:  pulse  (then /monitor)")
+    return monitor
+
+
+def _start_stream_monitor(caller_frame, throttle_interval, quiet=False):
     """Attach the light monitor and leave the thinking to a separate brain process.
 
     Nothing is installed into the training loop: no sys.settrace, no frame-local trace
@@ -7475,8 +7504,9 @@ def _start_stream_monitor(caller_frame, throttle_interval):
 
     _AT_FORK_DISARMERS.append(_forget_monitor_in_child)
 
-    print(f"[Pulse] Monitoring this run into {monitor.directory}")
-    print(f"[Pulse] Watch it with:  python -m pulse.brain {monitor.directory} --model <model>")
+    if not quiet:
+        print(f"[Pulse] Monitoring this run into {monitor.directory}")
+        print(f"[Pulse] Watch it with:  python -m pulse.brain {monitor.directory} --model <model>")
     return monitor
 
 
@@ -7533,9 +7563,11 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
 
     if mode is None:
         # The environment decides when the call doesn't: a plain auto_track()
-        # used to pass "cli" and so overrode PULSE_MODE=ui.
+        # used to pass "cli" and so overrode PULSE_MODE=ui. With nothing set, a
+        # terminal that can show the Pulse app gets it ("app"); anywhere else
+        # (a notebook, nohup, a log file) stays with the line-by-line "cli".
         env_mode = os.environ.get("PULSE_MODE", "").strip().lower()
-        mode = env_mode if env_mode in ("ui", "cli", "auto", "stream") else "cli"
+        mode = env_mode if env_mode in ("ui", "cli", "auto", "stream", "app") else _default_mode()
 
     # Marked only for as long as a session is actually starting: a first call
     # that fails (the Tk setup dialog over SSH raises) or is cancelled must not
@@ -7562,6 +7594,11 @@ def _auto_track_session(caller_frame, train_fn, throttle_interval, code_text, pr
 
     if _stream_mode_requested(mode):
         return _start_stream_monitor(caller_frame, throttle_interval)
+    if _app_mode_requested(mode):
+        started = _start_app(caller_frame, throttle_interval)
+        if started is not None:
+            return started
+        mode = "cli"            # no terminal for the app: the line-by-line mode, as before
 
     # Multi-GPU / multi-process launch detection (torchrun,
     # torch.distributed.launch, OpenMPI, Slurm) -- world_size > 1 means

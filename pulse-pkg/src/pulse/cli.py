@@ -94,7 +94,9 @@ root. `sudo pulse` reports "command not found" on a pip install, because sudo re
 PATH with its own and pip installs into ~/.local/bin: `pulse install-sudo` fixes that.
 """
 
-_RUN_MODE = "cli"          # what the injected auto_track() is given; "stream" for --stream
+_RUN_MODE = "app"          # what the injected auto_track() is given: the Pulse app on this run in
+                           # this terminal (the line-by-line mode where there is no terminal);
+                           # "stream" for --stream
 
 
 # ---------------------------------------------------------------------------------------
@@ -104,8 +106,9 @@ _RUN_MODE = "cli"          # what the injected auto_track() is given; "stream" f
 class PulseASTInjector(ast.NodeTransformer):
     """Add one `auto_track(mode=...)` call to a parsed module.
 
-    `mode` is what the call is given: "cli" is normal Pulse, "stream" starts the light
-    monitor instead. The call is written as `__import__("pulse").auto_track(...)`, so it
+    `mode` is what the call is given: "app" opens the Pulse app on the run in this
+    terminal (and is the line-by-line "cli" mode where there is no terminal), "stream"
+    starts the light monitor alone. The call is written as `__import__("pulse").auto_track(...)`, so it
     binds no name in the script's namespace and cannot collide with anything the script
     defines, and it carries the line number of the statement it sits in front of, so no
     other line number in the script moves.
@@ -116,7 +119,7 @@ class PulseASTInjector(ast.NodeTransformer):
     training loop must not pull it past the loop).
     """
 
-    def __init__(self, mode="cli"):
+    def __init__(self, mode="app"):
         self.mode = mode
 
     def _make_auto_track_call(self, anchor):
@@ -561,7 +564,7 @@ def run_script(script, script_args, stream=False, cwd=None, again=False):
     global _RUN_MODE, _RUN_ARGV0
     from . import pulse_cli
 
-    _RUN_MODE = "stream" if stream else "cli"
+    _RUN_MODE = "stream" if stream else "app"
     if stream:
         # --stream has to reach the auto_track() call whatever wrote it. Injection only
         # happens for a script that does NOT already call auto_track, so a script written

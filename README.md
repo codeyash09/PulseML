@@ -48,6 +48,14 @@ if __name__ == "__main__":
 
 The `__main__` guard is particularly important in multiprocessing or process-spawning environments.
 
+Run the script as you always do. In a terminal, Pulse opens as the full-screen app on that
+very run (see [The Pulse app](#the-pulse-app)): the run's state on the left, the agent on
+the right, your script's own output in the transcript, and the script goes on exactly as
+it would have. Leaving the app (Ctrl+C twice) gives you the terminal back while the
+training continues; when the script ends, the app stays until you leave it. Without a
+terminal (a notebook, `nohup`, a log file) Pulse keeps its line-by-line mode, and
+`auto_track(mode="cli")` or `PULSE_MODE=cli` asks for that mode anywhere.
+
 Once the process is running, Pulse discovers numeric variables available to the training process and exposes them through the CLI.
 
 ### AI provider configuration
@@ -229,7 +237,9 @@ from pulse import auto_track
 auto_track(mode="stream")
 ```
 
-and watch it from anywhere else:
+(`auto_track()` with no mode, in a terminal, is this monitor plus the Pulse app opened on
+the run in the same terminal -- the brain then runs beside the app.) Watch a stream from
+anywhere else:
 
 ```bash
 python -m pulse.brain                      # newest session
@@ -500,14 +510,16 @@ Type `pulse` in a terminal and Pulse opens as one full-screen app:
  ───────────────────────────────────────────────────────────────────────────────────────────────
   train.py                    ● live │ ❯ why did the loss stop moving?
   ~/experiments                      │
-  step 4,120 · 19.8/s · 3m 28s       │ ✻ Thinking  (47 words · ctrl+o to expand)
-                                     │ ● GREP(lr)
-  loss      0.5001 █▅▃▂▁▁▁▁▁▁▁▁      │ ● VIEW(train.py:1-12)
-  grad_norm 2.4e-5 █▆▄▂▁▁▁▁▁▁▁▁      │   ⎿ 23 lines  (ctrl+o to expand)
-                                     │ The loss is flat at 0.5 because of the `+ 0.5` on line 12 ...
-  Findings  2                        │ ────────────────────────────────────────────────────────────
-  ▲ loss stopped improving at 0.5    │ ❯
-                                     │ Enter send · / commands · Ctrl+O details · PgUp/PgDn scroll
+  step 4,120 · 19.8/s · 3m 28s       │ Thought for 6.2s
+                                     │
+  loss      0.5001 █▅▃▂▁▁▁▁▁▁▁▁      │ I need to see how the learning rate is used.
+  grad_norm 2.4e-5 █▆▄▂▁▁▁▁▁▁▁▁      │ Searched for lr · Read train.py:1-12  · 25 lines
+                                     │ Edited train.py  · +1 −1  · approved by deepseek-chat · applied
+  Findings  2                        │
+  ▲ loss stopped improving at 0.5    │ The loss is flat at 0.5 because of the `+ 0.5` on line 12 ...
+                                     │ ────────────────────────────────────────────────────────────
+  Tensors                            │ ❯
+  X  256x8 float32                   │ Enter send · / commands · click or Ctrl+O to expand · ↑↓ scroll
 ```
 
 1. **Setup** comes first, the same as ever: account, workspace, agent model, key (or the
@@ -524,10 +536,14 @@ Type `pulse` in a terminal and Pulse opens as one full-screen app:
    evidence. Its reasoning streams in as the model thinks, then folds to `Thought for 4s`;
    every tool call folds to a line that says what was done -- `Ran pytest -q`, `Read
    train.py:40-80`, `Searched for lr` -- and a click on it, or **Ctrl+O**, opens the
-   output in place. What the agent says to you is plain text; the run's own output is
-   dim. The agent can also talk to you while it works -- a message beside its tool calls
-   -- so you see what it found and what it is about to check without waiting for the end
-   of its turn. A fix is a diff you confirm; `/restart` then stops the
+   output in place. A change to your files is one line too, `Edited train.py · +3 −1`,
+   with what became of it (reviewed, applied, declined) on the same line and the diff
+   under it when opened. What the agent says to you is plain text; the run's own output
+   and Pulse's own notes are grey. One colour: Pulse's orange marks what is live, selected
+   or worth a look (a finding, an added line), red marks what is wrong, and nothing else
+   is coloured. The agent can also talk to you while it works -- a message beside its
+   tool calls -- so you see what it found and what it is about to check without waiting
+   for the end of its turn. A fix is a diff you confirm; `/restart` then stops the
    run and starts it again with the change (for runs started with `/run`).
 
 | Key | What it does |
@@ -558,12 +574,14 @@ at a paused `pulse run` is likewise handled as what it is -- a question gets an 
 change you asked for gets made -- instead of being read as a bug report to diagnose.
 
 `pulse watch <run>`, `pulse <script.py>` and `pulse attach --pid N` open the same app
-directly on that run. On Windows it needs a console that understands escape sequences
-(Windows Terminal, or the console of Windows 10 and later). Without a real terminal (a
-pipe, CI), on a very small one, or with `PULSE_CLASSIC=1`, Pulse keeps the line-by-line
-screens described below. `PULSE_STREAMING=0` turns off the streaming of the model's
-replies. `pulse run train.py` -- training with Pulse inside the script's own terminal --
-is unchanged.
+directly on that run, and so does a script that calls `auto_track()` when it is run in a
+terminal: the app opens beside the training, in the same terminal, with the script's own
+output in the transcript (`mode="app"`, the default there; the agent is the one used last
+time if its key is in the environment, else `/agent`). On Windows it needs a console that
+understands escape sequences (Windows Terminal, or the console of Windows 10 and later).
+Without a real terminal (a pipe, CI), on a very small one, or with `PULSE_CLASSIC=1`,
+Pulse keeps the line-by-line screens described below. `PULSE_STREAMING=0` turns off the
+streaming of the model's replies.
 
 ---
 

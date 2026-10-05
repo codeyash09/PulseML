@@ -418,7 +418,7 @@ def _confirm(state, path, before, after, created):
     from . import pulse_code as _pc
     cli = state.cli
     diff = _pc.render_diff(cli, {path: (before, after, created)})
-    print("\n" + diff)
+    _ui.show_change([f"{'CREATE' if created else 'EDIT'}: {_rel(state.root, path)}"], diff)
     if not cli.review:
         return True
     reviewed = cli._review_change_with_approver(state.request, f"{'create' if created else 'edit'} {_rel(state.root, path)}",
@@ -769,6 +769,10 @@ def _show(name, args, result):
     """What the agent just did, in the Pulse app's transcript or as a compact terminal line."""
     host = _ui.host()
     if host is not None and hasattr(host, "tool"):
+        if name in _WRITERS and getattr(host, "_edit_pending", None) is not None:
+            # the diff is already in the transcript (show_change): say what became of it
+            host.edit_status("not applied" if result.startswith("NOT APPLIED") else "applied", final=True)
+            return
         host.tool([f"{name.upper()}: {_brief(name, args)[len(name):].strip()}"], result)
         return
     cprint(f"● {_brief(name, args)}", color=_BLUE)

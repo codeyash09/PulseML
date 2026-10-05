@@ -33,7 +33,7 @@ import unicodedata
 
 __all__ = [
     "Unavailable", "enabled", "color_enabled", "header", "rule", "ok", "warn", "fail",
-    "note", "kv", "subhead", "message", "answer", "ask", "confirm", "choose", "Option", "Stage", "ready_block",
+    "note", "kv", "subhead", "message", "answer", "show_change", "change_status", "ask", "confirm", "choose", "Option", "Stage", "ready_block",
     "elapsed_text", "commit_looks_valid", "key_hint_for", "set_host", "host",
 ]
 
@@ -278,6 +278,37 @@ def message(text):
     bar = _s(_g("bar") + " ", "accent")
     with _out_lock:
         sys.stdout.write("\n" + "\n".join(bar + line for line in text.splitlines()) + "\n\n")
+        sys.stdout.flush()
+
+
+def show_change(labels, diff):
+    """A change the agent wants to make to the files, before it is reviewed or applied.
+    `labels` name the files ("EDIT: train.py", "CREATE: tests/test_x.py"); `diff` is the
+    coloured unified diff for a terminal. Inside the Pulse app it is one folded line that
+    opens to the diff; on a plain terminal the diff is printed."""
+    host = _HOST
+    if host is not None and hasattr(host, "edit"):
+        host.edit(list(labels), diff)
+        return
+    with _out_lock:
+        sys.stdout.write("\n" + diff + "\n")
+        sys.stdout.flush()
+
+
+def change_status(text, detail=None, color=None, final=False, terminal_text=None):
+    """What became of the change shown by show_change(): "approved by X", "applied", "not
+    applied". In the app `text` joins the change's line and `detail` (the reviewer's reason,
+    the /undo hint) shows under the diff when it is opened; `final` = the last word on it.
+    On a terminal `terminal_text` (or `text`) is printed in `color`."""
+    host = _HOST
+    if host is not None and hasattr(host, "edit_status"):
+        host.edit_status(text, detail=detail, final=final)
+        return
+    line = terminal_text if terminal_text is not None else text
+    if color is not None:
+        line = f"{color}{line}{_RESET}" if color_enabled() else line
+    with _out_lock:
+        sys.stdout.write(line + "\n")
         sys.stdout.flush()
 
 

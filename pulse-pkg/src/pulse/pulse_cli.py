@@ -9208,8 +9208,10 @@ class PulseCLI:
                    "-- asking you instead.", color=_YELLOW)
             return None
         verdict = "APPROVED" if decision.approved else "DENIED"
-        cprint(f"[Pulse] Auto mode: {settings.model} {verdict} the change -- {decision.reason}",
-               color=(_GREEN if decision.approved else _YELLOW))
+        _ui.change_status(f"{'approved' if decision.approved else 'denied'} by {settings.model.rsplit('/', 1)[-1]}",
+                          detail=f"{settings.model}: {decision.reason}",
+                          color=(_GREEN if decision.approved else _YELLOW),
+                          terminal_text=f"[Pulse] Auto mode: {settings.model} {verdict} the change -- {decision.reason}")
         _agent_log_event(f"AUTO MODE: change {verdict} by {settings.model}", f"{explanation}\nreason: {decision.reason}")
         if not decision.approved:
             self._last_change_denial = f"the auto-mode reviewer ({settings.model}) declined it: {decision.reason}"

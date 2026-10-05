@@ -183,6 +183,8 @@ class Entry:
     text      output of the agent or a command   text (may be several lines, coloured)
     thinking  the model's reasoning              text -- collapsed to one line by default
     tool      tools the agent ran                calls (one line each), output (collapsed)
+    edit      a change to the project's files    calls (EDIT:/CREATE: label), output (the
+                                                 diff, collapsed), text (its status)
     finding   a detector finding                 text, severity
     say       what the agent says while working   text (MESSAGE: / message_user)
     note      a quiet line from Pulse itself     text
@@ -206,7 +208,7 @@ class Entry:
         self._cache = {}
 
     def foldable(self) -> bool:
-        return self.kind in ("thinking", "tool") or (self.kind == "user" and self.text.count("\n") >= USER_FOLD_LINES)
+        return self.kind in ("thinking", "tool", "edit") or (self.kind == "user" and self.text.count("\n") >= USER_FOLD_LINES)
 
     def toggle(self, expanded: bool = False) -> None:
         """A click: open what is shut, shut what is open (`expanded` is the screen-wide state)."""
@@ -217,7 +219,12 @@ class Entry:
         return expanded if self.open is None else self.open
 
 
-_SEVERITY_STYLE = {"critical": "red", "error": "red", "warning": "amber", "info": "dim"}
+# One colour: Pulse's orange is for what is live, selected or worth a look; red is for what
+# is wrong; everything else is a shade of grey. Nothing green or yellow.
+_SEVERITY_STYLE = {"critical": "red", "error": "red", "warning": "accent", "info": "dim"}
+_RED_SGR_RE = re.compile(r"\033\[(?:[0-9;]*;)?(?:31|91)(?:;[0-9;]*)?m")
+_QUIET_KINDS = {"thinking", "tool", "edit", "note"}
+_QUIET_TAG_RE = re.compile(r"\bago\b|^(?:not |ended|crashed|finished|stopped|done)")
 EXPAND_HINT = "click or ctrl+o"
 USER_FOLD_LINES = 6                 # a pasted request longer than this folds to its first lines
 
@@ -233,6 +240,7 @@ _CALL_WORDS = {
     "DEPGRAPH": "Mapped the imports", "TRACE_VARIABLE": "Traced {}", "TRACE": "Traced {}",
     "DOC_LOOKUP": "Looked up {}", "DOCLOOKUP": "Looked up {}", "CHANGELOG": "Checked what changed",
     "TERMINAL": "Ran {}", "RUN_COMMAND": "Ran {}", "EDIT_FILE": "Edited {}", "EDIT": "Edited {}",
+    "CREATE": "Created {}",
     "REPLACE_SYMBOL": "Rewrote {}", "WRITE_FILE": "Wrote {}", "TODO_WRITE": "Updated the plan ({})",
     "START_RUN": "Started {} under Pulse", "RUN": "Started {} under Pulse", "RUN_STATUS": "Checked the run",
     "RUNSTATUS": "Checked the run", "RESTART_RUN": "Restarted the run", "RESTART": "Restarted the run",
@@ -257,6 +265,26 @@ def describe_call(call: str) -> str:
     if "{}" in words:
         return words.format(arg) if arg else words.replace(" {}", "").replace("{}", "").strip()
     return words
+
+
+def diff_counts(diff: str) -> Tuple[int, int]:
+    """Lines added and removed in a unified diff (its ---/+++ header not counted)."""
+    added = removed = 0
+    for line in diff.split("\n"):
+        if line.startswith("+") and not line.startswith("+++"):
+            added += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            removed += 1
+    return added, removed
+
+
+def _edit_head(entry: Entry) -> str:
+    said = [describe_call(c) for c in entry.calls]
+    head = " · ".join(said[:3]) + (f" +{len(said) - 3}" if len(said) > 3 else "")
+    added, removed = diff_counts(entry.output)
+    counts = f"  · +{added} \u2212{removed}" if _ui._unicode() else f"  · +{added} -{removed}"
+    status = entry.text.split("\n", 1)[0]
+    return head + s(counts + (f"  · {status}" if status else ""), "dim")
 
 
 def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
@@ -323,8 +351,20 @@ def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
                 for piece in wrap(row, width - 4):
                     out.append("  " + s(elbow if first else "  ", "dim") + s(piece, "dim"))
                     first = False
+    elif kind == "edit":
+        # a change to the files: one line saying what changed, the diff under it when open
+        out.append(_ui._clip(_edit_head(entry), width))
+        if expanded:
+            for row in entry.output.strip("\n").split("\n"):
+                if row.startswith("+++") or row.startswith("---"):
+                    continue
+                style = "bold" if row.startswith(("modified: ", "new file: ")) else \
+                    "accent" if row.startswith("+") else "dim"
+                out.extend("  " + s(piece, style) for piece in wrap(row, width - 2))
+            for detail in entry.text.split("\n")[1:]:        # the reviewer's reason, the /undo hint
+                out.extend("  " + s(piece, "dim") for piece in wrap(detail, width - 2))
     elif kind == "finding":
-        style = _SEVERITY_STYLE.get(entry.severity.lower(), "amber")
+        style = _SEVERITY_STYLE.get(entry.severity.lower(), "accent")
         mark = ("▲ " if _ui._unicode() else "! ") + (entry.severity.upper() + " " if entry.severity else "")
         pieces = wrap(entry.text, max(1, width - visible_len(mark)), indent="")
         out.append(s(mark, style, "bold") + pieces[0])
@@ -338,14 +378,14 @@ def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
             out.append(s(g("fail") + " ", "red") + s(pieces[0], "red"))
             out.extend("  " + s(p, "red") for p in pieces[1:])
     else:
-        # Pulse's own output (a diff, a note from the pipeline): quieter than the agent's
-        # words, unless the line brought its own colours
+        # Pulse's own output (a note from a pipeline, a command's output): quieter than the
+        # agent's words, in grey; a line that came out red (an error) stays red. The colours
+        # the pipelines paint for a plain terminal are dropped here.
         for part in entry.text.strip("\n").split("\n"):
             bare = _SGR_RE.sub("", part)
             lead = min(len(bare) - len(bare.lstrip(" ")), width // 2)
-            pieces = wrap(part, width, indent=" " * lead)
-            coloured = "\033[" in part
-            out.extend(piece if coloured and not entry.live else s(piece, "dim") for piece in pieces)
+            style = "red" if _RED_SGR_RE.search(part) else "dim"
+            out.extend(s(piece, style) for piece in wrap(bare, width, indent=" " * lead))
     entry._cache = {key: out}       # one frame size at a time is all that is ever asked for
     return out
 
@@ -500,9 +540,9 @@ def transcript_rows(view: View, width: int, only_last: bool = False) -> Tuple[Li
         block = entry_lines(entry, width, view.expanded)
         if not block:
             continue
-        # air between speakers, none inside a run of tool calls or output
-        if previous is not None and (entry.kind == "user" or previous == "user"
-                                     or (entry.kind != previous and "tool" not in (entry.kind, previous))):
+        # air before a paragraph and around what the person typed; the one-line machinery
+        # (thinking, tool calls, edits, notes) stacks without any
+        if previous is not None and (entry.kind == "user" or previous == "user" or entry.kind not in _QUIET_KINDS):
             lines.append("")
             owners.append(None)
         lines.extend(block)
@@ -609,7 +649,7 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
             chosen = row == view.option_index
             line = (s(g("sel") + " ", "accent", "bold") + s(label, "bold") if chosen else "  " + label)
             if tag:
-                line += s(f"  {tag}", "accent")
+                line += s(f"  {tag}", "dim" if _QUIET_TAG_RE.search(tag) else "accent")
             if detail:
                 line += s(f"  {detail}", "dim")
             block.append(_ui._clip(line, right_w))

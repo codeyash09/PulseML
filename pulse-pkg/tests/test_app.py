@@ -614,12 +614,14 @@ def test_a_fix_is_confirmed_in_the_input_line_and_applied(real_app, monkeypatch)
     run_line(real_app, "lower the learning rate")
     assert wait_for(lambda: "Apply these changes" in real_app.view.question, 20)
     assert "lr = 0.3" in open(path).read()                       # nothing is written before the answer
-    assert "+lr = 0.05" in text_of(real_app)                     # the diff is in the transcript
+    edit = next(e for e in real_app.view.entries if e.kind == "edit")
+    assert edit.calls == ["EDIT: train.py"] and "+lr = 0.05" in edit.output   # the diff is in the transcript
+    assert edit.open is True                                     # opened, so the person sees what they answer
     press(real_app, "enter")
     assert wait_for(lambda: not real_app.view.busy, 20)
     assert "lr = 0.05" in open(path).read()
-    edit = next(e for e in real_app.view.entries if e.kind == "tool" and e.calls[0].startswith("EDIT"))
-    assert edit.calls == ["EDIT: train.py"] and "Applied" in edit.output
+    assert edit.text.startswith("applied") and "/undo to revert" in edit.text
+    assert [plain(l) for l in tui.entry_lines(edit, 80, False)] == ["Edited train.py  · +1 −1  · applied"]
 
 
 def test_declining_the_diff_changes_nothing(real_app, monkeypatch):
@@ -1171,3 +1173,201 @@ def test_a_click_in_the_split_view_keeps_the_entry_on_its_row(app):
     frame, _r, _c = tui.compose(app.view, 110, 22)
     assert app.view.row_entries.get(row) is tool
     assert "Searched for lr" in PLAIN.sub("", frame[row])
+
+
+# ---------------------------------------------------------------- a change to the files
+
+DIFF = ("\033[1mmodified: train.py\033[0m\n\033[2m@@ -1,3 +1,3 @@\033[0m\n import x\n\033[31m-lr = 0.3\033[0m\n"
+        "\033[32m+lr = 0.05\033[0m\n rng = 1\n")
+
+
+def test_a_change_folds_to_one_line_and_opens_to_its_diff(app):
+    app.edit(["EDIT: train.py"], DIFF)
+    entry = app.view.entries[-1]
+    assert entry.kind == "edit" and app._edit_pending is entry
+    assert [plain(l) for l in tui.entry_lines(entry, 80, False)] == ["Edited train.py  · +1 −1"]
+    app.edit_status("approved by deepseek-chat", detail="deepseek/deepseek-chat: does what was asked")
+    app.edit_status("applied", detail="/undo to revert (commit abc123)", final=True)
+    assert app._edit_pending is None
+    assert [plain(l) for l in tui.entry_lines(entry, 80, False)] == ["Edited train.py  · +1 −1  · approved by deepseek-chat · applied"]
+    opened = [plain(l) for l in tui.entry_lines(entry, 80, True)]
+    assert opened[0].startswith("Edited train.py")
+    assert "  modified: train.py" in opened and "  -lr = 0.3" in opened and "  +lr = 0.05" in opened
+    assert opened[-2:] == ["  deepseek/deepseek-chat: does what was asked", "  /undo to revert (commit abc123)"]
+    assert entry.foldable()
+
+
+def test_a_status_with_no_change_on_the_table_is_a_note(app):
+    app.edit_status("applied", final=True)
+    assert app.view.entries[-1].kind == "note"
+
+
+def test_show_change_and_change_status_print_on_a_plain_terminal(capsys):
+    ui.set_host(None)
+    ui.show_change(["EDIT: train.py"], "modified: train.py\n+lr = 0.05")
+    ui.change_status("applied", color=None, terminal_text="✓ 1 file changed")
+    out = capsys.readouterr().out
+    assert "+lr = 0.05" in out and "✓ 1 file changed" in out and "applied\n" not in out
+
+
+def test_the_native_loop_puts_an_edits_fate_on_its_diff_line():
+    from pulse import pulse_code_agent as agent
+
+    class Host:
+        def __init__(self):
+            self._edit_pending = object()
+            self.statuses, self.tools = [], []
+
+        def edit_status(self, text, detail=None, final=False):
+            self.statuses.append((text, final))
+
+        def tool(self, calls, output):
+            self.tools.append(calls)
+
+    host = Host()
+    ui.set_host(host)
+    try:
+        agent._show("edit_file", {"path": "train.py"}, "train.py  (+1 -1 lines)")
+        agent._show("edit_file", {"path": "train.py"}, "NOT APPLIED -- the user declined this change")
+        host._edit_pending = None
+        agent._show("edit_file", {"path": "train.py"}, "NOT APPLIED -- the change would break the file")
+        agent._show("grep", {"pattern": "lr"}, "3 matches")
+    finally:
+        ui.set_host(None)
+    assert host.statuses == [("applied", True), ("not applied", True)]
+    assert host.tools == [["EDIT_FILE: train.py"], ["GREP: lr"]]
+
+
+def test_pipeline_colours_are_dropped_but_an_error_stays_red(monkeypatch):
+    monkeypatch.setattr(ui, "color_enabled", lambda: True)
+    green = tui.Entry("text", "\033[32m[Pulse] all good\033[0m")
+    red = tui.Entry("text", "\033[31m[Pulse] ⚠ lint FAILED\033[0m")
+    g_line, = tui.entry_lines(green, 80, False)
+    r_line, = tui.entry_lines(red, 80, False)
+    assert "\033[32m" not in g_line and g_line.startswith("\033[2m")
+    assert "\033[31m" in r_line and "\033[2m" not in r_line
+
+
+def test_only_a_live_tag_is_orange_in_a_picker(app, monkeypatch):
+    monkeypatch.setattr(ui, "color_enabled", lambda: True)
+    app.view.options = [("train.py", "step 10", "live"), ("train.py", "step 9", "ended 2h ago"),
+                        ("old.py", "", "not under Pulse")]
+    app.view.option_ids = [0, 1, 2]
+    frame, _r, _c = tui.compose(app.view, 90, 20)
+    rows = [ln for ln in frame if "train.py" in PLAIN.sub("", ln) or "old.py" in PLAIN.sub("", ln)]
+    assert "\033[38;5;208m  live" in rows[0]
+    assert "\033[2m  ended 2h ago" in rows[1] and "\033[38;5;208m  ended" not in rows[1]
+    assert "\033[2m  not under Pulse" in rows[2]
+
+
+def test_machinery_lines_stack_and_paragraphs_breathe(app):
+    app.view.entries = [tui.Entry("user", "q"), tui.Entry("thinking", "a b"), tui.Entry("say", "Plan"),
+                        tui.Entry("edit", calls=["EDIT: t.py"], output="+x"), tui.Entry("tool", calls=["TERMINAL: ls"], output="a"),
+                        tui.Entry("note", "Verified"), tui.Entry("thinking", "c d"), tui.Entry("say", "Done")]
+    lines = [plain(l) for l in tui.transcript_lines(app.view, 80)]
+    assert lines == ["❯ q", "", "Thought (2 words)", "", "Plan", "Edited t.py  · +1 −0", "Ran ls  · 1 line", "Verified",
+                     "Thought (2 words)", "", "Done"]
+
+
+# ---------------------------------------------------------------- auto_track() opens the app
+
+class FakeMonitor:
+    def __init__(self, tmp_path):
+        self.session_id = "s1"
+        self.directory = str(tmp_path / "stream")
+        self.script_path = str(tmp_path / "train.py")
+
+
+def _loop_until_done(app_):
+    """Stands in for App.loop: the screen is up, output is captured, until done."""
+    app_.install()
+    app_.up.set()
+    try:
+        while not app_.done:
+            time.sleep(0.01)
+    finally:
+        app_.uninstall()
+
+
+def test_auto_track_opens_the_app_beside_the_script(tmp_path, monkeypatch, capsys):
+    import atexit
+    from pulse import pulse_monitor
+    registered = []
+    monkeypatch.setattr(atexit, "register", lambda fn: registered.append(fn))
+    monkeypatch.setattr(appmod, "usable", lambda: True)
+    monkeypatch.setattr(appmod, "_new_cli", lambda root, focus, review=True, chdir=True: FakeCli())
+    monkeypatch.setattr(appmod, "_pick_agent_quietly", lambda cli, model="": None)
+    monkeypatch.setattr(appmod.App, "loop", _loop_until_done)
+    monkeypatch.setattr(appmod.App, "_open_run", lambda self, session, monitor=None: self.note("opened"))
+    monkeypatch.setattr(appmod, "signal", types.SimpleNamespace(signal=lambda *a: None, SIGINT=2, default_int_handler=None,
+                                                                getsignal=lambda s: None))
+    detached = []
+    monkeypatch.setattr(pulse_monitor, "detach", lambda: detached.append(True))
+    cwd = os.getcwd()
+    monitor = FakeMonitor(tmp_path)
+
+    app_ = appmod.watch_in_process(monitor)
+    assert app_ is not None and app_.hosting is monitor
+    assert os.getcwd() == cwd                                  # the script's working directory is its own
+    assert app_.up.is_set() and ui.host() is app_              # the script goes on with its output captured
+    print("step 0  loss 1.0")                                  # what the script prints lands in the transcript
+    assert wait_for(lambda: "step 0  loss 1.0" in text_of(app_))
+    assert "train.py is running here" in text_of(app_)
+
+    # the script ends: the run is marked finished, the app stays until the person leaves
+    at_exit, = registered
+    leaver = threading.Thread(target=lambda: (wait_for(lambda: "has finished" in text_of(app_)), setattr(app_, "done", True)))
+    leaver.start()
+    at_exit()
+    leaver.join()
+    assert detached == [True] and app_.done and ui.host() is None
+    assert "Left the app" not in capsys.readouterr().out        # the script was over, not left
+
+
+def test_leaving_the_app_gives_the_terminal_back_and_the_run_goes_on(tmp_path, monkeypatch, capsys):
+    import atexit
+    monkeypatch.setattr(atexit, "register", lambda fn: None)
+    monkeypatch.setattr(appmod, "usable", lambda: True)
+    monkeypatch.setattr(appmod, "_new_cli", lambda root, focus, review=True, chdir=True: FakeCli())
+    monkeypatch.setattr(appmod, "_pick_agent_quietly", lambda cli, model="": None)
+    monkeypatch.setattr(appmod.App, "loop", _loop_until_done)
+    monkeypatch.setattr(appmod.App, "_open_run", lambda self, session, monitor=None: None)
+    monkeypatch.setattr(appmod, "signal", types.SimpleNamespace(signal=lambda *a: None, SIGINT=2, default_int_handler=None,
+                                                                getsignal=lambda s: None))
+    app_ = appmod.watch_in_process(FakeMonitor(tmp_path))
+    app_.done = True                                           # Ctrl+C twice
+    assert wait_for(lambda: ui.host() is None)
+    time.sleep(0.05)
+    assert "Left the app; train.py goes on" in capsys.readouterr().out
+
+
+def test_without_a_terminal_auto_track_stays_with_the_line_by_line_mode(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "usable", lambda: False)
+    assert appmod.watch_in_process(FakeMonitor(tmp_path)) is None
+    from pulse import pulse as core
+    assert core._default_mode() == "cli"
+    monkeypatch.setattr(appmod, "usable", lambda: True)
+    assert core._default_mode() == "app"
+    monkeypatch.setenv("PULSE_MODE", "app")
+    assert core._app_mode_requested(None)
+    monkeypatch.delenv("PULSE_MODE")
+    assert core._app_mode_requested("app") and not core._app_mode_requested("cli")
+
+
+def test_app_mode_falls_back_to_cli_when_the_app_cannot_open(monkeypatch):
+    from pulse import pulse as core
+    calls = []
+    monkeypatch.setattr(core, "_start_app", lambda frame, interval: calls.append("app") or None)
+    monkeypatch.setattr(core, "_distributed_info", lambda: (0, 0, 1, "k"))
+    monkeypatch.setattr(core, "_determine_mode", lambda mode: calls.append(("mode", mode)) or (_ for _ in ()).throw(RuntimeError("stop here")))
+    with pytest.raises(RuntimeError, match="stop here"):
+        core._auto_track_session(sys._getframe(), None, 1.0, None, None, "app")
+    assert calls == ["app", ("mode", "cli")]
+
+
+def test_the_ctrl_c_hint_says_the_training_goes_on(app):
+    app.hosting = object()
+    app.on_key("ctrl+c")
+    assert "training goes on" in app.view.status and "/stop" in app.view.status
+    app.on_key("ctrl+c")
+    assert app.done

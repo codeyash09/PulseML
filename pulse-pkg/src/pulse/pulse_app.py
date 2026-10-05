@@ -95,7 +95,7 @@ DEBUG_COMMANDS: List[Tuple[str, str]] = [
     ("/close", "stop watching the open run"),
 ]
 
-_STATUS_STYLE = {"live": "green", "stalled": "amber", "crashed": "red"}
+_STATUS_STYLE = {"live": "accent", "stalled": "bold", "crashed": "red"}
 _RUN_LOG_DIR = "app-runs"
 
 # How a run is launched: `python -m pulse` puts the working directory first on sys.path, so
@@ -337,6 +337,9 @@ class App:
         self._partial = ""
         self._last_blank = True
         self._pane_w = 80
+        self._edit_pending: Optional[tui.Entry] = None   # the change whose fate is still being decided
+        self.hosting: Any = None                  # the in-process run's monitor, under auto_track()
+        self.up = threading.Event()               # set once the screen is up and output is captured
         self._height = 30
         self._question: Optional[_Question] = None
         self._draft = ""
@@ -443,6 +446,12 @@ class App:
                     self._hushed[ident] = outer
 
     def _ask(self, question: _Question) -> Any:
+        if self._edit_pending is not None:
+            # a question while a change is on the table ("Apply this change?") is about that
+            # change: open its diff so the person sees what they are answering
+            with self.lock:
+                self._edit_pending.open = True
+                self._edit_pending.touch()
         if threading.current_thread() is self._ui_thread:
             raise _ui.Unavailable("a question cannot be asked from the drawing thread")
         with self.lock:
@@ -563,6 +572,32 @@ class App:
         output = tui.clean(output).replace("\r", "")
         self._add(tui.Entry("tool", calls=calls or ["tools"], output=output))
 
+    def edit(self, labels: List[str], diff: str) -> None:
+        """A change the agent wants to make: one folded line ("Edited train.py · +1 −1"),
+        the diff under it when opened. What happens to it next (reviewed, applied, declined)
+        goes on the same line through edit_status()."""
+        entry = tui.Entry("edit", calls=labels or ["EDIT"], output=tui._SGR_RE.sub("", diff).replace("\r", ""))
+        self._add(entry)
+        self._edit_pending = entry
+
+    def edit_status(self, text: str, detail: Optional[str] = None, final: bool = False) -> None:
+        """`text` joins the change's line; `detail` (the reviewer's reason, the /undo hint)
+        shows under the diff when the entry is opened."""
+        entry = self._edit_pending
+        if entry is None:
+            self.note(text if not detail else f"{text} -- {detail}")
+            return
+        with self.lock:
+            head, _, rest = entry.text.partition("\n")
+            head = f"{head} · {text}" if head else text
+            entry.text = head + (("\n" + rest) if rest else "") + (f"\n{detail}" if detail else "")
+            if final:
+                entry.open = None            # decided: back to one line (a click reopens it)
+            entry.touch()
+            self.dirty = True
+        if final:
+            self._edit_pending = None
+
     def _observe(self, event: str, **data: Any) -> None:
         """What the model is doing, as it does it (see pulse_cli._complete): its reasoning
         grows in a live Thinking entry, its answer in a live line that goes away once the
@@ -682,7 +717,8 @@ class App:
                     self.done = True
                 else:
                     self._last_ctrl_c = time.monotonic()
-                    view.status = "Ctrl+C again to leave Pulse"
+                    view.status = ("Ctrl+C again leaves Pulse -- the training goes on without it · /stop stops the training"
+                                   if self.hosting is not None else "Ctrl+C again to leave Pulse")
                 return
             view.status = ""
             if key == "ctrl+o":
@@ -1357,6 +1393,7 @@ class App:
     def loop(self) -> int:
         with tui.Screen() as screen, tui.KeyReader() as keys:
             self.install()
+            self.up.set()
             try:
                 size = (0, 0)
                 last_frame = 0.0
@@ -1459,10 +1496,10 @@ def side_brief(state: Dict[str, Any], session: Dict[str, Any], status: str,
             break
     findings = state["findings"]
     if findings:
-        worst = tui._SEVERITY_STYLE.get(str(findings[0].severity).lower(), "amber")
+        worst = tui._SEVERITY_STYLE.get(str(findings[0].severity).lower(), "accent")
         bits.append(s(f"{len(findings)} finding{'s' if len(findings) != 1 else ''} (/findings)", worst))
     elif state["step"]:
-        bits.append(s("healthy", "green"))
+        bits.append(s("healthy", "dim"))
     return [s(_ui._clip(name, width - len(badge) - 1), "bold") + " " * gap + s(badge, _STATUS_STYLE.get(status, "dim")),
             _ui._clip(f" {g('dot')} ".join(bits), width)]
 
@@ -1520,10 +1557,10 @@ def side_lines(state: Dict[str, Any], session: Dict[str, Any], status: str, cons
     findings = state["findings"]
     lines.append(s("Findings", "bold") + (s(f"  {len(findings)}", "dim") if findings else ""))
     if not findings:
-        lines.append(s(g("ok") + " nothing the checks can see", "green") if state["step"]
+        lines.append(s(g("ok") + " nothing the checks can see", "dim") if state["step"]
                      else s("waiting for the first steps", "dim"))
     for finding in findings[:5]:
-        style = tui._SEVERITY_STYLE.get(str(finding.severity).lower(), "amber")
+        style = tui._SEVERITY_STYLE.get(str(finding.severity).lower(), "accent")
         mark = ("▲ " if _ui._unicode() else "! ")
         pieces = tui.wrap(finding.message, width - 2)[:3]
         lines.append(s(mark, style, "bold") + pieces[0])
@@ -1578,12 +1615,13 @@ def usable() -> bool:
     return size.columns >= 40 and size.lines >= 12
 
 
-def _new_cli(root: str, focus: List[str], review: bool = True) -> Any:
+def _new_cli(root: str, focus: List[str], review: bool = True, chdir: bool = True) -> Any:
     from . import pulse_code
     cli = pulse_code._CodeAgentCLI()
     cli.setup_code(root, focus, pulse_code.scan_project(root))
     cli.review = review
-    os.chdir(root)
+    if chdir:
+        os.chdir(root)
     cli.set_code_text(cli.code_text, script_path=cli.script_path)
     cli._project_root = root
     return cli
@@ -1649,6 +1687,131 @@ def run(paths: Any = (), yes: bool = False, root: Optional[str] = None) -> int:
         except Exception:
             pass
         _goodbye(app)
+
+
+def watch_in_process(monitor: Any, model: str = "") -> Optional[App]:
+    """auto_track() on a terminal: the app opens on this very run, beside the training.
+    The script keeps the main thread and runs exactly as it would have; the app runs on a
+    thread of its own, the script's output goes to the transcript, and the run's state,
+    the detectors and the agent are the DEBUG screen as for any other run. Leaving the
+    app (Ctrl+C twice, /quit) gives the terminal back and the training goes on; when the
+    script ends, the app stays until the person leaves it, so the end of the run and
+    the agent's verdict are not lost with the process. Returns the app, or None when the
+    terminal cannot show it (the caller falls back to the line-by-line mode)."""
+    from . import pulse_console as con
+    from . import pulse_monitor
+    if not usable() or threading.current_thread() is not threading.main_thread():
+        return None
+    root = os.getcwd()
+    cli = _new_cli(root, [], chdir=False)
+    _pick_agent_quietly(cli, model)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    app = App(cli, root)
+    app.hosting = monitor
+    script = os.path.basename(getattr(monitor, "script_path", None) or "the script")
+    session = {"session_id": monitor.session_id, "directory": monitor.directory,
+               "script": getattr(monitor, "script_path", None), "status": "live", "step": 0}
+    over = threading.Event()               # the script has ended
+
+    def show() -> None:
+        try:
+            app.install()
+            try:
+                app._open_run(session)
+                app.note(f"{script} is running here, under Pulse. Ask about it any time; Ctrl+C twice "
+                         "leaves Pulse and the training goes on.")
+            finally:
+                app.uninstall()
+            threading.Thread(target=sign_in, name="pulse-app-signin", daemon=True).start()
+            app.loop()
+        except BaseException:              # the app must never take the training down with it
+            try:
+                app.uninstall()
+            except Exception:
+                pass
+        finally:
+            app.done = True
+            app.up.set()
+            if not over.is_set():
+                print(f"[Pulse] Left the app; {script} goes on. `pulse` then /monitor opens it again.")
+
+    def sign_in() -> None:
+        # Signed in before on this machine: the run goes on the dashboard as it did in
+        # the line-by-line mode, without a question. Never signed in: nothing is asked.
+        from . import pulse_supabase as cloud
+        try:
+            if not cloud.load_cached_credentials():
+                return
+            cli.non_interactive = True
+            try:
+                with app.hush():
+                    cli._auth_flow()
+            finally:
+                cli.non_interactive = False
+            console = app.console
+            if cli.user_id and console is not None and app.runlog is None and not app.done:
+                app._start_runlog(session, console.workdir)
+        except Exception:
+            pass
+
+    thread = threading.Thread(target=show, name="pulse-app", daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10.0     # the script goes on once the screen captures its output
+    while not app.up.is_set() and thread.is_alive() and not app.done and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    def at_exit() -> None:
+        # The script is over (its end, or a crash already shown in the transcript). The
+        # run is marked finished now, so the screen says so, and the app stays until the
+        # person leaves it.
+        over.set()
+        if app.done or not thread.is_alive():
+            return
+        try:
+            pulse_monitor.detach()
+        except Exception:
+            pass
+        app.note(f"{script} has finished. Ctrl+C twice (or /quit) leaves Pulse.")
+        thread.join()
+
+    import atexit
+    atexit.register(at_exit)
+    return app
+
+
+def _pick_agent_quietly(cli: Any, model: str = "") -> None:
+    """The agent without a question: `model` (--model / PULSE_MODEL) if given, else the one
+    used last time if its key is still in the environment, else any provider whose key is.
+    Nothing found leaves the agent unset (/agent sets one from inside)."""
+    from . import pulse_supabase as cloud
+    wanted = [model] if model else []
+    try:
+        last = str(cloud.load_cached_profile().get("agent_provider") or "").strip()
+    except Exception:
+        last = ""
+    if last and last not in wanted:
+        wanted.append(last)
+    wanted.append("")                      # "": whichever provider has a key
+    previous = os.environ.get("PULSE_PROVIDER")
+    cli.non_interactive = True
+    try:
+        for want in wanted:
+            if want:
+                os.environ["PULSE_PROVIDER"] = want
+            else:
+                os.environ.pop("PULSE_PROVIDER", None)
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):     # its "[Pulse] agent set to" lines
+                    if cli._select_agent_provider_and_key(initial=True):
+                        return
+            except Exception:
+                pass
+    finally:
+        cli.non_interactive = False
+        if previous is None:
+            os.environ.pop("PULSE_PROVIDER", None)
+        else:
+            os.environ["PULSE_PROVIDER"] = previous
 
 
 def open_run(session: Dict[str, Any], model: str = "", monitor: Any = None) -> int:

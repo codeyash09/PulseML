@@ -970,7 +970,8 @@ def _run_turn_pipeline(cli, request, evidence=None):
     base_request, failures = request, 0
     for step in range(1, _MAX_AUTONOMOUS_STEPS + 1):
         if step > 1:
-            cprint(f"[Pulse Code] Step {step}/{_MAX_AUTONOMOUS_STEPS}: {base_request.splitlines()[0][:100]}", color=_BLUE)
+            if _ui.host() is None:      # the app shows the work itself; the terminal gets a marker
+                cprint(f"[Pulse Code] Step {step}/{_MAX_AUTONOMOUS_STEPS}: {base_request.splitlines()[0][:100]}", color=_BLUE)
             cli.compact_history()
         outcome, summary = _run_step(cli, step_request, evidence if not applied_any else None)
         if summary:
@@ -1123,7 +1124,11 @@ def _run_verification_pass(cli, fix, changes):
                 reason = str(verdict.get("reason", "")).strip()
                 icon = "✓" if passed else "✗"
                 color = _GREEN if passed else _RED
-                cprint(f"[4] Verification {icon}{(': ' + reason) if reason else ''}", color=color)
+                if _ui.host() is not None and hasattr(_ui.host(), "note"):
+                    _ui.host().note(f"Verified{(': ' + reason) if reason else ''}" if passed
+                                    else f"Verification failed{(': ' + reason) if reason else ''}")
+                else:
+                    cprint(f"[4] Verification {icon}{(': ' + reason) if reason else ''}", color=color)
                 return passed, reason
             notes = _service(cli, answer)
             if not notes:
@@ -1206,12 +1211,14 @@ def _confirm_and_apply(cli, request, plan, fix, changes):
         cprint("[Pulse Code] The change turned out to be empty; nothing was edited.", color=_YELLOW)
         return "answered", plan
     diff = render_diff(cli, changes)
-    print("\n" + diff)
+    labels = [cli._label_for_path.get(path) or os.path.relpath(path, cli._project_root).replace(os.sep, "/")
+              for path in changes]
+    _ui.show_change([f"{'CREATE' if changes[path][2] else 'EDIT'}: {label}" for path, label in zip(changes, labels)], diff)
     n_files = len(changes)
     reviewed = cli._review_change_with_approver(request, str(fix.get("explanation") or plan or ""), diff) \
         if cli.review else None
     if reviewed is False:
-        cprint("[Pulse Code] Not applied.", color=_YELLOW)
+        _ui.change_status("not applied", color=_YELLOW, final=True, terminal_text="[Pulse Code] Not applied.")
         return "declined", f"{plan}\n\n(Not applied: {getattr(cli, '_last_change_denial', '') or 'declined'}.)"
     if cli.review and reviewed is None:
         try:
@@ -1225,7 +1232,7 @@ def _confirm_and_apply(cli, request, plan, fix, changes):
             cli.review = False
             cprint("[Pulse Code] Review is now OFF for this session (/review on to re-enable).", color=_YELLOW)
         elif answer not in ("", "y", "yes"):
-            cprint("[Pulse Code] Not applied.", color=_YELLOW)
+            _ui.change_status("not applied", color=_YELLOW, final=True, terminal_text="[Pulse Code] Not applied.")
             return "declined", f"{plan}\n\n(The user declined the proposed change.)"
 
     if not fix.get("explanation"):
@@ -1233,12 +1240,10 @@ def _confirm_and_apply(cli, request, plan, fix, changes):
     cli._last_apply_skipped = []
     host = _ui.host()
     if host is not None and hasattr(host, "hush"):
-        # In the Pulse app the applier's step-by-step report folds under one EDIT entry.
-        with host.hush() as report:
+        # In the Pulse app the applier's step-by-step report (lint, writes) stays out of the
+        # transcript: the change's own line says what became of it.
+        with host.hush():
             cli._apply_code_fix(fix)
-        labels = [cli._label_for_path.get(path) or os.path.relpath(path, cli._project_root).replace(os.sep, "/")
-                  for path in changes]
-        host.tool([f"EDIT: {label}" for label in labels] or ["EDIT"], "".join(report))
     else:
         cli._apply_code_fix(fix)
     applied_ok = (cli._fix_applied_this_turn and not cli._last_apply_skipped
@@ -1248,10 +1253,12 @@ def _confirm_and_apply(cli, request, plan, fix, changes):
         # Never leave half a feature behind.
         cli._last_failure = "the change could not be written (a file changed underneath, or lint failed on write)"
         if cli._fix_applied_this_turn and getattr(cli, "_last_commit_id", None):
-            cprint("[Pulse Code] ⚠ Not every part was applied -- undoing the ones that were.", color=_RED)
+            _ui.change_status("not every part could be written -- undone", color=_RED, final=True,
+                              terminal_text="[Pulse Code] ⚠ Not every part was applied -- undoing the ones that were.")
             undo(cli, f"{cli._last_commit_id} force", quiet=True)
         else:
-            cprint("[Pulse Code] ⚠ Nothing was applied.", color=_RED)
+            _ui.change_status("could not be written", color=_RED, final=True,
+                              terminal_text="[Pulse Code] ⚠ Nothing was applied.")
         cli.reload()
         return "failed", plan
 
@@ -1259,8 +1266,9 @@ def _confirm_and_apply(cli, request, plan, fix, changes):
     cli.add_files([p for p in created if os.path.isfile(p)], focus=False)
     cli.reload()
     commit = getattr(cli, "_last_commit_id", None)
-    cprint(f"\n✓ {n_files} file{'s' if n_files != 1 else ''} changed" + (f"  ·  /undo to revert (commit {commit})" if commit else ""),
-           color=_GREEN)
+    _ui.change_status("applied", detail=f"/undo to revert (commit {commit})" if commit else None, color=_GREEN, final=True,
+                      terminal_text=f"\n✓ {n_files} file{'s' if n_files != 1 else ''} changed"
+                      + (f"  ·  /undo to revert (commit {commit})" if commit else ""))
     return "applied", f"{plan}\n\nApplied: {fix.get('explanation', '')}"
 
 
