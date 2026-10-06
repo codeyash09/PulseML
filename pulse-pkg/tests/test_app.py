@@ -1794,3 +1794,30 @@ def test_the_app_starts_with_the_remembered_mouse_and_audits(tmp_path, monkeypat
     cli_ = FakeCli()
     app_ = appmod.App(cli_, str(tmp_path))
     assert app_.mouse is False and app_.audits is False
+
+
+def test_the_dashboard_makes_its_window_before_its_tk_variables():
+    """A Tk variable made before the window raised "Too early to create variable: no default
+    root window" and the dashboard (mode="ui") never opened. Checked on the source: the test
+    machines have no display."""
+    import inspect
+    from pulse import pulse as core
+    source = inspect.getsource(core.Dashboard.__init__)
+    window = source.index("tk.Tk()")
+    for var in ("tk.BooleanVar(", "tk.StringVar(", "tk.IntVar(", "tk.DoubleVar("):
+        if var in source:
+            assert source.index(var) > window, f"{var} before the window"
+
+
+def test_auto_mode_opens_the_app_in_a_terminal(monkeypatch):
+    from pulse import pulse as core
+    seen = []
+    monkeypatch.setattr(core, "_default_mode", lambda: "app")
+    monkeypatch.setattr(core, "_in_multiprocessing_bootstrap", lambda frame: False, raising=False)
+    monkeypatch.setattr(core, "_auto_track_session",
+                        lambda frame, fn, interval, code, root, mode: seen.append(mode) or core._NO_SESSION)
+    core.auto_track(mode="auto")
+    monkeypatch.setattr(core, "_default_mode", lambda: "cli")              # no terminal for the app
+    core.auto_track(mode="auto")
+    core.auto_track(mode="ui")                                              # the window, when asked for
+    assert seen == ["app", "auto", "ui"]

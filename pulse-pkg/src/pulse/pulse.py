@@ -6428,12 +6428,14 @@ class Dashboard:
         # spiking well above its recent range) and, if so, pause training
         # (via the same control_queue used for ADD_VAR) and automatically
         # ask the agent to diagnose -- and if it can, fix -- it.
-        self.auto_intervene = tk.BooleanVar(value=True)
         self.explosion_multiplier = 5.0
         self.is_paused = False
         self._last_intervention_signature = None
 
         self.root = tk.Tk()
+        # A Tk variable needs its window: made before it, it raised "Too early to create
+        # variable: no default root window" and the dashboard never opened.
+        self.auto_intervene = tk.BooleanVar(master=self.root, value=True)
         self.root.title("Pulse — Live Dashboard")
         self.root.geometry("1280x800")
         apply_dark_theme(self.root)
@@ -7528,12 +7530,14 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
     training function for a one-off dry run that discovers shapes:
         auto_track(train_step)
 
-    mode: "ui" (dashboard + chat), "cli" (headless, Colab/SSH-friendly),
+    mode: "app" (the Pulse app on this run, in this terminal), "ui" (the
+    desktop dashboard window + chat), "cli" (line by line, Colab/SSH-friendly),
     "stream" (monitor only: stream to a separate brain process, the lightest
-    option and the one that never blocks training), or "auto" (detects a
-    real display and falls back to cli). Without one, the PULSE_MODE
-    environment variable decides, and "cli" if that is unset. Modes are
-    case-insensitive.
+    option and the one that never blocks training), or "auto" (the app in a
+    terminal that can show it, else the dashboard on a real display, else
+    cli). Without one, the PULSE_MODE environment variable decides, and
+    "app" (or "cli" where there is no terminal for it) if that is unset.
+    Modes are case-insensitive.
 
     Call it once per process: a later call is a no-op until shutdown(), and
     so is a call while a multiprocessing child re-imports the parent's
@@ -7570,6 +7574,10 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
         _pulse_log("AUTO_TRACK skipped: Pulse is already running in this process")
         return None
 
+    if str(mode or "").strip().lower() == "auto" and _default_mode() == "app":
+        # "auto" in a terminal that can show the Pulse app: the app, as for a plain
+        # auto_track() -- not a separate desktop window. mode="ui" still asks for that.
+        mode = "app"
     if mode is None:
         # The environment decides when the call doesn't: a plain auto_track()
         # used to pass "cli" and so overrode PULSE_MODE=ui. With nothing set, a
