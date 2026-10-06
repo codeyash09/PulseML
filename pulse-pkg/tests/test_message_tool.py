@@ -551,15 +551,19 @@ def test_unscrolled_the_transcript_shows_only_the_latest_exchange():
     assert "question 1" in scrolled or "question 0" in scrolled
 
 
-def test_arrows_scroll_when_nothing_is_typed(cli):
+def test_the_arrows_are_the_history_and_the_wheel_scrolls(cli):
+    """↑ brings back the last thing typed (like a shell); scrolling is the wheel's (and
+    PgUp/PgDn's) -- the app gets the wheel as its own events, not as arrows."""
     app = appmod.App(cli, cli._project_root)
     app.view.entries = [tui.Entry("text", f"line {i}") for i in range(80)]
+    app.view.editor.history = ["why is the loss flat"]
     app.on_key("up")
-    assert app.view.scroll == 3
+    assert app.view.editor.text == "why is the loss flat" and app.view.scroll == 0
     app.on_key("down")
-    assert app.view.scroll == 0
-    app.on_key("x")
-    app.on_key("up")                         # with text typed the arrows are the history
+    assert app.view.editor.text == ""
+    app.on_key("wheel:up:40:5")
+    assert app.view.scroll == 3
+    app.on_key("pgdn")
     assert app.view.scroll == 0
 
 

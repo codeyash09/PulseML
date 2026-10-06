@@ -27,7 +27,8 @@ KNOWN: Dict[str, Tuple[str, Tuple[str, ...], Any]] = {
     "approver": ("who answers the y/N for flagged commands and reviews changes: \"same\" (the agent's own "
                  "model), a model id, or \"off\" (you are asked)", (), "same"),
     "review": ("ask before applying a change (a reviewer model answers when one is set)", ("on", "off"), "on"),
-    "mouse": ("the app reads the mouse: clicks open folded lines (Shift+drag selects text)", ("on", "off"), "on"),
+    "mouse": ("the app reads the mouse: drag to copy text, click to open folded lines, the wheel scrolls; off "
+              "leaves the mouse to your terminal", ("on", "off"), "on"),
     "audits": ("the agent checks open runs on its own schedule", ("on", "off"), "on"),
     "remember_keys": ("keep pasted API keys in ~/.pulse/keys.json (owner-only) so you are not asked again",
                       ("on", "off"), "on"),

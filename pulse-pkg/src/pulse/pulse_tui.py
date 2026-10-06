@@ -516,6 +516,8 @@ class View:
         self.commands: List[Tuple[str, str]] = []   # (command, what it does), for hints
         self.frame = 0
         self.row_entries: Dict[int, Entry] = {}    # screen row -> the entry drawn there (for clicks)
+        self.side_scroll = 0                       # lines of the run pane scrolled past (the wheel over it)
+        self.side_cols = -1                        # last column of the run pane (-1: no pane beside)
         self.transcript_x = 1                      # column the transcript starts at
         self.first_row = 2                         # screen row of the transcript's first line
         self.room = 0                              # transcript rows on screen
@@ -697,9 +699,9 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
         if view.question:
             footer = "Enter answer · Esc cancel"
         elif view.busy:
-            footer = "working · Ctrl+C cancel · click or Ctrl+O to expand · ↑↓ scroll"
+            footer = "working · Ctrl+C cancel · drag to copy · click or Ctrl+O to expand · wheel scrolls"
         else:
-            footer = "Enter send · / commands · click or Ctrl+O to expand · ↑↓ scroll" + (
+            footer = "Enter send · / commands · drag to copy · click or Ctrl+O to expand · wheel scrolls" + (
                 " · Esc back to the agent" if view.side is not None else "")
     if view.status:
         footer = view.status
@@ -733,11 +735,15 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
     frame.extend(strip)
     if split:
         side = [(" " + ln) for ln in (view.side or [])]
+        view.side_scroll = max(0, min(view.side_scroll, len(side) - body_h))
+        side = side[view.side_scroll:]
+        view.side_cols = left_w
         bar = s(g("bar"), "dim")
         for i in range(body_h):
             left = pad(side[i] if i < len(side) else "", left_w + 1)
             frame.append(left + " " + bar + " " + pad(right[i] if i < len(right) else "", right_w))
     else:
+        view.side_cols = -1
         for i in range(body_h - len(strip)):
             frame.append(" " + pad(right[i] if i < len(right) else "", right_w))
     frame = frame[:height]
@@ -921,15 +927,64 @@ _MOUSE_RE = re.compile(r"\033\[<(\d+);(\d+);(\d+)([Mm])")
 
 
 def _mouse_key(button: int, x: int, y: int, release: bool) -> Optional[str]:
-    """SGR mouse report -> a key name: a click (on release, so a drag selects text), or the
-    wheel. x and y are 1-based from the terminal."""
+    """SGR mouse report -> a key name, with 0-based x:y: the wheel ("wheel:up:x:y"), the left
+    button going down ("press"), moving with it held ("drag"), coming up ("release" -- a
+    release where it went down is a click, after a drag it ends a selection), or the pointer
+    moving with no button held ("hover"). x and y are 1-based from the terminal."""
+    x, y = x - 1, y - 1
     if button & 64:
-        return "wheel:up" if button & 3 == 0 else "wheel:down"
-    if release and button & 3 == 0:
-        return f"click:{x - 1}:{y - 1}"
-    if button & 32 and button & 3 == 3:          # the pointer moved, no button held
-        return f"hover:{x - 1}:{y - 1}"
+        return f"wheel:{'up' if button & 3 == 0 else 'down'}:{x}:{y}"
+    if button & 32:
+        if button & 3 == 3:                      # moved, no button held
+            return f"hover:{x}:{y}"
+        return f"drag:{x}:{y}" if button & 3 == 0 else None
+    if button & 3 == 0:
+        return f"{'release' if release else 'press'}:{x}:{y}"
     return None
+
+
+def selection_cells(sel: Dict[str, Any]) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
+    """(first cell, last cell, the columns of the pane it is in), first before last."""
+    (ax, ay), (hx, hy) = sel["anchor"], sel["head"]
+    first, last = ((ax, ay), (hx, hy)) if (ay, ax) <= (hy, hx) else ((hx, hy), (ax, ay))
+    return first, last, sel["cols"]
+
+
+def _row_span(row: int, first, last, cols) -> Tuple[int, int]:
+    c0 = first[0] if row == first[1] else cols[0]
+    c1 = last[0] if row == last[1] else cols[1]
+    return max(c0, cols[0]), min(c1, cols[1])
+
+
+def selected_text(lines: List[str], sel: Dict[str, Any]) -> str:
+    """The text under a selection, as it reads on the screen: one line per row, inside the
+    pane the selection started in, trailing spaces dropped."""
+    first, last, cols = selection_cells(sel)
+    out = []
+    for row in range(first[1], last[1] + 1):
+        if row >= len(lines):
+            break
+        plain = _SGR_RE.sub("", lines[row])
+        c0, c1 = _row_span(row, first, last, cols)
+        out.append(plain[c0:c1 + 1].rstrip())
+    while out and not out[-1].strip():
+        out.pop()
+    return "\n".join(out).strip("\n")
+
+
+def highlight(lines: List[str], sel: Dict[str, Any]) -> List[str]:
+    """The frame with the selection shown in reverse video (the selected rows lose their
+    colours while selected)."""
+    first, last, cols = selection_cells(sel)
+    out = list(lines)
+    for row in range(first[1], min(last[1], len(lines) - 1) + 1):
+        plain = _SGR_RE.sub("", out[row])
+        c0, c1 = _row_span(row, first, last, cols)
+        if c1 < c0:
+            continue
+        plain = plain.ljust(c1 + 1)
+        out[row] = plain[:c0] + "\033[7m" + plain[c0:c1 + 1] + "\033[27m" + plain[c1 + 1:]
+    return out
 
 
 def parse_keys(data: str) -> Tuple[List[str], str]:

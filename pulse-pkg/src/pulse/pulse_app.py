@@ -354,6 +354,8 @@ class App:
         self.hosting: Any = None                  # the in-process run's monitor, under auto_track()
         self._screen: Any = None                  # the screen, while the loop runs
         self._hovered: Optional[tui.Entry] = None # the entry under the mouse
+        self._sel: Optional[Dict[str, Any]] = None # a selection being dragged or just made
+        self._frame: List[str] = []               # the frame last drawn (what a selection copies)
         try:
             from . import pulse_supabase as cloud
             if _settings.is_set("mouse"):
@@ -767,6 +769,8 @@ class App:
                     self.dirty = True                # only a change needs a redraw
                 return
             self.dirty = True
+            if self._sel is not None and not self._sel.get("dragging"):
+                self._sel = None                     # a key after a selection: it goes
             if key == "ctrl+c":
                 if question is not None:
                     question.cancelled = True
@@ -795,20 +799,20 @@ class App:
                 page = max(3, self._height // 2)
                 view.scroll = max(0, view.scroll + (page if key == "pgup" else -page))
                 return
-            if key in ("wheel:up", "wheel:down"):
-                view.scroll = max(0, view.scroll + (3 if key == "wheel:up" else -3))
+            if key.startswith("wheel:"):
+                parts = key.split(":")
+                up = parts[1] == "up"
+                x = int(parts[2]) if len(parts) > 2 else 10 ** 6
+                if view.side is not None and 0 <= view.side_cols and x <= view.side_cols:
+                    view.side_scroll = max(0, view.side_scroll + (-3 if up else 3))   # the run pane
+                else:
+                    view.scroll = max(0, view.scroll + (3 if up else -3))
+                return
+            if key.startswith(("press:", "drag:", "release:")):
+                self._mouse_button(key)
                 return
             if key.startswith("click:"):
-                _x, row = key.split(":")[1:]
-                entry = view.row_entries.get(int(row))
-                if entry is not None and entry.foldable():
-                    entry.toggle(view.expanded)
-                    tui.keep_in_place(view, entry, int(row))
-                return
-            if key in ("up", "down") and not view.editor.text and question is None:
-                # an empty input line: the arrows (and a mouse wheel, which most terminals turn
-                # into arrows on this screen) scroll the transcript
-                view.scroll = max(0, view.scroll + (3 if key == "up" else -3))
+                self._click(*(int(v) for v in key.split(":")[1:]))
                 return
             if key == "end" and view.scroll:
                 view.scroll = 0
@@ -856,6 +860,53 @@ class App:
                     self.done = True
             else:
                 view.editor.handle(key)
+
+    # ------------------------------------------------------------------ the mouse: clicks and selections
+
+    def _click(self, x: int, row: int) -> None:
+        entry = self.view.row_entries.get(row)
+        if entry is not None and entry.foldable():
+            entry.toggle(self.view.expanded)
+            tui.keep_in_place(self.view, entry, row)
+
+    def _mouse_button(self, key: str) -> None:
+        """A press starts a selection where it lands; a drag stretches it (within the pane it
+        started in); the release copies it -- or, with no drag, is a click."""
+        kind, x, y = key.split(":")[0], *(int(v) for v in key.split(":")[1:])
+        view = self.view
+        if kind == "press":
+            side = view.side is not None and 0 <= view.side_cols and x <= view.side_cols
+            cols = (0, view.side_cols) if side else (
+                view.transcript_x if view.side_cols >= 0 else 0, max(self._total_w - 1, 0))
+            self._sel = {"anchor": (x, y), "head": (x, y), "cols": cols, "dragging": True, "moved": False}
+            return
+        sel = self._sel
+        if sel is None:
+            if kind == "release":
+                self._click(x, y)
+            return
+        x = max(sel["cols"][0], min(x, sel["cols"][1]))
+        if kind == "drag":
+            sel["head"] = (x, y)
+            sel["moved"] = sel["moved"] or (x, y) != sel["anchor"]
+            return
+        sel["head"], sel["dragging"] = (x, y), False      # release
+        if not sel["moved"]:
+            self._sel = None
+            self._click(*sel["anchor"])
+            return
+        text = tui.selected_text(self._frame, sel)
+        if not text:
+            self._sel = None
+            return
+        sent = []
+        if self._screen is not None:
+            self._screen.copy(text)
+            sent.append("terminal")
+        threading.Thread(target=_copy_with_tool, args=(text,), daemon=True).start()
+        lines = text.count("\n") + 1
+        view.status = (f"Copied {len(text):,} characters" + (f" ({lines} lines)" if lines > 1 else "")
+                       + " -- paste with Ctrl+Shift+V (or your terminal's paste)")
 
     def _key_in_list(self, key: str, question: _Question) -> None:
         view = self.view
@@ -966,10 +1017,10 @@ class App:
         if screen is not None:
             screen.set_mouse(on)
         _settings.set("mouse", "on" if on else "off")
-        self.note("Mouse on: a click opens a folded line, the wheel scrolls (Shift+drag selects text in most "
-                  "terminals)." if on else
-                  "Mouse off: drag to select text as usual. Ctrl+O opens folded lines, the arrows scroll. "
-                  "/mouse on gives clicks back.")
+        self.note("Mouse on: drag over any text to copy it, a click opens a folded line, the wheel scrolls "
+                  "(over the run pane, the pane)." if on else
+                  "Mouse off: your terminal selects and scrolls as usual. Ctrl+O opens folded lines, PgUp/PgDn "
+                  "scroll. /mouse on gives the app the mouse back.")
 
     def _config(self, arg: str) -> None:
         """/config: the remembered settings. /config <name> <value> sets one (and applies it
@@ -1823,8 +1874,12 @@ class App:
         width = tui.side_width(self._total_w) - 1 if self._total_w >= tui.SPLIT_MIN_WIDTH else self._total_w - 2
         side = side_lines(state, session, self._status, console, self._rate, width)
         # the run's output under its figures, in whatever room the pane has left
+        # (at least a few lines, below the rest when the pane is longer than the screen:
+        # the wheel over the pane reaches them)
         room = tui.body_height(self._height) - len(side) - 2
-        if room >= 2:
+        if room < 3:
+            room = 8
+        if room >= 1:
             launched = self.launched.get(session.get("session_id", ""))
             if self.hosting is not None and session.get("session_id") == getattr(self.hosting, "session_id", None):
                 tail = list(self.run_output)[-room:]
@@ -1872,6 +1927,9 @@ class App:
                             if self.dirty or animating:
                                 self.view.frame += 1 if animating else 0
                                 lines, row, col = tui.compose(self.view, *size)
+                                self._frame = lines
+                                if self._sel is not None and self._sel["head"] != self._sel["anchor"]:
+                                    lines = tui.highlight(lines, self._sel)
                                 split = self.view.side is not None and size[0] >= tui.SPLIT_MIN_WIDTH
                                 self._pane_w = tui.pane_width(size[0], split)
                                 self.dirty, last_frame = False, now
@@ -2051,13 +2109,11 @@ def side_lines(state: Dict[str, Any], session: Dict[str, Any], status: str, cons
     names = sorted(histories, key=lambda n: (not detect.looks_like_loss(n), n))
     label_w = min(14, max((len(n) for n in names), default=4))
     spark_w = max(6, width - label_w - 11)
-    for name_ in names[:10]:
+    for name_ in names:                     # every one: the pane scrolls (the wheel over it)
         history = histories[name_]
         value = con.compact(history[-1])
         curve = con.sparkline(history, spark_w) if len(history) > 1 else ""
         lines.append(_ui._clip(name_, label_w).ljust(label_w) + " " + value.rjust(9) + " " + s(curve, "accent"))
-    if len(names) > 10:
-        lines.append(s(f"+{len(names) - 10} more (/vars)", "dim"))
     if not names:
         lines.append(s("no values yet", "dim"))
     lines.append("")
@@ -2134,8 +2190,8 @@ def _welcome(app: App) -> None:
     cli = app.cli
     app.note("Pulse is ready. Describe what you want built or fixed, or open a run to debug it.")
     if app.mouse:
-        app.note("A click opens a folded line. To select text hold Shift while you drag, or /mouse off; "
-                 "/copy copies the agent's last answer.")
+        app.note("Drag over any text to copy it; a click opens a folded line; the wheel scrolls; "
+                 "↑ brings back what you typed.")
     if not cli.agent_provider:
         app.note("No agent yet: /agent picks a model (OpenRouter models need no key -- you can sign in).")
     try:
@@ -2225,8 +2281,8 @@ def watch_in_process(monitor: Any, model: str = "") -> Optional[App]:
                 app._open_run(session)
                 app.note(f"{script} is running here, under Pulse. Ask about it any time; Ctrl+C twice "
                          "leaves Pulse and the training goes on."
-                         + (" To select text hold Shift while you drag, or /mouse off; /copy copies the "
-                            "agent's last answer." if app.mouse else ""))
+                         + (" Drag over any text to copy it; the wheel over the run's figures "
+                            "scrolls them." if app.mouse else ""))
             finally:
                 app.uninstall()
             threading.Thread(target=sign_in, name="pulse-app-signin", daemon=True).start()

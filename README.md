@@ -566,8 +566,8 @@ Type `pulse` in a terminal and Pulse opens as one full-screen app:
 | Enter | send the request, or answer a question Pulse asked |
 | `/` | commands; typing shows the ones that match, Tab completes |
 | Ctrl+O | fold / unfold the agent's thinking and tool output |
-| mouse | what can be clicked lights up under the pointer; a click on a folded line opens it where it is (and shuts it again); the wheel scrolls. The app reads the mouse, so hold Shift to select text, or `/mouse off` to give the mouse back to the terminal (remembered); `/copy` puts the agent's last answer on the clipboard |
-| ↑ / ↓ (empty line) | scroll back through the conversation; the screen otherwise shows the latest exchange |
+| mouse | drag over any text to copy it (it is highlighted, then put on the clipboard -- through the terminal and the system's clipboard tool); what can be clicked lights up under the pointer and a click opens or shuts it; the wheel scrolls the conversation, and over the run's figures scrolls them. `/mouse off` leaves the mouse to your terminal (remembered); `/copy` copies the agent's last answer |
+| ↑ / ↓ | what you typed before, like a shell; PgUp/PgDn (or the wheel) scroll the conversation, which otherwise shows the latest exchange |
 | Ctrl+C | cancel what is running; twice at an empty prompt leaves |
 | Esc, `/home` | back to the agent for anything else -- it works on your home project, without the run's data -- while the run stays watched (its findings and crashes still show up, and a crash still gets the agent); Esc or `/monitor` brings it back |
 | `/change [run]` | look at another run; the run you leave stays watched. Every run you opened is watched until `/close` (or `/close all`); a finding from one off screen carries its name |

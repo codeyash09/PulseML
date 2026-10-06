@@ -1100,7 +1100,7 @@ def test_no_dashboard_row_when_not_signed_in(real_app, tmp_path, monkeypatch):
 
 def test_mouse_reports_become_clicks_and_wheel_keys():
     keys, rest = tui.parse_keys("\033[<0;12;5M\033[<0;12;5m\033[<64;3;3M\033[<65;3;3M")
-    assert keys == ["click:11:4", "wheel:up", "wheel:down"]      # a click counts on release
+    assert keys == ["press:11:4", "release:11:4", "wheel:up:2:2", "wheel:down:2:2"]
     assert tui.parse_keys("\033[<0;12")[1] == "\033[<0;12"            # still arriving
 
 
@@ -1524,7 +1524,7 @@ def test_mouse_off_gives_the_mouse_back_and_is_remembered(app, monkeypatch):
     app._screen = FakeScreen()
     app._command("/mouse off")
     assert app.mouse is False and app._screen.mouse is False and settings.get("mouse") == "off"
-    assert "drag to select" in text_of(app)
+    assert "your terminal selects" in text_of(app)
     app._command("/mouse")                                   # toggles back
     assert app.mouse is True and app._screen.mouse is True and settings.get("mouse") == "on"
 
@@ -1626,7 +1626,7 @@ def test_no_restart_reminder_after_the_agent_restarted_the_run_itself(app, monke
 
 def test_movement_reports_become_hover_keys():
     keys, _rest = tui.parse_keys("\033[<35;12;5M\033[<32;12;5M")
-    assert keys == ["hover:11:4"]                            # a drag (button held) is not a hover
+    assert keys == ["hover:11:4", "drag:11:4"]               # with the button held it is a drag
 
 
 def test_the_clickable_line_under_the_mouse_lights_up(app, monkeypatch):
@@ -1821,3 +1821,79 @@ def test_auto_mode_opens_the_app_in_a_terminal(monkeypatch):
     core.auto_track(mode="auto")
     core.auto_track(mode="ui")                                              # the window, when asked for
     assert seen == ["app", "auto", "ui"]
+
+
+
+# ---------------------------------------------------------------- selecting, copying, scrolling
+
+def _frame_app(app):
+    app.view.entries = [tui.Entry("user", "why is the loss flat"),
+                        tui.Entry("say", "The loss is flat because of the + 0.5 on line 12.")]
+    app._total_w, app._height = 90, 20
+    frame, _r, _c = tui.compose(app.view, 90, 20)
+    app._frame = frame
+    return frame
+
+
+def test_a_drag_selects_text_and_copies_it(app, monkeypatch):
+    copied = []
+    monkeypatch.setattr(appmod, "_copy_with_tool", lambda text: copied.append(("tool", text)))
+    app._screen = FakeScreen()
+    frame = _frame_app(app)
+    row = next(i for i, line in enumerate(frame) if "The loss is flat" in plain(line))
+    col = plain(frame[row]).index("The loss")
+    app.on_key(f"press:{col}:{row}")
+    app.on_key(f"drag:{col + 7}:{row}")
+    app.on_key(f"release:{col + 7}:{row}")
+    assert app._screen.copied == ["The loss"]
+    assert wait_for(lambda: copied == [("tool", "The loss")])
+    assert "Copied 8 characters" in app.view.status
+    lit = tui.highlight(frame, app._sel)
+    assert "\033[7mThe loss\033[27m" in lit[row]
+    app.on_key("a")                                          # typing: the selection goes
+    assert app._sel is None
+
+
+def test_a_selection_over_several_lines_stays_in_its_pane():
+    lines = ["  left pane one   | right one", "  left pane two   | right two"]
+    sel = {"anchor": (2, 0), "head": (14, 1), "cols": (0, 16)}
+    assert tui.selected_text(lines, sel) == "left pane one\n  left pane two"
+
+
+def test_a_press_and_release_in_place_is_still_a_click(app):
+    tool = tui.Entry("tool", calls=["GREP: lr"], output="a\nb")
+    app.view.entries = [tui.Entry("user", "q"), tool]
+    tui.compose(app.view, 90, 20)
+    row = next(r for r, e in app.view.row_entries.items() if e is tool)
+    app.on_key(f"press:5:{row}")
+    app.on_key(f"release:5:{row}")
+    assert tool.open is True and app._sel is None
+
+
+def test_up_brings_back_what_was_typed_and_the_wheel_scrolls(app):
+    app.view.editor.history = ["first question", "second question"]
+    app.on_key("up")
+    assert app.view.editor.text == "second question" and app.view.scroll == 0
+    app.view.editor.take(remember=False)
+    app.view.entries = [tui.Entry("text", f"line {i}") for i in range(80)]
+    app.on_key("wheel:up:30:5")
+    assert app.view.scroll == 3
+
+
+def test_the_wheel_over_the_run_pane_scrolls_the_pane(app):
+    app.view.side = [f"value {i}" for i in range(60)]
+    tui.compose(app.view, 120, 20)
+    assert app.view.side_cols > 0
+    app.on_key("wheel:down:5:8")
+    frame, _r, _c = tui.compose(app.view, 120, 20)
+    assert app.view.side_scroll == 3 and plain(frame[2]).startswith(" value 3")
+    assert app.view.scroll == 0                                  # the conversation did not move
+
+
+def test_the_run_pane_lists_every_value():
+    from pulse import pulse_console as con
+    state = {"step": 5, "histories": {f"v{i}": [1.0, 2.0] for i in range(14)}, "findings": [], "tensors": {},
+             "gaps": 0, "finished": False}
+    console = types.SimpleNamespace(workdir="/x", brain=types.SimpleNamespace(agent=None, schedule=None))
+    lines = [plain(l) for l in appmod.side_lines(state, {"script": "/x/t.py"}, "live", console, None, 40)]
+    assert sum(1 for l in lines if l.startswith("v")) == 14 and not any("more (/vars)" in l for l in lines)
