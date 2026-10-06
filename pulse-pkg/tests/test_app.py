@@ -1954,3 +1954,51 @@ def test_findings_that_come_with_the_one_being_handled_are_not_a_new_turn(app):
     app.view.busy = False
     app._run_job(lambda: None, ())
     assert len(started) == 1                                         # one turn for the one problem
+
+
+# ---------------------------------------------------------------- the other "seen but not acted on" gaps
+
+def test_a_problem_found_by_the_scheduled_check_gets_the_agent(real_app, tmp_path, monkeypatch):
+    real_app._open_run(make_run(tmp_path))
+    real_app._status = "live"
+    seen = []
+    monkeypatch.setattr(real_app, "_on_findings", lambda findings: seen.extend(findings))
+    real_app.console._report_audit({"status": "problem", "step": 40, "findings": ["lr far too high"],
+                                    "text": '{"status": "problem"}\nThe lr of 3.0 makes every step overshoot.'})
+    assert len(seen) == 1 and seen[0].check == "audit" and "lr far too high" in seen[0].message
+    assert "found a problem" in text_of(real_app)
+
+
+def test_a_stall_is_said_once_and_so_is_moving_again(app):
+    app.session = {"session_id": "s1", "script": "/p/train.py"}
+    app._note_stall("stalled")
+    app._note_stall("stalled")
+    app._note_stall("live")
+    texts = [e.text for e in app.view.entries]
+    assert sum("stopped making steps" in t for t in texts) == 1 and any("moving again" in t for t in texts)
+
+
+def test_a_stall_after_pause_is_not_called_stuck(app):
+    app.session = {"session_id": "s1", "script": "/p/train.py"}
+    app._paused_here = True
+    app._note_stall("stalled")
+    assert not any("stopped making steps" in e.text for e in app.view.entries)
+
+
+def test_a_serious_finding_off_screen_is_taken_on_when_home(real_app, tmp_path, monkeypatch):
+    real_app._open_run(make_run(tmp_path, "train"))
+    real_app._switch_to(make_run(tmp_path, "evalrun"))
+    real_app._background_run()
+    seen = []
+    monkeypatch.setattr(real_app, "_on_findings", lambda findings: seen.append(real_app.session["session_id"]))
+    real_app.parked["train"]["console"]._announce([_finding()])
+    assert seen == ["train"] and real_app.background                 # the view stays home
+
+
+def test_a_serious_finding_off_screen_with_another_run_shown_says_where(real_app, tmp_path):
+    real_app._open_run(make_run(tmp_path, "train"))
+    real_app._switch_to(make_run(tmp_path, "evalrun"))
+    real_app.parked["train"]["console"]._announce([_finding()])
+    real_app.parked["train"]["console"]._announce([_finding()])
+    assert real_app.session["session_id"] == "evalrun"
+    assert sum("needs a look" in e.text for e in real_app.view.entries) == 1 and "/change train.py" in text_of(real_app)

@@ -543,6 +543,10 @@ class Console:
         self._brain_lock = self.brain.state_lock
         self._thread: Optional[threading.Thread] = None
         self.brain.on_finding = self._announce
+        # Something serious -- a critical finding, a scheduled check that says "problem", a
+        # crash -- gets the agent's diagnosis at once instead of just a line (see _escalate).
+        self.brain.escalate = self._escalate
+        self._diagnosed: set = set()
 
     # -------------------------------------------------------------- background
 
@@ -552,6 +556,66 @@ class Console:
         for finding in findings:
             paint = severity_colour(finding.severity)
             self._print(f"\n{paint('  ' + finding.severity.upper())} {finding.message}")
+
+    # findings the agent is not started on by itself: a run that stopped making steps is
+    # also what a pause looks like
+    _NOT_FOR_THE_AGENT = {"throughput_stopped"}
+
+    def _escalate(self, findings: List[detect.Finding], pack: Dict[str, Any]) -> None:
+        """The brain's escalation: a critical finding, or a scheduled audit that says
+        "problem". The agent explains it once, in the background, and says what to change."""
+        audit = pack.get("audit") if isinstance(pack, dict) else None
+        if audit is not None:
+            key = ("audit", audit.get("step"), audit.get("t"))
+            what = "the scheduled check found a problem: " + " ".join(str(audit.get("text") or "").split())[:400]
+        else:
+            serious = [f for f in findings if f.severity == detect.CRITICAL and f.check not in self._NOT_FOR_THE_AGENT
+                       and (f.check, f.variable) not in self._diagnosed]
+            if not serious:
+                return
+            key = (serious[0].check, serious[0].variable)
+            for finding in serious:
+                self._diagnosed.add((finding.check, finding.variable))
+            what = "; ".join(f.message for f in serious[:3])
+        if audit is not None and key in self._diagnosed:
+            return
+        self._diagnosed.add(key)
+        self._diagnose(what)
+
+    def _check_crash(self) -> None:
+        """A crash event in the stream: the agent explains it once."""
+        for event in list(self.brain.events):
+            if event.get("event") == "crash" and ("crash", event.get("step")) not in self._diagnosed:
+                self._diagnosed.add(("crash", event.get("step")))
+                trace = str(event.get("traceback") or "").rstrip().splitlines()
+                self._diagnose("the run crashed: " + (str(event.get("exception") or "") or (trace[-1] if trace else "")))
+
+    def _diagnose(self, what: str) -> None:
+        if self.agent is None:
+            self._print(dim("  (no model to look at it: start with --model, or `pulse openrouter` to sign in)"))
+            return
+        if getattr(self, "_diagnosing", False):
+            return                                   # one at a time: the evidence carries the rest
+        self._diagnosing = True
+
+        def work() -> None:
+            try:
+                pack = self.brain.evidence(include_code=True)
+                prompt = (
+                    "You are Pulse, watching a training run with someone at a terminal. Something "
+                    f"serious just happened: {what}\n\nFrom the evidence and the code below, say in a few "
+                    "sentences what causes it, then exactly what to change (file, line, old -> new) to fix "
+                    "it, and whether the run should be stopped and restarted with the fix.\n\n"
+                    f"{self.brain.render_evidence(pack)}\n")
+                self._print(dim(f"\n  {what[:160]} -- asking the agent..."))
+                answer = self.agent(prompt)
+                self._print("\n  " + bold("agent") + "  " + (answer or "(no answer)").strip().replace("\n", "\n  ") + "\n")
+            except Exception as exc:
+                self._print(red(f"  The model could not be reached: {type(exc).__name__}: {exc}"))
+            finally:
+                self._diagnosing = False
+
+        threading.Thread(target=work, name="pulse-console-diagnose", daemon=True).start()
 
     def _print(self, text: str) -> None:
         """Print without mangling the line the person is typing."""
@@ -568,6 +632,7 @@ class Console:
                 self._print(dim(f"  (monitor read failed: {type(exc).__name__}: {exc})"))
             else:
                 self._report_audit(result.get("audit"))
+                self._check_crash()
             time.sleep(0.5)
 
     def _report_audit(self, record: Optional[Dict[str, Any]]) -> None:

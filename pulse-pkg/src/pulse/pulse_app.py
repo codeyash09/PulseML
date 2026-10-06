@@ -45,6 +45,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import pulse_tui as tui
@@ -107,7 +108,8 @@ DEBUG_COMMANDS: List[Tuple[str, str]] = [
 
 _STATUS_STYLE = {"live": "accent", "stalled": "bold", "crashed": "red"}
 # what makes up the run the app is looking at; a parked run keeps them in App.parked
-_WATCH_FIELDS = ("console", "session", "_monitor", "runlog", "_status", "_rate", "_rate_at")
+_WATCH_FIELDS = ("console", "session", "_monitor", "runlog", "_status", "_rate", "_rate_at",
+                 "_stall_said", "_paused_here")
 # serious findings the agent does not start on by itself: a run that stopped making steps is
 # also what a pause looks like
 _NOT_FOR_THE_AGENT = {"throughput_stopped"}
@@ -373,6 +375,8 @@ class App:
         self._problem_pending: Optional[List[Any]] = None   # serious findings that came while it was busy
         self._problems_seen: set = set()           # (session, check, variable) the agent was started on
         self._auto_turn_session: Optional[str] = None   # the run an automatic turn is about, while it runs
+        self._stall_said = False                   # the open run's stall was announced
+        self._paused_here = False                  # /pause sent from here: a stall is expected
         self._auto_crash_turns = 0                 # crash turns started without the person typing
         self._run_partial = ""
         self.up = threading.Event()               # set once the screen is up and output is captured
@@ -1263,6 +1267,7 @@ class App:
         with self.lock:
             self.console, self.session, self._monitor = console, session, monitor
             self._rate = self._rate_at = None
+            self._stall_said = self._paused_here = False
             self._status = session.get("status") or "live"
         script = session.get("script") or ""
         workdir = console.workdir
@@ -1439,6 +1444,43 @@ class App:
             self.note("The agent looks at that when it has finished what it is doing.")
             return
         self._start_problem_turn(serious)
+
+    def _note_stall(self, status: str) -> None:
+        """A run that stops making steps while its process lives -- stuck (a deadlock, a hung
+        data loader, a wait on a dead rank) or paused -- is said once, and so is it moving
+        again. Not an agent turn by itself: a pause looks the same. With the lock held."""
+        was = self._stall_said
+        if status == "stalled" and not was:
+            self._stall_said = True
+            if not self._paused_here:
+                name = os.path.basename((self.session or {}).get("script") or "") or "The run"
+                self.error(f"{name} has stopped making steps but is still running: stuck (a deadlock, a "
+                           "hung data loader) or paused. Ask the agent to look at it, or /stop.")
+        elif status == "live" and was:
+            self._stall_said = False
+            if not self._paused_here:
+                self.note(f"{os.path.basename((self.session or {}).get('script') or 'The run')} is moving again.")
+
+    def _on_parked_findings(self, console: Any, findings: List[Any]) -> None:
+        """A run watched off screen raised something serious. At home (no other run on
+        screen) the agent takes it on, as for a crash there; with another run on screen the
+        person is told where to look."""
+        serious = [f for f in findings if str(getattr(f, "severity", "")).lower() == "critical"
+                   and getattr(f, "check", "") not in _NOT_FOR_THE_AGENT]
+        session_id = next((sid for sid, st in self.parked.items() if st["console"] is console), None)
+        if not serious or session_id is None:
+            return
+        if self.console is None or self.background:
+            self._park()
+            self._unpark_quietly(session_id, background=True)
+            self._on_findings(serious)
+        else:
+            name = os.path.basename((console.session or {}).get("script") or "") or "a watched run"
+            key = (session_id, "parked-note")
+            if key not in self._problems_seen:
+                self._problems_seen.add(key)
+                self.error(f"{name} (watched off screen) needs a look: {serious[0].message}. "
+                           f"/change {name} opens it.")
 
     def _start_problem_turn(self, findings: List[Any]) -> None:
         script = os.path.basename((self.session or {}).get("script") or "the run")
@@ -1666,8 +1708,10 @@ class App:
             else:
                 console.send_control(stream.CONTROL_SET_INTERVAL, interval=seconds)
         elif word == "/pause":
+            self._paused_here = True
             console.send_control(stream.CONTROL_PAUSE)
         elif word == "/resume":
+            self._paused_here = False
             console.send_control(stream.CONTROL_RESUME)
         elif word == "/stop":
             if _ui.confirm("Stop the training run?", default=False):
@@ -1909,6 +1953,7 @@ class App:
                 if described and described["status"] != self._status:
                     self._status = described["status"]
                     self._refresh_header()
+                    self._note_stall(self._status)
                     if self._status == "crashed":
                         self._on_crash()
                     elif self._status not in ("live", "stalled"):
@@ -1928,6 +1973,7 @@ class App:
                 session["last_seen"] = described.get("last_seen")
                 if self._status == "crashed":
                     self._on_crash()
+                self._note_stall(described["status"])
         step = int(state["step"] or 0)
         if self._rate_at is not None and now > self._rate_at[0]:
             delta = (step - self._rate_at[1]) / (now - self._rate_at[0])
@@ -2046,6 +2092,12 @@ def _make_console(app: App, session: Dict[str, Any], agent: Optional[Callable[[s
     class AppConsole(con.Console):
         """The console's brain and views; what it prints goes to the app's transcript."""
 
+        def _escalate(self, findings: List[Any], pack: Dict[str, Any]) -> None:
+            pass                                 # the app's agent takes problems on (App._on_findings)
+
+        def _check_crash(self) -> None:
+            pass                                 # and crashes (App._on_crash)
+
         def _print(self, text: str) -> None:
             app.feed(text + "\n")
 
@@ -2053,6 +2105,9 @@ def _make_console(app: App, session: Dict[str, Any], agent: Optional[Callable[[s
             if self is app.console:              # serious ones get the agent, /quiet or not
                 with app.lock:
                     app._on_findings(findings)
+            else:
+                with app.lock:
+                    app._on_parked_findings(self, findings)
             if self.quiet:
                 return
             name = ""
@@ -2076,10 +2131,15 @@ def _make_console(app: App, session: Dict[str, Any], agent: Optional[Callable[[s
                 text = f"{name}: {text}" if text else f"{name}."
             if record.get("status") == "problem":
                 found = "; ".join(str(f) for f in (record.get("findings") or [])[:3])
-                app.error("The agent's check found a problem" + (f": {found}" if found else "")
-                          + ". Ask about it here, or /findings.")
+                app.error("The agent's check found a problem" + (f": {found}" if found else "") + ".")
                 if text:
                     app.say(text)
+                if self is app.console:          # not just a line: the agent takes it on
+                    with app.lock:
+                        app._on_findings([types.SimpleNamespace(
+                            check="audit", variable=f"audit@{record.get('step')}", severity="critical",
+                            message=(found or audit_words(record.get("text") or "") or "the scheduled check "
+                                     "found a problem")[:600])])
                 return
             app.note("Checked the run" + (f": {text}" if text else "."))
 

@@ -1339,3 +1339,58 @@ class StaleSessionsDoNotHideALiveRunTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class ClassicConsoleActsOnProblemsTest(unittest.TestCase):
+    """The line-by-line console (no full terminal, or PULSE_CLASSIC=1): a crash, a critical
+    finding or a scheduled check that says "problem" gets the agent's diagnosis at once."""
+
+    def _console(self):
+        from pulse import pulse_console as console_mod
+        tmp = tempfile.mkdtemp(prefix="pulse-classic-")
+        self.addCleanup(_remove_tree, tmp)
+        prompts = []
+        session = {"session_id": "s", "directory": tmp, "script": os.path.join(tmp, "train.py")}
+        console = console_mod.Console(session, agent=lambda prompt: prompts.append(prompt) or "Line 12 adds 0.5.")
+        printed = []
+        console._print = printed.append
+        return console, prompts, printed
+
+    def _wait(self, condition):
+        deadline = time.time() + 5
+        while not condition() and time.time() < deadline:
+            time.sleep(0.02)
+        return condition()
+
+    def test_a_critical_finding_is_diagnosed_once(self):
+        from pulse import pulse_detect as detect
+        console, prompts, printed = self._console()
+        nan = detect.Finding("nonfinite", "loss", detect.CRITICAL, "loss is NaN")
+        console._escalate([nan], {})
+        self.assertTrue(self._wait(lambda: any("Line 12" in p for p in printed)))
+        console._escalate([nan], {})
+        time.sleep(0.2)
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("loss is NaN", prompts[0])
+
+    def test_a_warning_or_a_stall_is_not_escalated(self):
+        from pulse import pulse_detect as detect
+        console, prompts, printed = self._console()
+        console._escalate([detect.Finding("plateau", "loss", detect.WARNING, "flat"),
+                           detect.Finding("throughput_stopped", "step", detect.CRITICAL, "no steps")], {})
+        time.sleep(0.2)
+        self.assertEqual(prompts, [])
+
+    def test_a_crash_is_diagnosed(self):
+        console, prompts, printed = self._console()
+        console.brain.events.append({"event": "crash", "step": 7, "exception": "ValueError: shapes"})
+        console._check_crash()
+        console._check_crash()
+        self.assertTrue(self._wait(lambda: len(prompts) == 1))
+        self.assertIn("ValueError: shapes", prompts[0])
+
+    def test_an_audit_problem_is_diagnosed(self):
+        console, prompts, printed = self._console()
+        console._escalate([], {"audit": {"step": 3, "t": 1.0, "text": "the lr is far too high"}})
+        self.assertTrue(self._wait(lambda: len(prompts) == 1))
+        self.assertIn("lr is far too high", prompts[0])
