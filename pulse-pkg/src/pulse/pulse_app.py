@@ -108,6 +108,9 @@ DEBUG_COMMANDS: List[Tuple[str, str]] = [
 _STATUS_STYLE = {"live": "accent", "stalled": "bold", "crashed": "red"}
 # what makes up the run the app is looking at; a parked run keeps them in App.parked
 _WATCH_FIELDS = ("console", "session", "_monitor", "runlog", "_status", "_rate", "_rate_at")
+# serious findings the agent does not start on by itself: a run that stopped making steps is
+# also what a pause looks like
+_NOT_FOR_THE_AGENT = {"throughput_stopped"}
 _AUTO_CRASH_TURNS = 3       # crashes in a row the agent starts on by itself, before the person is asked
 _RUN_LOG_DIR = "app-runs"
 
@@ -367,6 +370,9 @@ class App:
         self.run_output: "collections.deque[str]" = collections.deque(maxlen=400)   # what that run printed
         self._crashes_seen: set = set()            # sessions whose crash the agent was started on
         self._crash_pending: Optional[str] = None  # a crash that came while the agent was busy
+        self._problem_pending: Optional[List[Any]] = None   # serious findings that came while it was busy
+        self._problems_seen: set = set()           # (session, check, variable) the agent was started on
+        self._auto_turn_session: Optional[str] = None   # the run an automatic turn is about, while it runs
         self._auto_crash_turns = 0                 # crash turns started without the person typing
         self._run_partial = ""
         self.up = threading.Event()               # set once the screen is up and output is captured
@@ -735,11 +741,15 @@ class App:
                 self._flush_partial()
                 self.view.busy, self.view.live, self.view.status = False, "", ""
                 self._job = None
+                self._auto_turn_session = None
                 self._refresh_header()
                 self.dirty = True
                 pending, self._crash_pending = self._crash_pending, None
+                problems, self._problem_pending = self._problem_pending, None
                 if pending and not self.done:
                     self._start_crash_turn(pending, self._crash_summary())
+                elif problems and not self.done and self._status in ("live", "stalled"):
+                    self._start_problem_turn(problems)
 
     def _cancel_job(self) -> None:
         job = self._job
@@ -1391,6 +1401,59 @@ class App:
         self.view.entries.append(tui.Entry("user", f"Why did {script} crash? Fix it."))
         self._last_blank = False
         self.dirty = True
+        self._auto_turn_session = (self.session or {}).get("session_id")
+        self._start(self._crash_turn, request)
+
+    # ------------------------------------------------------------------ a serious finding
+
+    def _on_findings(self, findings: List[Any]) -> None:
+        """The open run's checks raised something serious -- a NaN or Inf, an exploding norm, a
+        loss that blew up or never learned: the agent takes it on at once, as for a crash
+        (a warning is only announced). Once per problem; with the lock held."""
+        session_id = (self.session or {}).get("session_id")
+        serious = [f for f in findings
+                   if str(getattr(f, "severity", "")).lower() == "critical"
+                   and getattr(f, "check", "") not in _NOT_FOR_THE_AGENT
+                   and (session_id, getattr(f, "check", ""), getattr(f, "variable", "")) not in self._problems_seen]
+        if not serious or self._status not in ("live", "stalled"):
+            return
+        if self._auto_turn_session == session_id:
+            # the agent is already on this run's problem: the new findings are in its evidence
+            # (a NaN loss brings a NaN gradient and an infinite val_loss with it), not a new turn
+            for finding in serious:
+                self._problems_seen.add((session_id, getattr(finding, "check", ""), getattr(finding, "variable", "")))
+            return
+        for finding in serious:
+            self._problems_seen.add((session_id, getattr(finding, "check", ""), getattr(finding, "variable", "")))
+        cli = self.cli
+        if not cli.agent_provider or not cli.agent_key:
+            self.note("No agent is set up to look at that: /agent picks a model, then ask what went wrong.")
+            return
+        self._auto_crash_turns += 1
+        if self._auto_crash_turns > _AUTO_CRASH_TURNS:
+            self.note(f"The agent has started on {_AUTO_CRASH_TURNS} problems in a row by itself; it leaves this one "
+                      "to you. Ask about it here.")
+            return
+        if self._job is not None or self.view.busy:
+            self._problem_pending = (self._problem_pending or []) + serious
+            self.note("The agent looks at that when it has finished what it is doing.")
+            return
+        self._start_problem_turn(serious)
+
+    def _start_problem_turn(self, findings: List[Any]) -> None:
+        script = os.path.basename((self.session or {}).get("script") or "the run")
+        found = "; ".join(str(getattr(f, "message", f)) for f in findings[:3])
+        variable = getattr(findings[0], "variable", "") or "it"
+        request = (f"{script} is still running, and Pulse's checks found something serious: {found}. The "
+                   "evidence has the run's values. Find the cause in the code, explain it in a sentence or two, "
+                   "and fix it. Then decide what to do with the run: restart it with the fix (restart_run, or "
+                   "a RESTART: line) when the run as it is cannot recover (a NaN in the weights never goes "
+                   "away), stop it (stop_run) if it is only burning compute, or leave it running if the "
+                   "problem is harmless -- and say which you did.")
+        self.view.entries.append(tui.Entry("user", f"What is wrong with {variable} in {script}? Fix it."))
+        self._last_blank = False
+        self.dirty = True
+        self._auto_turn_session = (self.session or {}).get("session_id")
         self._start(self._crash_turn, request)
 
     def _crash_turn(self, request: str) -> None:
@@ -1987,6 +2050,9 @@ def _make_console(app: App, session: Dict[str, Any], agent: Optional[Callable[[s
             app.feed(text + "\n")
 
         def _announce(self, findings: List[Any]) -> None:
+            if self is app.console:              # serious ones get the agent, /quiet or not
+                with app.lock:
+                    app._on_findings(findings)
             if self.quiet:
                 return
             name = ""

@@ -1897,3 +1897,60 @@ def test_the_run_pane_lists_every_value():
     console = types.SimpleNamespace(workdir="/x", brain=types.SimpleNamespace(agent=None, schedule=None))
     lines = [plain(l) for l in appmod.side_lines(state, {"script": "/x/t.py"}, "live", console, None, 40)]
     assert sum(1 for l in lines if l.startswith("v")) == 14 and not any("more (/vars)" in l for l in lines)
+
+
+# ---------------------------------------------------------------- a serious finding
+
+def _finding(check="nonfinite", variable="loss", severity="critical", message="loss is NaN"):
+    return types.SimpleNamespace(check=check, variable=variable, severity=severity, message=message)
+
+
+def test_a_nan_gets_the_agent_at_once(app):
+    started = _crashed_app(app)
+    app._status = "live"
+    app._on_findings([_finding()])
+    app._on_findings([_finding()])                                     # announced again: not twice
+    assert len(started) == 1 and "loss is NaN" in started[0][0] and "restart" in started[0][0]
+    assert any(e.kind == "user" and "What is wrong with loss" in e.text for e in app.view.entries)
+
+
+def test_a_warning_or_a_pause_does_not_start_the_agent(app):
+    started = _crashed_app(app)
+    app._status = "live"
+    app._on_findings([_finding(check="plateau", severity="warning", message="loss stopped improving")])
+    app._on_findings([_finding(check="throughput_stopped", message="no steps for 2 min")])
+    assert started == []
+
+
+def test_a_finding_while_the_agent_is_busy_waits(app):
+    started = _crashed_app(app)
+    app._status = "live"
+    app.view.busy = True
+    app._on_findings([_finding()])
+    assert started == [] and app._problem_pending
+    app.view.busy = False
+    app._run_job(lambda: None, ())
+    assert len(started) == 1 and app._problem_pending is None
+
+
+def test_the_open_runs_console_hands_findings_to_the_agent(real_app, tmp_path, monkeypatch):
+    real_app._open_run(make_run(tmp_path))
+    real_app._status = "live"
+    seen = []
+    monkeypatch.setattr(real_app, "_on_findings", lambda findings: seen.extend(findings))
+    real_app.console.quiet = True                                       # /quiet: shown or not, the agent hears
+    real_app.console._announce([_finding()])
+    assert [f.message for f in seen] == ["loss is NaN"]
+
+
+def test_findings_that_come_with_the_one_being_handled_are_not_a_new_turn(app):
+    started = _crashed_app(app)
+    app._status = "live"
+    app._on_findings([_finding()])
+    app.view.busy = True                                             # the agent is on it
+    app._on_findings([_finding(variable="grad_norm", message="grad_norm is NaN")])
+    app._on_findings([_finding(variable="val_loss", message="val_loss is infinite")])
+    assert app._problem_pending is None
+    app.view.busy = False
+    app._run_job(lambda: None, ())
+    assert len(started) == 1                                         # one turn for the one problem
