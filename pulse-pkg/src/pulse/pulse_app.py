@@ -2208,7 +2208,7 @@ def watch_in_process(monitor: Any, model: str = "") -> Optional[App]:
     if not usable() or threading.current_thread() is not threading.main_thread():
         return None
     root = os.getcwd()
-    cli = _new_cli(root, [], chdir=False)
+    cli = _new_cli(root, [], chdir=False, review=_settings.on("review"))
     _pick_agent_quietly(cli, model)
     signal.signal(signal.SIGINT, signal.default_int_handler)
     app = App(cli, root)
@@ -2255,6 +2255,11 @@ def watch_in_process(monitor: Any, model: str = "") -> Optional[App]:
                     cli._auth_flow()
             finally:
                 cli.non_interactive = False
+            # the workspace and project from the settings, as the line-by-line setup uses them
+            workspace, project = _settings.remembered_id("workspace"), _settings.remembered_id("project")
+            if workspace:
+                cli.team_id = workspace
+                cli.project_id = project if project else None
             console = app.console
             if cli.user_id and console is not None and app.runlog is None and not app.done:
                 app._start_runlog(session, console.workdir)
@@ -2347,10 +2352,14 @@ def _shutdown_held():
 
 
 def _pick_agent_quietly(cli: Any, model: str = "") -> None:
-    """The agent without a question: `model` (--model / PULSE_MODEL) if given, else the one
-    used last time if its key is still in the environment, else any provider whose key is.
-    Nothing found leaves the agent unset (/agent sets one from inside)."""
+    """The agent without a question: `model` (--model / PULSE_MODEL) if given, else the one in
+    the settings (with its saved key), else the one used last time if its key is in the
+    environment, else any provider whose key is. Nothing found leaves the agent unset
+    (/agent sets one from inside)."""
     from . import pulse_supabase as cloud
+    if not model and _settings.apply_agent(cli):
+        return
+    _settings.load_keys_into_environment()        # a saved key serves the fallbacks below too
     wanted = [model] if model else []
     try:
         last = str(cloud.load_cached_profile().get("agent_provider") or "").strip()
@@ -2386,21 +2395,8 @@ def open_run(session: Dict[str, Any], model: str = "", monitor: Any = None) -> i
     account setup here -- the point is to be looking at the run at once; `--model` (or
     PULSE_MODEL) sets the agent, and /agent sets or changes it from inside."""
     root = os.getcwd()
-    cli = _new_cli(root, [])
-    if model:
-        previous = os.environ.get("PULSE_PROVIDER")
-        os.environ["PULSE_PROVIDER"] = model
-        cli.non_interactive = True
-        try:
-            cli._select_agent_provider_and_key(initial=True)
-        except Exception:
-            pass
-        finally:
-            cli.non_interactive = False
-            if previous is None:
-                os.environ.pop("PULSE_PROVIDER", None)
-            else:
-                os.environ["PULSE_PROVIDER"] = previous
+    cli = _new_cli(root, [], review=_settings.on("review"))
+    _pick_agent_quietly(cli, model)
     signal.signal(signal.SIGINT, signal.default_int_handler)
     app = App(cli, root)
     app.install()

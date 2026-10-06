@@ -111,3 +111,24 @@ def test_the_remembered_workspace_skips_the_picker(home, monkeypatch):
     settings.set("workspace", {"id": "t2", "name": "BBB"})
     cli._team_flow()
     assert cli.team_id == "t2"
+
+
+def test_auto_track_and_pulse_watch_use_the_saved_agent_and_key(home, monkeypatch):
+    from pulse import pulse_app
+    name = next(n for n, info in pc.PROVIDERS.items() if info.get("env_key") == "DEEPSEEK_API_KEY")
+    settings.set("agent", {"provider": name})
+    settings.save_key("DEEPSEEK_API_KEY", "sk-saved")
+    cli = _cli()
+    pulse_app._pick_agent_quietly(cli)
+    assert cli.agent_provider == name and cli.agent_key == "sk-saved"
+
+
+def test_a_model_asked_for_still_wins_over_the_settings(home, monkeypatch):
+    from pulse import pulse_app
+    name = next(n for n, info in pc.PROVIDERS.items() if info.get("env_key") == "DEEPSEEK_API_KEY")
+    settings.set("agent", {"provider": name})
+    settings.save_key("DEEPSEEK_API_KEY", "sk-saved")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or")
+    cli = _cli()
+    pulse_app._pick_agent_quietly(cli, "openrouter/qwen/qwen3-coder")
+    assert "qwen3-coder" in cli.agent_provider
