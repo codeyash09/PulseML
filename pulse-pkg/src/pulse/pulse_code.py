@@ -1457,7 +1457,9 @@ def _handle_command(cli, line):
     elif word == "/review":
         arg = rest.strip().lower()
         cli.review = True if arg in ("on", "true", "1") else False if arg in ("off", "false", "0") else not cli.review
-        cprint(f"[Pulse Code] Review before applying is {'ON' if cli.review else 'OFF'}.")
+        from . import pulse_settings as _settings
+        _settings.set("review", "on" if cli.review else "off")
+        cprint(f"[Pulse Code] Review before applying is {'ON' if cli.review else 'OFF'} (remembered).")
     elif word in ("/undo", "/revert"):
         undo(cli, rest)
     elif word == "/context":
@@ -1478,7 +1480,7 @@ def _handle_command(cli, line):
     elif word == "/log":
         cli._cmd_log("")
     elif lowered == "/agent":
-        cli._select_agent_provider_and_key(initial=False)
+        cli._pick_agent_and_remember(initial=False)
     elif lowered == "/cloud":
         cli._print_cloud_status()
     elif lowered == "/cloud flush":

@@ -529,8 +529,13 @@ Type `pulse` in a terminal and Pulse opens as one full-screen app:
   X  256x8 float32                   │ Enter send · / commands · click or Ctrl+O to expand · ↑↓ scroll
 ```
 
-1. **Setup** comes first, the same as ever: account, workspace, agent model, key (or the
-   OpenRouter sign-in).
+1. **Setup** comes first: account, workspace, project, agent model, key (or the OpenRouter
+   sign-in) -- once. What you pick is remembered in `~/.pulse/settings.json` (a pasted key in
+   `~/.pulse/keys.json`, readable by you only), so the next start goes straight to the agent.
+   `/config` shows the settings and changes them (`/config agent` opens the model picker,
+   `/config mouse off` sets a value, `/config reset` forgets everything); `pulse config` does
+   the same from a shell. `/config remember_keys off` deletes the saved keys and stops saving
+   them; a key in the environment always wins over a saved one.
 2. **Home is the agent.** Type what you want built, fixed or explained; it plans, reads the
    project with its tools, shows a diff and asks before applying it. This is `pulse code`
    -- `pulse code [paths]` opens the same app with those files in focus.

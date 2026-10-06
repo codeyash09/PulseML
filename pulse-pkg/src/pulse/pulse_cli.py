@@ -49,6 +49,7 @@ from pulse.pulse_backend import (
 from pulse import pulse_detect as _pulse_detect
 from pulse import pulse_supabase as cloud
 from pulse import pulse_ui as _ui
+from pulse import pulse_settings as _settings
 from pulse import pulse_terminal as _terminal
 from pulse import pulse_approver as _approver
 from pulse import pulse_openrouter as _openrouter
@@ -1372,7 +1373,10 @@ def _ui_key_screen(chosen: str, openrouter: bool = False) -> None:
                  "your browser; Pulse keeps that key so you stay signed in.")
         _ui.note("A key you paste is used only to call the model and is never written to disk.")
     else:
-        _ui.note("Used only to call the model you selected. Pulse never writes it to disk.")
+        _ui.note("Used only to call the model you selected. "
+                 + ("Kept in ~/.pulse/keys.json, readable by you only, so you are not asked again "
+                    "(/config remember_keys off: never kept)." if _settings.on("remember_keys")
+                    else "Pulse does not keep it (/config remember_keys on to keep it)."))
         _ui.note("No key? Press Enter: Pulse can sign you in to OpenRouter and use one of its "
                  "models instead.")
     _ui._emit()
@@ -5530,6 +5534,19 @@ class PulseCLI:
                 cprint(f"[Pulse] ⚠ Could not create a workspace ({exc}) -- continuing without a team. Try /repo or restart to pick one.", color=_RED)
             return
 
+        remembered = _settings.remembered_id("workspace")
+        team = next((t for t in existing if t["team_id"] == remembered), None) if remembered else None
+        if team is not None:
+            self.team_id = team["team_id"]
+            self.team_join_code = team.get("join_code")
+            self.team_admin_ids = list(team.get("admin_ids") or [])
+            _say(f"[Pulse] Workspace: {self._describe_workspace(team, self.user_id)} (from your settings -- "
+                 "/config workspace changes it).",
+                 "Workspace", self._describe_workspace(team, self.user_id).replace("  --  ", "  ·  ")
+                 + "  ·  from your settings")
+            cloud.save_cached_credentials(self.user_id, self.email, self.team_id)
+            return
+
         while True:
             _flush_stdin()
             existing = cloud.find_teams_for_user(self.user_id)  # re-fetch so rename/delete/leave are reflected immediately
@@ -5701,10 +5718,14 @@ class PulseCLI:
             cprint(f"[Pulse] ⚠ Team setup failed, continuing without a team: {exc}", color=_RED)
         if not self.team_id:
             return
+        if not getattr(self, "non_interactive", False):
+            _settings.set("workspace", {"id": self.team_id, "name": self.team_join_code or self.team_id})
         try:
             self._project_flow(cached_project_id)
         except cloud.SupabaseError as exc:
             cprint(f"[Pulse] ⚠ Project setup failed, continuing without a project: {exc}", color=_RED)
+        if self.project_id and not getattr(self, "non_interactive", False):
+            _settings.set("project", {"id": self.project_id, "name": self.project_name or self.project_id})
 
     def _clear_project(self) -> None:
         self.project_id = None
@@ -5761,6 +5782,16 @@ class PulseCLI:
         if self.non_interactive:
             self._project_flow_unattended(team, cloud.find_projects_for_team(team, self.user_id), cached_project_id)
             return
+
+        remembered = _settings.remembered_id("project")
+        if remembered:
+            project = next((p for p in cloud.find_projects_for_team(team, self.user_id)
+                            if p["project_id"] == remembered), None)
+            if project is not None:
+                self._apply_project(project)
+                _say(f"[Pulse] Project: '{self.project_name}' (from your settings -- /config project changes it).",
+                     "Project", self._describe_project(project).replace("  --  ", "  ·  ") + "  ·  from your settings")
+                return
 
         while True:
             _flush_stdin()
@@ -6932,6 +6963,14 @@ class PulseCLI:
         self._restart_process()  # does not return
         return True
 
+    def _pick_agent_and_remember(self, initial: bool = False) -> bool:
+        """Ask for the agent, and keep the answer in the settings (and its key, if keys are
+        remembered) so the next start does not ask again."""
+        ok = self._select_agent_provider_and_key(initial=initial)
+        if ok and not getattr(self, "non_interactive", False):
+            _settings.remember_agent(self)
+        return ok
+
     def _select_agent_provider_and_key(self, initial: bool = False) -> bool:
         """Prompt the user to pick an AI provider and API key (or, for a
         local/self-hosted provider, an API base URL + model name instead
@@ -7413,7 +7452,10 @@ class PulseCLI:
                     self.agent_history = []
                     cprint(f"[Pulse] Resumed with agent {auto_provider} (auto-filled after restart).")
 
-        if not self.agent_provider and not self._select_agent_provider_and_key(initial=True):
+        if not self.agent_provider and not getattr(self, "non_interactive", False) and _settings.apply_agent(self):
+            _say(f"[Pulse] Agent: {self.agent_provider} (from your settings -- /config agent changes it).",
+                 "Agent", f"{self.agent_provider}  ·  from your settings (/config agent changes it)")
+        if not self.agent_provider and not self._pick_agent_and_remember(initial=True):
             return
 
         if self.pending_startup_error:
@@ -9307,6 +9349,9 @@ class PulseCLI:
         value = config.get(self._config_key("approver")) if config else None
         if value is None and config:
             value = config.get(self._config_key("approver_model"))
+        if value is None:
+            saved = _settings.get("approver")
+            value = None if str(saved or "").lower() in ("", "same") else saved
         provider = getattr(self, "agent_provider", None)
         agent_model = getattr(self, "agent_model_string", None) or (
             PROVIDERS.get(provider, {}).get("model") if provider else None)
@@ -15304,9 +15349,7 @@ class PulseCLI:
                 continue
 
             if cmd_lower == "/agent":
-                self._select_agent_provider_and_key(
-                    initial=False
-                )
+                self._pick_agent_and_remember(initial=False)
                 continue
 
             if cmd_lower == "/cloud":

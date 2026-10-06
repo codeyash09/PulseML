@@ -49,6 +49,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import pulse_tui as tui
 from . import pulse_ui as _ui
+from . import pulse_settings as _settings
 
 DEBUG_PROMPT = (
     "\n\nYOU ARE ATTACHED TO A LIVE TRAINING RUN\n"
@@ -78,6 +79,7 @@ HOME_COMMANDS: List[Tuple[str, str]] = [
     ("/undo", "undo the latest change"),
     ("/log", "the change history"),
     ("/cloud", "sign-in, workspace and sync status"),
+    ("/config", "your settings, remembered between starts: /config mouse off, /config agent"),
     ("/copy", "copy the agent's last answer to the clipboard (/copy 2: the one before)"),
     ("/mouse", "clicks open folded lines; /mouse off gives the mouse back to select text"),
     ("/help", "every command"),
@@ -354,7 +356,10 @@ class App:
         self._hovered: Optional[tui.Entry] = None # the entry under the mouse
         try:
             from . import pulse_supabase as cloud
-            self.mouse = cloud.load_cached_profile().get("app_mouse", "on") != "off"
+            if _settings.is_set("mouse"):
+                self.mouse = _settings.on("mouse")
+            else:                                  # what /mouse saved before there were settings
+                self.mouse = cloud.load_cached_profile().get("app_mouse", "on") != "off"
         except Exception:
             self.mouse = True
         self.run_output: "collections.deque[str]" = collections.deque(maxlen=400)   # what that run printed
@@ -384,7 +389,7 @@ class App:
         self.parked: Dict[str, Dict[str, Any]] = {}
         self._parked_at = 0.0
         self._monitor: Any = None                    # a py-spy sampler this app started
-        self.audits = True
+        self.audits = _settings.on("audits")
         self.launched: Dict[str, Dict[str, Any]] = {}    # session id -> what /run started
         self._rate: Optional[float] = None
         self._rate_at: Optional[Tuple[float, int]] = None
@@ -937,6 +942,8 @@ class App:
             self._launch(rest)
         elif word == "/mouse":
             self._set_mouse(rest)
+        elif word in ("/config", "/settings"):
+            self._config(rest)
         elif word == "/copy":
             self._copy(rest)
         elif self.console is not None and self._run_command(word, rest):
@@ -958,12 +965,75 @@ class App:
         screen = self._screen
         if screen is not None:
             screen.set_mouse(on)
-        from . import pulse_supabase as cloud
-        cloud.save_cached_profile(app_mouse="on" if on else "off")
+        _settings.set("mouse", "on" if on else "off")
         self.note("Mouse on: a click opens a folded line, the wheel scrolls (Shift+drag selects text in most "
                   "terminals)." if on else
                   "Mouse off: drag to select text as usual. Ctrl+O opens folded lines, the arrows scroll. "
                   "/mouse on gives clicks back.")
+
+    def _config(self, arg: str) -> None:
+        """/config: the remembered settings. /config <name> <value> sets one (and applies it
+        now); /config agent|workspace|project opens its picker; /config reset forgets all."""
+        words = arg.split()
+        if not words:
+            print()
+            print(_ui._s("Settings", "bold") + _ui._s(f"  {_settings.path()}", "dim"))
+            for name, shown, what in _settings.rows():
+                print("  " + _ui._s(name.ljust(14), "accent") + shown)
+                print("  " + " " * 14 + _ui._s(what, "dim"))
+            print(_ui._s("/config <name> <value> changes one (/config mouse off) · /config agent, workspace or "
+                         "project opens its picker · /config reset forgets them all", "dim"))
+            return
+        name, value = words[0].lower(), " ".join(words[1:]).strip()
+        cli = self.cli
+        if name == "reset":
+            if _ui.confirm("Forget every setting and saved key? The next start asks again.", default=False):
+                _settings.reset()
+                self.note("Settings and saved keys forgotten. The next start asks again.")
+            return
+        problem = _settings.check(name, value or "x")
+        if problem and not (name in _settings.KNOWN and not value):
+            self.note(f"/config: {problem}.")
+            return
+        if name == "agent":
+            if cli._pick_agent_and_remember(initial=False):
+                self.note(f"Agent: {cli.agent_provider} -- remembered for the next start.")
+                self._refresh_header()
+            return
+        if name in ("workspace", "project"):
+            if not getattr(cli, "user_id", None):
+                self.note("Not signed in to Pulse Cloud, so there is no workspace to pick. /cloud shows the status.")
+                return
+            _settings.unset("project")
+            if name == "workspace":
+                _settings.unset("workspace")
+                cli._select_workspace_and_project()
+            else:
+                cli._project_flow(None)
+                if cli.project_id:
+                    _settings.set("project", {"id": cli.project_id, "name": cli.project_name or cli.project_id})
+            self.note(f"{name.capitalize()} remembered for the next start.")
+            return
+        if not value:
+            shown = dict((n, v) for n, v, _w in _settings.rows())[name]
+            choices = _settings.KNOWN[name][1]
+            self.note(f"{name} = {shown}" + (f"   (/config {name} {'|'.join(choices)})" if choices else ""))
+            return
+        value = value.lower() if _settings.KNOWN[name][1] else value
+        _settings.set(name, value)
+        if name == "mouse":
+            self._set_mouse(value)
+            return
+        if name == "audits":
+            self._set_audits(value)
+            return
+        if name == "review":
+            cli.review = value == "on"
+        if name == "remember_keys" and value == "off":
+            _settings.forget_keys()
+            self.note("Saved keys deleted; pasted keys are not kept from now on.")
+            return
+        self.note(f"{name} = {value} -- remembered for the next start.")
 
     def _copy(self, arg: str) -> None:
         """The agent's last answer (or the n-th from the end) to the clipboard."""
@@ -1513,6 +1583,7 @@ class App:
         arg = arg.lower()
         if arg in ("on", "off"):
             self.audits = arg == "on"
+            _settings.set("audits", arg)
             if self.console is not None:
                 agent = self._brain_agent()
                 self.console.brain.agent = self.console.agent = agent
@@ -2102,7 +2173,7 @@ def run(paths: Any = (), yes: bool = False, root: Optional[str] = None) -> int:
         cprint(f"[Pulse] {os.path.relpath(outside[0], root)} is outside the project root {root}; "
                "run `pulse` from a directory that contains it.", color=_RED)
         return 1
-    cli = _new_cli(root, focus, review=not yes)
+    cli = _new_cli(root, focus, review=not yes and _settings.on("review"))
     cli.print_banner()
     try:
         cli.interactive_setup()                      # the setup Pulse always had, unchanged

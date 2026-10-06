@@ -1520,14 +1520,13 @@ class FakeScreen:
 
 
 def test_mouse_off_gives_the_mouse_back_and_is_remembered(app, monkeypatch):
-    saved = {}
-    monkeypatch.setattr(cloud, "save_cached_profile", lambda **k: saved.update(k))
+    from pulse import pulse_settings as settings
     app._screen = FakeScreen()
     app._command("/mouse off")
-    assert app.mouse is False and app._screen.mouse is False and saved == {"app_mouse": "off"}
+    assert app.mouse is False and app._screen.mouse is False and settings.get("mouse") == "off"
     assert "drag to select" in text_of(app)
     app._command("/mouse")                                   # toggles back
-    assert app.mouse is True and app._screen.mouse is True and saved == {"app_mouse": "on"}
+    assert app.mouse is True and app._screen.mouse is True and settings.get("mouse") == "on"
 
 
 def test_the_screen_turns_mouse_reporting_on_and_off():
@@ -1756,3 +1755,42 @@ def test_the_top_bar_at_home_names_every_watched_run(real_app, tmp_path):
     assert context.startswith(os.path.basename(real_app.home_root)) or "~" in context or real_app.home_root in context
     assert "evalrun.py" in context and "train.py" in context and "/change" in context
     assert "evalrun_project" not in context                                   # home's folder, not the run's
+
+
+# ---------------------------------------------------------------- /config
+
+def test_config_lists_and_changes_settings_and_applies_them_now(app, monkeypatch):
+    from pulse import pulse_settings as settings
+    app._screen = FakeScreen()
+    app.install()                                            # what /config prints goes to the transcript
+    try:
+        app._command("/config")
+        app._flush_partial()
+    finally:
+        app.uninstall()
+    ui.set_host(app)
+    shown = text_of(app)
+    assert "mouse" in shown and "remember_keys" in shown and "/config reset" in shown
+    app._command("/config mouse off")
+    assert app.mouse is False and app._screen.mouse is False and settings.get("mouse") == "off"
+    app._command("/config review off")
+    assert app.cli.review is False and settings.get("review") == "off"
+    app._command("/config mouse sideways")
+    assert "mouse is on or off" in text_of(app)
+    app._command("/settings audits")
+    assert "audits = on" in text_of(app)
+    picked = []
+    app.cli._pick_agent_and_remember = lambda initial=False: picked.append(initial) or True
+    app.cli.agent_provider = "DeepSeek"
+    app._command("/config agent")
+    assert picked == [False] and "remembered for the next start" in text_of(app)
+
+
+def test_the_app_starts_with_the_remembered_mouse_and_audits(tmp_path, monkeypatch):
+    from pulse import pulse_settings as settings
+    monkeypatch.setattr(settings, "_home", lambda: tmp_path)
+    settings.set("mouse", "off")
+    settings.set("audits", "off")
+    cli_ = FakeCli()
+    app_ = appmod.App(cli_, str(tmp_path))
+    assert app_.mouse is False and app_.audits is False

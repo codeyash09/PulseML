@@ -60,6 +60,9 @@ Pulse - a live ML training debugger.
   pulse openrouter [status|logout]
                                  sign in to OpenRouter -- or create an account -- in the browser
                                  and keep the API key, so Pulse's agent has a model to use
+  pulse config [name [value]]    the settings Pulse remembers between starts (agent, workspace,
+                                 project, reviewer, review, mouse, audits, saved keys);
+                                 `pulse config reset` forgets them. Inside pulse: /config
                                  without you handling a key (free models need no credits)
 
 options for `pulse run` (before the script; everything after it is the script's):
@@ -688,6 +691,9 @@ def main(argv=None):
     if argv and argv[0] == "openrouter":
         from .pulse_openrouter import main as openrouter_main
         return openrouter_main(argv[1:])
+    if argv and argv[0] in ("config", "settings"):
+        from .pulse_settings import main as settings_main
+        return settings_main(argv[1:])
 
     console_commands = ("watch", "attach", "console", "sessions", "install-sudo")
     launch_options = ("--stream", "--cwd", "--again", "--agent-log", "--approver")
