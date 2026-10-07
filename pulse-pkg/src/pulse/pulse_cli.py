@@ -1456,7 +1456,9 @@ SYSTEM_PROMPT = (
     "- Current tracked matrix/tensor/scalar stats.\n"
     "- Static variable names and shapes discovered from the user's source.\n"
     "- Training code when available.\n\n"
-    "RESPONSE FORMAT:\n"
+    "RESPONSE FORMAT (when you are diagnosing a problem and the current instruction gives no "
+    "format of its own -- a question gets a plain answer, and a step that asks for JSON gets "
+    "only the JSON):\n"
     "1. Diagnosis — one sentence, the specific root cause.\n"
     "2. Reasoning — grounded in the actual numbers and code, with real math.\n"
     "3. Fix — a concrete change.\n\n"
@@ -1541,7 +1543,8 @@ SYSTEM_PROMPT = (
     "    MESSAGE: <one line> -- say something to the user right now, while you keep working: what you "
     "found so far, what you are about to check, a heads-up. It is not a tool: it gets no result back and "
     "does not end your turn, so put it in the same reply as the directives you are issuing. Text around "
-    "directives is not shown to the user; MESSAGE: always is.\n"
+    "directives may not reach the user (it is often folded away with the tool output); MESSAGE: always "
+    "does.\n"
     "    TERMINAL: <shell command> -- run a REAL command in the project's working directory and get "
     "back its actual stdout, stderr, exit code and duration -- e.g. 'TERMINAL: pytest tests/test_model.py', "
     "'TERMINAL: python -m py_compile model.py', 'TERMINAL: git status', 'TERMINAL: grep -R \"loss_val\" .'. "
@@ -1625,9 +1628,11 @@ SYSTEM_PROMPT = (
     "against the code and numbers yourself rather than taking it on trust.\n\n"
 
     "CODE FIXES:\n"
-    "If, and only if, the user explicitly asks you to fix, edit, patch, or change the code "
-    "(not just diagnose it), respond with ONLY a single JSON object and nothing else -- no prose "
-    "before or after it, no markdown code fences.\n"
+    "When a message in this conversation asks you for the edit itself (Pulse's IMPLEMENT step "
+    "says so: the plan is settled, give the change), respond with ONLY a single JSON object and "
+    "nothing else -- no prose before or after it, no markdown code fences. In every other turn, "
+    "follow that turn's own instructions about the shape of your answer (a plan ending in "
+    "CHANGE_NEEDED, a diagnosis, a verdict): the JSON belongs only to the step that asks for it.\n"
     "PREFER THE SMALLEST FIX THAT ADDRESSES THE ROOT CAUSE: a single changed line, a changed argument, "
     "a swapped function call, or a few adjacent lines is almost always the right size for a bug fix. "
     "Do not rewrite a function, restructure a class, reformat unrelated code, or 'clean up' anything "
@@ -1664,8 +1669,9 @@ SYSTEM_PROMPT = (
     "  - If the actual bug lives in another file that was sent this turn (e.g. a modularized "
     "project's model.py), fix it there via files[i] rather than working around it in the main "
     "script.\n"
-    "  - If you were not shown the code, or the user has not asked for a fix, do not emit this JSON "
-    "format -- answer normally per RESPONSE FORMAT above.\n"
+    "  - Outside the step that asks for the edit, do not emit this JSON format. In that step, if "
+    "you have not seen the lines you need to change (in the code shown or in VIEW output), VIEW "
+    "them first rather than guessing at `old`.\n"
     "NO CHANGE NEEDED: being asked to fix something is not proof that the code is wrong. If your "
     "diagnosis finds no bug in the code (the run is healthy, the alarm was noise, or the cause is "
     "outside the code), respond instead with ONLY {\"no_change\": true, \"reason\": \"one sentence\"} "
@@ -2153,7 +2159,9 @@ _PASS3_IMPLEMENT_TMPL = (
     "the bug is a line that can break a run that is otherwise working. If you notice a second, "
     "unrelated problem while you're in here, do not fix it in this change -- mention it in the "
     "explanation field as something worth a separate look. "
-    "Implement the fix for the root cause diagnosed above. The user wants this fix applied to their code. Default to the "
+    "Implement the fix for the root cause diagnosed above -- if it is a real defect in the code: "
+    "this pass can be reached because Pulse's own checks raised an alarm, and an alarm is not "
+    "proof of a bug (see the no_change answer below). Default to the "
     "smallest possible change -- a single line or a few adjacent lines -- and only widen the edit if "
     "the root cause genuinely can't be fixed that narrowly. Do not refactor, restructure, or rewrite "
     "code beyond what's needed to fix the diagnosed root cause. Respond with ONLY the code-fix JSON "
@@ -2162,20 +2170,41 @@ _PASS3_IMPLEMENT_TMPL = (
     "code -- do not invent a change: respond with ONLY "
     '{{"no_change": true, "reason": "one sentence"}} and nothing will be written.'
 )
+# Appended to the last call of a bounded tool loop: without it, the answer to that call could
+# still be "let me check X" -- and that, unanswered, was what got printed as the result.
+_LAST_TOOL_ROUND_NOTE = ("\n\n(That was the last round of tool results -- none will come back after "
+                         "this. Answer now from what you have, with no tool directives.)")
+
 _PASS4_VERIFY_TMPL = (
-    "Your analysis:\n{diagnosis}\n\n"
+    "{brief}\n\n"
     "The fix you are about to apply:\n{fix_desc}\n\n"
     "PASS 4 -- VERIFY: Carefully check the math/logic of this fix against the numbers and code you "
-    'were given. Also check its SCOPE: does it change only what\'s needed to fix the diagnosed root '
-    "cause, or does it also rewrite/restructure/reformat code that didn't need to change -- every "
-    "line in the diff should trace directly to the diagnosed root cause, with nothing swept in "
-    "alongside it. If you can quickly confirm any of this for real instead of just reasoning about "
-    "it -- TERMINAL: python -m py_compile on the changed file, GREP: for other call sites that would "
-    "need the same change -- do that first; you'll get the result back before you have to answer. "
-    'Once you have, respond with ONLY a JSON object of the form {{"passes": true or false, "reason": '
-    '"one sentence"}}. passes=true only if the fix is logically/numerically correct, actually '
-    "addresses the diagnosed root cause, AND is no larger than necessary to do so."
+    "were given. Also check its SCOPE: {scope} If you can confirm any of this for real instead of "
+    "just reasoning about it, do that first -- you'll get the result back before you answer. The "
+    "fix is NOT applied yet: the files on disk are still the old code, so compiling or running them "
+    "says nothing about the fix. Check it by reading: VIEW the lines around each change, GREP: for "
+    "other call sites that need the same change. "
+    'Then respond with ONLY a JSON object of the form {{"passes": true or false, "reason": '
+    '"one sentence"}}. passes=true only if {passes}'
 )
+# what PASS 4 judges a fix against: the diagnosis of a problem Pulse found, or the change the
+# person asked for (a feature request has no "root cause", and judged as a bug fix it failed)
+_VERIFY_DIAGNOSIS = {
+    "brief": "Your analysis:\n{diagnosis}",
+    "scope": ("does it change only what's needed to fix the diagnosed root cause, or does it also "
+              "rewrite/restructure/reformat code that didn't need to change -- every line in the diff "
+              "should trace directly to the diagnosed root cause, with nothing swept in alongside it."),
+    "passes": ("the fix is logically/numerically correct, actually addresses the diagnosed root cause, "
+               "AND is no larger than necessary to do so."),
+    "only": "Fix only the bug; a revision must stay as small as the bug requires.",
+}
+_VERIFY_REQUEST = {
+    "brief": "The person asked for:\n{request}\n\nYour plan:\n{diagnosis}",
+    "scope": ("does the diff do exactly what was asked -- all of it, and nothing else? Unrelated "
+              "rewrites, renames or reformatting do not belong in it."),
+    "passes": "the change is correct, does what the person asked, AND does nothing they did not ask for.",
+    "only": "Make only the change that was asked for; a revision must not grow beyond it.",
+}
 _PASS6_CONFIRM_TMPL = (
     "The fix below was applied and the program was then {rerun}.\n\n"
     "The fix:\n{fix_desc}\n\n"
@@ -2238,18 +2267,17 @@ _PASS3_CONFIRM_NO_CHANGE_NOTE = (
     "If a change IS needed, respond with ONLY the code-fix JSON object (old/new/files/explanation)."
 )
 _PASS4_RECHECK_TMPL = (
-    "Your analysis:\n{diagnosis}\n\n"
+    "{brief}\n\n"
     "The fix you proposed:\n{fix_desc}\n\n"
-    "An automated check on this fix reported:\n{reason}\n\n"
-    "PASS 4b -- RE-EXAMINE: That check is itself automated and can be wrong; it is one more "
-    "piece of evidence, not a verdict, and it is not evidence that your fix is right either. "
-    "Look again at the code and the evidence you were given and decide for yourself.\n"
+    "Your own verification of this fix concluded it does not pass:\n{reason}\n\n"
+    "PASS 4b -- RE-EXAMINE: Look again at the code and the evidence. Keep the fix only if you can "
+    "say concretely why that objection is wrong; otherwise correct it, or drop it.\n"
     "Respond with ONLY one of:\n"
     '- {{"decision": "keep", "reason": "one sentence"}} if the fix should be applied as it is\n'
     '- {{"decision": "revise", "old": [...], "new": [...], "files": [...], "explanation": "..."}} '
     "with a corrected fix (keep \"resume\": false in it if your fix asked for a fresh start)\n"
     '- {{"decision": "drop", "reason": "one sentence"}} if it should not be applied at all\n'
-    "Fix only the bug; a revision must stay as small as the bug requires."
+    "{only}"
 )
 
 # Output-token budget for every agent call. Deliberately generous: reasoning
@@ -7839,13 +7867,20 @@ class PulseCLI:
                         return text
                     return "[... earlier output truncated ...]\n" + text[-_RESTART_FEEDBACK_MAX_CHARS:]
 
+                if crashed:
+                    what_happened = (f"the restarted training process crashed with exit code "
+                                     f"{result.returncode}")
+                else:
+                    # it ran to the end; the check of its output said the problem is still there
+                    what_happened = (f"the restarted training process finished (exit code "
+                                     f"{result.returncode}), but judged from its output the fix did "
+                                     f"not do its job: {reason}")
                 failure_question = (
-                    f"After the fix you just applied, the restarted training process crashed "
-                    f"with exit code {result.returncode}. Its output:\n\n"
+                    f"After the fix you just applied, {what_happened}. Its output:\n\n"
                     f"STDOUT:\n{_tail(result.stdout)}\n\nSTDERR:\n{_tail(result.stderr)}\n\n"
-                    "This is the same bug context as before -- fix the CURRENT code shown below "
-                    "directly. Do not start the diagnosis over from scratch, and do not reintroduce "
-                    "whatever change just failed."
+                    "This is the same bug context as before -- fix the CURRENT code (shown with "
+                    "this question) directly. Do not start the diagnosis over from scratch, and do "
+                    "not reintroduce whatever change just failed."
                 )
                 self._suppress_auto_restart = True
                 try:
@@ -8332,8 +8367,8 @@ class PulseCLI:
                 lines.append(
                     "\nThis project is modularized -- other local files it imports are included "
                     "below, each line-numbered under its own header. When proposing a code fix, "
-                    "set each fix's \"file\" to the exact header shown here (e.g. \"model.py\") so "
-                    f"Pulse edits the right file. Omit \"file\" to default to {entry_label}."
+                    "set files[i] (the list beside old/new) to the exact header shown here (e.g. \"model.py\") so "
+                    f"Pulse edits the right file. Leave files[i] empty (or omit the list) to default to {entry_label}."
                 )
                 for path, text in self.extra_files.items():
                     label = self._label_for_path.get(path, os.path.basename(path))
@@ -10713,6 +10748,34 @@ class PulseCLI:
         except OSError:
             pass
 
+    def _act_on_detection(self, problem: Optional[str]) -> None:
+        """What the detector found, handled by the rule every path shares (pulse_detect.acts_on):
+        a critical finding starts the agent (when auto-fix is on); a warning -- a plateau, a
+        widening gap -- is shown once and the run goes on. In this mode the agent works on the
+        training thread, so starting it on every warning stalled a healthy run for minutes."""
+        if not problem:
+            return
+        findings = getattr(self, "_last_detector_findings", None)
+        if findings is None:
+            # the legacy detector (PULSE_LEGACY_DETECTOR=1) gives only text: as before
+            if self.auto_intervene:
+                self._escalate_training_problem(problem)
+            return
+        acting = [f for f in findings if _pulse_detect.acts_on(f)]
+        if acting and self.auto_intervene:
+            self._escalate_training_problem("; ".join(f.message for f in acting))
+        shown = self.__dict__.setdefault("_findings_shown", set())
+        for finding in findings:
+            if finding in acting and self.auto_intervene:
+                continue
+            key = (finding.check, finding.variable)
+            if key in shown:
+                continue
+            shown.add(key)
+            hint = "" if self.auto_intervene or finding not in acting else "  (auto-fix is off: /autofix on lets the agent act)"
+            cprint(f"[Pulse] {finding.severity.upper()} {finding.message}{hint}",
+                   color=_RED if finding.severity == _pulse_detect.CRITICAL else _YELLOW)
+
     def _escalate_training_problem(self, problem: Optional[str]) -> None:
         """Shared escalation path for anything that decides training
         looks like it's going wrong -- either _check_for_trouble's
@@ -11223,7 +11286,7 @@ class PulseCLI:
             parts.append('"resume": false (the run restarts fresh, not from its last checkpoint)')
         return "\n\n".join(parts)
 
-    def _verify_fix_with_retries(self, fix: Dict[str, Any], diagnosis: str):
+    def _verify_fix_with_retries(self, fix: Dict[str, Any], diagnosis: str, request: Optional[str] = None):
         """PASS 4: check the fix's math/logic before it's handed to the
         user. If it fails, ask the agent to revise and re-check, up to
         _MAX_VERIFY_ATTEMPTS times. Returns (fix, passed, reason).
@@ -11235,6 +11298,17 @@ class PulseCLI:
         """
         reason = ""
         seen = set()
+        mode = _VERIFY_REQUEST if request else _VERIFY_DIAGNOSIS
+        brief = mode["brief"].format(diagnosis=diagnosis, request=request or "")
+
+        def verify_prompt(fix_desc: str, last_round: bool = False) -> str:
+            text = _PASS4_VERIFY_TMPL.format(brief=brief, fix_desc=fix_desc, scope=mode["scope"],
+                                             passes=mode["passes"])
+            if last_round:
+                text += ("\n\n(That was the last round of tool results: answer now, with the JSON verdict, "
+                         "from what you have.)")
+            return text
+
         for attempt in range(_MAX_VERIFY_ATTEMPTS):
             fix_desc = self._describe_fix(fix)
             signature = json.dumps([fix["old"], fix["new"]], sort_keys=True)
@@ -11244,10 +11318,7 @@ class PulseCLI:
             seen.add(signature)
             try:
                 with _Spinner("Checking the fix"):
-                    verify_answer = self._call_model(
-                        _PASS4_VERIFY_TMPL.format(diagnosis=diagnosis, fix_desc=fix_desc),
-                        max_tokens=_AGENT_MAX_TOKENS,
-                    )
+                    verify_answer = self._call_model(verify_prompt(fix_desc), max_tokens=_AGENT_MAX_TOKENS)
             except AgentRequestFailed as exc:
                 if exc.transient:
                     raise      # not a verdict: see _ask_agent_impl, which parks the whole request
@@ -11268,7 +11339,7 @@ class PulseCLI:
                     try:
                         with _Spinner("Checking the fix"):
                             verify_answer = self._call_model(
-                                _PASS4_VERIFY_TMPL.format(diagnosis=diagnosis, fix_desc=fix_desc),
+                                verify_prompt(fix_desc, last_round=_tool_round == _MAX_VERIFY_TOOL_ROUNDS - 1),
                                 max_tokens=_AGENT_MAX_TOKENS,
                             )
                     except AgentRequestFailed as exc:
@@ -11292,7 +11363,7 @@ class PulseCLI:
                 with _Spinner("Re-examining the fix"):
                     recheck_answer = self._call_model(
                         _PASS4_RECHECK_TMPL.format(
-                            diagnosis=diagnosis, fix_desc=fix_desc,
+                            brief=brief, fix_desc=fix_desc, only=mode["only"],
                             reason=reason or "(no reason given)"),
                         max_tokens=_AGENT_MAX_TOKENS,
                     )
@@ -11444,8 +11515,15 @@ class PulseCLI:
             self.agent_history.append({"role": "assistant", "content": answer})
             self.agent_history.append({"role": "user", "content": notes})
             prompt = (_USER_REQUEST_TMPL.format(request=question)
-                      + "\n\n(The results of what you checked are above. Continue, or answer.)")
+                      + "\n\n(The results of what you checked are above. Continue, or answer.)"
+                      + (_LAST_TOOL_ROUND_NOTE if _round + 1 == _MAX_ANALYZE_TOOL_ROUNDS else ""))
         change = bool(re.search(r"(?m)^\s*CHANGE_NEEDED\s*$", answer))
+        fix = None if change else self._parse_code_fix(answer)
+        if fix is not None:
+            # it went straight to the edit: a change was asked for; show its explanation, and
+            # Pulse's implement step asks for the edit in the form it applies
+            change = True
+            answer = str(fix.get("explanation") or "I will make the change.")
         cleaned, *_rest = self._extract_directives(answer)
         cleaned, _requests = self._extract_new_directives(cleaned)
         text = re.sub(r"(?m)^\s*CHANGE_NEEDED\s*$", "", cleaned).strip()
@@ -11531,7 +11609,9 @@ class PulseCLI:
                     self.agent_history.append({"role": "assistant", "content": regions})
                     self.agent_history.append({"role": "user", "content": note})
                     with _Spinner("Reading for region of error"):
-                        regions = self._call_model(_PASS1_LOCATE, max_tokens=_AGENT_MAX_TOKENS)
+                        regions = self._call_model(
+                            _PASS1_LOCATE + (_LAST_TOOL_ROUND_NOTE if _round + 1 == _MAX_LOCATE_TOOL_ROUNDS else ""),
+                            max_tokens=_AGENT_MAX_TOKENS)
                 print(f"\n[1] Region of error\n{regions}\n")
 
                 # Pass 2: focused second read + diagnosis/reasoning. Investigative directives
@@ -11544,7 +11624,9 @@ class PulseCLI:
                 for _round in range(_MAX_ANALYZE_TOOL_ROUNDS + 1):
                     with _Spinner("Analyzing"):
                         raw_analysis = self._call_model(
-                            _PASS2_ANALYZE_TMPL.format(regions=regions), max_tokens=_AGENT_MAX_TOKENS
+                            _PASS2_ANALYZE_TMPL.format(regions=regions)
+                            + (_LAST_TOOL_ROUND_NOTE if _round == _MAX_ANALYZE_TOOL_ROUNDS and _round else ""),
+                            max_tokens=_AGENT_MAX_TOKENS
                         )
                     (
                         analysis, calc_exprs, promote_names, gputrack_names, gpuuntrack_names,
@@ -11668,7 +11750,8 @@ class PulseCLI:
 
             # Pass 4: verify the fix's math/logic before handing it to the
             # user; revise and re-check on failure (bounded retries).
-            fix, verify_ok, verify_reason = self._verify_fix_with_retries(fix, full_answer)
+            fix, verify_ok, verify_reason = self._verify_fix_with_retries(
+                fix, full_answer, request=question if from_user else None)
             status = "passed" if verify_ok else "not confirmed -- fix NOT applied"
             print(f"[4] Verification {status}: {verify_reason}\n")
             if not verify_ok:
@@ -12962,6 +13045,7 @@ class PulseCLI:
         # on a fine-tune sitting at 97% is true and worth showing, and pausing the run
         # to ask an agent about it is not. Only actionable severities escalate.
         raised = [f for f in raised if f.severity in (_pulse_detect.CRITICAL, _pulse_detect.WARNING)]
+        self._last_detector_findings = list(raised)
         if not raised:
             return None
         order = {_pulse_detect.CRITICAL: 0, _pulse_detect.WARNING: 1}
@@ -13680,7 +13764,8 @@ class PulseCLI:
         "suspect.\n\n"
         "Reply with ONLY these five lines, in exactly this format, and nothing else -- no diagnosis, "
         "no prose:\n"
-        "SENSITIVITY: <0.0-1.0, a preset (loose/medium/tight), or 'spike|plateau|oscillation <value|auto>'>\n"
+        "SENSITIVITY: <0.0-1.0, a preset (loose/medium/tight), or 'spike|plateau|oscillation <value|auto>'; "
+        "medium when the code gives you no reason to choose>\n"
         "NORMAL_START: <comma-separated var=value pairs for loss-like tracked variables you can justify, or 'none'>\n"
         "GPUTRACK: <comma-separated variable names to track closely from the start, or 'none'>\n"
         "NEXTCHECK: <steps (20-20000) until your first periodic check-in>\n"
@@ -15203,32 +15288,33 @@ class PulseCLI:
         # The Keras callback has already populated epoch histories,
         # so the detector can now actually see loss / val_loss.
         # ------------------------------------------------------------
-        if self.auto_intervene:
+        # Detection runs whether or not auto-fix is on (with it off, nothing was even
+        # computed, let alone shown); auto-fix only decides whether the agent acts.
+        self._last_detector_findings = None
+        problem = self._check_for_trouble()
 
-            problem = self._check_for_trouble()
+        if _PULSE_LOGGING:
+            try:
+                detector_histories = {
+                    k: len(v)
+                    for k, v in getattr(
+                        self,
+                        "epoch_scalar_histories",
+                        {},
+                    ).items()
+                }
 
-            if _PULSE_LOGGING:
-                try:
-                    detector_histories = {
-                        k: len(v)
-                        for k, v in getattr(
-                            self,
-                            "epoch_scalar_histories",
-                            {},
-                        ).items()
-                    }
+                _pulse_log(
+                    "DETECTOR "
+                    f"result={problem!r} "
+                    f"epoch_histories="
+                    f"{detector_histories!r}",
+                )
 
-                    _pulse_log(
-                        "DETECTOR "
-                        f"result={problem!r} "
-                        f"epoch_histories="
-                        f"{detector_histories!r}",
-                    )
+            except Exception:
+                pass
 
-                except Exception:
-                    pass
-
-            self._escalate_training_problem(problem)
+        self._act_on_detection(problem)
 
         # ------------------------------------------------------------
         # UPDATE FINISHED

@@ -3,6 +3,7 @@ VERDICT format, and the note each scheduler leaves for the next check-in."""
 import pytest
 
 from pulse.pulse_cli import PulseCLI
+from pulse import pulse_cli as pulse_cli_mod
 
 
 def make_cli(replies, tools=None):
@@ -293,3 +294,27 @@ def test_terminal_python_is_the_runs_own_interpreter(tmp_path):
     from pulse import pulse_terminal as t
     result = t.TerminalExecutor(default_cwd=str(tmp_path)).run(t.TerminalRequest(command='echo "$PATH"'))
     assert result.stdout.strip().split(os.pathsep)[0] == os.path.dirname(os.path.abspath(sys.executable))
+
+
+def test_the_in_process_run_acts_only_on_critical_findings_and_detects_with_autofix_off(monkeypatch):
+    """One rule on every path (pulse_detect.acts_on): a warning is shown, the run goes on; a
+    critical finding gets the agent. With auto-fix off nothing was computed at all."""
+    from pulse import pulse_detect as detect
+    cli = PulseCLI.__new__(PulseCLI)
+    escalated, printed = [], []
+    cli._escalate_training_problem = lambda problem: escalated.append(problem)
+    monkeypatch.setattr(pulse_cli_mod, "cprint", lambda text, **k: printed.append(text))
+    plateau = detect.Finding("plateau", "loss", detect.WARNING, "loss stopped improving")
+    nan = detect.Finding("nonfinite", "loss", detect.CRITICAL, "loss is NaN")
+    cli.auto_intervene = True
+    cli._last_detector_findings = [plateau]
+    cli._act_on_detection("loss stopped improving")
+    assert escalated == [] and any("loss stopped improving" in p for p in printed)
+    cli._last_detector_findings = [plateau, nan]
+    cli._act_on_detection("x")
+    assert escalated == ["loss is NaN"]
+    cli.auto_intervene = False
+    cli._findings_shown = set()
+    printed.clear()
+    cli._act_on_detection("x")
+    assert escalated == ["loss is NaN"] and any("/autofix on" in p for p in printed)

@@ -557,10 +557,6 @@ class Console:
             paint = severity_colour(finding.severity)
             self._print(f"\n{paint('  ' + finding.severity.upper())} {finding.message}")
 
-    # findings the agent is not started on by itself: a run that stopped making steps is
-    # also what a pause looks like
-    _NOT_FOR_THE_AGENT = {"throughput_stopped"}
-
     def _escalate(self, findings: List[detect.Finding], pack: Dict[str, Any]) -> None:
         """The brain's escalation: a critical finding, or a scheduled audit that says
         "problem". The agent explains it once, in the background, and says what to change."""
@@ -569,8 +565,7 @@ class Console:
             key = ("audit", audit.get("step"), audit.get("t"))
             what = "the scheduled check found a problem: " + " ".join(str(audit.get("text") or "").split())[:400]
         else:
-            serious = [f for f in findings if f.severity == detect.CRITICAL and f.check not in self._NOT_FOR_THE_AGENT
-                       and (f.check, f.variable) not in self._diagnosed]
+            serious = [f for f in findings if detect.acts_on(f) and (f.check, f.variable) not in self._diagnosed]
             if not serious:
                 return
             key = (serious[0].check, serious[0].variable)
@@ -603,9 +598,11 @@ class Console:
                 pack = self.brain.evidence(include_code=True)
                 prompt = (
                     "You are Pulse, watching a training run with someone at a terminal. Something "
-                    f"serious just happened: {what}\n\nFrom the evidence and the code below, say in a few "
-                    "sentences what causes it, then exactly what to change (file, line, old -> new) to fix "
-                    "it, and whether the run should be stopped and restarted with the fix.\n\n"
+                    f"serious just happened: {what}\n\nFrom the evidence and the training script below, say "
+                    "in a few sentences what causes it, then exactly what to change (file, line, old -> new) "
+                    "to fix it, and whether the run should be stopped and restarted with the fix. Only the "
+                    "entry script is shown: if the cause is in another file, name it (from the traceback, or "
+                    "the imports) and say what to look for there.\n\n"
                     f"{self.brain.render_evidence(pack)}\n")
                 self._print(dim(f"\n  {what[:160]} -- asking the agent..."))
                 answer = self.agent(prompt)
@@ -642,7 +639,13 @@ class Console:
         in the prompt -- and the pump used to throw the answer away, so with --model set
         the console spent a call every fifteen minutes and showed nothing.
         """
-        if not record or record.get("status") in (None, "skipped", "busy"):
+        if not record or record.get("status") in ("skipped", "busy"):
+            return
+        if record.get("status") is None:
+            text = (record.get("text") or "").strip()
+            if text:      # no readable verdict, but its words may be the diagnosis
+                self._print("\n" + bold("  audit") + dim(" (no verdict could be read)") + "\n  "
+                            + text.replace("\n", "\n  "))
             return
         if record.get("status") == "error":
             self._print(red(f"\n  audit failed: {record.get('error')}"))

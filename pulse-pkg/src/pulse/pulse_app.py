@@ -51,21 +51,30 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from . import pulse_tui as tui
 from . import pulse_ui as _ui
 from . import pulse_settings as _settings
+from . import pulse_detect as detect
 
-DEBUG_PROMPT = (
-    "\n\nYOU ARE ATTACHED TO A LIVE TRAINING RUN\n"
-    "The person opened a run in the Pulse app and is looking at it with you. Each request comes "
-    "with EVIDENCE FROM THE RUN: its step, every tracked value's curve, tensors, the detectors' "
-    "findings and recent events. Use it and quote the numbers. Diagnose before you conclude: read "
-    "the code with the tools, check what you suspect. A question about the run is a question -- "
-    "answer it in words, with no code change. Change code only when asked to fix something, or "
-    "when the person agrees to a fix you proposed. The run keeps executing the code it started "
-    "with. After an edit, decide whether to run it again with restart_run (RESTART: in the text "
-    "protocol): do when the fix only takes effect in a fresh run or you need to see it work (after "
-    "a crash, almost always); don't when the run is healthy and the change can wait for its next "
-    "start -- and say which you chose. run_status "
-    "(RUNSTATUS:) gives the run's latest numbers whenever you need them again.\n"
-)
+def _debug_prompt(restart: str, status: str) -> str:
+    return (
+        "\n\nYOU ARE ATTACHED TO A LIVE TRAINING RUN\n"
+        "The person opened a run in the Pulse app and is looking at it with you. Each request comes "
+        "with EVIDENCE FROM THE RUN: its step, every tracked value's curve, tensors, the detectors' "
+        "findings and recent events. Use it and quote the numbers. Diagnose before you conclude: read "
+        "the code with the tools, check what you suspect. A question about the run is a question -- "
+        "answer it in words, with no code change. Change code only when asked to fix something, or "
+        "when the person agrees to a fix you proposed. (A request Pulse makes by itself when the run "
+        "crashes or its checks find something serious asks you to fix it: that is the person's "
+        "standing instruction.) The run keeps executing the code it started with. After an edit, "
+        f"decide whether to run it again with {restart}: do when the fix only takes effect in a "
+        "fresh run or you need to see it work (after a crash, almost always); don't when the run is "
+        "healthy and the change can wait for its next start -- and say which you chose. "
+        f"{status} gives the run's latest numbers whenever you need them again.\n"
+    )
+
+
+# the text pipeline's directives, and the native tool loop's tool names (each loop is told
+# about the tools it really has)
+DEBUG_PROMPT = _debug_prompt("a RESTART: line", "RUNSTATUS:")
+DEBUG_PROMPT_NATIVE = _debug_prompt("restart_run", "run_status")
 
 HOME_COMMANDS: List[Tuple[str, str]] = [
     ("/monitor", "pick a run on this machine and open it beside the agent"),
@@ -110,9 +119,6 @@ _STATUS_STYLE = {"live": "accent", "stalled": "bold", "crashed": "red"}
 # what makes up the run the app is looking at; a parked run keeps them in App.parked
 _WATCH_FIELDS = ("console", "session", "_monitor", "runlog", "_status", "_rate", "_rate_at",
                  "_stall_said", "_paused_here")
-# serious findings the agent does not start on by itself: a run that stopped making steps is
-# also what a pause looks like
-_NOT_FOR_THE_AGENT = {"throughput_stopped"}
 _AUTO_CRASH_TURNS = 3       # crashes in a row the agent starts on by itself, before the person is asked
 _RUN_LOG_DIR = "app-runs"
 
@@ -1275,6 +1281,7 @@ class App:
             self._point(workdir, [script] if script and os.path.isfile(script) else [])
         from . import pulse_code
         self.cli._system_prompt_override = pulse_code.CODE_SYSTEM_PROMPT + DEBUG_PROMPT
+        self.cli._native_prompt_suffix = DEBUG_PROMPT_NATIVE
         self._start_runlog(session, workdir)
         self._refresh_header()
         name = os.path.basename(script) or session.get("session_id") or "the run"
@@ -1350,6 +1357,7 @@ class App:
         self._point(self.home_root, self.home_focus)
         from . import pulse_code
         self.cli._system_prompt_override = pulse_code.CODE_SYSTEM_PROMPT
+        self.cli._native_prompt_suffix = ""
         self._refresh_header()
         if not quiet:
             self.note("Stopped watching the run. It keeps going; /monitor opens it again.")
@@ -1416,9 +1424,7 @@ class App:
         loss that blew up or never learned: the agent takes it on at once, as for a crash
         (a warning is only announced). Once per problem; with the lock held."""
         session_id = (self.session or {}).get("session_id")
-        serious = [f for f in findings
-                   if str(getattr(f, "severity", "")).lower() == "critical"
-                   and getattr(f, "check", "") not in _NOT_FOR_THE_AGENT
+        serious = [f for f in findings if detect.acts_on(f)
                    and (session_id, getattr(f, "check", ""), getattr(f, "variable", "")) not in self._problems_seen]
         if not serious or self._status not in ("live", "stalled"):
             return
@@ -1465,8 +1471,7 @@ class App:
         """A run watched off screen raised something serious. At home (no other run on
         screen) the agent takes it on, as for a crash there; with another run on screen the
         person is told where to look."""
-        serious = [f for f in findings if str(getattr(f, "severity", "")).lower() == "critical"
-                   and getattr(f, "check", "") not in _NOT_FOR_THE_AGENT]
+        serious = [f for f in findings if detect.acts_on(f)]
         session_id = next((sid for sid, st in self.parked.items() if st["console"] is console), None)
         if not serious or session_id is None:
             return
@@ -1540,6 +1545,7 @@ class App:
         from . import pulse_code
         self._point(self.home_root, self.home_focus)
         self.cli._system_prompt_override = pulse_code.CODE_SYSTEM_PROMPT
+        self.cli._native_prompt_suffix = ""
 
     def _aim_at_run(self) -> None:
         from . import pulse_code
@@ -1550,6 +1556,7 @@ class App:
         if os.path.isdir(console.workdir):
             self._point(console.workdir, [script] if script and os.path.isfile(script) else [])
         self.cli._system_prompt_override = pulse_code.CODE_SYSTEM_PROMPT + DEBUG_PROMPT
+        self.cli._native_prompt_suffix = DEBUG_PROMPT_NATIVE
 
     def _park(self) -> None:
         """Keep watching the open run, off screen: its console goes on reading the run (its
@@ -2120,10 +2127,16 @@ def _make_console(app: App, session: Dict[str, Any], agent: Optional[Callable[[s
         def _report_audit(self, record: Optional[Dict[str, Any]]) -> None:
             """A scheduled look at the run: one quiet line in the model's words. The decision
             JSON in its answer is for Pulse (when to look next), not for the person."""
-            if not record or record.get("status") in (None, "skipped", "busy"):
+            if not record or record.get("status") in ("skipped", "busy"):
                 return
             if record.get("status") == "error":
                 app.note(f"The scheduled check of the run failed: {record.get('error')}")
+                return
+            if record.get("status") is None:
+                # an answer with no readable verdict: its words may still be the diagnosis
+                text = audit_words(record.get("text") or "")
+                if text:
+                    app.note("Checked the run (no verdict could be read from the answer): " + text[:1200])
                 return
             text = audit_words(record.get("text") or "")
             if self is not app.console:          # a run watched off screen: say which one

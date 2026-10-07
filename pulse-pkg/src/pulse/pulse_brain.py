@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import os
 import threading
 import time
@@ -433,7 +434,17 @@ class Brain:
             out.append("\nWhat previous audits concluded: " + "; ".join(
                 f"{a.get('status')} (risk {a.get('risk')})" for a in audits))
         if pack.get("code"):
-            out.append("\nTraining code:\n" + pack["code"])
+            heading = "\nTraining code:"
+            if fixes:
+                # A fix edits the file; the process keeps running the code it started with (the
+                # run only takes a fix up when it is restarted). Read without this, the curves
+                # were blamed on code that never produced them.
+                first = min((f.get("step") or 0) for f in fixes)
+                heading = (f"\nTraining code AS IT IS NOW on disk -- it was changed during this run (from "
+                           f"step {first}, see the fixes above). This process keeps running the code it "
+                           "started with until it is restarted: the curves were produced by the code "
+                           "before those changes, not by what is shown here.")
+            out.append(heading + "\n" + pack["code"])
         return "\n".join(out)
 
     # ------------------------------------------------------------------ thinking
@@ -606,7 +617,30 @@ def parse_decision(answer: str) -> Dict[str, Any]:
                 return loaded
             end = text.find("}", end + 1)
         start = text.rfind("{", 0, start)
-    return {}
+    return _labelled_decision(text)
+
+
+_LABEL_RE = {
+    "status": re.compile(r"(?im)^[\s*_#>-]*status[\s*_]*[:=-][\s*_`\"']*(ok|watch|problem)\b"),
+    "risk": re.compile(r"(?im)^[\s*_#>-]*risk[\s*_]*[:=-][\s*_`\"']*(low|medium|high)\b"),
+    "next_check_minutes": re.compile(
+        r"(?im)^[\s*_#>-]*next[\s_]*check(?:[\s_]*minutes)?[\s*_]*[:=-][\s*_`\"']*(\d+(?:\.\d+)?)"),
+}
+
+
+def _labelled_decision(text: str) -> Dict[str, Any]:
+    """The decision written as labelled lines instead of JSON ("**Status:** problem", "Risk:
+    high", "Next check: 1 minute"). A model that answered the audit that way had its whole
+    diagnosis dropped -- read as no verdict at all, and so never shown."""
+    found: Dict[str, Any] = {}
+    for key, pattern in _LABEL_RE.items():
+        m = pattern.search(text)
+        if m:
+            found[key] = float(m.group(1)) if key == "next_check_minutes" else m.group(1).lower()
+    if "status" not in found:
+        return {}
+    found.setdefault("findings", [])
+    return found
 
 
 # Room for the answer AND the thinking before it: a reasoning model (DeepSeek V4, o-series,
@@ -620,8 +654,14 @@ class EmptyAnswer(RuntimeError):
     """The model returned no answer text (it ran out of tokens while thinking, or refused)."""
 
 
+# A careful audit of a long run can think for 20,000 tokens: 5-10 minutes on a fast model.
+# At 300 s one in six was cut off -- still billed, and recorded as a failed audit.
+AGENT_TIMEOUT_SECONDS = 900.0
+
+
 def build_litellm_agent(model: str, api_key: Optional[str] = None, api_base: Optional[str] = None,
-                        max_tokens: int = AGENT_MAX_TOKENS, timeout: float = 300.0) -> Callable[[str], str]:
+                        max_tokens: int = AGENT_MAX_TOKENS,
+                        timeout: float = AGENT_TIMEOUT_SECONDS) -> Callable[[str], str]:
     """An agent callable backed by litellm, for running the brain standalone. An empty answer
     raises EmptyAnswer rather than returning "": a caller that parses "" sees no verdict and
     cannot tell that apart from a model that looked and had nothing to say."""

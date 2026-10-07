@@ -2404,6 +2404,19 @@ class DetectionEngine:
         return None
 
 
+# What Pulse does by itself with a finding, the same on every path (the app, the line-by-line
+# console, an in-process run): a critical one starts the agent on it; a warning is shown and
+# the run goes on. "No steps for a while" is critical but left to the person: a pause, a slow
+# data loader or a long evaluation look exactly the same.
+NOT_FOR_THE_AGENT = frozenset({"throughput_stopped"})
+
+
+def acts_on(finding: Any) -> bool:
+    """Does Pulse start the agent on this finding without being asked?"""
+    return (str(getattr(finding, "severity", "")).lower() == CRITICAL
+            and getattr(finding, "check", "") not in NOT_FOR_THE_AGENT)
+
+
 def summarise(findings: Sequence[Finding]) -> str:
     """The one-line form, for a log line or a prompt header."""
     if not findings:
