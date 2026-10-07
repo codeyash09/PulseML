@@ -51,6 +51,20 @@ POST_FIX_INTERVAL_SECONDS = 120.0
 HISTORY_CAP = 5000
 AUDIT_POINTS = 100
 
+# The checks judge a variable by its latest reading, so the brain asks them once per
+# reading rather than once per poll: at the monitor's 4 Hz and the console's 2 Hz poll,
+# every poll holds two readings, and a one-reading NaN or spike that was not the last of
+# them was never looked at. Bounded, so a brain that opens a long run late does not
+# replay the whole backlog one reading at a time; the backlog is folded in at once.
+PER_READING_CHECKS = 64
+
+# Statistics of host-resident tensors, asked of the monitor on this cadence (and at once
+# after a NaN): the tensor checks have nothing to work with otherwise. A few per round,
+# in rotation, so one look never costs the training thread more than a few small passes.
+TENSOR_PROBE_INTERVAL_SECONDS = 60.0
+TENSOR_PROBE_BATCH = 8
+_TENSOR_META_KEYS = ("shape", "dtype", "device", "elements", "step", "requires_grad")
+
 
 class Schedule:
     """When the brain next looks properly, and why.
@@ -238,7 +252,12 @@ class Brain:
     ) -> None:
         self.directory = os.path.abspath(directory)
         self.reader = stream.StreamReader(self.directory)
-        self.engine = detect.DetectionEngine(sensitivity=sensitivity)
+        # require_new_data and the reading counts passed to update(): a confirmation is a
+        # second look at a new reading of the same variable. Without them a frame for
+        # any other variable re-checked the old one and confirmed what it found -- a
+        # one-reading grad_norm spike, logged in its own frame, became a CRITICAL as
+        # soon as the loss arrived in the next.
+        self.engine = detect.DetectionEngine(sensitivity=sensitivity, require_new_data=True)
         self.schedule = Schedule(os.path.join(self.directory, "schedule.json"))
         self.agent = agent
         self.poll_interval = poll_interval
@@ -248,6 +267,14 @@ class Brain:
         self.histories: Dict[str, List[float]] = {}
         self.tensors: Dict[str, Dict[str, Any]] = {}
         self.tensor_stats: Dict[str, Dict[str, Any]] = {}
+        # Readings taken per scalar, and looks taken per tensor, which the history cap
+        # never undoes: what tells the engine a capped history has new data in it.
+        self.reading_counts: Dict[str, int] = {}
+        self.tensor_counts: Dict[str, int] = {}
+        self.tensor_probe_interval = TENSOR_PROBE_INTERVAL_SECONDS
+        self._last_tensor_probe: Optional[float] = None
+        self._probe_cursor = 0
+        self._probe_now = False
         self.events: List[Dict[str, Any]] = []
         self.step = 0
         self.session: Dict[str, Any] = self.reader.session()
@@ -289,31 +316,51 @@ class Brain:
 
     def _fold(self, frames: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[detect.Finding]]:
         urgent: List[Dict[str, Any]] = []
-        for frame in frames:
+        raised: List[detect.Finding] = []
+        scalar_frames = [i for i, frame in enumerate(frames) if frame.get("kind") == stream.KIND_SCALARS]
+        # Frames before this one are backlog: folded in, and judged together at the next check.
+        check_from = (scalar_frames[-PER_READING_CHECKS]
+                      if len(scalar_frames) > PER_READING_CHECKS else 0)
+        dirty = False
+        for index, frame in enumerate(frames):
             kind = frame.get("kind")
             if kind == stream.KIND_SCALARS:
                 self.step = int(frame.get("step") or self.step)
+                # The monitor marks a value that is the same object read again -- an
+                # epoch-level val_loss sampled forty times an epoch. That is one reading,
+                # and taking each sample for another is how a healthy run read as frozen.
+                repeats = set(frame.get("repeats") or ())
                 for name, value in (frame.get("values") or {}).items():
                     if not isinstance(value, (int, float)) or isinstance(value, bool):
                         continue
+                    if name in repeats and self.histories.get(name):
+                        continue
                     history = self.histories.setdefault(name, [])
                     history.append(float(value))
+                    self.reading_counts[name] = self.reading_counts.get(name, 0) + 1
+                    dirty = True
                     if len(history) > HISTORY_CAP:
                         del history[:-HISTORY_CAP]
+                if dirty and index >= check_from:
+                    raised.extend(self._detect())
+                    dirty = False
             elif kind == stream.KIND_TENSOR:
                 name = frame.get("name")
                 if not name:
                     continue
-                meta = {k: v for k, v in frame.items()
-                        if k in ("shape", "dtype", "device", "elements", "step")}
+                meta = {k: v for k, v in frame.items() if k in _TENSOR_META_KEYS}
                 self.tensors[name] = meta
                 if frame.get("stats"):
                     self.tensor_stats[name] = dict(frame["stats"])
+                self.tensor_counts[name] = self.tensor_counts.get(name, 0) + 1
+                dirty = True
             elif kind == stream.KIND_EVENT:
                 self.events.append(frame)
                 del self.events[:-200]
                 if frame.get("urgent"):
                     urgent.append(frame)
+                    if frame.get("event") == "nonfinite":
+                        self._probe_now = True
                 if frame.get("event") == "finished":
                     self.finished = True
             elif kind == stream.KIND_HELLO:
@@ -321,8 +368,67 @@ class Brain:
             elif kind == stream.KIND_BYE:
                 self.finished = True
 
-        result = self.engine.update(self.histories, step=self.step, tensor_stats=self.tensor_stats)
-        return urgent, result["raised"]
+        if dirty:
+            raised.extend(self._detect())
+        if any(f.check in ("nonfinite", "tensor_nonfinite") for f in raised):
+            self._probe_now = True
+        return urgent, raised
+
+    def _detect(self) -> List[detect.Finding]:
+        counts = dict(self.reading_counts)
+        counts.update(self.tensor_counts)
+        result = self.engine.update(self.histories, step=self.step,
+                                    tensor_stats=self._tensor_view(), counts=counts)
+        return list(result["raised"])
+
+    def _tensor_view(self) -> Dict[str, Dict[str, Any]]:
+        """What the tensor checks are given: the last statistics of each tensor, under
+        the metadata the monitor sends whenever it changes.
+
+        The metadata alone is enough for a dtype or device change, and it arrives without
+        any probe; the statistics (NaN counts, std, all-zero) arrive when asked for. The
+        metadata wins where both say something: statistics describe a host copy in
+        numpy's terms ("float32"), and set beside the tensor's own ("torch.float32") that
+        read as a dtype change on every probe.
+        """
+        view: Dict[str, Dict[str, Any]] = {}
+        for name in set(self.tensors) | set(self.tensor_stats):
+            meta = {k: v for k, v in (self.tensors.get(name) or {}).items()
+                    if k in ("shape", "dtype", "device", "requires_grad") and v is not None}
+            view[name] = dict(self.tensor_stats.get(name) or {}, **meta)
+        return view
+
+    def _maybe_probe_tensors(self, now: Optional[float] = None) -> None:
+        """Ask the monitor for statistics of a few host-resident tensors, if one is due."""
+        if self.finished:
+            return
+        now = time.monotonic() if now is None else now
+        due = (self._probe_now or self._last_tensor_probe is None
+               or now - self._last_tensor_probe >= self.tensor_probe_interval)
+        if not due:
+            return
+        from .pulse_monitor import AUTO_PROBE_MAX_ELEMENTS
+
+        def on_host(meta: Dict[str, Any]) -> bool:
+            device = str(meta.get("device") or "cpu").lower()
+            return device.startswith("cpu") or "/device:cpu" in device
+
+        eligible = sorted(name for name, meta in self.tensors.items()
+                          if on_host(meta) and (meta.get("elements") or 0) <= AUTO_PROBE_MAX_ELEMENTS)
+        if not eligible:
+            return
+        if self._probe_now:
+            names = eligible[:TENSOR_PROBE_BATCH * 4]
+        else:
+            start = self._probe_cursor % len(eligible)
+            names = (eligible[start:] + eligible[:start])[:TENSOR_PROBE_BATCH]
+            self._probe_cursor = start + len(names)
+        self._probe_now = False
+        self._last_tensor_probe = now
+        try:
+            self.reader.send_control(stream.CONTROL_SNAPSHOT, names=names, auto=True)
+        except OSError:
+            pass
 
     # ------------------------------------------------------------------ evidence
 
@@ -505,6 +611,7 @@ class Brain:
         if frames:
             self._last_activity = time.monotonic()
         raised = self.ingest(frames) if frames else []
+        self._maybe_probe_tensors()
         audited = None
         if self.schedule.due() and not self._final_audit_done:
             if not self.finished and not frames:
