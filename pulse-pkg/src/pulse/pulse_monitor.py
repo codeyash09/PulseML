@@ -793,9 +793,35 @@ def detach() -> None:
     _SAMPLER = None
     if monitor is not None:
         try:
+            _final_reading(monitor)
+        except Exception:
+            pass
+        try:
             monitor.close()
         except Exception:
             pass
+
+
+def _final_reading(monitor: "Monitor") -> None:
+    """One last read of the values the run left behind, as it ends.
+
+    The sampler looks a few times a second, so whatever a script computes last -- the final
+    epoch's val_loss, the closing accuracy -- and then exits on was usually never read: every
+    run's last evaluation was missing, and the closing audit said so ("12 epochs, 11 validation
+    points"). A loop at the top level of the script leaves its variables in __main__'s globals,
+    which still exist while the interpreter shuts down. Only variables already being tracked
+    are read, and the repeat rule still applies: an unchanged value is not a new reading.
+    """
+    if getattr(monitor, "training_thread", None) != threading.main_thread().ident:
+        return
+    main = sys.modules.get("__main__")
+    known = set(getattr(monitor, "_last_values", {}) or {})
+    if main is None or not known:
+        return
+    values = {name: value for name, value in vars(main).items() if name in known}
+    if values:
+        monitor._last_sample = 0.0              # past the sampling interval: this one is due
+        monitor.observe_locals(values)
 
 
 def active() -> Optional["Monitor"]:

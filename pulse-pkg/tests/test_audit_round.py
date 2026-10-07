@@ -98,3 +98,54 @@ def test_the_shared_rule_for_what_pulse_acts_on():
     assert detect.acts_on(f("nonfinite", detect.CRITICAL))
     assert not detect.acts_on(f("plateau", detect.WARNING))
     assert not detect.acts_on(f("throughput_stopped", detect.CRITICAL))
+
+
+# ---------------------------------------------------------------- what the evidence says
+
+def test_the_last_value_a_script_computes_before_exiting_is_read(tmp_path):
+    """The sampler looks a few times a second; a final val_loss computed just before the
+    script exits used to be missing from every run (and the closing audit said so)."""
+    import os
+    import subprocess
+    import sys
+    from pulse import pulse_stream as stream
+    script = tmp_path / "train.py"
+    script.write_text(
+        "import time\n"
+        "from pulse import auto_track\n"
+        "auto_track(mode='stream', throttle_interval=0.08)\n"
+        "val_loss = 1.0\n"
+        "loss = 2.0\n"
+        "for i in range(25):\n"
+        "    loss = loss * 0.9\n"
+        "    time.sleep(0.04)\n"
+        "val_loss = 0.123\n")
+    src = os.path.dirname(os.path.dirname(stream.__file__))
+    env = dict(os.environ, PYTHONPATH=src, PULSE_HOME=str(tmp_path / "home"), PULSE_CACHE_DIR=str(tmp_path / "home"))
+    subprocess.run([sys.executable, str(script)], cwd=str(tmp_path), env=env, timeout=120, check=True,
+                   capture_output=True)
+    directory = next(root for root, _d, files in os.walk(tmp_path / ".pulse_stream") if "session.json" in files)
+    seen = []
+    for frame in stream.StreamReader(directory).poll():
+        if frame.get("kind") == stream.KIND_SCALARS and "val_loss" in (frame.get("values") or {}):
+            seen.append(frame["values"]["val_loss"])
+    assert seen and seen[-1] == 0.123, seen
+
+
+def test_a_finished_runs_evidence_gives_its_length_not_the_time_since_it_started():
+    pack = {"step": 300, "elapsed_seconds": 31.2, "finished": True, "session": {"script": "t.py"}}
+    first = brain.Brain.render_evidence(pack).splitlines()[0]
+    assert "31.2s long, finished" in first
+    pack["finished"] = False
+    assert "elapsed, still running" in brain.Brain.render_evidence(pack).splitlines()[0]
+
+
+def test_a_low_risk_audit_problem_is_shown_not_acted_on():
+    from pulse import pulse_console
+    console = pulse_console.Console.__new__(pulse_console.Console)
+    console._diagnosed, diagnosed = set(), []
+    console._diagnose = diagnosed.append
+    console._escalate([], {"audit": {"step": 3, "t": 1.0, "risk": "low", "text": "stopped at step 399 of 400"}})
+    assert diagnosed == []
+    console._escalate([], {"audit": {"step": 4, "t": 2.0, "risk": "high", "text": "lr is 0 from step 13"}})
+    assert len(diagnosed) == 1

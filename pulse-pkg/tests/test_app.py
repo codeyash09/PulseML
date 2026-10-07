@@ -2008,3 +2008,13 @@ def test_an_audit_with_no_readable_verdict_is_still_shown(real_app, tmp_path):
     real_app._open_run(make_run(tmp_path))
     real_app.console._report_audit({"status": None, "text": "decay_steps = epochs: lr is 0 from step 13."})
     assert "no verdict could be read" in text_of(real_app) and "decay_steps" in text_of(real_app)
+
+
+def test_an_audit_problem_rated_low_risk_does_not_start_the_agent(real_app, tmp_path, monkeypatch):
+    real_app._open_run(make_run(tmp_path))
+    real_app._status = "live"
+    seen = []
+    monkeypatch.setattr(real_app, "_on_findings", lambda findings: seen.extend(findings))
+    real_app.console._report_audit({"status": "problem", "risk": "low", "step": 9, "findings": ["step 399 of 400"],
+                                    "text": "The run stopped at step 399."})
+    assert seen == [] and "found a problem" in text_of(real_app)

@@ -2147,7 +2147,9 @@ def _make_console(app: App, session: Dict[str, Any], agent: Optional[Callable[[s
                 app.error("The agent's check found a problem" + (f": {found}" if found else "") + ".")
                 if text:
                     app.say(text)
-                if self is app.console:          # not just a line: the agent takes it on
+                # not just a line: the agent takes it on -- unless the check itself rates it
+                # low risk ("problem, risk low" -- e.g. a cosmetic last-step gap -- is a note)
+                if self is app.console and str(record.get("risk") or "").lower() != "low":
                     with app.lock:
                         app._on_findings([types.SimpleNamespace(
                             check="audit", variable=f"audit@{record.get('step')}", severity="critical",

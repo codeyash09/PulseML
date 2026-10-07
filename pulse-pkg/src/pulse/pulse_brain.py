@@ -204,12 +204,21 @@ You are auditing a training run that Pulse has been watching. Pulse's determinis
 checks have already run over this data and reported what they found (below). Your job \
 is the part they cannot do.
 
-Look at the actual numbers. Do not assume the checks would have caught anything worth \
-catching: they compare each curve against fixed thresholds, one variable at a time. \
-They cannot tell that a loss which is still technically decreasing is decreasing far \
-slower than this architecture should, that two metrics are inconsistent with each \
-other, that a value is plausible but wrong for this model, or that the run is healthy \
-in every way except the one that matters.
+Look at the actual numbers and read the code. Do not assume the checks would have \
+caught anything worth catching: they compare each curve against fixed thresholds, one \
+variable at a time. They cannot read the code, tell that two metrics are inconsistent \
+with each other, that a value is plausible but wrong for this model, or that the run is \
+healthy in every way except the one that matters.
+
+What counts as a problem: something you can point at -- a line of code that is wrong, a \
+value that cannot be right, two numbers that contradict each other -- or harm that is \
+already certain (NaN or exploding weights, a loss that is diverging). A curve that has \
+flattened, is noisier than you expected, or sits higher than you would guess is not a \
+problem by itself: how low a loss can go depends on the data (its noise, how much the \
+classes overlap) and the model's capacity, which you mostly cannot see, and a per-batch \
+loss bounces by design -- judge its trend and the epoch-level metrics. Pulse acts on \
+"problem" at once (the agent is started on the run), so a suspicion without a cause you \
+can name is "watch", with what would settle it.
 
 {evidence}
 
@@ -270,6 +279,7 @@ class Brain:
         self.tensor_stats: Dict[str, Dict[str, Any]] = {}
         # Readings taken per scalar, and looks taken per tensor, which the history cap
         # never undoes: what tells the engine a capped history has new data in it.
+        self._last_frame_t: Optional[float] = None    # wall time of the newest frame read
         self.reading_counts: Dict[str, int] = {}
         self.tensor_counts: Dict[str, int] = {}
         self.tensor_probe_interval = TENSOR_PROBE_INTERVAL_SECONDS
@@ -318,6 +328,8 @@ class Brain:
     def _fold(self, frames: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[detect.Finding]]:
         urgent: List[Dict[str, Any]] = []
         raised: List[detect.Finding] = []
+        if frames and isinstance(frames[-1].get("t"), (int, float)):
+            self._last_frame_t = float(frames[-1]["t"])
         scalar_frames = [i for i, frame in enumerate(frames) if frame.get("kind") == stream.KIND_SCALARS]
         # Frames before this one are backlog: folded in, and judged together at the next check.
         check_from = (scalar_frames[-PER_READING_CHECKS]
@@ -457,7 +469,11 @@ class Brain:
         pack: Dict[str, Any] = {
             "session": {k: self.session.get(k) for k in ("session_id", "script", "pid")},
             "step": self.step,
-            "elapsed_seconds": round(time.time() - float(self.session.get("started") or time.time()), 1),
+            # a finished run's length, not the time since it started: read an hour later, a
+            # 40 s run said "3600 s elapsed", and the audit took it for one crawling along
+            "elapsed_seconds": round((self._last_frame_t if self.finished and self._last_frame_t else time.time())
+                                     - float(self.session.get("started") or time.time()), 1),
+            "finished": bool(self.finished),
             "scalars": curves,
             "tensors": {k: dict(v) for k, v in self.tensors.items()},
             "tensor_stats": {k: dict(v) for k, v in self.tensor_stats.items()},
@@ -487,8 +503,9 @@ class Brain:
     def render_evidence(pack: Dict[str, Any]) -> str:
         """The evidence as text for a prompt: compact, but nothing silently dropped."""
         out: List[str] = []
-        out.append(f"Run: step {pack.get('step')}, {pack.get('elapsed_seconds')}s elapsed, "
-                   f"script {(pack.get('session') or {}).get('script')}")
+        out.append(f"Run: step {pack.get('step')}, {pack.get('elapsed_seconds')}s "
+                   + ("long, finished" if pack.get("finished") else "elapsed, still running")
+                   + f", script {(pack.get('session') or {}).get('script')}")
         if pack.get("stream_gaps"):
             out.append(f"NOTE: {pack['stream_gaps']} sample(s) were dropped under load; "
                        f"the curves below have holes.")

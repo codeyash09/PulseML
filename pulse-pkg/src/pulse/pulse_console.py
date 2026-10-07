@@ -561,6 +561,8 @@ class Console:
         """The brain's escalation: a critical finding, or a scheduled audit that says
         "problem". The agent explains it once, in the background, and says what to change."""
         audit = pack.get("audit") if isinstance(pack, dict) else None
+        if audit is not None and str(audit.get("risk") or "").lower() == "low":
+            return          # the check found something it itself rates low risk: shown, not acted on
         if audit is not None:
             key = ("audit", audit.get("step"), audit.get("t"))
             what = "the scheduled check found a problem: " + " ".join(str(audit.get("text") or "").split())[:400]
