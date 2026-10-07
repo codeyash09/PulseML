@@ -110,10 +110,7 @@ This is Pulse's advantage. For Python code prefer the AST tools over grep:
 # Running things
 run_command runs a real command in the project directory and returns the real stdout/stderr/exit code. Use it for tests, linters, builds, git, and small repro scripts. Commands that delete files, rewrite git history, reach outside the project, start background processes or overwrite files via redirects pause for the user's confirmation; ordinary read/run/test commands do not. A command is killed at its timeout (two minutes unless you pass one), so run_command is NOT how a training run is started.
 
-# Training runs
-start_run starts a script under Pulse: it runs in the background, Pulse watches it (step, every metric's curve, the detectors' findings) and shows it to the user. When the user asks to run, start, launch or train, or to try the change, that is the tool -- not run_command. run_status returns the run's current numbers and findings; restart_run stops the run and starts it again (after a fix); stop_run stops it (the user is asked first).
-
-# Checking your work (do this like a careful engineer, not as an afterthought)
+{runs}# Checking your work (do this like a careful engineer, not as an afterthought)
 - smoke_test is the check to run after you change code. It runs, in order: a compile/undefined-name check of every file you changed, a tiny probe (if you give one), and the project's own test suite. It stops at the first stage that fails and tells you which. Run it before you finish, and again after fixing what it found.
 - A probe is a few lines of Python that build the thing you changed on tiny inputs and run it once: construct the model, make a small synthetic batch (batch size 2-4), run forward, the loss and backward. Torch layers are traced, so a shape mismatch is reported as the exact layer and the shape it received, not a traceback into library code. Pass `expect` to pin down the shapes you rely on, e.g. {"logits": "(B, 10)", "y": "(B,)"}: B must be the same size everywhere. Write a probe whenever your change touches a model, a data pipeline, a loss, or anything with a shape. Never run the full training script as a probe.
 - check_shape answers "what is the shape of X?" with the real value instead of your guess. Use it BEFORE you write code that depends on a shape (a Linear's in_features after a conv stack, what a DataLoader yields, what a function returns), and when a shape error leaves you unsure which side is wrong. It runs a snippet in the project and reports shape, dtype and device of the expressions you name.
@@ -122,6 +119,32 @@ start_run starts a script under Pulse: it runs in the background, Pulse watches 
 # Finishing
 When the work is done and verified, reply with a short summary: what you changed, how you checked it, and anything the user should know. No tool call in a reply means you are finished, so only reply without one when you are.
 """
+
+# Run control exists only inside the Pulse app, which owns the runs on screen. Outside it the
+# tools are not offered at all (offered, every call came back "only available inside the app").
+_RUNS_SECTION = """# Training runs
+start_run starts a script under Pulse: it runs in the background, Pulse watches it (step, every metric's curve, the detectors' findings) and shows it to the user. When the user asks to run, start, launch or train, or to try the change, that is the tool -- not run_command. run_status returns the run's current numbers and findings; restart_run stops the run and starts it again (after a fix); stop_run stops it (the user is asked first).
+
+"""
+_NO_RUNS_SECTION = """# Training runs
+A training run is not started from here: run_command kills anything still going at its timeout. When the user asks to run or train, tell them the command (`pulse run --stream <script>`, or `pulse` to open the Pulse app, where you can start and watch runs), and use run_command only for short, bounded checks.
+
+"""
+_RUN_TOOLS = {"start_run", "run_status", "restart_run", "stop_run"}
+
+
+def _with_runs():
+    host = _ui.host()
+    return host is not None and hasattr(host, "run_actions")
+
+
+def _system_prompt(cli):
+    base = SYSTEM_PROMPT.replace("{runs}", _RUNS_SECTION if _with_runs() else _NO_RUNS_SECTION)
+    return base + (getattr(cli, "_native_prompt_suffix", "") or "")
+
+
+def _tools():
+    return TOOLS if _with_runs() else [t for t in TOOLS if t["function"]["name"] not in _RUN_TOOLS]
 
 # ---------------------------------------------------------------------------------------
 # Tool schemas
@@ -655,7 +678,7 @@ def _t_replace_symbol(state, a):
     if content is None:
         return f"'{a.get('path')}' does not exist, is binary, or is too large."
     if path not in state.seen:
-        return f"Read '{a.get('path')}' (or its outline) with read_file before editing it."
+        return f"Read '{a.get('path')}' with read_file before editing it."
     if state.seen[path] != content:
         state.seen[path] = content
         return f"'{a.get('path')}' has changed on disk since you last read it. Read it again, then redo the edit."
@@ -961,8 +984,17 @@ def _run_action(name, **args):
     return action(**args)
 
 
+def _ran_the_change(state, result):
+    """A run started with the changed code is the check of the change: the "you changed files
+    but have not checked" nudge no longer applies (run_status shows how it does)."""
+    if str(result).startswith(("Started", "Restarted")):
+        state.dirty = False
+    return result
+
+
 def _t_start_run(state, a):
-    return _run_action("start_run", script=str(a.get("script") or ""), args=str(a.get("args") or ""))
+    return _ran_the_change(state, _run_action("start_run", script=str(a.get("script") or ""),
+                                               args=str(a.get("args") or "")))
 
 
 def _t_run_status(state, a):
@@ -970,7 +1002,7 @@ def _t_run_status(state, a):
 
 
 def _t_restart_run(state, a):
-    return _run_action("restart_run")
+    return _ran_the_change(state, _run_action("restart_run"))
 
 
 def _t_stop_run(state, a):
@@ -1181,7 +1213,7 @@ def compact(cli, force=False):
     try:
         with _Spinner("Compacting context"):
             summary = cli._call_model(f"{_pc._SUMMARIZE}\n\n---\n{transcript}", max_tokens=_AGENT_MAX_TOKENS,
-                                      history=[], system=SYSTEM_PROMPT)
+                                      history=[], system=_system_prompt(cli))
     except AgentRequestFailed:
         return False
     cli.native_history[:] = [{"role": "user", "content": f"Summary of the earlier conversation and work:\n{summary.strip()}"}] + keep
@@ -1221,7 +1253,8 @@ def _chat(cli, messages):
     """One completion with tools. Retries transient errors; raises AgentRequestFailed otherwise."""
     model = cli.agent_model_string or PROVIDERS[cli.agent_provider]["model"]
     max_tokens = _clamp_output_tokens(model, _AGENT_MAX_TOKENS)
-    payload = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+    # the app adds what a live run changes (DEBUG_PROMPT_NATIVE) while one is open
+    payload = [{"role": "system", "content": _system_prompt(cli)}] + messages
     last_exc = None
     waiter = _ratelimit.RateLimitWaiter()      # a rate limit is waited out, not counted as an attempt
     attempt = 0
@@ -1229,7 +1262,7 @@ def _chat(cli, messages):
         attempt += 1
         try:
             response = _complete(
-                model=model, messages=payload, tools=TOOLS, tool_choice="auto", max_tokens=max_tokens,
+                model=model, messages=payload, tools=_tools(), tool_choice="auto", max_tokens=max_tokens,
                 timeout=_AGENT_TIMEOUT_SECONDS, api_base=cli.agent_api_base,
                 api_key=(cli.agent_key if cli.agent_key and cli.agent_key != "local" else None))
             cli._record_usage(response)
@@ -1281,19 +1314,23 @@ def _assistant_message(reply):
 # ---------------------------------------------------------------------------------------
 
 
+# phrasings of "I am about to do X" -- not advice ("you can", "I would suggest", "the next
+# step would be"), which is a legitimate way to end an answer
 _INTENT_RE = re.compile(
-    r"(?i)\b(?:let me|let's|i(?:'ll| will| am going to| can| should| need to| would)|next,? i|first,? i|"
-    r"i'?m going to|now i|going to|i will now|we need to|the next step|i(?:'ll| will) (?:start|begin|now))\b")
+    r"(?i)\b(?:let me|let's|i(?:'ll| will| am going to| need to)|next,? i|first,? i|"
+    r"i'?m going to|now i|i will now|i(?:'ll| will) (?:start|begin|now))\b(?! know)")
 
 
 def _nudge(state, reply_text=""):
     """A reason the agent should not stop yet, or None."""
     if (reply_text and not state.calls_made and not state.changes
-            and _INTENT_RE.search(reply_text) and len(reply_text) < 1500):
-        # It announced what it would do and stopped (the tools were not called). Doing is the job.
-        return ("You described what you would do but did not do it. Do it now, in this reply, with the "
-                "tools (read, grep, edit, run_command, start_run...). If the request needs no action, say "
-                "so plainly instead.")
+            and _INTENT_RE.search(reply_text.strip()[-300:]) and len(reply_text) < 1500):
+        # It ended by announcing what it would do and stopped (no tool was called). Doing is
+        # the job. Only the end of the reply counts: an answer that mentions "let me know" or
+        # suggests a next step in its middle is still an answer.
+        return ("Your reply ended by saying what you would do, without doing it. If it needs doing, do it "
+                "now, in this reply, with the tools (read, grep, edit, run_command, start_run...). If that "
+                "reply was your complete answer, repeat it on its own.")
     open_items = [t for t in state.todos if t["status"] != "completed"]
     if open_items:
         return ("You stopped, but your todo list still has unfinished items:\n"
@@ -1301,8 +1338,9 @@ def _nudge(state, reply_text=""):
                 + "\nContinue with them, or update the list if they are no longer needed.")
     if state.dirty:
         if state.smoke_ok is False:
-            return ("Your last smoke_test failed and you have not fixed it. Read what it reported, fix the cause, "
-                    "and run smoke_test again.")
+            return ("Your last smoke_test failed and you have not fixed it. Read what it reported. If your change "
+                    "caused it, fix the cause and run smoke_test again; if the failure is unrelated to your change "
+                    "(a test that was already failing), say so in your final answer instead of fixing it.")
         return ("You changed files but have not checked the result. Run smoke_test now (with a `probe` that builds "
                 "what you changed on a tiny input if it touches a model, data, loss or any shape), and fix any "
                 "failure. If nothing can be run here, say so plainly in your final answer.")

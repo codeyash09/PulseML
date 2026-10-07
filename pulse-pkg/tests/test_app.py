@@ -2002,3 +2002,9 @@ def test_a_serious_finding_off_screen_with_another_run_shown_says_where(real_app
     real_app.parked["train"]["console"]._announce([_finding()])
     assert real_app.session["session_id"] == "evalrun"
     assert sum("needs a look" in e.text for e in real_app.view.entries) == 1 and "/change train.py" in text_of(real_app)
+
+
+def test_an_audit_with_no_readable_verdict_is_still_shown(real_app, tmp_path):
+    real_app._open_run(make_run(tmp_path))
+    real_app.console._report_audit({"status": None, "text": "decay_steps = epochs: lr is 0 from step 13."})
+    assert "no verdict could be read" in text_of(real_app) and "decay_steps" in text_of(real_app)

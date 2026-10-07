@@ -1774,7 +1774,9 @@ SYSTEM_PROMPT = (
     "- Heatmap images (log-scale, dark background) when available — look for banding, dead rows/"
     "columns, saturation, or regions breaking from the surrounding pattern.\n"
     "- Line-numbered training code, only on turns where 'Send Code' is checked.\n\n"
-    "RESPONSE FORMAT (always, in this order):\n"
+    "RESPONSE FORMAT (when you are diagnosing a problem and the current instruction gives no "
+    "format of its own -- a question gets a plain answer, and a step that asks for JSON gets "
+    "only the JSON), in this order:\n"
     "1. **Diagnosis** — one sentence, the specific root cause.\n"
     "2. **Reasoning** — grounded in the actual numbers/image you were given, expressed with real "
     "math. E.g. if gradients have std=142.7, show the update magnitude: $\\Delta w = \\eta \\cdot "
@@ -1890,10 +1892,14 @@ SYSTEM_PROMPT = (
     "    COST: -- running token/cost usage for this chat session's agent calls so far.\n\n"
 
     "CODE FIXES:\n"
-    "If, and only if, the user explicitly asks you to fix, edit, patch, or change the code (not just "
-    "diagnose it) AND training code has been sent this turn, respond with ONLY a single JSON object "
-    "and nothing else -- no prose before or after it, no markdown code fences, no Diagnosis/Reasoning/"
-    "Fix sections.\n"
+    "When a message in this conversation asks you for the edit itself (Pulse's IMPLEMENT step "
+    "says so: the plan is settled, give the change), respond with ONLY a single JSON object and "
+    "nothing else -- no prose before or after it, no markdown code fences, no Diagnosis/Reasoning/"
+    "Fix sections. Copy each `old` snippet from code shown anywhere in this conversation (the "
+    "training code, or VIEW output); if you have not seen the lines you need, VIEW them first. In "
+    "every other turn, follow that turn's own instructions about the shape of your answer (a plan "
+    "ending in CHANGE_NEEDED, a diagnosis, a verdict): the JSON belongs only to the step that "
+    "asks for it.\n"
     "PREFER THE SMALLEST FIX THAT ADDRESSES THE ROOT CAUSE: a single changed line, a changed argument, "
     "a swapped function call, or a few adjacent lines is almost always the right size for a bug fix. "
     "Do not rewrite a function, restructure a class, reformat unrelated code, or 'clean up' anything "
@@ -1924,9 +1930,9 @@ SYSTEM_PROMPT = (
     "  - If the actual bug lives in another file that was sent this turn (e.g. a modularized "
     "project's model.py), fix it there via files[i] rather than working around it in the main "
     "script.\n"
-    "  - If code wasn't sent this turn, or the user hasn't asked for a fix, do not emit this JSON "
-    "format -- answer normally per RESPONSE FORMAT above, and if a fix was requested without code, "
-    "say that checking 'Send Code' is needed first."
+    "  - Outside the step that asks for the edit, do not emit this JSON format. In that step, if "
+    "you have not seen the lines you need to change (in the code shown or in VIEW output), VIEW "
+    "them first rather than guessing at `old`."
 )
 
 # Provider/model choices for the chat panel dropdown. Kept to models that
@@ -5788,6 +5794,11 @@ def _chat_panel_class():
                     + "\n\n(The results of what you checked are above. Continue, or answer.)",
                     max_tokens=_AGENT_MAX_TOKENS)
             change = bool(re.search(r"(?m)^\s*CHANGE_NEEDED\s*$", answer))
+            fix = None if change else self._parse_code_fix(answer)
+            if fix is not None:
+                # it went straight to the edit: a change was asked for (see pulse_cli)
+                change = True
+                answer = str(fix.get("explanation") or "I will make the change.")
             cleaned, *_rest = _extract_directives(answer)
             cleaned, _requests = _extract_new_directives(cleaned)
             text = re.sub(r"(?m)^\s*CHANGE_NEEDED\s*$", "", cleaned).strip()
@@ -5898,8 +5909,13 @@ def _chat_panel_class():
                 fix = self._parse_code_fix(fix_answer)
                 if fix is None:
                     self.after(0, lambda: self._set_stage(None))
-                    full_answer += f"\n\n{fix_answer}"
-                    self.after(0, lambda: self._append("Pulse (3 · Fix)", fix_answer))
+                    # the prompt offers {"no_change": true, "reason": ...}: show it as an answer,
+                    # not as raw JSON (the CLI's parser, as for fixes)
+                    from .pulse_cli import PulseCLI
+                    declined = PulseCLI._parse_no_change(fix_answer, json_only=True)
+                    shown = f"No code change needed: {declined}" if declined is not None else fix_answer
+                    full_answer += f"\n\n{shown}"
+                    self.after(0, lambda t=shown: self._append("Pulse (3 · Fix)", t))
                     self.history.append({"role": "assistant", "content": full_answer})
                     return
 

@@ -444,8 +444,23 @@ def test_a_reply_that_only_announces_a_plan_is_nudged_to_act(cli, monkeypatch):
     monkeypatch.setattr(native.litellm, "completion", completion)
     assert native.run_native_turn(cli, "check lr") == "answered"
     nudge = sent[1]["messages"][-1]["content"]
-    assert "did not do it" in nudge and "tools" in nudge
+    assert "without doing it" in nudge and "tools" in nudge
     assert len(sent) == 3
+
+
+def test_an_answer_that_ends_with_advice_is_not_nudged(cli, monkeypatch):
+    """"I can lower it" / "the next step would be" in an answer is advice, not an announcement;
+    and "let me know" is not "let me"."""
+    for text in ("lr is 0.3 on line 1. If you want, I can lower it -- the next step would be 0.1.",
+                 "lr is 0.3 on line 1, which is fine for this model. Let me know if you want it changed."):
+        sent = []
+
+        def completion(**kw):
+            sent.append(kw)
+            return native_reply(text)
+
+        monkeypatch.setattr(native.litellm, "completion", completion)
+        assert native.run_native_turn(cli, "what is lr?") == "answered" and len(sent) == 1, text
 
 
 def test_a_plain_answer_is_not_nudged(cli, monkeypatch):

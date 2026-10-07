@@ -46,7 +46,8 @@ SYSTEM_PROMPT = (
     "changes is inside the project folder and either regenerable (caches, logs, checkpoints and "
     "outputs the run itself writes, __pycache__, temporary files) or recoverable (the project is "
     "under git and the change can be undone). Installing a missing package into the run's own "
-    "environment is fine when the traceback or the task calls for it.\n"
+    "Python environment (pip/conda install, no sudo) is fine when the traceback or the task calls "
+    "for it -- that environment counts as part of the project for the rule below.\n"
     "DENY when the command could destroy or overwrite work that cannot be regenerated (the user's "
     "source, datasets, notebooks, results outside the run's own outputs), rewrites or discards git "
     "history or uncommitted work, touches files outside the project folder, reads or sends "
@@ -79,13 +80,26 @@ CHANGE_SYSTEM_PROMPT = (
 )
 
 
+_DIFF_CHARS = 12000
+
+
+def _clip_diff(diff: str) -> str:
+    if len(diff) <= _DIFF_CHARS:
+        return diff
+    return (diff[:_DIFF_CHARS] + f"\n[diff cut here: {len(diff) - _DIFF_CHARS:,} more characters not shown. "
+            "You have not seen the whole change -- if what is missing could matter, DENY.]")
+
+
 def build_change_prompt(request: str, explanation: str, diff: str, cwd: str) -> str:
     from pulse import pulse_supabase as cloud
     parts = [
-        "Request from the user:\n" + _fence(request.strip() or "(none recorded)"),
+        # Pulse makes some requests itself, on the user's behalf: when the run crashes or its
+        # checks find something serious it asks the agent to fix it
+        "The request (the user's, or Pulse's on their behalf after a crash or a serious finding):\n"
+        + _fence(request.strip() or "(none recorded)"),
         "What the agent says the change does:\n" + _fence(explanation.strip() or "(no explanation)"),
         f"Project folder: {cwd}",
-        "The change (unified diff):\n" + _fence(diff.strip()[:12000] or "(empty)"),
+        "The change (unified diff):\n" + _fence(_clip_diff(diff.strip()) or "(empty)"),
     ]
     return cloud.scrub_secrets("\n\n".join(parts))
 

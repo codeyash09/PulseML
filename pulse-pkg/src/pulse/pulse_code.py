@@ -240,7 +240,8 @@ _REVISE = (
 
 _REVISE_APPLIED = (
     "Your change has ALREADY been applied to the files, but it has a problem:\n{problem}\n\n"
-    "Respond with ONLY a JSON object in the step 2 format holding just the ADDITIONAL edits needed "
+    "If you need to see the files as they are now, VIEW them first. Then respond with ONLY a JSON "
+    "object in the step 2 format holding just the ADDITIONAL edits needed "
     "on top of the files as they are now: every old[i] must match the current, already-changed "
     "text; do not repeat an edit (or an insertion) that is already in place, and do not create a "
     "file that now exists. No prose, no fences."
@@ -1164,6 +1165,10 @@ def _revise(cli, implement, problem, applied=False):
         prompt += "\n\nThe step 2 instructions, for reference:\n" + implement
     with _Spinner("Revising"):
         raw = cli._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS)
+    # step 2's instructions (and so this revision) allow VIEW:/GREP: to see the current text
+    # before quoting it: service them, as step 2 itself does
+    if parse_change(cli, raw) is None:
+        raw = _tool_rounds(cli, raw, prompt)
     return parse_change(cli, raw)
 
 
