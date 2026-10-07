@@ -262,7 +262,13 @@ def records_every_tick(name: str) -> bool:
     """
     if looks_like_loss(name) or looks_like_metric(name):
         return False
-    if looks_like_counter(name):
+    # A learning rate held by the optimizer and a class count are configured objects
+    # too: `lr = opt.param_groups[0]["lr"]` is the same float every step until the
+    # schedule moves it, and `num_classes = 10` is the cached small int. Recorded only
+    # when they changed, the LR had two readings at its first jump (lr_jump needs
+    # three) and the class count had one (chance_level needs it among the series
+    # with eight), so neither check could fire on the CLI path.
+    if looks_like_counter(name) or looks_like_lr(name) or looks_like_class_count(name):
         return True
     padded = "_" + re.sub(r"[^a-z0-9]+", "_", _lower(name)).strip("_") + "_"
     return any(f"_{key}_" in padded for key in DetectionEngine.SANE_RANGES)
@@ -380,6 +386,34 @@ def thresholds(sensitivity: float) -> Dict[str, float]:
         "relation_tolerance": 0.10 - 0.07 * s,      # perplexity vs exp(loss), etc.
         "component_share_floor": 0.15 - 0.08 * s,   # share of the objective a term has left
     }
+
+
+# The named settings of the dial, as /sensitivity and pulse_config.json spell them.
+SENSITIVITY_PRESETS = {
+    "loosest": 0.0, "quiet": 0.0,
+    "loose": 0.2,
+    "default": 0.3,
+    "medium": 0.5, "normal": 0.5,
+    "tight": 0.75,
+    "tightest": 1.0, "twitchy": 1.0,
+}
+
+
+def parse_sensitivity(value: Any, default: float = 0.3) -> float:
+    """A configured sensitivity -- a number or a preset name -- as a 0..1 dial."""
+    if isinstance(value, bool) or value is None:
+        return default
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        text = str(value).strip().lower()
+        if text in SENSITIVITY_PRESETS:
+            return SENSITIVITY_PRESETS[text]
+        try:
+            number = float(text)
+        except ValueError:
+            return default
+    return min(1.0, max(0.0, number)) if math.isfinite(number) else default
 
 
 class Finding:
@@ -1198,7 +1232,17 @@ class DetectionEngine:
         # half the compute has still gone nowhere.
         if looks_like_waste(name):
             share = _mean(recent)
-            if share > t["waste_fraction"] and share > early * 1.5:
+            if 0.98 <= share <= 1.0 + 1e-9 and _stdev(recent) < 1e-9:
+                # Pinned at its ceiling every step -- a clip that is always active is not
+                # protecting the run, it is setting the step size. Asked first: the
+                # waste fraction is at most 0.5, so behind the two tests below this
+                # could only answer for readings 8 to 11, after which a value pinned at
+                # 1.0 was reported as "high for the whole run" instead.
+                out.append(Finding("waste_pinned", name, WARNING,
+                                   f"{name} is pinned at {share:.3g} on every reading: it is not "
+                                   f"an exception any more, it is the normal path",
+                                   step, {"value": share}, 0.8))
+            elif share > t["waste_fraction"] and share > early * 1.5:
                 out.append(Finding("waste_rising", name, WARNING,
                                    f"{name} has risen to {share:.3g} (from {early:.3g}): that share "
                                    f"of every batch is not training the model",
@@ -1208,13 +1252,6 @@ class DetectionEngine:
                                    f"{name} has been {share:.3g} for the whole run: that share of "
                                    f"every batch is being thrown away, steadily",
                                    step, {"share": share}, 0.7))
-            elif share >= 0.98 and _stdev(recent) < 1e-9:
-                # Pinned at its ceiling every step -- a clip that is always active is not
-                # protecting the run, it is setting the step size.
-                out.append(Finding("waste_pinned", name, WARNING,
-                                   f"{name} is pinned at {share:.3g} on every reading: it is not "
-                                   f"an exception any more, it is the normal path",
-                                   step, {"value": share}, 0.8))
 
         # Hardware that is idle, and a pipeline that has stopped feeding it.
         if looks_like_utilisation(name) and early > 0 and late < early * t["utilisation_floor"]:

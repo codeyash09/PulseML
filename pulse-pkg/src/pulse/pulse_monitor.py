@@ -37,9 +37,16 @@ import threading
 import re
 import time
 import uuid
+import weakref
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from . import pulse_stream as stream
+from .pulse_detect import records_every_tick
+
+# What the brain may ask for statistics of by itself (a periodic look, or a look after a
+# NaN): host-resident and no bigger than this. Anything else is answered only when a
+# person asked for it, because the statistics are computed here, on the training thread.
+AUTO_PROBE_MAX_ELEMENTS = 4_000_000
 
 # Values that are worth a device sync to read, in elements.
 _SMALL_ELEMENT_LIMIT = 4
@@ -185,6 +192,9 @@ def _describe(value: Any) -> Optional[Dict[str, Any]]:
         meta["dtype"] = str(dtype)
     if device is not None:
         meta["device"] = str(device)
+    requires_grad = getattr(value, "requires_grad", None)
+    if isinstance(requires_grad, bool):
+        meta["requires_grad"] = requires_grad
     elements = 1
     for dim in dims:
         elements *= dim
@@ -243,6 +253,10 @@ class Monitor:
         self._known_tensors: Dict[str, Dict[str, Any]] = {}
         self._requested: set = set()        # names the brain asked to see in full
         self._pending_probe: List[str] = []
+        self._auto_probe: set = set()       # of those, the ones the brain asked for unprompted
+        # name -> (the object last read, the step it was read at): what tells a new reading
+        # from the same one read again. See _is_repeat.
+        self._sources: Dict[str, Tuple[Any, int]] = {}
         self._paused = False
         self._on_pause = on_pause
         self._stop_requested = False
@@ -306,6 +320,7 @@ class Monitor:
             self.step = _infer_step(local_vars, self.step + 1)
 
         scalars: Dict[str, Any] = {}
+        repeats: List[str] = []
         tripwires: List[Tuple[str, float]] = []
         tensor_due = (now - self._last_tensor_sample) >= self.tensor_interval
 
@@ -319,6 +334,12 @@ class Monitor:
                 # becomes invisible: "this value has not moved in six readings" is the
                 # signal, and it cannot be reconstructed from a stream that only carries
                 # changes. A float a few times a second is not worth the blind spot.
+                # But a repeat is only a *reading* if the loop produced it again; the
+                # ones that are the same object read twice are marked, so the brain does
+                # not take an epoch-level val_loss, sampled forty times an epoch, for a
+                # loss that froze.
+                if self._is_repeat(name, value, number):
+                    repeats.append(name)
                 scalars[name] = number
                 self._last_values[name] = number
                 if not math.isfinite(number):
@@ -335,7 +356,10 @@ class Monitor:
         if tensor_due:
             self._last_tensor_sample = now
         if scalars:
-            self.writer.emit(stream.KIND_SCALARS, {"step": self.step, "values": scalars})
+            frame: Dict[str, Any] = {"step": self.step, "values": scalars}
+            if repeats:
+                frame["repeats"] = repeats
+            self.writer.emit(stream.KIND_SCALARS, frame)
         for name, number in tripwires:
             # A non-finite loss is the one thing worth interrupting for: the brain may
             # be asleep, and every further step is wasted compute.
@@ -376,6 +400,7 @@ class Monitor:
                 self.writer.emit(stream.KIND_TENSOR, dict(meta, name=name, step=self.step))
             return
         self._last_values[name] = number
+        self._remember_source(name, value)          # asked for explicitly: always a reading
         self.writer.emit(stream.KIND_SCALARS, {"step": self.step, "values": {name: number}})
         if not math.isfinite(number):
             self.writer.emit(stream.KIND_EVENT, {
@@ -383,6 +408,37 @@ class Monitor:
                 "value": "nan" if math.isnan(number) else ("inf" if number > 0 else "-inf"),
                 "step": self.step, "urgent": True,
             })
+
+    def _is_repeat(self, name: str, value: Any, number: float) -> bool:
+        """Is this sample the reading already sent, read again?
+
+        The same rule as the CLI's detector history: a value equal to the last one is a
+        new reading when the loop made it again (a new object -- a stuck loss recomputed
+        every step to the same number), and the same reading when it is the object that
+        was there last time (an epoch-level val_loss nobody has reassigned). A counter, a
+        configured constant or a learning rate is the same object for as long as it does
+        not change, so for those every sample on which the run itself moved on counts.
+        """
+        previous = self._sources.get(name)
+        last = self._last_values.get(name)
+        same_value = last is not None and (last == number or (last != last and number != number))
+        if previous is not None and same_value:
+            held, at_step = previous
+            held_object = held() if isinstance(held, weakref.ref) else held
+            if held_object is value and not (at_step != self.step and records_every_tick(name)):
+                return True
+        self._remember_source(name, value)
+        return False
+
+    def _remember_source(self, name: str, value: Any) -> None:
+        # Weakly: holding a loss tensor would keep its autograd graph alive. A float or a
+        # numpy scalar cannot be weakly referenced and is a few bytes, so it is held --
+        # which also stops its id being reused by the next float.
+        try:
+            held: Any = weakref.ref(value)
+        except TypeError:
+            held = value if isinstance(value, (int, float)) or getattr(value, "shape", None) == () else None
+        self._sources[name] = (held, self.step)
 
     def event(self, name: str, **fields: Any) -> None:
         """Report something that is not a number: a crash, a phase change, a lint finding."""
@@ -396,12 +452,23 @@ class Monitor:
         This is the only place the monitor touches bulk data, it happens because the
         brain explicitly asked, and the reference is dropped before we return.
         """
-        names, self._pending_probe = self._pending_probe, []
+        names, self._pending_probe = list(dict.fromkeys(self._pending_probe)), []
+        auto, self._auto_probe = self._auto_probe, set()
         for name in names:
-            value = local_vars.get(name)
+            value = original = local_vars.get(name)
             if value is None:
                 self.writer.emit(stream.KIND_EVENT, {"event": "probe_missing", "name": name})
                 continue
+            if name in auto:
+                # Nobody asked for this one; the brain looks on a schedule. That must not
+                # cost the training thread a device sync or a pass over a huge tensor:
+                # use the host mirror the code keeps, if it keeps one, or skip it.
+                if _on_accelerator(value) and not _GPU_READS:
+                    value = _cpu_mirror(name, local_vars)
+                meta = _describe(value) if value is not None else None
+                if meta is None or meta.get("elements", 0) > AUTO_PROBE_MAX_ELEMENTS:
+                    self.writer.emit(stream.KIND_EVENT, {"event": "probe_skipped", "name": name})
+                    continue
             try:
                 from . import pulse_backend as backend
                 stats = backend.statistics(value)
@@ -413,7 +480,9 @@ class Monitor:
                 "name": name, "step": self.step, "stats": {
                     key: (float(val) if isinstance(val, (int, float)) and not isinstance(val, bool) else val)
                     for key, val in dict(stats).items()},
-                **(_describe(value) or {}),
+                # The tensor's own shape, dtype and device, even when the numbers came
+                # from its host mirror: the mirror being on the CPU is not the tensor moving.
+                **(_describe(original) or {}),
             })
 
     def _handle_control(self) -> None:
@@ -434,7 +503,12 @@ class Monitor:
     def _handle_message(self, message: Dict[str, Any]) -> None:
         action = message.get("action")
         if action == stream.CONTROL_SNAPSHOT:
-            self._pending_probe.extend(str(n) for n in _names(message))
+            names = [str(n) for n in _names(message)]
+            self._pending_probe.extend(names)
+            if message.get("auto"):
+                self._auto_probe.update(names)
+            else:
+                self._auto_probe.difference_update(names)    # someone asked: answer in full
         elif action == stream.CONTROL_TRACK:
             for name in _names(message):
                 self._requested.add(str(name))

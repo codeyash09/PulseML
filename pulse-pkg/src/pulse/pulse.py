@@ -325,6 +325,36 @@ def _finite_number(v) -> bool:
         return False
 
 
+def _configured_sensitivity(script_path=None, default=0.3):
+    """The detector sensitivity set in pulse_config.json -- the same file, found the same
+    way, that the CLI reads its `sensitivity` from -- or PULSE_SENSITIVITY. The dashboard
+    used a fixed 0.3 (and a fixed 5x spike multiplier) whatever the run was configured with."""
+    env = os.environ.get("PULSE_SENSITIVITY", "").strip()
+    if env:
+        return _pulse_detect.parse_sensitivity(env, default)
+    configured = os.environ.get("PULSE_CONFIG", "").strip()
+    candidates = [configured] if configured else []
+    if script_path:
+        directory = os.path.dirname(os.path.abspath(script_path))
+        candidates += [os.path.join(directory, "pulse_config.json"), os.path.join(directory, "pulse_config")]
+    candidates += [os.path.join(os.getcwd(), "pulse_config.json"), os.path.join(os.getcwd(), "pulse_config")]
+    for path in candidates:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            return default
+        if not isinstance(raw, dict):
+            return default
+        for key, value in raw.items():
+            if re.sub(r"[^a-z0-9]+", "_", str(key).strip().lower()).strip("_") == "sensitivity":
+                return _pulse_detect.parse_sensitivity(value, default)
+        return default
+    return default
+
+
 def _values_equal(a, b) -> bool:
     """NaN-safe / None-safe equality, used when deciding whether a scalar's
     value actually changed since the last recorded point. `nan != nan` is
@@ -6444,7 +6474,10 @@ class Dashboard:
         # spiking well above its recent range) and, if so, pause training
         # (via the same control_queue used for ADD_VAR) and automatically
         # ask the agent to diagnose -- and if it can, fix -- it.
-        self.explosion_multiplier = 5.0
+        # The dial the run was configured with; the spike multiplier is derived from it
+        # unless something pins it (None: derived).
+        self.sensitivity = _configured_sensitivity(script_path)
+        self.explosion_multiplier = None
         self.is_paused = False
         self._last_intervention_signature = None
 
@@ -6711,55 +6744,57 @@ class Dashboard:
 
     def _check_for_trouble(self, manifest):
         """Look at the current manifest for signs training is going bad.
-        Returns a short human-readable description, or None. Mirrors the
-        CLI's PulseCLI._check_for_trouble, adapted to what's actually
-        available here -- a per-variable `stats` dict with `latest_value`
-        and a short `recent` window, not PulseCLI's full unbounded
-        per-step history -- so these checks are necessarily coarser than
-        their CLI counterparts, but catch the same broad classes of
-        problem:
-        - non-finite scalar values (unambiguous trigger)
-        - a loss-like scalar spiking to explosion_multiplier-x its own
-          recent minimum
-        - a loss/metric frozen bit-for-bit across the whole `recent`
-          window (not just slow-moving -- something not actually running)
-        - a grad/weight-norm scalar spiking (exploding) or collapsing
-          toward zero (vanishing) relative to its own recent average
-        - a learning-rate scalar jumping >=10x between its last two
-          observations (scheduler misconfiguration)
-        - a metric hitting (near-)perfect accuracy within its first
-          couple of observations (classic data-leakage shape)
-        Also flags any matrix/tensor (track or lotrack) whose latest
-        stats show nan/inf.
+        Returns a short human-readable description, or None. Runs the same
+        DetectionEngine as PulseCLI._check_for_trouble over what the manifest
+        carries: each scalar's bounded (step, value) history and each tensor's
+        full statistics. The manifest history keeps only changes, so a value
+        frozen bit-for-bit adds no points and `frozen` cannot be seen here.
         """
         histories = {}
         tensor_stats = {}
+        counts = {}
         for name, stats in manifest.items():
             if not isinstance(stats, dict) or "error" in stats:
                 continue
             if stats.get("kind") != "scalar":
-                nan = stats.get("nan", 0) or 0
-                inf = stats.get("inf", 0) or 0
-                if nan or inf:
-                    tensor_stats[name] = {"nan": nan, "inf": inf}
+                # Everything statistics() measured, not just the NaN and Inf counts: the
+                # std, the all-zero test, the dtype and the device are tensor checks too.
+                view = {k: v for k, v in stats.items()
+                        if k not in ("image", "state", "updated", "history", "recent")}
+                if view:
+                    tensor_stats[name] = view
+                    updated = stats.get("updated")
+                    if isinstance(updated, (int, float)):
+                        counts[name] = int(updated * 1000)   # each probe is a new look
                 continue
-            recent = list(stats.get("recent") or [])
+            # The manifest's bounded (step, value) history, not the 20-value `recent`
+            # window: in twenty readings every gentle descent looks like "no better than
+            # when it started", and checks that need more than twenty never ran at all.
+            values = [point[1] for point in (stats.get("history") or [])
+                      if isinstance(point, (list, tuple)) and len(point) == 2]
+            if not values:
+                values = list(stats.get("recent") or [])
             latest = stats.get("latest_value")
-            # `recent` is mirrored into the manifest a beat before latest_value is
+            # The history is mirrored into the manifest a beat before latest_value is
             # written, so the newest reading can be missing from it.
-            if latest is not None and (not recent or recent[-1] != latest):
-                recent.append(latest)
-            if recent:
-                histories[name] = recent
+            if latest is not None and (not values or not _values_equal(values[-1], latest)):
+                values.append(latest)
+            if values:
+                histories[name] = values
 
         engine = getattr(self, "_detector", None)
         if engine is None:
-            engine = _pulse_detect.DetectionEngine(sensitivity=0.3)
+            # require_new_data: this re-reads the same manifest every REFRESH_MS, and the
+            # same data seen twice is not a confirmation of anything.
+            engine = _pulse_detect.DetectionEngine(sensitivity=getattr(self, "sensitivity", 0.3),
+                                                   require_new_data=True)
             self._detector = engine
+        engine.sensitivity = getattr(self, "sensitivity", 0.3)
         engine.overrides = ({"explosion_multiplier": self.explosion_multiplier}
                             if getattr(self, "explosion_multiplier", None) else {})
         try:
-            raised = engine.update(histories, tensor_stats=tensor_stats or None)["raised"]
+            raised = engine.update(histories, tensor_stats=tensor_stats or None,
+                                   counts=counts)["raised"]
         except Exception as exc:
             _pulse_log(f"GUI DETECTOR ERROR {type(exc).__name__}: {exc}")
             return None
