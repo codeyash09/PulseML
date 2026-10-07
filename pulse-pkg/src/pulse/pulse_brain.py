@@ -609,9 +609,22 @@ def parse_decision(answer: str) -> Dict[str, Any]:
     return {}
 
 
+# Room for the answer AND the thinking before it: a reasoning model (DeepSeek V4, o-series,
+# Claude with thinking) counts its reasoning against max_tokens, and at 4,000 it spent all of
+# it thinking about an audit's evidence and returned an empty answer -- every scheduled check
+# paid for and silently recorded as "no verdict". The same budget the agent's own calls get.
+AGENT_MAX_TOKENS = 32000
+
+
+class EmptyAnswer(RuntimeError):
+    """The model returned no answer text (it ran out of tokens while thinking, or refused)."""
+
+
 def build_litellm_agent(model: str, api_key: Optional[str] = None, api_base: Optional[str] = None,
-                        max_tokens: int = 4000, timeout: float = 300.0) -> Callable[[str], str]:
-    """An agent callable backed by litellm, for running the brain standalone."""
+                        max_tokens: int = AGENT_MAX_TOKENS, timeout: float = 300.0) -> Callable[[str], str]:
+    """An agent callable backed by litellm, for running the brain standalone. An empty answer
+    raises EmptyAnswer rather than returning "": a caller that parses "" sees no verdict and
+    cannot tell that apart from a model that looked and had nothing to say."""
     if not api_key:
         # An openrouter/ model with no key given: the environment's, else the key from
         # `pulse openrouter` (litellm itself only knows about the environment).
@@ -628,7 +641,13 @@ def build_litellm_agent(model: str, api_key: Optional[str] = None, api_base: Opt
             **({"api_key": api_key} if api_key else {}),
             **({"api_base": api_base} if api_base else {}),
         )
-        return (response.choices[0].message.content or "").strip()
+        text = (response.choices[0].message.content or "").strip()
+        if not text:
+            finish = getattr(response.choices[0], "finish_reason", None)
+            raise EmptyAnswer("the model gave no answer" + (
+                f" (it used its whole {max_tokens:,}-token budget, most likely thinking)" if finish == "length"
+                else f" (finish reason: {finish})" if finish else ""))
+        return text
     ask.model = model                # what this agent thinks with, for whoever is handed it
     return ask
 

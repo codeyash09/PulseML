@@ -101,7 +101,7 @@ def review_change(settings: "ApproverSettings", request: str, explanation: str, 
     last_error = "no answer"
     for _attempt in range(2):
         try:
-            response = completion(model=settings.model, messages=messages, max_tokens=4000,
+            response = completion(model=settings.model, messages=messages, max_tokens=APPROVER_MAX_TOKENS,
                                   timeout=APPROVER_TIMEOUT_SECONDS, api_key=settings.api_key,
                                   api_base=settings.api_base)
             content = (response.choices[0].message.content or "").strip()
@@ -216,6 +216,11 @@ _DENY_RE = re.compile(r"^[\s>*_`#-]*(?:DENY|DENIED)\b[\s*_`]*[:\-—–]?\s*(.*)
                       re.IGNORECASE | re.MULTILINE)
 
 
+# A reasoning model spends tokens thinking before its one-line verdict; at 4,000 a long diff
+# could use them all and return nothing (then the person is asked after all).
+APPROVER_MAX_TOKENS = 16000
+
+
 def parse(answer: Optional[str]) -> Decision:
     """The verdict line. Fails closed: an answer with both an APPROVE line and a DENY line,
     or with neither in the asked-for shape, is unreadable (the caller falls back to asking
@@ -243,7 +248,7 @@ def ask(settings: ApproverSettings, command: str, why: str, cwd: str, purpose: s
     last_error = "no answer"
     for _attempt in range(2):          # an empty reply from a reasoning model gets one retry
         try:
-            response = completion(model=settings.model, messages=messages, max_tokens=4000,
+            response = completion(model=settings.model, messages=messages, max_tokens=APPROVER_MAX_TOKENS,
                                   timeout=APPROVER_TIMEOUT_SECONDS, api_key=settings.api_key,
                                   api_base=settings.api_base)
             content = (response.choices[0].message.content or "").strip()
