@@ -6620,7 +6620,9 @@ class Dashboard:
         manifest = self._load_manifest()
         self._manifest = manifest
 
-        if self.auto_intervene.get() and not self.is_paused:
+        # Detection runs whether or not Auto-fix is ticked (unticked, nothing was even
+        # computed); the box only decides whether Pulse acts on what it finds.
+        if not self.is_paused:
             problem = self._check_for_trouble(manifest)
             _pulse_log(
                 f"GUI AUTO_GATE enabled={self.auto_intervene.get()} paused={self.is_paused} "
@@ -6629,7 +6631,11 @@ class Dashboard:
             )
             if problem and problem != self._last_intervention_signature:
                 self._last_intervention_signature = problem
-                self._trigger_auto_intervention(problem)
+                if self.auto_intervene.get():
+                    self._trigger_auto_intervention(problem)
+                else:
+                    self.chat_panel.after(0, lambda m=problem: self.chat_panel._append(
+                        "Pulse", f"⚠ CRITICAL: {m}  (Auto-fix is off: tick it to let the agent act)"))
 
         for name, stats in sorted(manifest.items()):
             if name in self.hidden_tiles:
@@ -6800,7 +6806,17 @@ class Dashboard:
             return None
         actionable = [f for f in raised
                       if f.severity in (_pulse_detect.CRITICAL, _pulse_detect.WARNING)]
-        return "; ".join(f.message for f in actionable) if actionable else None
+        # The rule every path shares (pulse_detect.acts_on): a critical finding is acted on;
+        # a warning is shown in the chat, once, and the run goes on.
+        shown = self.__dict__.setdefault("_findings_shown", set())
+        for finding in actionable:
+            key = (finding.check, finding.variable)
+            if not _pulse_detect.acts_on(finding) and key not in shown:
+                shown.add(key)
+                self.chat_panel.after(0, lambda m=finding.message, s=finding.severity: self.chat_panel._append(
+                    "Pulse", f"⚠ {s.upper()}: {m}"))
+        acting = [f for f in actionable if _pulse_detect.acts_on(f)]
+        return "; ".join(f.message for f in acting) if acting else None
 
     def _trigger_auto_intervention(self, problem):
         """Pause the user's training loop and hand the problem to the agent.

@@ -204,7 +204,14 @@ def make_cli():
     cli._maybe_periodic_checkin = lambda: None
     cli._prime_with_agent_if_needed = lambda: None
     problems = []
-    cli._escalate_training_problem = lambda problem: problems.append(problem) if problem else None
+    # what the detector found, acted on or only shown (pulse_detect.acts_on decides which)
+    act = cli._act_on_detection
+
+    def record(problem):
+        problems.extend(f.message for f in (cli._last_detector_findings or []))
+        act(problem)
+    cli._act_on_detection = record
+    cli._escalate_training_problem = lambda problem: None
     return cli, problems
 
 
