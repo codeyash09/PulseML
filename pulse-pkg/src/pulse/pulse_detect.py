@@ -388,6 +388,34 @@ def thresholds(sensitivity: float) -> Dict[str, float]:
     }
 
 
+# The named settings of the dial, as /sensitivity and pulse_config.json spell them.
+SENSITIVITY_PRESETS = {
+    "loosest": 0.0, "quiet": 0.0,
+    "loose": 0.2,
+    "default": 0.3,
+    "medium": 0.5, "normal": 0.5,
+    "tight": 0.75,
+    "tightest": 1.0, "twitchy": 1.0,
+}
+
+
+def parse_sensitivity(value: Any, default: float = 0.3) -> float:
+    """A configured sensitivity -- a number or a preset name -- as a 0..1 dial."""
+    if isinstance(value, bool) or value is None:
+        return default
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        text = str(value).strip().lower()
+        if text in SENSITIVITY_PRESETS:
+            return SENSITIVITY_PRESETS[text]
+        try:
+            number = float(text)
+        except ValueError:
+            return default
+    return min(1.0, max(0.0, number)) if math.isfinite(number) else default
+
+
 class Finding:
     """One thing a check believes about one variable, with the evidence attached."""
 
