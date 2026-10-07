@@ -119,6 +119,7 @@ _STATUS_STYLE = {"live": "accent", "stalled": "bold", "crashed": "red"}
 # what makes up the run the app is looking at; a parked run keeps them in App.parked
 _WATCH_FIELDS = ("console", "session", "_monitor", "runlog", "_status", "_rate", "_rate_at",
                  "_stall_said", "_paused_here")
+_STATUS_PATIENCE_SECONDS = 10.0   # run_status asked again sooner than this waits for progress
 _AUTO_CRASH_TURNS = 3       # crashes in a row the agent starts on by itself, before the person is asked
 _RUN_LOG_DIR = "app-runs"
 
@@ -627,6 +628,19 @@ class App:
     def _agent_run_status(self) -> str:
         if self.console is None:
             return "No run is open. /monitor (the person) or start_run (you) opens one."
+        # Asked again within seconds -- an agent waiting for a restarted run to get somewhere
+        # called this every second, a model call each time. A repeat waits for progress first.
+        now = time.monotonic()
+        last = getattr(self, "_status_asked_at", None)
+        if last is not None and now - last < _STATUS_PATIENCE_SECONDS:
+            step = int(getattr(self.console.brain, "step", 0) or 0)
+            deadline = now + _STATUS_PATIENCE_SECONDS
+            while time.monotonic() < deadline and self._status in ("live", "stalled") \
+                    and int(getattr(self.console.brain, "step", 0) or 0) < step + 50:
+                time.sleep(0.5)
+                with self.lock:
+                    self._poll_status()
+        self._status_asked_at = time.monotonic()
         return self._evidence()
 
     def tool(self, calls: List[str], output: str, said: str = "") -> None:

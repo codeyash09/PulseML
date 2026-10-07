@@ -7489,6 +7489,11 @@ def _stream_mode_requested(mode):
         os.environ.get("PULSE_MODE", "").strip().lower() == "stream"
 
 
+def _headless_mode_requested(mode):
+    return str(mode or "").strip().lower() == "headless" or \
+        os.environ.get("PULSE_MODE", "").strip().lower() == "headless"
+
+
 def _app_mode_requested(mode):
     return str(mode or "").strip().lower() == "app" or \
         os.environ.get("PULSE_MODE", "").strip().lower() == "app"
@@ -7651,7 +7656,7 @@ def auto_track(train_fn=None, throttle_interval=1.0, code_text=None, project_roo
         # terminal that can show the Pulse app gets it ("app"); anywhere else
         # (a notebook, nohup, a log file) stays with the line-by-line "cli".
         env_mode = os.environ.get("PULSE_MODE", "").strip().lower()
-        mode = env_mode if env_mode in ("ui", "cli", "auto", "stream", "app") else _default_mode()
+        mode = env_mode if env_mode in ("ui", "cli", "auto", "stream", "app", "headless") else _default_mode()
 
     # Marked only for as long as a session is actually starting: a first call
     # that fails (the Tk setup dialog over SSH raises) or is cancelled must not
@@ -7678,6 +7683,12 @@ def _auto_track_session(caller_frame, train_fn, throttle_interval, code_text, pr
 
     if _stream_mode_requested(mode):
         return _start_stream_monitor(caller_frame, throttle_interval)
+    if _headless_mode_requested(mode):
+        # the light monitor here, and a detached debugger watching it (pulse_headless)
+        monitor = _start_stream_monitor(caller_frame, throttle_interval, quiet=True)
+        from . import pulse_headless
+        pulse_headless.attach_in_background(monitor)
+        return monitor
     if _app_mode_requested(mode):
         started = _start_app(caller_frame, throttle_interval)
         if started is not None:

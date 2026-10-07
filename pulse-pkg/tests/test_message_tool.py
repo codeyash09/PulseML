@@ -384,6 +384,7 @@ def test_run_tools_outside_the_app_say_so(cli):
 
 
 def test_run_status_and_restart_go_through_the_open_run(cli, tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "_STATUS_PATIENCE_SECONDS", 0.0)    # asked twice at once below
     app = appmod.App(cli, cli._project_root)
     assert "No run is open" in app._agent_run_status()
     assert "No run is open" in app._agent_restart_run()

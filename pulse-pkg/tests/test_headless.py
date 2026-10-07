@@ -1,180 +1,124 @@
-"""Pulse has to import on a machine with no GUI toolkit.
-
-tkinter is not a pip package: it comes with the interpreter on desktop installs and is
-absent from most server and container images, including a plain `apt install python3`
-box. Importing it at module scope made `import pulse` fail outright on exactly the
-machines Pulse is written for -- a headless GPU box, a container, an SSH session --
-even though those runs never open a window.
-"""
+"""Headless mode (pulse_headless): Pulse debugs a run by itself, in the background."""
+import json
 import os
-import shutil
-import site
 import subprocess
 import sys
-import tempfile
-import textwrap
-import unittest
+import time
+import types
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(os.path.dirname(HERE), "src")
+import pytest
 
-# Refuse to import tkinter (and the PIL bridge that needs it), then import Pulse.
-PRETEND_NO_TKINTER = textwrap.dedent("""\
-    import sys
-
-    class Blocker:
-        BLOCKED = ("tkinter", "PIL.ImageTk")
-
-        def find_spec(self, fullname, path=None, target=None):
-            if fullname in self.BLOCKED or fullname.startswith("tkinter."):
-                raise ImportError(f"No module named {fullname!r} (blocked by the test)")
-            return None
-
-    sys.meta_path.insert(0, Blocker())
-    for name in list(sys.modules):
-        if name == "tkinter" or name.startswith("tkinter."):
-            del sys.modules[name]
-
-    import pulse
-    import pulse.pulse as core
-    print("IMPORT_OK", pulse.__version__)
-    print("HAS_TK", core.HAS_TK)
-    print("MODE", core._determine_mode("auto"))
-    print("AUTO_TRACK", callable(pulse.auto_track))
-""")
+from pulse import cli as cli_mod
+from pulse import pulse_app as appmod
+from pulse import pulse_headless as headless
+from pulse import pulse_supabase as cloud
+from pulse import pulse_tui as tui
 
 
-def run(code):
-    env = dict(os.environ,
-               PYTHONPATH=os.pathsep.join(
-                   p for p in (SRC, site.getusersitepackages(),
-                               os.environ.get("PYTHONPATH", "")) if p),
-               PULSE_LOGGING="0", NO_COLOR="1")
-    return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
-                          env=env, timeout=300)
+@pytest.fixture(autouse=True)
+def home(tmp_path, monkeypatch):
+    monkeypatch.setattr(cloud, "CACHE_PATH", tmp_path / "pulsehome" / "credentials.json")
+    return tmp_path / "pulsehome"
 
 
-class HeadlessImportTest(unittest.TestCase):
-    def test_pulse_imports_without_tkinter(self):
-        result = run(PRETEND_NO_TKINTER)
-        self.assertIn("IMPORT_OK", result.stdout,
-                      "import pulse failed without tkinter:\n" + result.stderr[-1500:])
-        self.assertIn("HAS_TK False", result.stdout)
-        self.assertIn("AUTO_TRACK True", result.stdout)
-
-    def test_mode_detection_falls_back_to_cli_without_tkinter(self):
-        result = run(PRETEND_NO_TKINTER)
-        self.assertIn("MODE cli", result.stdout,
-                      "auto mode picked a GUI it cannot draw:\n" + result.stdout)
-
-    def test_tracking_a_run_works_without_tkinter(self):
-        # The directory is made here rather than in the child, so it can be cleaned up:
-        # a child that creates its own leaves it behind on every run.
-        work = tempfile.mkdtemp(prefix="pulse-headless-")
-        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
-        code = PRETEND_NO_TKINTER + textwrap.dedent(f"""\
-
-            import glob, os, time
-            work = {work!r}
-            os.chdir(work)
-            os.environ["PULSE_HOME"] = os.path.join(work, ".pulse")
-
-            from pulse import pulse_monitor
-            monitor = pulse_monitor.attach(script_path=os.path.join(work, "train.py"),
-                                           interval=0.0)
-            loss = 2.0
-            for step in range(5):
-                loss = loss * 0.9
-                monitor.observe("loss", loss, step=step)
-            pulse_monitor.detach()
-
-            from pulse.pulse_brain import Brain
-            brain = Brain(sorted(glob.glob(os.path.join(work, ".pulse_stream", "*")))[-1])
-            brain.poll_once()
-            print("READINGS", len(brain.histories.get("loss", [])))
-        """)
-        result = run(code)
-        self.assertIn("READINGS 5", result.stdout,
-                      "a run could not be tracked without tkinter:\n" + result.stderr[-1500:])
-
-    def test_asking_for_the_dashboard_without_tkinter_says_why(self):
-        code = PRETEND_NO_TKINTER + textwrap.dedent("""\
-
-            import pulse.pulse as core
-            try:
-                core._chat_panel_class()
-                print("NO_ERROR")
-            except RuntimeError as exc:
-                print("EXPLAINED", "tkinter" in str(exc), "python3-tk" in str(exc))
-        """)
-        result = run(code)
-        self.assertIn("EXPLAINED True True", result.stdout,
-                      "the GUI failure did not explain itself:\n" + result.stdout + result.stderr[-800:])
+class FakeCli:
+    agent_provider = agent_key = agent_model_string = agent_api_base = None
+    focus = []
+    _project_root = None
 
 
-class QuietOutputTest(unittest.TestCase):
-    """Importing Pulse must not put escape codes in the program's own output.
-
-    pulse_cli replaces builtins.print for the whole process so a line Pulse is drawing
-    in the background is not left half-overwritten. That is right on a terminal and
-    wrong everywhere else: piped to a file, every line the user's script printed came
-    out as "\\r\\033[KLINE".
-    """
-
-    def test_piped_output_has_no_escape_codes(self):
-        result = run("import pulse\nprint('HELLO')\nprint('WORLD')\n")
-        self.assertEqual(result.stdout, "HELLO\nWORLD\n",
-                         "escape codes leaked into piped output: %r" % result.stdout)
-
-    def test_output_to_a_file_has_no_escape_codes(self):
-        work = tempfile.mkdtemp(prefix="pulse-quiet-")
-        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
-        path = os.path.join(work, "out.txt")
-        code = f"import pulse\nwith open({path!r}, 'w') as f:\n    print('LINE', file=f)\n"
-        run(code)
-        with open(path, encoding="utf-8") as handle:
-            self.assertEqual(handle.read(), "LINE\n")
-
-    def test_print_still_works_with_every_argument(self):
-        result = run("import pulse\nprint('a', 'b', sep='-', end='!')\n")
-        self.assertEqual(result.stdout, "a-b!")
-
-    def test_a_terminal_still_gets_the_line_cleared(self):
-        """The other side of it: on a tty the decoration has to still happen.
-
-        Without this, a change that made the check permanently False would pass every
-        other test here -- they all check the non-tty case.
-        """
-        import pty
-
-        code = ("import pulse, sys\n"
-                "from pulse.pulse_cli import safe_print\n"
-                "print('ON A TTY', sys.stdout.isatty())\n")
-        pid, fd = pty.fork()
-        if pid == 0:                                  # child: stdout IS a terminal
-            env = dict(os.environ,
-                       PYTHONPATH=os.pathsep.join(
-                           p for p in (SRC, site.getusersitepackages(),
-                                       os.environ.get("PYTHONPATH", "")) if p),
-                       PULSE_LOGGING="0", NO_COLOR="1")
-            os.execve(sys.executable, [sys.executable, "-c", code], env)
-        output = b""
-        try:
-            while True:
-                chunk = os.read(fd, 4096)
-                if not chunk:
-                    break
-                output += chunk
-        except OSError:
-            pass
-        finally:
-            os.close(fd)
-            os.waitpid(pid, 0)
-        text = output.decode("utf-8", "replace")
-        self.assertIn("ON A TTY True", text, f"the pty did not look like a terminal: {text!r}")
-        self.assertIn("\033[K", text,
-                      f"on a real terminal the line is no longer cleared: {text!r}")
+def test_nobody_is_asked_anything(tmp_path):
+    log = open(tmp_path / "log", "w")
+    app = headless.HeadlessApp(FakeCli(), str(tmp_path), log)
+    with pytest.raises(EOFError):
+        app._ask(types.SimpleNamespace(label="Apply this change?"))
+    log.close()
+    assert "nobody to answer: no" in (tmp_path / "log").read_text()
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+def test_what_the_app_would_show_goes_to_the_log(tmp_path):
+    log = open(tmp_path / "log", "w")
+    app = headless.HeadlessApp(FakeCli(), str(tmp_path), log)
+    app._add(tui.Entry("tool", calls=["TERMINAL: pytest -q"], output="3 passed"))
+    app._add(tui.Entry("say", "Fixed the swapped matmul."))
+    app._add(tui.Entry("finding", "loss is NaN", severity="critical"))
+    app.feed("\x1b[32m[Pulse] colour and\x1b[K\x1b[0m clear codes\n")
+    log.close()
+    text = (tmp_path / "log").read_text()
+    assert "Ran pytest -q" in text and "3 passed" in text and "agent: Fixed the swapped matmul." in text
+    assert "⚠ CRITICAL loss is NaN" in text and "\x1b" not in text and "colour and clear codes" in text
+
+
+def test_pulse_run_headless_starts_the_supervisor_and_returns(tmp_path, monkeypatch):
+    script = tmp_path / "train.py"
+    script.write_text("print(1)\n")
+    started = []
+    monkeypatch.setattr(headless, "_spawn", lambda args, cwd, log: started.append((args, cwd)) or 4242)
+    assert cli_mod.main(["run", "--headless", "--cwd", str(tmp_path), "train.py", "--epochs", "3"]) == 0
+    (args, cwd), = started
+    assert args[0] == "supervise" and args[-3:] == [str(script), "--epochs", "3"] and cwd == str(tmp_path)
+
+
+def test_list_and_stop(home, monkeypatch, capsys):
+    (home / "headless").mkdir(parents=True)
+    (home / "headless" / "1.json").write_text(json.dumps({"pid": os.getpid(), "script": "/p/train.py",
+                                                          "log": "/l", "started": time.time()}))
+    (home / "headless" / "2.json").write_text(json.dumps({"pid": 999999999, "script": "/p/gone.py", "log": "/l"}))
+    assert headless.main([]) == 0
+    out = capsys.readouterr().out
+    assert "train.py" in out and "gone.py" not in out and not (home / "headless" / "2.json").exists()
+    killed = []
+    monkeypatch.setattr(headless.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    assert headless.main(["stop", "train.py"]) == 0 and killed[-1] == (os.getpid(), headless.signal.SIGTERM)
+
+
+def test_auto_track_headless_starts_a_debugger_beside_the_run(monkeypatch):
+    from pulse import pulse as core
+    started = []
+    monkeypatch.setattr(core, "_start_stream_monitor", lambda frame, interval, quiet=False: "monitor")
+    monkeypatch.setattr(headless, "attach_in_background", lambda monitor: started.append(monitor))
+    assert core._auto_track_session(sys._getframe(), None, 1.0, None, None, "headless") == "monitor"
+    assert started == ["monitor"]
+
+
+def test_a_headless_run_without_an_agent_is_watched_and_the_supervisor_ends(tmp_path, home):
+    """For real: `pulse run --headless` on a short script, no model -- it starts, watches,
+    and the supervisor exits after the run is over."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "train.py").write_text(
+        "import time\nloss = 1.0\nfor step in range(30):\n    loss *= 0.9\n    time.sleep(0.05)\nprint('DONE', loss)\n")
+    src = os.path.dirname(os.path.dirname(headless.__file__))
+    env = {k: v for k, v in os.environ.items() if not k.endswith("_API_KEY") and k not in ("PULSE_MODEL", "PULSE_PROVIDER")}
+    env.update(PYTHONPATH=src, PULSE_HOME=str(home), PULSE_CACHE_DIR=str(home), PULSE_HEADLESS_GRACE="2")
+    r = subprocess.run([sys.executable, "-c", "import sys; from pulse import cli; sys.exit(cli.main(sys.argv[1:]))",
+                        "run", "--headless", "train.py"], cwd=str(project), env=env, capture_output=True,
+                       text=True, timeout=60)
+    assert r.returncode == 0 and "Debugging train.py in the background" in r.stdout, r.stdout + r.stderr
+    log = next((home / "headless").glob("*.log"))
+    deadline = time.time() + 120
+    while time.time() < deadline and "debugger stopped" not in log.read_text():
+        time.sleep(1)
+    text = log.read_text()
+    assert "No agent is set up" in text and "Started under Pulse" in text, text
+    assert "nothing is left to do" in text and "debugger stopped" in text, text
+    assert not list((home / "headless").glob("*.json"))             # unregistered when it ends
+
+
+def test_tensor_statistics_say_when_they_were_taken():
+    from pulse import pulse_brain as brain
+    pack = {"step": 199, "session": {}, "tensors": {"w": {"shape": [8, 1], "dtype": "float64"}},
+            "tensor_stats": {"w": {"min": -0.1, "max": 0.2, "mean": 0.05, "nan": 0, "inf": 0, "taken_at_step": 29}}}
+    assert "(values at step 29, the run is now at 199)" in brain.Brain.render_evidence(pack)
+
+
+def test_run_status_asked_again_at_once_waits_for_progress(tmp_path, monkeypatch):
+    app = appmod.App(FakeCli(), str(tmp_path))
+    brain = types.SimpleNamespace(step=10)
+    app.console = types.SimpleNamespace(brain=brain)
+    app._status = "live"
+    app._evidence = lambda: f"step {brain.step}"
+    app._poll_status = lambda: setattr(brain, "step", brain.step + 30)
+    assert app._agent_run_status() == "step 10"
+    t = time.monotonic()
+    assert app._agent_run_status() == "step 70" and time.monotonic() - t < 5     # waited for 50 steps

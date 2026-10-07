@@ -601,6 +601,30 @@ streaming of the model's replies.
 
 ---
 
+## Headless mode: no screen, Pulse debugs by itself
+
+```bash
+pulse run --headless train.py --epochs 3     # returns at once; the run is debugged in the background
+pulse headless                               # what is being debugged, with the log of each
+pulse headless stop [pid|script]             # stop debugging (the training goes on)
+```
+
+Or from the script: `auto_track(mode="headless")`, or `PULSE_MODE=headless`.
+
+A supervisor process, detached from the terminal, launches the run and watches it with the
+same checks and scheduled audits as the app. When the run crashes, a check finds something
+serious, or an audit says "problem", the agent takes it on by itself: it reads the code,
+fixes it, and decides whether to restart the run. Nobody is asked anything. Every command
+and every code change goes through the reviewer model (auto mode); with no reviewer, or
+one that cannot answer, the answer is no. After three automatic fixes in a row it stops
+acting and only watches, until the run has been healthy for ten minutes. When the run is
+over it does a closing audit and exits.
+
+Everything it does goes to a log in `~/.pulse/headless/`. When this machine is signed in to
+Pulse Cloud, the run also goes on the [dashboard](https://pulsedashb.netlify.app/). `pulse`,
+then `/monitor`, opens the run in the app at any time. The agent and the reviewer are the
+ones in your settings (`pulse config`), or `PULSE_MODEL`.
+
 ## The `pulse` command
 
 Pulse does not have to be written into a script. Installing it puts a `pulse` command on

@@ -364,7 +364,9 @@ class Brain:
                 meta = {k: v for k, v in frame.items() if k in _TENSOR_META_KEYS}
                 self.tensors[name] = meta
                 if frame.get("stats"):
-                    self.tensor_stats[name] = dict(frame["stats"])
+                    # when they were taken: statistics are a snapshot, and set beside the latest
+                    # loss without a step, step-29 weights read as a model that had not learned
+                    self.tensor_stats[name] = dict(frame["stats"], taken_at_step=frame.get("step"))
                 self.tensor_counts[name] = self.tensor_counts.get(name, 0) + 1
                 dirty = True
             elif kind == stream.KIND_EVENT:
@@ -541,6 +543,10 @@ class Brain:
                     line += (f"  min {_num(stats.get('min'))} max {_num(stats.get('max'))} "
                              f"mean {_num(stats.get('mean'))} nan {stats.get('nan', 0)} "
                              f"inf {stats.get('inf', 0)}")
+                    taken = stats.get("taken_at_step")
+                    if taken is not None:
+                        line += f"  (values at step {taken}" + (
+                            f", the run is now at {pack.get('step')})" if taken != pack.get("step") else ")")
                 out.append(line)
         events = pack.get("recent_events") or []
         if events:
