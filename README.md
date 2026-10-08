@@ -601,29 +601,36 @@ streaming of the model's replies.
 
 ---
 
-## Headless mode: no screen, Pulse debugs by itself
+## Headless mode: start a run and walk away
 
 ```bash
-pulse run --headless train.py --epochs 3     # returns at once; the run is debugged in the background
-pulse headless                               # what is being debugged, with the log of each
-pulse headless stop [pid|script]             # stop debugging (the training goes on)
+pulse run --headless train.py --epochs 3     # returns at once; you can close the terminal
 ```
 
-Or from the script: `auto_track(mode="headless")`, or `PULSE_MODE=headless`.
+Your run starts in the background, and Pulse watches it there instead of on your screen. When
+the run crashes, or Pulse's checks or its periodic AI review find something seriously wrong,
+the agent fixes the code by itself and restarts the run -- as many times as it takes. You are
+never asked anything: a second AI (the reviewer) approves each command and each code change,
+and anything it does not approve is not done. When the run ends, Pulse writes a closing review
+and stops.
 
-A supervisor process, detached from the terminal, launches the run and watches it with the
-same checks and scheduled audits as the app. When the run crashes, a check finds something
-serious, or an audit says "problem", the agent takes it on by itself: it reads the code,
-fixes it, and decides whether to restart the run. Nobody is asked anything. Every command
-and every code change goes through the reviewer model (auto mode); with no reviewer, or
-one that cannot answer, the answer is no. After three automatic fixes in a row it stops
-acting and only watches, until the run has been healthy for ten minutes. When the run is
-over it does a closing audit and exits.
+**Where it shows up.** The first time, Pulse asks you to sign in to Pulse Cloud (if you are
+not) and to pick a workspace and a project; the run goes on the
+[dashboard](https://pulsedashb.netlify.app/) there, and the choice is remembered. Change it
+with `--to WORKSPACE/PROJECT` -- both together, e.g. `--to "Lab/GPT small"` (also remembered) --
+or with `pulse config workspace`.
 
-Everything it does goes to a log in `~/.pulse/headless/`. When this machine is signed in to
-Pulse Cloud, the run also goes on the [dashboard](https://pulsedashb.netlify.app/). `pulse`,
-then `/monitor`, opens the run in the app at any time. The agent and the reviewer are the
-ones in your settings (`pulse config`), or `PULSE_MODEL`.
+**Keeping an eye on it.**
+
+| | |
+|---|---|
+| `pulse headless` | what is being debugged in the background, and the log of each |
+| `~/.pulse/headless/<run>.log` | everything Pulse did: what it found, what it changed, why |
+| `pulse`, then `/monitor` | open the run in the app, live |
+| `pulse headless stop [pid\|script]` | stop the background debugging (the training goes on) |
+
+From the script itself: `auto_track(mode="headless")`, or `PULSE_MODE=headless`
+(`PULSE_TO=WORKSPACE/PROJECT` chooses where it goes).
 
 ## The `pulse` command
 

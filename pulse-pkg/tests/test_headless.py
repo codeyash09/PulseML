@@ -52,11 +52,25 @@ def test_what_the_app_would_show_goes_to_the_log(tmp_path):
 def test_pulse_run_headless_starts_the_supervisor_and_returns(tmp_path, monkeypatch):
     script = tmp_path / "train.py"
     script.write_text("print(1)\n")
-    started = []
+    started, asked = [], []
     monkeypatch.setattr(headless, "_spawn", lambda args, cwd, log: started.append((args, cwd)) or 4242)
-    assert cli_mod.main(["run", "--headless", "--cwd", str(tmp_path), "train.py", "--epochs", "3"]) == 0
+    monkeypatch.setattr(headless, "choose_destination", lambda workspace, project, interactive=True: asked.append(
+        (workspace, project)) or {"team_id": "t1", "project_id": "p1", "label": "workspace Lab, project MNIST"})
+    assert cli_mod.main(["run", "--headless", "--to", "Lab/MNIST", "--cwd", str(tmp_path),
+                         "train.py", "--epochs", "3"]) == 0
     (args, cwd), = started
+    assert asked == [("Lab", "MNIST")]
     assert args[0] == "supervise" and args[-3:] == [str(script), "--epochs", "3"] and cwd == str(tmp_path)
+    assert args[args.index("--team-id") + 1] == "t1" and args[args.index("--project-id") + 1] == "p1"
+
+
+def test_to_needs_both_and_goes_with_headless(capsys):
+    assert cli_mod.main(["run", "--to", "Lab/MNIST", "train.py"]) == 1
+    assert "goes with --headless" in capsys.readouterr().out
+    for half in ("Lab", "Lab/", "/MNIST"):
+        assert cli_mod.main(["run", "--headless", "--to", half, "train.py"]) == 1
+        assert "both of them" in capsys.readouterr().out
+    assert headless.split_destination(" Lab / GPT small ") == ("Lab", "GPT small")
 
 
 def test_list_and_stop(home, monkeypatch, capsys):
@@ -94,7 +108,7 @@ def test_a_headless_run_without_an_agent_is_watched_and_the_supervisor_ends(tmp_
     r = subprocess.run([sys.executable, "-c", "import sys; from pulse import cli; sys.exit(cli.main(sys.argv[1:]))",
                         "run", "--headless", "train.py"], cwd=str(project), env=env, capture_output=True,
                        text=True, timeout=60)
-    assert r.returncode == 0 and "Debugging train.py in the background" in r.stdout, r.stdout + r.stderr
+    assert r.returncode == 0 and "Pulse is debugging it in the background" in r.stdout, r.stdout + r.stderr
     log = next((home / "headless").glob("*.log"))
     deadline = time.time() + 120
     while time.time() < deadline and "debugger stopped" not in log.read_text():
@@ -122,3 +136,62 @@ def test_run_status_asked_again_at_once_waits_for_progress(tmp_path, monkeypatch
     assert app._agent_run_status() == "step 10"
     t = time.monotonic()
     assert app._agent_run_status() == "step 70" and time.monotonic() - t < 5     # waited for 50 steps
+
+
+
+# ---------------------------------------------------------------- where the run goes online
+
+TEAMS = [{"team_id": "t1", "join_code": "AAA", "name": "Lab", "admin_ids": []},
+         {"team_id": "t2", "join_code": "BBB", "name": "Home", "admin_ids": []}]
+PROJECTS = {"t1": [{"project_id": "p1", "name": "MNIST"}, {"project_id": "p2", "name": "GPT small"}],
+            "t2": [{"project_id": "p3", "name": "Toys"}]}
+
+
+@pytest.fixture
+def signed_in(monkeypatch):
+    from pulse import pulse_cli
+    monkeypatch.setattr(cloud, "load_cached_credentials", lambda: {"user_id": "u1"})
+    monkeypatch.setattr(cloud, "find_teams_for_user", lambda uid: TEAMS)
+    monkeypatch.setattr(cloud, "find_projects_for_team", lambda team, uid: PROJECTS[team["team_id"]])
+    monkeypatch.setattr(cloud, "save_cached_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(pulse_cli.PulseCLI, "_auth_flow", lambda self: setattr(self, "user_id", "u1"))
+    monkeypatch.setattr(pulse_cli, "_ui_workspace_menu", lambda *a, **k: pytest.fail("the workspace picker was shown"))
+    monkeypatch.setattr(pulse_cli, "_ui_project_menu", lambda *a, **k: pytest.fail("the project picker was shown"))
+
+
+def test_flags_choose_the_workspace_and_project_and_are_remembered(signed_in):
+    from pulse import pulse_settings as settings
+    where = headless.choose_destination("lab", "gpt", interactive=False)
+    assert where["team_id"] == "t1" and where["project_id"] == "p2" and "GPT small" in where["label"]
+    assert settings.remembered_id("workspace") == "t1" and settings.remembered_id("project") == "p2"
+    again = headless.choose_destination(interactive=False)            # next time: no flags, no question
+    assert again["team_id"] == "t1" and again["project_id"] == "p2"
+
+
+def test_a_flag_that_matches_nothing_says_what_there_is(signed_in):
+    with pytest.raises(headless.DestinationError, match="Lab.*Home"):
+        headless.choose_destination("nope", interactive=False)
+
+
+def test_not_signed_in_and_nobody_to_ask_means_this_machine_only(monkeypatch):
+    monkeypatch.setattr(cloud, "load_cached_credentials", lambda: None)
+    assert headless.choose_destination(interactive=False) == {}
+
+
+def test_the_headless_debugger_has_no_limit_on_automatic_fixes(tmp_path):
+    log = open(tmp_path / "log", "w")
+    app = headless.HeadlessApp(FakeCli(), str(tmp_path), log)
+    assert app.auto_fix_limit is None and appmod.App(FakeCli(), str(tmp_path)).auto_fix_limit == 3
+
+
+
+def test_with_nothing_remembered_the_pickers_ask_once(signed_in, monkeypatch):
+    from pulse import pulse_cli
+    from pulse import pulse_settings as settings
+    monkeypatch.setattr(pulse_cli, "_ui_workspace_menu", lambda existing, cached, describe: "2")
+    monkeypatch.setattr(pulse_cli, "_ui_project_menu", lambda projects, cached, describe, **k: "1")
+    monkeypatch.setattr(pulse_cli, "_prompt_text", lambda *a, **k: "")     # "GitHub repo URL (optional)": skipped
+    monkeypatch.setattr("builtins.input", lambda *a: "")
+    where = headless.choose_destination(interactive=True)
+    assert where["team_id"] == "t2" and where["project_id"] == "p3" and "Toys" in where["label"]
+    assert settings.remembered_id("workspace") == "t2" and settings.remembered_id("project") == "p3"

@@ -11,12 +11,14 @@ its stream, runs the checks and the scheduled audits, and when the run crashes, 
 finds something serious or an audit says "problem", it starts the agent on it -- which
 reads the code, fixes it and decides whether to restart the run. Nobody is asked anything:
 every command and every code change goes through the reviewer model (auto mode), and when
-there is no reviewer, or it cannot answer, the answer is no. After three automatic fixes in
-a row it stops acting and only watches, until the run has been healthy for a while.
+there is no reviewer, or it cannot answer, the answer is no. There is no limit on how many
+times it fixes and restarts.
 
-Everything it does goes to a log file (~/.pulse/headless/) and, when this machine is signed
-in to Pulse Cloud, to the run's row on the dashboard. `pulse`, then /monitor, opens the run
-in the app at any time.
+Where the run goes online is settled before it leaves the terminal (choose_destination):
+signed in to Pulse Cloud, a workspace and a project -- asked once, remembered in the settings,
+or given on the command line (--to WORKSPACE/PROJECT, both together). Everything the supervisor does goes to
+a log file (~/.pulse/headless/) and to the run's row on the dashboard. `pulse`, then /monitor,
+opens the run in the app at any time.
 """
 from __future__ import annotations
 
@@ -42,8 +44,6 @@ DASHBOARD_URL = "https://pulsedashb.netlify.app/"
 _GRACE_SECONDS = float(os.environ.get("PULSE_HEADLESS_GRACE", "20"))
 # terminal control sequences (colours, "clear to end of line"): not for a log file
 _CONTROL_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
-# After this long healthy, the run gets its three automatic fixes again.
-_HEALTHY_RESET_SECONDS = 600.0
 
 _BOOT = ("import os, runpy, sys; cwd = os.getcwd(); "
          "sys.path[:] = [p for p in sys.path if p not in ('', '.', cwd, os.path.abspath(cwd))]; "
@@ -77,20 +77,152 @@ def _log_path(script: str) -> str:
     return str(_home() / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.path.basename(script)}.log")
 
 
-def start(script: str, script_args: List[str], cwd: Optional[str] = None) -> int:
-    """`pulse run --headless script args`: launch the supervisor in the background and return."""
+def split_destination(value: str):
+    """"Lab/GPT small" -> ("Lab", "GPT small"). Both halves are needed: a workspace without a
+    project is a setup left half done."""
+    workspace, sep, project = str(value or "").partition("/")
+    if not sep or not workspace.strip() or not project.strip():
+        raise ValueError(f"--to takes WORKSPACE/PROJECT, both of them (e.g. --to \"Lab/GPT small\"), not {value!r}")
+    return workspace.strip(), project.strip()
+
+
+class DestinationError(Exception):
+    """A --workspace / --project that matches nothing (the message lists what there is)."""
+
+
+def _match(items: List[Dict[str, Any]], wanted: str, keys: List[str], describe) -> Dict[str, Any]:
+    wanted_l = wanted.strip().lower()
+    exact = [i for i in items if any(str(i.get(k) or "").strip().lower() == wanted_l for k in keys)]
+    if len(exact) == 1:
+        return exact[0]
+    partial = [i for i in items if wanted_l in describe(i).lower()]
+    if len(partial) == 1:
+        return partial[0]
+    names = "; ".join(describe(i) for i in items) or "none"
+    raise DestinationError(("several match" if (exact or partial) else "nothing matches")
+                           + f" {wanted!r} -- there are: {names}")
+
+
+def choose_destination(workspace: Optional[str] = None, project: Optional[str] = None,
+                       interactive: bool = True) -> Dict[str, Any]:
+    """Where the run goes online, settled while there is still a terminal: signed in to Pulse
+    Cloud (asked, if not), the workspace and the project. Given on the command line, they are
+    used and remembered; otherwise the remembered ones are used; otherwise the pickers ask --
+    once, and the answer is remembered (pulse config workspace/project changes it). Returns
+    {"team_id", "project_id", "label"}, or {} for "this machine only"."""
+    from . import pulse_settings as settings
+    from . import pulse_supabase as cloud
+    cli = pulse_app._new_cli(os.getcwd(), [], chdir=False)
+    cli.non_interactive = not interactive
+    if not cloud.load_cached_credentials():
+        if not interactive:
+            return {}
+        from . import pulse_ui as ui
+        try:
+            wanted = ui.confirm("Sign in to Pulse Cloud, so this run shows up on your dashboard?", default=True)
+        except ui.Unavailable:
+            wanted = input("Sign in to Pulse Cloud, so this run shows up on your dashboard? (Y/n) > ").strip().lower() \
+                in ("", "y", "yes")
+        if not wanted:
+            return {}
+    try:
+        cli._auth_flow()
+    except cloud.SupabaseError as exc:
+        print(f"[Pulse] Could not sign in ({exc}); the run will be logged on this machine only.")
+        return {}
+    if not cli.user_id:
+        return {}
+    describe_team = lambda t: cli._describe_workspace(t, cli.user_id)   # noqa: E731
+    if workspace:
+        team = _match(cloud.find_teams_for_user(cli.user_id), workspace, ["team_id", "join_code", "name"],
+                      describe_team)
+        settings.set("workspace", {"id": team["team_id"], "name": describe_team(team)})
+        if not project:
+            settings.unset("project")       # the old project belonged to the old workspace
+    if project:
+        team_id = settings.remembered_id("workspace")
+        if not team_id:
+            raise DestinationError("a project needs its workspace: --to WORKSPACE/PROJECT")
+        team = next((t for t in cloud.find_teams_for_user(cli.user_id) if t["team_id"] == team_id), None)
+        if team is None:
+            raise DestinationError("the remembered workspace is gone: --to WORKSPACE/PROJECT")
+        ref = {"team_id": team["team_id"], "admin_ids": list(team.get("admin_ids") or [])}
+        found = _match(cloud.find_projects_for_team(ref, cli.user_id), project, ["project_id", "name"],
+                       cli._describe_project)
+        settings.set("project", {"id": found["project_id"], "name": (found.get("name") or "").strip()
+                                 or found["project_id"]})
+    # the remembered workspace and project are used without a question; a missing one is
+    # asked for (the pickers), when there is someone to ask, and remembered
+    teams = cloud.find_teams_for_user(cli.user_id)
+    team = next((t for t in teams if t["team_id"] == settings.remembered_id("workspace")), None)
+    if team is None:
+        if not interactive:
+            return {}
+        cli._select_workspace_and_project()            # pickers; remembers what is chosen
+        team = next((t for t in teams if t["team_id"] == cli.team_id), None) if cli.team_id else None
+        if team is None:
+            return {}
+    ref = {"team_id": team["team_id"], "admin_ids": list(team.get("admin_ids") or [])}
+    projects = cloud.find_projects_for_team(ref, cli.user_id)
+    chosen = next((p for p in projects if p["project_id"] == (cli.project_id or settings.remembered_id("project"))), None)
+    if chosen is None and interactive:
+        cli.team_id, cli.team_join_code = team["team_id"], team.get("join_code")
+        cli.team_admin_ids = list(team.get("admin_ids") or [])
+        cli._project_flow(None)
+        chosen = next((p for p in projects if p["project_id"] == cli.project_id), None) if cli.project_id else None
+        if chosen is None and cli.project_id:          # just created: not in the list read above
+            chosen = {"project_id": cli.project_id, "name": cli.project_name}
+    if chosen is not None:
+        settings.set("project", {"id": chosen["project_id"],
+                                 "name": (chosen.get("name") or "").strip() or chosen["project_id"]})
+    team_name = (team.get("name") or "").strip() or f"join code {team.get('join_code')}"
+    label = f"workspace {team_name}" + (
+        f", project {(chosen.get('name') or '').strip() or chosen['project_id']}" if chosen else "")
+    return {"team_id": team["team_id"], "project_id": chosen["project_id"] if chosen else None, "label": label}
+
+
+def start(script: str, script_args: List[str], cwd: Optional[str] = None,
+          workspace: Optional[str] = None, project: Optional[str] = None) -> int:
+    """`pulse run --headless script args`: settle where it goes online, launch the supervisor
+    in the background, and return."""
     cwd = os.path.abspath(cwd or os.getcwd())
     path = os.path.abspath(os.path.join(cwd, os.path.expanduser(script)))
     if not os.path.isfile(path):
         print(f"pulse run --headless: no such script: {path}")
         return 1
+    try:
+        where = choose_destination(workspace, project, interactive=sys.stdin.isatty())
+    except DestinationError as exc:
+        print(f"pulse run --headless: {exc}")
+        return 1
+    except (EOFError, KeyboardInterrupt):
+        print("\n[Pulse] Cancelled; nothing was started.")
+        return 1
     log_path = _log_path(path)
-    pid = _spawn(["supervise", "--log", log_path, "--", path, *script_args], cwd, log_path)
-    print(f"[Pulse] Debugging {os.path.basename(path)} in the background (supervisor pid {pid}).")
-    print(f"[Pulse] What it does: {log_path}")
-    print(f"[Pulse] Online: {DASHBOARD_URL} (when this machine is signed in) · in the app: `pulse`, then /monitor")
-    print("[Pulse] `pulse headless` lists what is being debugged; `pulse headless stop` stops it (the run goes on).")
+    pid = _spawn(["supervise", "--log", log_path, *_where_args(where), "--", path, *script_args], cwd, log_path)
+    _say_started(os.path.basename(path), pid, log_path, where)
     return 0
+
+
+def _where_args(where: Dict[str, Any]) -> List[str]:
+    out = []
+    if where.get("team_id"):
+        out += ["--team-id", where["team_id"]]
+    if where.get("project_id"):
+        out += ["--project-id", where["project_id"]]
+    return out
+
+
+def _say_started(name: str, pid: int, log_path: str, where: Dict[str, Any]) -> None:
+    print(f"[Pulse] {name} is running, and Pulse is debugging it in the background (pid {pid}).")
+    print("[Pulse] You can close this terminal. If it crashes or goes wrong, the agent fixes the code and restarts it.")
+    if where:
+        print(f"[Pulse] Online: {where['label']} -- {DASHBOARD_URL}")
+        print("[Pulse]   (remembered for next time; --to WORKSPACE/PROJECT, or `pulse config`, changes it)")
+    else:
+        print("[Pulse] Not signed in to Pulse Cloud: this machine only (`pulse` once signs in).")
+    print(f"[Pulse] Everything it does: {log_path}")
+    print("[Pulse] Look at it: `pulse`, then /monitor · list: `pulse headless` · stop debugging: `pulse headless stop`")
 
 
 def attach_in_background(monitor: Any) -> Optional[int]:
@@ -98,11 +230,19 @@ def attach_in_background(monitor: Any) -> Optional[int]:
     script = getattr(monitor, "script_path", None) or "run"
     log_path = _log_path(script)
     try:
-        pid = _spawn(["supervise", "--log", log_path, "--attach", monitor.directory], os.getcwd(), log_path)
+        wanted = os.environ.get("PULSE_TO", "").strip()
+        workspace, project = split_destination(wanted) if wanted else (None, None)
+        where = choose_destination(workspace, project, interactive=sys.stdin.isatty())
+    except (ValueError, DestinationError, EOFError, KeyboardInterrupt) as exc:
+        print(f"[Pulse] {exc or 'No workspace chosen'}: this run is logged on this machine only.")
+        where = {}
+    try:
+        pid = _spawn(["supervise", "--log", log_path, *_where_args(where), "--attach", monitor.directory],
+                     os.getcwd(), log_path)
     except OSError as exc:
         print(f"[Pulse] Could not start the background debugger ({exc}); the run is still monitored.")
         return None
-    print(f"[Pulse] Debugging this run in the background (pid {pid}); log: {log_path} · online: {DASHBOARD_URL}")
+    _say_started(os.path.basename(script), pid, log_path, where)
     return pid
 
 
@@ -117,6 +257,7 @@ class HeadlessApp(pulse_app.App):
         self._log_lock = threading.Lock()
         self.audits = True
         self.mouse = False
+        self.auto_fix_limit = None          # it fixes and restarts as often as the run needs
 
     # -------------------------------------------------------------- the log
 
@@ -193,7 +334,7 @@ def _describe(entry: tui.Entry) -> str:
     return entry.text
 
 
-def _sign_in(cli: Any, app: HeadlessApp) -> None:
+def _sign_in(cli: Any, app: HeadlessApp, team_id: Optional[str] = None, project_id: Optional[str] = None) -> None:
     """The cached Pulse Cloud login, without a question: the run then has a dashboard row."""
     from . import pulse_settings as settings
     from . import pulse_supabase as cloud
@@ -204,12 +345,14 @@ def _sign_in(cli: Any, app: HeadlessApp) -> None:
             return
         with app.hush():
             cli._auth_flow()
-        workspace, project = settings.remembered_id("workspace"), settings.remembered_id("project")
+        workspace = team_id or settings.remembered_id("workspace")
+        project = project_id or (settings.remembered_id("project") if not team_id else None)
         if workspace:
             cli.team_id = workspace
             cli.project_id = project or None
         if cli.user_id:
-            app.write(f"Signed in to Pulse Cloud: the run goes on the dashboard ({DASHBOARD_URL}).")
+            app.write(f"Signed in to Pulse Cloud: the run goes on the dashboard ({DASHBOARD_URL}), "
+                      f"workspace {cli.team_id or '(none)'}, project {cli.project_id or '(none)'}.")
     except Exception as exc:
         app.write(f"Pulse Cloud sign-in failed ({type(exc).__name__}: {exc}); logging here only.")
 
@@ -223,11 +366,15 @@ def _register(log_path: str, script: str) -> Path:
 
 def supervise(argv: List[str]) -> int:
     """The background process itself (started by start() / attach_in_background())."""
-    log_path, attach, script_argv = None, None, []
+    log_path, attach, script_argv, team_id, project_id = None, None, [], None, None
     i = 0
     while i < len(argv):
         if argv[i] == "--log":
             log_path, i = argv[i + 1], i + 2
+        elif argv[i] == "--team-id":
+            team_id, i = argv[i + 1], i + 2
+        elif argv[i] == "--project-id":
+            project_id, i = argv[i + 1], i + 2
         elif argv[i] == "--attach":
             attach, i = argv[i + 1], i + 2
         elif argv[i] == "--":
@@ -252,7 +399,7 @@ def supervise(argv: List[str]) -> int:
     else:
         app.write("No agent is set up (`pulse` sets one, or /config agent): the run is watched and checked, "
                   "but nothing will be fixed.")
-    _sign_in(cli, app)
+    _sign_in(cli, app, team_id, project_id)
     app.install()
     try:
         if attach:
@@ -283,7 +430,6 @@ def supervise(argv: List[str]) -> int:
 
 def _watch(app: HeadlessApp, stopping: threading.Event) -> int:
     idle_since: Optional[float] = None
-    quiet_since = time.monotonic()
     closing_audit_done: Optional[str] = None
     while not stopping.is_set():
         with app.lock:
@@ -291,11 +437,6 @@ def _watch(app: HeadlessApp, stopping: threading.Event) -> int:
         busy = app._job is not None or app.view.busy or bool(app._crash_pending or app._problem_pending)
         live = app._status in ("live", "stalled")
         now = time.monotonic()
-        if busy or not live:
-            quiet_since = now
-        elif app._auto_crash_turns and now - quiet_since > _HEALTHY_RESET_SECONDS:
-            app._auto_crash_turns = 0        # healthy for a while: automatic fixes are allowed again
-            app.write("The run has been healthy for 10 minutes: automatic fixes are allowed again.")
         if live or busy:
             idle_since = None
         else:

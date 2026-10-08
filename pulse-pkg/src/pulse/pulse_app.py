@@ -385,6 +385,7 @@ class App:
         self._stall_said = False                   # the open run's stall was announced
         self._paused_here = False                  # /pause sent from here: a stall is expected
         self._auto_crash_turns = 0                 # crash turns started without the person typing
+        self.auto_fix_limit: Optional[int] = _AUTO_CRASH_TURNS   # None: no limit (headless)
         self._run_partial = ""
         self.up = threading.Event()               # set once the screen is up and output is captured
         self._height = 30
@@ -1401,7 +1402,7 @@ class App:
         script = os.path.basename((self.session or {}).get("script") or "the run")
         what = self._crash_summary()
         self._auto_crash_turns += 1
-        if self._auto_crash_turns > _AUTO_CRASH_TURNS:
+        if self.auto_fix_limit is not None and self._auto_crash_turns > self.auto_fix_limit:
             # crash, fix, restart, crash again...: the person decides what next
             self.error(f"{script} crashed again" + (f": {what}" if what else "") + ".")
             self.note(f"That is {self._auto_crash_turns} crashes in a row; the agent is not starting on this one "
@@ -1455,8 +1456,8 @@ class App:
             self.note("No agent is set up to look at that: /agent picks a model, then ask what went wrong.")
             return
         self._auto_crash_turns += 1
-        if self._auto_crash_turns > _AUTO_CRASH_TURNS:
-            self.note(f"The agent has started on {_AUTO_CRASH_TURNS} problems in a row by itself; it leaves this one "
+        if self.auto_fix_limit is not None and self._auto_crash_turns > self.auto_fix_limit:
+            self.note(f"The agent has started on {self.auto_fix_limit} problems in a row by itself; it leaves this one "
                       "to you. Ask about it here.")
             return
         if self._job is not None or self.view.busy:

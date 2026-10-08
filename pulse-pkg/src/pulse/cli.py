@@ -60,11 +60,13 @@ Pulse - a live ML training debugger.
   pulse openrouter [status|logout]
                                  sign in to OpenRouter -- or create an account -- in the browser
                                  and keep the API key, so Pulse's agent has a model to use
-  pulse run --headless train.py  no screen: Pulse debugs the run by itself in the background --
-                                 the agent fixes crashes and serious problems, a reviewer model
-                                 approves each change, everything is logged (~/.pulse/headless/)
-                                 and goes to the dashboard. `pulse headless` lists them,
-                                 `pulse headless stop` stops one (the run goes on).
+  pulse run --headless [--to WORKSPACE/PROJECT] train.py
+                                 start the run and walk away: Pulse watches it in the background,
+                                 and when it crashes or goes wrong the agent fixes the code and
+                                 restarts it (a reviewer model approves every change). It goes on
+                                 the dashboard in that workspace and project -- asked once, then
+                                 remembered. Logged in ~/.pulse/headless/. `pulse headless` lists
+                                 them, `pulse headless stop` stops one (the run goes on).
   pulse config [name [value]]    the settings Pulse remembers between starts (agent, workspace,
                                  project, reviewer, review, mouse, audits, saved keys);
                                  `pulse config reset` forgets them. Inside pulse: /config
@@ -704,7 +706,7 @@ def main(argv=None):
         return headless_main(argv[1:])
 
     console_commands = ("watch", "attach", "console", "sessions", "install-sudo")
-    launch_options = ("--stream", "--cwd", "--again", "--agent-log", "--approver", "--headless")
+    launch_options = ("--stream", "--cwd", "--again", "--agent-log", "--approver", "--headless", "--to")
 
     # `run` starts a run. Without it, a script name means "the run of this script that is
     # already going" -- so `pulse train.py` watches, and only `pulse run train.py` starts
@@ -738,11 +740,35 @@ def main(argv=None):
         options, rest = [], list(argv[1:])
         while rest and rest[0].startswith("-") and rest[0] != "--":
             options.append(rest.pop(0))
-            if options[-1] in ("--cwd", "--approver") and rest:
+            if options[-1] in ("--cwd", "--approver", "--to") and rest:
                 options.append(rest.pop(0))
         headless = "--headless" in options
-        if headless:
-            argv = ["run"] + [o for o in options if o != "--headless"] + rest
+        # where a headless run goes online, workspace and project together (a workspace alone is
+        # half a setup): --to WORKSPACE/PROJECT, remembered (pulse_headless.choose_destination)
+        destination = {"workspace": None, "project": None}
+        kept = []
+        i = 0
+        while i < len(options):
+            option = options[i]
+            if option.split("=", 1)[0] == "--to":
+                if "=" in option:
+                    value = option.split("=", 1)[1]
+                else:
+                    value = options[i + 1] if i + 1 < len(options) else ""
+                    i += 1
+                from .pulse_headless import split_destination
+                try:
+                    destination["workspace"], destination["project"] = split_destination(value)
+                except ValueError as exc:
+                    print(f"pulse run: {exc}")
+                    return 1
+            elif option != "--headless":
+                kept.append(option)
+            i += 1
+        if destination["workspace"] and not headless:
+            print("pulse run: --to goes with --headless (the app asks, or `pulse config`).")
+            return 1
+        argv = ["run"] + kept + rest
         try:
             stream, cwd, again, script, script_args = _parse_run_args(argv[1:])
         except _UsageError as problem:
@@ -752,7 +778,7 @@ def main(argv=None):
             return 1 if str(problem) else 0
         if headless:
             from .pulse_headless import start as headless_start
-            return headless_start(script, script_args, cwd=cwd)
+            return headless_start(script, script_args, cwd=cwd, **destination)
         try:
             return run_script(script, script_args, stream=stream, cwd=cwd, again=again)
         except KeyboardInterrupt:
