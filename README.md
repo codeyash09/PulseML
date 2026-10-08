@@ -632,8 +632,8 @@ or with `pulse config workspace`.
 From the script itself: `auto_track(mode="headless")`, or `PULSE_MODE=headless`
 (`PULSE_TO=WORKSPACE/PROJECT` chooses where it goes).
 
-The full operator's guide -- setup, every option, what it does on its own, the log, stopping,
-settings and troubleshooting -- is in [docs/headless.md](docs/headless.md).
+Quick guide:
+[docs/headless.md](docs/headless.md).
 
 ## The `pulse` command
 
