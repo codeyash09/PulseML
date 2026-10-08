@@ -338,6 +338,8 @@ def refresh_session(refresh_token: Optional[str]) -> bool:
     invalid refresh token -- caller should fall back to a fresh interactive
     login in that case, same graceful-degradation pattern as the rest of
     this module."""
+    global _REFRESH_REJECTED
+    _REFRESH_REJECTED = False
     if not refresh_token:
         return False
     body = {"refresh_token": refresh_token}
@@ -347,6 +349,11 @@ def refresh_session(refresh_token: Optional[str]) -> bool:
         req = urllib.request.Request(url, data=data, method="POST", headers=_headers())
         with urllib.request.urlopen(req, timeout=_TIMEOUT_INTERACTIVE) as resp:
             auth_response = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # the server looked at the token and said no (expired, revoked, already used) -- as
+        # opposed to not being reachable, which says nothing about the login
+        _REFRESH_REJECTED = exc.code in (400, 401, 403)
+        return False
     except Exception:
         return False
     if not isinstance(auth_response, dict) or "access_token" not in auth_response:
@@ -356,6 +363,15 @@ def refresh_session(refresh_token: Optional[str]) -> bool:
     user = auth_response.get("user")
     _SESSION_EMAIL = (user.get("email") or "").strip().lower() or None if isinstance(user, dict) else None
     return True
+
+
+_REFRESH_REJECTED = False
+
+
+def refresh_was_rejected() -> bool:
+    """Did the last refresh_session() fail because the server refused the token (the login is
+    gone), rather than because it could not be reached?"""
+    return _REFRESH_REJECTED
 
 
 def session_email() -> Optional[str]:

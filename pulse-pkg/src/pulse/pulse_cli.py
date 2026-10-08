@@ -5137,6 +5137,19 @@ class PulseCLI:
             # Best-effort: an older cache with no refresh_token yet, or an
             # expired one, just leaves us on the anon key as before.
             refreshed = cloud.refresh_session(cached.get("refresh_token"))
+            if refreshed:
+                # The refresh token is single-use: Supabase hands back a new one and the old one is
+                # dead. Kept only in memory, the next start presented the dead one, the refresh
+                # failed, and that run "signed in" on the anon key -- every Teams/Projects call 401.
+                cloud._persist_rotated_refresh_token(cached.get("refresh_token"), cloud.get_refresh_token())
+            elif cached.get("refresh_token") and cloud.refresh_was_rejected():
+                # The server refused the cached session (expired, or a refresh token already
+                # used): the user record still loads, but nothing behind row-level security
+                # would. Sign in again. (Offline is not this: the login is kept.)
+                cprint("[Pulse] Your Pulse Cloud login has expired -- signing in again.", color=_YELLOW)
+                cloud.clear_cached_credentials()
+                cached = None
+        if cached:
             session_email = cloud.session_email() if refreshed else None
             if session_email and session_email != str(cached.get("email") or "").strip().lower():
                 # The refresh token belongs to a different account than the cached

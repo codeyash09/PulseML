@@ -132,6 +132,17 @@ def choose_destination(workspace: Optional[str] = None, project: Optional[str] =
         return {}
     if not cli.user_id:
         return {}
+    try:
+        return _destination(cli, workspace, project, interactive)
+    except cloud.SupabaseError as exc:
+        # a cloud that refuses or is unreachable must not stop the run from starting
+        print(f"[Pulse] Pulse Cloud did not answer ({exc}); the run will be logged on this machine only.")
+        return {}
+
+
+def _destination(cli: Any, workspace: Optional[str], project: Optional[str], interactive: bool) -> Dict[str, Any]:
+    from . import pulse_settings as settings
+    from . import pulse_supabase as cloud
     describe_team = lambda t: cli._describe_workspace(t, cli.user_id)   # noqa: E731
     if workspace:
         team = _match(cloud.find_teams_for_user(cli.user_id), workspace, ["team_id", "join_code", "name"],
