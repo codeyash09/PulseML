@@ -195,3 +195,8 @@ def test_with_nothing_remembered_the_pickers_ask_once(signed_in, monkeypatch):
     where = headless.choose_destination(interactive=True)
     assert where["team_id"] == "t2" and where["project_id"] == "p3" and "Toys" in where["label"]
     assert settings.remembered_id("workspace") == "t2" and settings.remembered_id("project") == "p3"
+
+
+def test_a_gone_process_is_not_alive_and_this_one_is():
+    assert headless._alive(os.getpid())
+    assert not headless._alive(999999999)

@@ -463,12 +463,36 @@ def _watch(app: HeadlessApp, stopping: threading.Event) -> int:
 
 # ---------------------------------------------------------------------------------- `pulse headless`
 
+def _alive(pid: int) -> bool:
+    """Is that process still there? (On Windows os.kill(pid, 0) is not a check: signal 0 is
+    CTRL_C_EVENT there, so it would interrupt the process it asks about.)"""
+    if os.name == "nt":
+        import ctypes
+        kernel = ctypes.windll.kernel32                  # type: ignore[attr-defined]
+        handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        try:
+            return bool(kernel.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def _running() -> List[Dict[str, Any]]:
     out = []
     for path in sorted(_home().glob("*.json")):
         try:
             info = json.loads(path.read_text())
-            os.kill(int(info["pid"]), 0)
+            if not _alive(int(info["pid"])):
+                raise OSError("gone")
         except (OSError, ValueError, KeyError):
             try:
                 path.unlink()
