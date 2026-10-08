@@ -1789,6 +1789,44 @@ def patch_debug_session(session_id: str, fields: Dict[str, Any], timeout: float 
     )
 
 
+def claim_commands(run_id: str, runner_id: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """Atomically claim pending dashboard commands for one local run."""
+    if not is_valid_uuid(run_id) or not is_valid_uuid(runner_id):
+        return []
+    rows = _request(
+        "GET", "Commands",
+        params={"run_id": f"eq.{run_id}", "status": "eq.pending",
+                "select": "id,run_id,project_id,user_id,command", "order": "created_at.asc",
+                "limit": str(max(1, min(int(limit), 20)))},
+        timeout=_TIMEOUT_BACKGROUND,
+    ) or []
+    claimed: List[Dict[str, Any]] = []
+    for row in rows:
+        updated = _request(
+            "PATCH", "Commands",
+            params={"id": f"eq.{row['id']}", "status": "eq.pending"},
+            body={"status": "processing", "claimed_by": runner_id,
+                  "started_at": datetime.now(timezone.utc).isoformat()},
+            prefer="return=representation", timeout=_TIMEOUT_BACKGROUND,
+        ) or []
+        if updated:
+            claimed.append(row)
+    return claimed
+
+
+def finish_command(command_id: str, status: str, result: str) -> None:
+    """Save a command's terminal state and scrubbed result for the dashboard."""
+    if status not in ("completed", "failed"):
+        raise ValueError("command status must be completed or failed")
+    _request(
+        "PATCH", "Commands",
+        params={"id": f"eq.{command_id}", "status": "eq.processing"},
+        body={"status": status, "result": scrub_secrets(result),
+              "completed_at": datetime.now(timezone.utc).isoformat()},
+        prefer="return=minimal", timeout=_TIMEOUT_BACKGROUND,
+    )
+
+
 # ----------------------------------------------------------------------------
 # Environment info -- gathered once at session start, pushed as the first
 # Debug_Sessions.telemetry entry (see PulseCLI._cloud_setup).

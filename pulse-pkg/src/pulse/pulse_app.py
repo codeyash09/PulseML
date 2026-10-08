@@ -162,8 +162,12 @@ class RunLog:
     TELEMETRY_EVERY = 60.0
     FLUSH_EVERY = 60.0
 
-    def __init__(self, cli: Any, session: Dict[str, Any], workdir: str) -> None:
+    def __init__(self, cli: Any, session: Dict[str, Any], workdir: str,
+                 on_command: Optional[Callable[[str], str]] = None) -> None:
+        from . import pulse_supabase as cloud
+
         self.cli = cli
+        self._cloud = cloud
         self.session = session
         self.workdir = workdir
         self.id: Optional[str] = None
@@ -179,6 +183,9 @@ class RunLog:
         self._last_flush = time.monotonic()
         self._worker: Optional[threading.Thread] = None
         self._closed = False
+        self._command_handler = on_command
+        self._command_stop = threading.Event()
+        self._command_worker: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------ what gets recorded
 
@@ -196,6 +203,34 @@ class RunLog:
             self._fields["telemetry"].append(first)
             self._dirty.add("telemetry")
         self._spawn(create=True)
+        if self._command_handler is not None:
+            self._command_worker = threading.Thread(
+                target=self._listen_commands, daemon=True, name="pulse-run-commands"
+            )
+            self._command_worker.start()
+
+    def _listen_commands(self) -> None:
+        cloud = self._cloud
+        while not self._command_stop.wait(2.0):
+            if not self.id:
+                continue
+            try:
+                commands = cloud.claim_commands(self.id, getattr(self.cli, "user_id", ""))
+            except Exception:
+                continue
+            for command in commands:
+                command_id = str(command.get("id") or "")
+                try:
+                    text = str(command.get("command") or "").strip()
+                    if not text or len(text) > 8000:
+                        raise ValueError("Command must contain 1 to 8000 characters.")
+                    result = self._command_handler(text) if self._command_handler else ""
+                    cloud.finish_command(command_id, "completed", result or "Handled by the Pulse app.")
+                except Exception as exc:
+                    try:
+                        cloud.finish_command(command_id, "failed", f"{type(exc).__name__}: {exc}")
+                    except Exception:
+                        pass
 
     def tick(self, state: Dict[str, Any], status: str, events: List[Dict[str, Any]], session: Dict[str, Any]) -> None:
         """Called a few times a minute with the brain's current state."""
@@ -230,9 +265,21 @@ class RunLog:
                     self._incident("stopped", str(event.get("reason") or "the run was stopped"))
                     force = True
             self._seen_events = len(events)
-            if now - self._last_telemetry >= self.TELEMETRY_EVERY or not self._last_telemetry:
+            if force or now - self._last_telemetry >= self.TELEMETRY_EVERY or not self._last_telemetry:
                 self._last_telemetry = now
-                snapshot: Dict[str, Any] = {"t": time.time(), "step": state.get("step") or 0}
+                snapshot: Dict[str, Any] = {
+                    "t": time.time(), "step": state.get("step") or 0, "status": status,
+                    "gaps": state.get("gaps") or 0, "finished": bool(state.get("finished")),
+                    "findings": [
+                        {"severity": getattr(item, "severity", "info"),
+                         "message": getattr(item, "message", str(item)),
+                         "check": getattr(item, "check", ""),
+                         "variable": getattr(item, "variable", ""),
+                         "step": state.get("step")}
+                        for item in (state.get("findings") or [])
+                    ],
+                    "tensors": state.get("tensors") or {},
+                }
                 for name, history in (state.get("histories") or {}).items():
                     if history:
                         snapshot[name] = history[-1]
@@ -281,7 +328,10 @@ class RunLog:
         if not self.enabled or self._closed:
             return
         self._closed = True
+        self._command_stop.set()
         self._spawn(wait=5.0)
+        if self._command_worker is not None and self._command_worker is not threading.current_thread():
+            self._command_worker.join(timeout=1.0)
 
     # ------------------------------------------------------------------ sending
 
@@ -297,7 +347,7 @@ class RunLog:
             self._worker.join(wait)
 
     def _send(self, create: bool) -> None:
-        from . import pulse_supabase as cloud
+        cloud = self._cloud
         dirty: set = set()
         try:
             if create and self.id is None:
@@ -397,6 +447,8 @@ class App:
         self._think_started = 0.0
         self._streamed_reasoning = False
         self._job: Optional[threading.Thread] = None
+        self._remote_pending: "collections.deque[Dict[str, Any]]" = collections.deque()
+        self._remote_active: Optional[Dict[str, Any]] = None
         self._last_ctrl_c = 0.0
         self._ui_thread = threading.current_thread()
         # the run that is open (DEBUG), if any
@@ -761,6 +813,8 @@ class App:
             self.note("Cancelled.")
         except Exception as exc:                     # one failing command must not end the app
             self.error(f"That failed: {type(exc).__name__}: {exc}")
+            if self._remote_active is not None:
+                self._remote_active["error"] = f"{type(exc).__name__}: {exc}"
         finally:
             with self.lock:
                 self._flush_partial()
@@ -771,10 +825,41 @@ class App:
                 self.dirty = True
                 pending, self._crash_pending = self._crash_pending, None
                 problems, self._problem_pending = self._problem_pending, None
+                remote, self._remote_active = self._remote_active, None
+                if remote is not None:
+                    logs = getattr(self.cli, "_agent_logs", [])
+                    answer = next((entry.get("answer") for entry in reversed(logs)
+                                   if entry.get("question") == remote["line"]), None)
+                    remote["result"] = remote.get("error") or answer or "Handled by the Pulse app."
+                    remote["done"].set()
                 if pending and not self.done:
                     self._start_crash_turn(pending, self._crash_summary())
                 elif problems and not self.done and self._status in ("live", "stalled"):
                     self._start_problem_turn(problems)
+
+    def _run_remote_command(self, line: str) -> str:
+        remote: Dict[str, Any] = {"line": line, "done": threading.Event()}
+        with self.lock:
+            self._remote_pending.append(remote)
+            self.dirty = True
+        while not remote["done"].wait(0.25):
+            if self.done:
+                raise RuntimeError("Pulse app closed before the command could run.")
+        if remote.get("error"):
+            raise RuntimeError(remote["error"])
+        return str(remote.get("result") or "Handled by the Pulse app.")
+
+    def _start_pending_remote_command(self) -> None:
+        with self.lock:
+            if self._job is not None or not self._remote_pending or self.done:
+                return
+            remote = self._remote_pending.popleft()
+            self._remote_active = remote
+            self._flush_partial()
+            self.view.entries.append(tui.Entry("user", remote["line"]))
+            self.view.scroll = 0
+            self.dirty = True
+        self._start(self._handle, remote["line"])
 
     def _cancel_job(self) -> None:
         job = self._job
@@ -1311,7 +1396,7 @@ class App:
     def _start_runlog(self, session: Dict[str, Any], workdir: str) -> None:
         """The run's own row on the dashboard; the agent's turns about it go there too."""
         self._stop_runlog()
-        log = RunLog(self.cli, session, workdir)
+        log = RunLog(self.cli, session, workdir, on_command=self._run_remote_command)
         if not log.enabled:
             return
         self.runlog = log
@@ -2073,6 +2158,7 @@ class App:
                         key = "ctrl+c"
                     if key:
                         self.on_key(key)
+                    self._start_pending_remote_command()
             finally:
                 job = self._job
                 if job is not None and job.is_alive():

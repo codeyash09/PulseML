@@ -4093,6 +4093,8 @@ class PulseCLI:
         self.project_is_secret: bool = False
         self.project_repo: Optional[str] = None
         self.debug_session_id: Optional[str] = None
+        self._remote_command_stop = threading.Event()
+        self._remote_command_thread: Optional[threading.Thread] = None
         self._cloud_sync = cloud.BackgroundSync(on_error=self._on_cloud_error)
         self._cloud_warned = False
         # Local mirrors of the three array columns on Debug_Sessions. Kept
@@ -5122,6 +5124,46 @@ class PulseCLI:
                     )
 
         self._load_history_context()
+        self._start_remote_command_listener()
+
+    def _start_remote_command_listener(self) -> None:
+        """Poll this run's RLS-protected queue and handle prompts as user turns."""
+        if not self.user_id or not self.debug_session_id or self._remote_command_thread is not None:
+            return
+        self._remote_command_stop.clear()
+
+        def listen() -> None:
+            from . import pulse_supabase as cloud
+            while not self._remote_command_stop.wait(2.0):
+                try:
+                    commands = cloud.claim_commands(self.debug_session_id, self.user_id)
+                except Exception:
+                    continue
+                for queued in commands:
+                    command_id = str(queued.get("id") or "")
+                    try:
+                        question = str(queued.get("command") or "").strip()
+                        if not question or len(question) > 8000:
+                            raise ValueError("Command must contain 1 to 8000 characters.")
+                        answer = self.ask_agent(question, from_user=True)
+                        cloud.finish_command(command_id, "completed", answer or "Handled by Pulse.")
+                    except Exception as exc:
+                        try:
+                            cloud.finish_command(command_id, "failed", f"{type(exc).__name__}: {exc}")
+                        except Exception:
+                            pass
+
+        self._remote_command_thread = threading.Thread(
+            target=listen, daemon=True, name="pulse-cli-commands"
+        )
+        self._remote_command_thread.start()
+        atexit.register(self._stop_remote_command_listener)
+
+    def _stop_remote_command_listener(self) -> None:
+        self._remote_command_stop.set()
+        worker = self._remote_command_thread
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=1.0)
 
     def _auth_flow(self) -> None:
         configured_auth = str(self._config_value("auth", "account_action", default="login")).strip().lower()

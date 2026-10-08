@@ -1007,13 +1007,17 @@ def test_a_watched_run_gets_its_own_dashboard_row(monkeypatch):
     assert first["script"] == "/p/train.py" and first["python"] == "3.12" and first["mode"] == "stream"
 
     state = {"step": 40, "histories": {"loss": [1.0, 0.5], "lr": [0.1]},
-             "findings": [finding("plateau", "loss", "warning", "loss has barely moved")]}
+             "findings": [finding("plateau", "loss", "warning", "loss has barely moved")],
+             "tensors": {"weights": {"shape": [32, 16], "dtype": "float32"}}, "gaps": 2}
     log.tick(state, "live", [], session)
     settle(log)
     incidents = fake.field("incidents")
     assert incidents[-1]["kind"] == "finding" and incidents[-1]["severity"] == "warning" and incidents[-1]["step"] == 40
     snapshot = fake.field("telemetry")[-1]
     assert snapshot["step"] == 40 and snapshot["loss"] == 0.5 and snapshot["lr"] == 0.1
+    assert snapshot["status"] == "live" and snapshot["gaps"] == 2
+    assert snapshot["findings"][0]["severity"] == "warning"
+    assert snapshot["tensors"]["weights"]["shape"] == [32, 16]
     assert 95 <= fake.field("uptime_seconds") <= 105
 
     log.tick(state, "live", [], session)              # the same finding again: no new incident

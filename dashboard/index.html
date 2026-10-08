@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <title>Pulse — Teams</title>
+  <meta
+    name="description"
+    content="Pulse Teams — live machine learning training observability."
+  >
+
+  <link
+    rel="icon"
+    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='16' fill='%23f2f2ef'/%3E%3Ctext x='50' y='70' font-family='Arial' font-weight='700' font-size='62' fill='%23050505' text-anchor='middle'%3EP%3C/text%3E%3C/svg%3E"
+  >
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap"
+    rel="stylesheet"
+  >
+
+  <link rel="stylesheet" href="styles.css">
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+</head>
+
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+
+    <button
+      class="wordmark"
+      id="home-btn"
+      type="button"
+      aria-label="Pulse home"
+    >
+      <span class="wordmark-mark">P</span>
+      <span>Pulse</span>
+    </button>
+
+    <div class="topbar-center">
+      <span class="topbar-product">PULSE</span>
+      <span class="topbar-divider"></span>
+      <span id="topbar-workspace"></span>
+    </div>
+
+    <div class="topbar-right" id="topbar-right"></div>
+
+  </div>
+</header>
+
+
+<main id="app">
+
+  <!-- =========================================================
+       LOGIN
+  ========================================================== -->
+
+  <section id="view-login" class="view">
+
+    <div class="login-page">
+
+      <div class="login-glow"></div>
+
+      <div class="login-content">
+
+        <div class="login-eyebrow">
+          <span class="status-indicator"></span>
+          PULSE / TEAMS
+        </div>
+
+        <h1>
+          Watch training
+          <span>actually happen.</span>
+        </h1>
+
+        <p class="login-description">
+          See every training run your team is watching.
+          Runtime state, commits, hardware, incidents,
+          and activity in one place.
+        </p>
+
+        <form id="login-form" class="login-form" autocomplete="off">
+
+          <label class="sr-only" for="login-username">
+            Email
+          </label>
+
+          <input
+            id="login-username"
+            name="username"
+            type="email"
+            placeholder="Email"
+            autocomplete="username"
+            spellcheck="false"
+          >
+
+          <label class="sr-only" for="login-password">
+            Password
+          </label>
+
+          <input
+            id="login-password"
+            name="password"
+            type="password"
+            placeholder="Password"
+            autocomplete="current-password"
+          >
+
+          <button type="submit">
+            Sign in
+            <span>→</span>
+          </button>
+
+        </form>
+
+        <p
+          class="login-error"
+          id="login-error"
+          role="alert"
+        ></p>
+
+      </div>
+
+      <div class="login-footer">
+        <span>HEADLESS</span>
+        <span>SHARED</span>
+        <span>LOCAL-FIRST</span>
+      </div>
+
+    </div>
+
+  </section>
+
+
+  <!-- =========================================================
+       WORKSPACES
+  ========================================================== -->
+
+  <section id="view-workspaces" class="view" hidden>
+
+    <div class="page-shell">
+
+      <div class="page-header workspace-header">
+
+        <div>
+
+          <div class="section-eyebrow">
+            YOUR PULSE
+          </div>
+
+          <h1>Your workspaces.</h1>
+
+          <p>
+            Training environments you're connected to.
+          </p>
+
+        </div>
+
+      </div>
+
+      <div
+        id="workspace-list"
+        class="workspace-list"
+      ></div>
+
+      <p
+        id="workspaces-empty"
+        class="empty-state"
+        hidden
+      >
+        No workspaces yet. Join or create one from the
+        Pulse CLI first.
+      </p>
+
+    </div>
+
+  </section>
+
+
+  <!-- =========================================================
+       PROJECTS  (workspace -> project -> run)
+  ========================================================== -->
+
+  <section id="view-projects" class="view" hidden>
+
+    <div class="page-shell">
+
+      <div class="page-header workspace-header">
+
+        <div>
+
+          <div class="section-eyebrow" id="projects-workspace">
+            WORKSPACE
+          </div>
+
+          <h1>Your projects.</h1>
+
+          <p>
+            Pick a project to see its runs. Secret projects only
+            appear for workspace admins and people who joined with
+            the project's join code.
+          </p>
+
+        </div>
+
+        <button
+          class="icon-btn"
+          id="projects-notifications-btn"
+          type="button"
+          aria-haspopup="dialog"
+          aria-controls="notifications-modal"
+          title="Notification settings for this workspace"
+        >
+          <span aria-hidden="true">🔔</span>
+          Notifications
+        </button>
+
+      </div>
+
+      <div
+        id="project-list"
+        class="workspace-list"
+      ></div>
+
+      <p
+        id="projects-empty"
+        class="empty-state"
+        hidden
+      >
+        No projects in this workspace yet. Create one from the
+        Pulse CLI, or join a secret project with its code below.
+      </p>
+
+      <form
+        id="project-join-form"
+        class="login-form project-join-form"
+        autocomplete="off"
+      >
+        <input
+          id="project-join-code"
+          type="text"
+          placeholder="Secret project join code"
+          aria-label="Secret project join code"
+          spellcheck="false"
+          autocapitalize="characters"
+          maxlength="24"
+        />
+        <button type="submit">Join project</button>
+      </form>
+
+      <p
+        id="project-join-msg"
+        class="project-join-msg"
+        role="alert"
+      ></p>
+
+    </div>
+
+  </section>
+
+
+  <!-- =========================================================
+       DASHBOARD
+  ========================================================== -->
+
+  <section id="view-dashboard" class="view" hidden>
+
+    <div class="project-console-shell">
+
+      <header class="project-console-header">
+        <div class="project-console-identity">
+          <div class="project-console-crumb" id="project-crumb">PULSE / PROJECT</div>
+          <h1 id="workspace-title">—</h1>
+        </div>
+        <div class="project-console-controls">
+          <span class="project-console-connection"><i></i> CONNECTED</span>
+          <span id="refresh-label">Updated just now</span>
+          <button class="console-control-btn" id="refresh-btn" type="button" title="Refresh run data">Refresh</button>
+          <button class="console-control-btn" id="notifications-btn" type="button"
+            aria-haspopup="dialog" aria-controls="notifications-modal" title="Notification settings">Notifications</button>
+        </div>
+      </header>
+
+      <div class="project-console-layout">
+        <aside class="run-sidebar" aria-label="Project runs">
+          <div class="run-sidebar-header">
+            <span>RUNS</span>
+            <span class="run-count" id="run-count">0</span>
+          </div>
+          <div id="session-list" class="run-list"></div>
+          <p id="empty-state" class="run-rail-empty" hidden></p>
+        </aside>
+
+        <section id="active-console" class="active-console" aria-label="Selected run console"></section>
+      </div>
+
+    </div>
+
+  </section>
+
+</main>
+
+
+<!-- =========================================================
+     NOTIFICATIONS MODAL
+========================================================== -->
+
+<div
+  class="modal-overlay"
+  id="notifications-modal"
+  role="dialog"
+  aria-modal="true"
+  aria-labelledby="notifications-title"
+  hidden
+>
+
+  <div class="modal-card">
+
+    <div class="modal-header">
+      <h2 id="notifications-title">Notifications</h2>
+      <button
+        class="modal-close"
+        id="notifications-close-btn"
+        type="button"
+        aria-label="Close"
+      >×</button>
+    </div>
+
+    <p class="modal-description">
+      Get alerted the moment any run in this workspace goes live
+      or logs a new incident. Connect Discord once per workspace,
+      then choose where each project's alerts go. Alerts fire
+      from this browser tab while Pulse is open.
+    </p>
+
+    <div class="modal-field">
+      <label>Discord</label>
+      <div class="integration-row" id="discord-integration-row"></div>
+    </div>
+
+    <div class="modal-field" id="project-channels-field" hidden>
+      <label>Project channels</label>
+      <p class="modal-field-hint">
+        Pick a channel per project, or mute it. "Workspace default"
+        uses the channel above. Only workspace admins can change these.
+      </p>
+      <div class="project-channel-list" id="project-channel-list"></div>
+    </div>
+
+    <!-- <div class="modal-field">
+      <label>Slack</label>
+      <div class="integration-row" id="slack-integration-row"></div>
+    </div> -->
+
+    <div class="modal-field">
+      <label for="notif-browser-push">
+        <input
+          type="checkbox"
+          id="notif-browser-push"
+        >
+        Browser push notifications
+      </label>
+      <p class="modal-field-hint" id="notif-push-status"></p>
+    </div>
+
+    <p class="modal-status" id="notif-save-status" role="status"></p>
+
+    <div class="modal-actions">
+      <button
+        class="modal-btn-secondary"
+        id="notifications-test-btn"
+        type="button"
+      >
+        Send test alert
+      </button>
+
+      <button
+        class="modal-btn-primary"
+        id="notifications-save-btn"
+        type="button"
+      >
+        Save
+      </button>
+    </div>
+
+  </div>
+
+</div>
+
+
+<footer class="footer">
+
+  <div class="footer-inner">
+
+    <span>pulse.</span>
+
+    <div>
+      <span>RUNTIME OBSERVABILITY</span>
+      <span>SHARED WORKSPACE</span>
+      <span>LOCAL-FIRST</span>
+    </div>
+
+  </div>
+
+</footer>
+
+
+<script src="app.js"></script>
+
+</body>
+</html>
