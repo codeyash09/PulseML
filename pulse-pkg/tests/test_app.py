@@ -2026,3 +2026,13 @@ def test_an_audit_problem_rated_low_risk_does_not_start_the_agent(real_app, tmp_
     real_app.console._report_audit({"status": "problem", "risk": "low", "step": 9, "findings": ["step 399 of 400"],
                                     "text": "The run stopped at step 399."})
     assert seen == [] and "found a problem" in text_of(real_app)
+
+
+def test_trace_output_is_drawn_as_a_tree(app):
+    """/trace hands its tree to the app (host.trace_output); separators fit the pane."""
+    app.trace_output("TRACE loss  train.py\n  what loss feeds  (each line's children are its effects)\n"
+                     + "-" * 200 + "\n  loss\n  `-> used: print('TRAINED', loss)")
+    entry = app.view.entries[-1]
+    assert entry.kind == "trace"
+    lines = [plain(l) for l in tui.entry_lines(entry, 60, False)]
+    assert all(len(l) <= 60 for l in lines) and not any(l.strip() == "-" for l in lines)

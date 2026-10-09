@@ -473,86 +473,94 @@ class _Capture(io.TextIOBase):
 
 
 class App:
-    def __init__(self, cli: Any, session: Dict[str, Any], workdir: str,
-                 on_command: Optional[Callable[[str], str]] = None,
-                 on_response: Optional[Callable[[str], Optional[str]]] = None) -> None:
-        from . import pulse_supabase as cloud
-
+    def __init__(self, cli: Any, root: str) -> None:
+        from . import pulse_cli
         self.cli = cli
-        self._cloud = cloud
-        self.session = session
-        self.workdir = workdir
-        self.id: Optional[str] = None
-        self.enabled = bool(getattr(cli, "user_id", None))
-        self._lock = threading.Lock()
-        self._fields: Dict[str, Any] = {"agent_logs": [], "error_tracebacks": [], "telemetry": [],
-                                        "incidents": [], "uptime_seconds": 0}
-        self._dirty: set = set()
-        self._seen_findings: set = set()
-        self._seen_events = 0
-        self._status: Optional[str] = None
-        self._last_telemetry = 0.0
-        self._last_flush = time.monotonic()
-        self._worker: Optional[threading.Thread] = None
-        self._closed = False
-        self._command_handler = on_command
-        self._response_handler = on_response
-        self._command_stop = threading.Event()
-        self._command_worker: Optional[threading.Thread] = None
-        self._command_active: Optional[threading.Thread] = None
-        self._command_backlog: "collections.deque[Dict[str, Any]]" = collections.deque()
-        self._command_lock = threading.Lock()
-        self._command_error_reported = False
-
-    # ------------------------------------------------------------------ what gets recorded
-
-    def start(self) -> None:
-        if not self.enabled:
-            return
-        cloud = self._cloud
-        first = {"t": time.time(), "mode": "stream", "script": self.session.get("script"),
-                 "pulse_session": self.session.get("session_id"), "pid": self.session.get("pid")}
+        self.home_root = root
+        self.home_focus = list(getattr(cli, "focus", []) or [])
+        self.view = tui.View()
+        self.lock = threading.RLock()
+        self.done = False
+        self.exit_code = 0
+        self.dirty = True
+        self._partial = ""
+        self._last_blank = True
+        self._pane_w = 80
+        self._edit_pending: Optional[tui.Entry] = None   # the change whose fate is still being decided
+        self.hosting: Any = None                  # the in-process run's monitor, under auto_track()
+        self._screen: Any = None                  # the screen, while the loop runs
+        self._hovered: Optional[tui.Entry] = None # the entry under the mouse
+        self._sel: Optional[Dict[str, Any]] = None # a selection being dragged or just made
+        self._frame: List[str] = []               # the frame last drawn (what a selection copies)
         try:
-            first.update(cloud.collect_environment_info() or {})
+            from . import pulse_supabase as cloud
+            if _settings.is_set("mouse"):
+                self.mouse = _settings.on("mouse")
+            else:                                  # what /mouse saved before there were settings
+                self.mouse = cloud.load_cached_profile().get("app_mouse", "on") != "off"
         except Exception:
-            pass
-        with self._lock:
-            self._fields["telemetry"].append(first)
-            self._dirty.add("telemetry")
-        self._spawn(create=True)
-        if self._command_handler is not None:
-            self._command_worker = threading.Thread(
-                target=self._listen_commands, daemon=True, name="pulse-run-commands"
-            )
-            self._command_worker.start()
+            self.mouse = True
+        self.run_output: "collections.deque[str]" = collections.deque(maxlen=400)   # what that run printed
+        self._crashes_seen: set = set()            # sessions whose crash the agent was started on
+        self._crash_pending: Optional[str] = None  # a crash that came while the agent was busy
+        self._problem_pending: Optional[List[Any]] = None   # serious findings that came while it was busy
+        self._problems_seen: set = set()           # (session, check, variable) the agent was started on
+        self._auto_turn_session: Optional[str] = None   # the run an automatic turn is about, while it runs
+        self._stall_said = False                   # the open run's stall was announced
+        self._paused_here = False                  # /pause sent from here: a stall is expected
+        self._auto_crash_turns = 0                 # crash turns started without the person typing
+        self.auto_fix_limit: Optional[int] = _AUTO_CRASH_TURNS   # None: no limit (headless)
+        self._run_partial = ""
+        self.up = threading.Event()               # set once the screen is up and output is captured
+        self._height = 30
+        self._question: Optional[_Question] = None
+        self._draft = ""
+        self._hushed: Dict[int, List[str]] = {}      # thread id -> what it printed while hushed
+        self._live_thinking: Optional[tui.Entry] = None
+        self._live_answer: Optional[tui.Entry] = None
+        self._think_started = 0.0
+        self._streamed_reasoning = False
+        self._job: Optional[threading.Thread] = None
+        self._remote_pending: "collections.deque[Dict[str, Any]]" = collections.deque()
+        self._remote_active: Optional[Dict[str, Any]] = None
+        self._last_ctrl_c = 0.0
+        self._ui_thread = threading.current_thread()
+        # the run that is open (DEBUG), if any
+        self.console: Any = None
+        self.session: Optional[Dict[str, Any]] = None
+        self.background = False                      # the run is watched, its pane is not shown
+        self.runlog: Optional[RunLog] = None         # the run's row on the dashboard
+        self._orig_sync: Any = None
+        # runs still watched but not the open one: session id -> what _WATCH_FIELDS hold for it
+        self.parked: Dict[str, Dict[str, Any]] = {}
+        self._parked_at = 0.0
+        self._monitor: Any = None                    # a py-spy sampler this app started
+        self.audits = _settings.on("audits")
+        self.launched: Dict[str, Dict[str, Any]] = {}    # session id -> what /run started
+        self._rate: Optional[float] = None
+        self._rate_at: Optional[Tuple[float, int]] = None
+        self._side_at = 0.0
+        self._status = "live"
+        self._pc = pulse_cli
+        self._saved: Dict[str, Any] = {}
+        self._refresh_header()
 
-    def _listen_commands(self) -> None:
-        cloud = self._cloud
-        while not self._command_stop.wait(2.0):
-            if not self.id:
-                continue
-            try:
-                commands = cloud.claim_commands(self.id, getattr(self.cli, "user_id", ""))
-            except Exception as exc:
-                self._report_command_error(f"Could not poll dashboard commands: {exc}")
-                continue
-            for command in commands:
-                command_id = str(command.get("id") or "")
-                try:
-                    text = str(command.get("command") or "").strip()
-                    if not text or len(text) > 8000:
-                        raise ValueError("Command must contain 1 to 8000 characters.")
-                    response = self._response_handler(text) if self._response_handler else None
-                    if response is not None:
-                        cloud.finish_command(command_id, "completed", response)
-                    else:
-                        self._command_backlog.append(command)
-                except Exception as exc:
-                    try:
-                        cloud.finish_command(command_id, "failed", f"{type(exc).__name__}: {exc}")
-                    except Exception as finish_error:
-                        self._report_command_error(f"Could not save dashboard command result: {finish_error}")
-            self._start_next_command()
+    # ================================================================== the transcript
+
+    def _add(self, entry: tui.Entry) -> None:
+        with self.lock:
+            self._flush_partial()
+            self.view.entries.append(entry)
+            self._last_blank = False
+            self.dirty = True
+
+    def note(self, text: str) -> None:
+        self._add(tui.Entry("note", text))
+
+    def trace_output(self, text: str) -> None:
+        """/trace's tree (pulse_console hands it here): its own entry, drawn as a tree."""
+        self._add(tui.Entry("trace", text))
+
     def error(self, text: str) -> None:
         self._add(tui.Entry("error", text))
 
