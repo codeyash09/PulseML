@@ -427,6 +427,7 @@ def supervise(argv: List[str]) -> int:
             return 1
         return _watch(app, stopping)
     finally:
+        app.done = True                              # a dashboard prompt still waiting is failed, not left hanging
         try:
             app._close_all()
         except Exception:
@@ -445,7 +446,9 @@ def _watch(app: HeadlessApp, stopping: threading.Event) -> int:
     while not stopping.is_set():
         with app.lock:
             app._refresh_side(force=True)
-        busy = app._job is not None or app.view.busy or bool(app._crash_pending or app._problem_pending)
+        app._start_pending_remote_command()          # prompts sent from the dashboard
+        busy = app._job is not None or app.view.busy or bool(app._crash_pending or app._problem_pending
+                                                             or app._remote_pending)
         live = app._status in ("live", "stalled")
         now = time.monotonic()
         if live or busy:

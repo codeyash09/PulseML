@@ -151,6 +151,116 @@ class _Question:
         self.done = threading.Event()
 
 
+class CommandQueue:
+    """Prompts sent from the web dashboard to one Debug_Sessions row (the Commands table).
+
+    Every couple of seconds the row's pending commands are claimed. One that cannot be done
+    from afar is answered at once with why (`refuse` returns the reason, or None); the rest
+    are handed to `run`, one at a time, and what it returns -- or why it failed -- goes back
+    to the dashboard. `row_id` is read each time: a row is created in the background."""
+
+    POLL_EVERY = 2.0
+
+    def __init__(self, cli: Any, row_id: Callable[[], Optional[str]], run: Callable[[str], str],
+                 refuse: Optional[Callable[[str], Optional[str]]] = None,
+                 on_error: Optional[Callable[[str], None]] = None) -> None:
+        from . import pulse_supabase as cloud
+        self.cli = cli
+        self._cloud = cloud
+        self._row_id = row_id
+        self._run = run
+        self._refuse = refuse
+        self._on_error = on_error
+        self._stop = threading.Event()
+        self._poller: Optional[threading.Thread] = None
+        self._active: Optional[threading.Thread] = None
+        self._backlog: "collections.deque[Dict[str, Any]]" = collections.deque()
+        self._lock = threading.Lock()
+        self._error_said = False
+
+    def start(self) -> None:
+        if self._poller is None:
+            self._poller = threading.Thread(target=self._listen, daemon=True, name="pulse-commands")
+            self._poller.start()
+
+    def close(self) -> None:
+        """Stop listening. Commands claimed but not started are failed with the reason, so the
+        dashboard does not show them as running for ever."""
+        self._stop.set()
+        with self._lock:
+            left, self._backlog = list(self._backlog), collections.deque()
+        for command in left:
+            self._finish(command, "failed", "Pulse stopped watching this run before it got to this command.")
+        poller = self._poller
+        if poller is not None and poller is not threading.current_thread():
+            poller.join(timeout=1.0)
+
+    def _listen(self) -> None:
+        while not self._stop.wait(self.POLL_EVERY):
+            row = self._row_id()
+            if not row:
+                continue
+            try:
+                claimed = self._cloud.claim_commands(row, getattr(self.cli, "user_id", "") or "")
+            except Exception as exc:
+                self._report(f"Could not read the dashboard's commands: {exc}")
+                continue
+            for command in claimed:
+                text = str(command.get("command") or "").strip()
+                if not text or len(text) > 8000:
+                    self._finish(command, "failed", "A command is 1 to 8000 characters.")
+                    continue
+                try:
+                    refused = self._refuse(text) if self._refuse else None
+                except Exception as exc:
+                    refused = f"{type(exc).__name__}: {exc}"
+                if refused is not None:
+                    self._finish(command, "failed", refused)
+                elif self._stop.is_set():
+                    self._finish(command, "failed", "Pulse stopped watching this run before it got to this command.")
+                else:
+                    with self._lock:
+                        self._backlog.append(command)
+            self._next()
+
+    def _next(self) -> None:
+        with self._lock:
+            if self._stop.is_set() or not self._backlog:
+                return
+            if self._active is not None and self._active.is_alive():
+                return
+            command = self._backlog.popleft()
+            self._active = threading.Thread(target=self._execute, args=(command,), daemon=True,
+                                            name="pulse-command")
+            self._active.start()
+
+    def _execute(self, command: Dict[str, Any]) -> None:
+        text = str(command.get("command") or "").strip()
+        try:
+            result = self._run(text)
+            self._finish(command, "completed", result or "Done.")
+        except Exception as exc:
+            self._finish(command, "failed", str(exc) or type(exc).__name__)
+        finally:
+            self._next()
+
+    def _finish(self, command: Dict[str, Any], status: str, result: str) -> None:
+        try:
+            self._cloud.finish_command(str(command.get("id") or ""), status, result)
+        except Exception as exc:
+            self._report(f"Could not send a command's result to the dashboard: {exc}")
+
+    def _report(self, message: str) -> None:
+        if self._error_said or self._on_error is None:
+            return
+        self._error_said = True
+        try:
+            self._on_error(message)
+        except Exception:
+            pass
+
+
+
 class RunLog:
     """One Debug_Sessions row for a run the app watches, so it shows on the web dashboard
     like a run started with `pulse run`: a first telemetry entry about the environment,
@@ -164,7 +274,8 @@ class RunLog:
 
     def __init__(self, cli: Any, session: Dict[str, Any], workdir: str,
                  on_command: Optional[Callable[[str], str]] = None,
-                 on_response: Optional[Callable[[str], Optional[str]]] = None) -> None:
+                 on_response: Optional[Callable[[str], Optional[str]]] = None,
+                 on_error: Optional[Callable[[str], None]] = None) -> None:
         from . import pulse_supabase as cloud
 
         self.cli = cli
@@ -184,14 +295,10 @@ class RunLog:
         self._last_flush = time.monotonic()
         self._worker: Optional[threading.Thread] = None
         self._closed = False
-        self._command_handler = on_command
-        self._response_handler = on_response
-        self._command_stop = threading.Event()
-        self._command_worker: Optional[threading.Thread] = None
-        self._command_active: Optional[threading.Thread] = None
-        self._command_backlog: "collections.deque[Dict[str, Any]]" = collections.deque()
-        self._command_lock = threading.Lock()
-        self._command_error_reported = False
+        # prompts sent to this run from the web dashboard
+        self.commands: Optional[CommandQueue] = (
+            CommandQueue(cli, lambda: self.id, on_command, refuse=on_response, on_error=on_error)
+            if on_command is not None else None)
 
     # ------------------------------------------------------------------ what gets recorded
 
@@ -209,102 +316,8 @@ class RunLog:
             self._fields["telemetry"].append(first)
             self._dirty.add("telemetry")
         self._spawn(create=True)
-        if self._command_handler is not None:
-            self._command_worker = threading.Thread(
-                target=self._listen_commands, daemon=True, name="pulse-run-commands"
-            )
-            self._command_worker.start()
-
-    def _listen_commands(self) -> None:
-        cloud = self._cloud
-        while not self._command_stop.wait(2.0):
-            if not self.id:
-                continue
-            try:
-                commands = cloud.claim_commands(self.id, getattr(self.cli, "user_id", ""))
-            except Exception as exc:
-                self._report_command_error(f"Could not poll dashboard commands: {exc}")
-                continue
-            for command in commands:
-                command_id = str(command.get("id") or "")
-                try:
-                    text = str(command.get("command") or "").strip()
-                    if not text or len(text) > 8000:
-                        raise ValueError("Command must contain 1 to 8000 characters.")
-                    response = self._response_handler(text) if self._response_handler else None
-                    if response is not None:
-                        cloud.finish_command(command_id, "completed", response)
-                    else:
-                        self._command_backlog.append(command)
-                except Exception as exc:
-                    try:
-                        cloud.finish_command(command_id, "failed", f"{type(exc).__name__}: {exc}")
-                    except Exception as finish_error:
-                        self._report_command_error(f"Could not save dashboard command result: {finish_error}")
-            self._start_next_command()
-
-    def _start_next_command(self) -> None:
-        with self._command_lock:
-            if self._command_stop.is_set() or not self._command_backlog:
-                return
-            if self._command_active is not None and self._command_active.is_alive():
-                return
-            command = self._command_backlog.popleft()
-            worker = threading.Thread(target=self._execute_command, args=(command,),
-                                      daemon=True, name="pulse-run-command")
-            self._command_active = worker
-            worker.start()
-
-    def _execute_command(self, command: Dict[str, Any]) -> None:
-        cloud = self._cloud
-        command_id = str(command.get("id") or "")
-        text = str(command.get("command") or "").strip()
-        try:
-            result = self._command_handler(text) if self._command_handler else ""
-            cloud.finish_command(command_id, "completed", result or "Command completed.")
-        except Exception as exc:
-            try:
-                cloud.finish_command(command_id, "failed", f"{type(exc).__name__}: {exc}")
-            except Exception as finish_error:
-                self._report_command_error(f"Could not save dashboard command result: {finish_error}")
-        finally:
-            self._start_next_command()
-
-    def _report_command_error(self, message: str) -> None:
-        if self._command_error_reported:
-            return
-        self._command_error_reported = True
-        app = getattr(self._command_handler, "__self__", None)
-        report = getattr(app, "error", None)
-        if callable(report):
-            report(message)
-
-    def output(self, lines: List[str]) -> None:
-        if not self.enabled or self._closed or not lines:
-            return
-        with self._lock:
-            self._fields["telemetry"].append({"t": time.time(), "type": "run_output", "lines": lines[-200:]})
-            self._dirty.add("telemetry")
-        self._spawn()
-
-    def input_required(self, prompt_id: str, label: str, options: Optional[List[Dict[str, str]]] = None) -> None:
-        if not self.enabled or self._closed:
-            return
-        with self._lock:
-            self._fields["telemetry"].append({"t": time.time(), "type": "remote_prompt",
-                                               "prompt_id": prompt_id, "label": label,
-                                               "options": options or []})
-            self._dirty.add("telemetry")
-        self._spawn()
-
-    def input_resolved(self, prompt_id: str) -> None:
-        if not self.enabled or self._closed:
-            return
-        with self._lock:
-            self._fields["telemetry"].append({"t": time.time(), "type": "remote_prompt_resolved",
-                                               "prompt_id": prompt_id})
-            self._dirty.add("telemetry")
-        self._spawn()
+        if self.commands is not None:
+            self.commands.start()
 
     def tick(self, state: Dict[str, Any], status: str, events: List[Dict[str, Any]], session: Dict[str, Any]) -> None:
         """Called a few times a minute with the brain's current state."""
@@ -372,11 +385,16 @@ class RunLog:
         if force or now - self._last_flush >= self.FLUSH_EVERY:
             self._spawn()
 
-    def agent_turn(self, question: str, answer: str, fix_applied: Optional[Dict[str, Any]] = None) -> None:
+    def agent_turn(self, question: str, answer: str, fix_applied: Optional[Dict[str, Any]] = None,
+                   who: Optional[str] = None) -> None:
+        """`who` asked: "you" (typed here), "dashboard" (sent from the web), "pulse" (a turn
+        Pulse started itself -- a crash, a finding, an audit)."""
         if not self.enabled or self._closed:
             return
         with self._lock:
             entry: Dict[str, Any] = {"t": time.time(), "question": question, "answer": answer}
+            if who:
+                entry["who"] = who
             if fix_applied:
                 entry["fix_applied"] = fix_applied
                 self._incident("fix_applied", str(fix_applied.get("explanation") or "code edited"),
@@ -402,10 +420,9 @@ class RunLog:
         if not self.enabled or self._closed:
             return
         self._closed = True
-        self._command_stop.set()
+        if self.commands is not None:
+            self.commands.close()
         self._spawn(wait=5.0)
-        if self._command_worker is not None and self._command_worker is not threading.current_thread():
-            self._command_worker.join(timeout=1.0)
 
     # ------------------------------------------------------------------ sending
 
@@ -523,6 +540,7 @@ class App:
         self._job: Optional[threading.Thread] = None
         self._remote_pending: "collections.deque[Dict[str, Any]]" = collections.deque()
         self._remote_active: Optional[Dict[str, Any]] = None
+        self._home_commands: Optional[CommandQueue] = None   # the dashboard's prompts to the app's own row
         self._last_ctrl_c = 0.0
         self._ui_thread = threading.current_thread()
         # the run that is open (DEBUG), if any
@@ -647,6 +665,12 @@ class App:
                 self._edit_pending.touch()
         if threading.current_thread() is self._ui_thread:
             raise _ui.Unavailable("a question cannot be asked from the drawing thread")
+        remote = self._remote_active
+        if remote is not None and threading.current_thread() is self._job:
+            # a prompt from the dashboard: nobody may be at this machine to answer, so the
+            # question is not left waiting on the screen -- it is declined, and the dashboard told
+            remote["asked"] = str(question.label or "a question")
+            raise EOFError("a question only the person at the machine can answer")
         with self.lock:
             held = self._hushed.get(threading.get_ident())
             if held:
@@ -905,39 +929,117 @@ class App:
                 problems, self._problem_pending = self._problem_pending, None
                 remote, self._remote_active = self._remote_active, None
                 if remote is not None:
-                    logs = getattr(self.cli, "_agent_logs", [])
-                    answer = next((entry.get("answer") for entry in reversed(logs)
-                                   if entry.get("question") == remote["line"]), None)
-                    remote["result"] = remote.get("error") or answer or "Handled by the Pulse app."
+                    remote["result"] = self._remote_result(remote)
                     remote["done"].set()
                 if pending and not self.done:
                     self._start_crash_turn(pending, self._crash_summary())
                 elif problems and not self.done and self._status in ("live", "stalled"):
                     self._start_problem_turn(problems)
 
-    def _run_remote_command(self, line: str) -> str:
-        remote: Dict[str, Any] = {"line": line, "done": threading.Event()}
+    # ================================================================== the web dashboard's prompts
+
+    _REMOTE_REFUSED = {
+        ("/exit", "/quit", "/q"): "Only the person at the machine can close Pulse.",
+        ("/mouse", "/copy"): "That is about the terminal Pulse runs in; from the dashboard it does nothing.",
+        ("/config", "/settings", "/agent"): "Settings and the agent's model are changed at the machine.",
+        ("/monitor", "/runs", "/watch", "/sessions", "/attach", "/change"):
+            "On the dashboard, open the run you want and send the prompt there.",
+    }
+
+    def _remote_refusal(self, line: str) -> Optional[str]:
+        """Why a prompt from the dashboard cannot be done from afar (None: it can)."""
+        word, _, rest = line.strip().partition(" ")
+        word = word.lower()
+        for words, why in self._REMOTE_REFUSED.items():
+            if word in words:
+                return f"{word}: {why}"
+        if word == "/run" and not rest.strip():
+            return "/run needs the script from the dashboard: /run train.py --epochs 3"
+        return None
+
+    def _start_home_commands(self) -> None:
+        """The dashboard's prompts to the row setup opened for this app (each watched run has
+        its own). The app answers them in turn with the person's own; the CLI's listener, which
+        would answer them on a thread of its own, behind the app's back, is stopped."""
+        cli = self.cli
+        if self._home_commands is not None or not getattr(cli, "user_id", None) \
+                or not getattr(cli, "debug_session_id", None):
+            return
+        stop = getattr(cli, "_stop_remote_command_listener", None)
+        if callable(stop):
+            stop()
+        self._home_commands = CommandQueue(cli, lambda: getattr(cli, "debug_session_id", None),
+                                           lambda text: self._run_remote_command(text, None),
+                                           refuse=self._remote_refusal, on_error=self.error)
+        self._home_commands.start()
+
+    def _run_remote_command(self, line: str, session_id: Optional[str] = None) -> str:
+        """A prompt from the dashboard, done as if typed here, after whatever is in hand. Sent
+        to a run (`session_id`), it is about that run, which is brought on screen first if it
+        is watched off screen. Returns what it showed, for the dashboard. Called on the
+        command queue's thread; blocks until done."""
+        remote: Dict[str, Any] = {"line": line, "session": session_id, "done": threading.Event()}
         with self.lock:
             self._remote_pending.append(remote)
             self.dirty = True
         while not remote["done"].wait(0.25):
             if self.done:
-                raise RuntimeError("Pulse app closed before the command could run.")
-        if remote.get("error"):
-            raise RuntimeError(remote["error"])
-        return str(remote.get("result") or "Handled by the Pulse app.")
+                raise RuntimeError("Pulse closed before it got to this command.")
+        if remote.get("failed"):
+            raise RuntimeError(remote["result"])
+        return str(remote.get("result") or "Done.")
 
     def _start_pending_remote_command(self) -> None:
         with self.lock:
-            if self._job is not None or not self._remote_pending or self.done:
+            if self._job is not None or self._question is not None or not self._remote_pending or self.done:
                 return
             remote = self._remote_pending.popleft()
             self._remote_active = remote
+        self._start(self._remote_job, remote)
+
+    def _remote_job(self, remote: Dict[str, Any]) -> None:
+        target = remote.get("session")
+        if target is not None and target != (self.session or {}).get("session_id"):
+            state = self.parked.get(target)
+            if state is None:
+                raise RuntimeError("Pulse is no longer watching that run.")
+            self._switch_to(state["session"])
+        with self.lock:
             self._flush_partial()
-            self.view.entries.append(tui.Entry("user", remote["line"]))
+            self.view.entries.append(tui.Entry("note", "From the dashboard:"))
+            mark = tui.Entry("user", remote["line"])
+            self.view.entries.append(mark)
             self.view.scroll = 0
             self.dirty = True
-        self._start(self._handle, remote["line"])
+        remote["mark"] = mark
+        self._handle(remote["line"], about_run=target is not None)
+
+    def _remote_result(self, remote: Dict[str, Any]) -> str:
+        """What a dashboard prompt showed here, as plain text: the transcript after it, without
+        the model's reasoning. With the lock held."""
+        if remote.get("error"):
+            remote["failed"] = True
+            return str(remote["error"])
+        entries, mark = self.view.entries, remote.get("mark")
+        start = next((i for i in range(len(entries) - 1, -1, -1) if entries[i] is mark), None)
+        lines: List[str] = []
+        for entry in entries[start + 1:] if start is not None else []:
+            if entry.kind in ("user", "thinking"):
+                continue
+            if entry.kind in ("tool", "edit"):
+                lines.extend(entry.calls)
+                if entry.kind == "edit" and entry.text:
+                    lines.append(entry.text)
+            elif entry.text:
+                lines.append(entry.text)
+        text = tui._SGR_RE.sub("", "\n".join(lines)).strip()
+        if remote.get("asked"):
+            text = (text + "\n\n" if text else "") + (
+                f"It stopped at a question only the person at the machine can answer "
+                f"({remote['asked']}), so that was declined.")
+        if len(text) > 20000:
+            text = text[:20000].rstrip() + "\n…"
+        return text or "Done (nothing to show)."
 
     def _cancel_job(self) -> None:
         job = self._job
@@ -1474,7 +1576,10 @@ class App:
     def _start_runlog(self, session: Dict[str, Any], workdir: str) -> None:
         """The run's own row on the dashboard; the agent's turns about it go there too."""
         self._stop_runlog()
-        log = RunLog(self.cli, session, workdir, on_command=self._run_remote_command)
+        run_id = session.get("session_id")
+        log = RunLog(self.cli, session, workdir,
+                     on_command=lambda text: self._run_remote_command(text, run_id),
+                     on_response=self._remote_refusal, on_error=self.error)
         if not log.enabled:
             return
         self.runlog = log
@@ -1488,10 +1593,12 @@ class App:
 
         def sync(question: str, answer: str, traceback_signature: Optional[str] = None,
                  fix_applied: Optional[Dict[str, Any]] = None) -> None:
+            who = "dashboard" if self._remote_active is not None else (
+                "pulse" if self._auto_turn_session is not None else "you")
             try:
                 original(question, answer, traceback_signature=traceback_signature, fix_applied=fix_applied)
             finally:
-                log.agent_turn(question, answer, fix_applied=fix_applied)
+                log.agent_turn(question, answer, fix_applied=fix_applied, who=who)
 
         cli._sync_agent_turn = sync
 
@@ -2204,6 +2311,7 @@ class App:
             self._screen = screen
             self.install()
             self.up.set()
+            self._start_home_commands()
             try:
                 size = (0, 0)
                 last_frame = 0.0
@@ -2261,6 +2369,8 @@ class App:
                         except Exception:
                             pass
                 self.parked.clear()
+                if self._home_commands is not None:
+                    self._home_commands.close()
                 if self._monitor is not None:
                     try:
                         self._monitor.stop()

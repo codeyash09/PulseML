@@ -5150,6 +5150,11 @@ class PulseCLI:
                         question = str(queued.get("command") or "").strip()
                         if not question or len(question) > 8000:
                             raise ValueError("Command must contain 1 to 8000 characters.")
+                        if question.startswith("/"):
+                            # no command line here (a script tracked without the app): a
+                            # slash command would only reach the agent as a question
+                            raise ValueError("Slash commands work when the run is watched in the Pulse "
+                                             "app; ask in plain words here.")
                         answer = self.ask_agent(question, from_user=True)
                         cloud.finish_command(command_id, "completed", answer or "Handled by Pulse.")
                     except Exception as exc:

@@ -45,6 +45,8 @@ const PULSE_BOT_ICON_DATA_URI =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%231d1d1f'/%3E%3Ctext x='50' y='70' font-family='Arial' font-weight='700' font-size='62' fill='white' text-anchor='middle'%3EP%3C/text%3E%3C/svg%3E";
 
 let currentAccessToken = null;
+let currentRefreshToken = null;
+let refreshTokenPromise = null;
 let currentUser = null;
 let currentTeam = null;
 let currentProject = null;
@@ -57,6 +59,10 @@ let commandSuggestionIndex = 0;
 let emailCache = new Map();
 
 let refreshInFlight = false;
+// Bumped by every new load of a list; a load that finds it changed after an await is stale
+// (another workspace/project was opened meanwhile) and drops what it fetched.
+let viewGeneration = 0;
+let refreshGeneration = 0;
 let lastRenderedSignature = "";
 
 // Only the browser-push toggle lives in localStorage now -- Discord/Slack
@@ -80,24 +86,17 @@ let notifyBaseline = null;
 // brings the user back, so the modal can show "Discord connected." once.
 let pendingIntegrationNotice = null;
 
+// What a prompt sent from here can be: commands about the machine's terminal or its other
+// runs (/exit, /mouse, /copy, /config, /agent, /monitor, /change ...) are refused by the runner.
 const HOME_COMMANDS = [
-  ["/monitor", "pick a run on this machine and open it beside the agent"],
-  ["/change", "look at another run; the one you leave stays watched"],
-  ["/runs", "the same list: every run on this machine"],
   ["/run", "start a script under Pulse and watch it: /run train.py --epochs 3"],
-  ["/agent", "switch AI provider/model (or sign in with OpenRouter)"],
   ["/files", "what the agent sees in full, and how much it can search"],
   ["/add", "put files or folders in focus"],
   ["/drop", "take a file out of focus"],
   ["/review", "show a diff and ask before applying: /review on|off"],
   ["/undo", "undo the latest change"],
   ["/log", "the change history"],
-  ["/cloud", "sign-in, workspace and sync status"],
-  ["/config", "your settings, remembered between starts: /config mouse off, /config agent"],
-  ["/copy", "copy the agent's last answer to the clipboard (/copy 2: the one before)"],
-  ["/mouse", "clicks open folded lines; /mouse off gives the mouse back to select text"],
-  ["/help", "every command"],
-  ["/exit", "leave Pulse"]
+  ["/help", "every command"]
 ];
 
 const DEBUG_COMMANDS = [
@@ -116,7 +115,6 @@ const DEBUG_COMMANDS = [
   ["/interval", "sample faster or slower: /interval 0.5"],
   ["/quiet", "stop announcing findings (/loud resumes)"],
   ["/home", "back to the agent for anything else; the run stays watched"],
-  ["/change", "look at another run; the one you leave stays watched"],
   ["/close", "stop watching the open run"]
 ];
 
@@ -178,6 +176,87 @@ const els = {
    SUPABASE GET
 ============================================================ */
 
+// Every request to Supabase. An access token lasts an hour: when the server says it has
+// expired (401), it is renewed once with the refresh token and the request sent again; if
+// that is refused too, the sign-in is over and the login screen says so.
+async function supabaseFetch(url, options = {}) {
+
+  const send = () => fetch(url, {
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+      apikey: SUPABASE_KEY,
+      Authorization: `Bearer ${currentAccessToken || SUPABASE_KEY}`
+    }
+  });
+
+  let response = await send();
+
+  if (response.status === 401 && currentAccessToken) {
+    if (await refreshAccessToken()) {
+      response = await send();
+    } else {
+      sessionExpired();
+    }
+  }
+
+  return response;
+}
+
+
+function refreshAccessToken() {
+
+  if (!currentRefreshToken) {
+    return Promise.resolve(false);
+  }
+
+  if (!refreshTokenPromise) {
+    refreshTokenPromise = (async () => {
+      try {
+        const response = await fetch(
+          `${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`,
+          {
+            method: "POST",
+            headers: {
+              apikey: SUPABASE_KEY,
+              Authorization: `Bearer ${SUPABASE_KEY}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ refresh_token: currentRefreshToken })
+          }
+        );
+        if (!response.ok) return false;
+        const data = await response.json();
+        if (!data.access_token) return false;
+        currentAccessToken = data.access_token;
+        currentRefreshToken = data.refresh_token || currentRefreshToken;
+        if (currentUser) {
+          currentUser.access_token = currentAccessToken;
+          currentUser.refresh_token = currentRefreshToken;
+          sessionStorage.setItem(SS_SESSION_KEY, JSON.stringify(currentUser));
+        }
+        return true;
+      } catch (error) {
+        console.warn("Could not renew the sign-in:", error);
+        return false;
+      } finally {
+        refreshTokenPromise = null;
+      }
+    })();
+  }
+
+  return refreshTokenPromise;
+}
+
+
+function sessionExpired() {
+
+  if (!currentUser) return;
+  signOut();
+  els.loginError.textContent = "Your sign-in expired. Sign in again.";
+}
+
+
 async function pgGet(table, params = {}) {
 
   const url =
@@ -187,13 +266,7 @@ async function pgGet(table, params = {}) {
     url.searchParams.set(key, value);
   });
 
-  const response = await fetch(url.toString(), {
-    headers: {
-      apikey: SUPABASE_KEY,
-      Authorization:
-        `Bearer ${currentAccessToken || SUPABASE_KEY}`
-    }
-  });
+  const response = await supabaseFetch(url.toString());
 
   if (!response.ok) {
 
@@ -209,7 +282,9 @@ async function pgGet(table, params = {}) {
 }
 
 
-async function pgPatch(table, match, body) {
+// `expectRows`: the change must reach a row. Row Level Security turns a change the user
+// may not make into "0 rows updated", which is otherwise a silent success.
+async function pgPatch(table, match, body, { expectRows = false } = {}) {
 
   const url =
     new URL(`${SUPABASE_URL}/rest/v1/${table}`);
@@ -218,15 +293,12 @@ async function pgPatch(table, match, body) {
     url.searchParams.set(key, value);
   });
 
-  const response = await fetch(url.toString(), {
+  const response = await supabaseFetch(url.toString(), {
     method: "PATCH",
 
     headers: {
-      apikey: SUPABASE_KEY,
-      Authorization:
-        `Bearer ${currentAccessToken || SUPABASE_KEY}`,
       "Content-Type": "application/json",
-      Prefer: "return=minimal"
+      Prefer: expectRows ? "return=representation" : "return=minimal"
     },
 
     body: JSON.stringify(body)
@@ -241,18 +313,23 @@ async function pgPatch(table, match, body) {
       `PATCH ${table} -> HTTP ${response.status}: ${text}`
     );
   }
+
+  if (expectRows) {
+    const rows = await response.json().catch(() => []);
+    if (!Array.isArray(rows) || !rows.length) {
+      throw new Error("Only a workspace admin can change that.");
+    }
+  }
 }
 
 
 async function pgPost(table, body) {
 
-  const response = await fetch(
+  const response = await supabaseFetch(
     `${SUPABASE_URL}/rest/v1/${table}`,
     {
       method: "POST",
       headers: {
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${currentAccessToken || SUPABASE_KEY}`,
         "Content-Type": "application/json",
         Prefer: "return=minimal"
       },
@@ -279,13 +356,10 @@ async function callEdgeFunction(name, { method = "POST", params, body } = {}) {
     });
   }
 
-  const response = await fetch(url.toString(), {
+  const response = await supabaseFetch(url.toString(), {
     method,
 
     headers: {
-      apikey: SUPABASE_KEY,
-      Authorization:
-        `Bearer ${currentAccessToken || SUPABASE_KEY}`,
       "Content-Type": "application/json"
     },
 
@@ -438,6 +512,9 @@ async function loginUser(email, password) {
     currentAccessToken =
       authData.access_token;
 
+    currentRefreshToken =
+      authData.refresh_token || null;
+
     const profileRows =
       await pgGet("profiles", {
         id: `eq.${authData.user.id}`,
@@ -454,7 +531,9 @@ async function loginUser(email, password) {
       id: profile.id,
       email: profile.email,
       access_token:
-        authData.access_token
+        authData.access_token,
+      refresh_token:
+        authData.refresh_token || null
     };
 
   } catch (error) {
@@ -851,12 +930,12 @@ async function loadCommands(sessions) {
   try {
     const rows = await pgGet("Commands", {
       run_id: `in.(${ids.join(",")})`,
-      select: "id,run_id,user_id,command,status,result,created_at",
-      order: "created_at.asc",
+      select: "id,run_id,user_id,command,status,result,created_at,completed_at",
+      order: "created_at.desc",
       limit: "200"
     });
     const byRun = new Map();
-    rows.forEach(row => {
+    rows.reverse().forEach(row => {
       const commands = byRun.get(row.run_id) || [];
       commands.push(row);
       byRun.set(row.run_id, commands);
@@ -877,15 +956,15 @@ async function loadCommands(sessions) {
    FORMATTING
 ============================================================ */
 
+// Also used inside attribute values, so quotes are escaped too.
 function escapeHtml(value) {
 
-  const element =
-    document.createElement("div");
-
-  element.textContent =
-    value ?? "";
-
-  return element.innerHTML;
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 
@@ -1250,6 +1329,21 @@ function signOut() {
   currentProject = null;
   currentSessions = [];
   currentAccessToken = null;
+  currentRefreshToken = null;
+  activeSessionId = null;
+  commandDrafts = new Map();
+  lastRenderedSignature = "";
+  teamIntegration = null;
+  notifyBaseline = null;
+  viewGeneration++;
+  refreshGeneration++;
+
+  if (!els.notificationsModal.hidden) {
+    closeNotificationsModal();
+  }
+
+  els.sessionList.innerHTML = "";
+  els.activeConsole.innerHTML = "";
 
   sessionStorage.removeItem(
     SS_SESSION_KEY
@@ -1441,7 +1535,8 @@ async function renameWorkspace(team, row) {
     await pgPatch(
       "Teams",
       { team_id: `eq.${team.team_id}` },
-      { name: trimmed }
+      { name: trimmed },
+      { expectRows: true }
     );
 
   } catch (error) {
@@ -1484,11 +1579,22 @@ async function renameWorkspace(team, row) {
   }
 }
 
+const WORKSPACES_EMPTY_TEXT =
+  els.workspacesEmpty.textContent;
+
+const PROJECTS_EMPTY_TEXT =
+  els.projectsEmpty.textContent;
+
 async function loadAndRenderWorkspaces() {
 
-  els.workspaceList.innerHTML = "";
+  const generation = ++viewGeneration;
+
+  if (!currentUser) return;
 
   els.workspacesEmpty.hidden = true;
+
+  els.workspacesEmpty.textContent =
+    WORKSPACES_EMPTY_TEXT;
 
   try {
 
@@ -1497,7 +1603,11 @@ async function loadAndRenderWorkspaces() {
         currentUser.id
       );
 
+    if (generation !== viewGeneration || !currentUser) return;
+
     if (!teams.length) {
+
+      els.workspaceList.innerHTML = "";
 
       els.workspacesEmpty.hidden = false;
 
@@ -1599,10 +1709,14 @@ async function loadAndRenderWorkspaces() {
       );
 
 
+    if (generation !== viewGeneration || !currentUser) return;
+
+    const rows = document.createDocumentFragment();
+
     workspaceStates.forEach(
       ({ team, liveCount }) => {
 
-        els.workspaceList.appendChild(
+        rows.appendChild(
           renderWorkspaceRow(
             team,
             liveCount
@@ -1611,9 +1725,15 @@ async function loadAndRenderWorkspaces() {
       }
     );
 
+    els.workspaceList.replaceChildren(rows);
+
   } catch (error) {
 
+    if (generation !== viewGeneration) return;
+
     console.error(error);
+
+    els.workspaceList.innerHTML = "";
 
     els.workspacesEmpty.hidden = false;
 
@@ -1633,13 +1753,12 @@ async function openWorkspace(team) {
   notifyBaseline = null;
   teamIntegration = null;
 
-  await showProjects(team);
-
-  try {
-    await loadTeamIntegration();
-  } catch (error) {
-    console.warn("Could not load notification integrations:", error);
-  }
+  await Promise.all([
+    showProjects(team),
+    loadTeamIntegration().catch(error => {
+      console.warn("Could not load notification integrations:", error);
+    })
+  ]);
 }
 
 
@@ -1717,9 +1836,12 @@ async function loadAndRenderProjects() {
 
   const team = currentTeam;
 
-  els.projectList.innerHTML = "";
+  const generation = ++viewGeneration;
 
-  els.projectsEmpty.hidden = true;
+  const stale = () =>
+    generation !== viewGeneration || team !== currentTeam;
+
+  if (!team) return;
 
   try {
 
@@ -1727,16 +1849,23 @@ async function loadAndRenderProjects() {
       await loadProjectsForTeam(team);
 
     // Switched workspace while this was loading.
-    if (team !== currentTeam) {
+    if (stale()) {
       return;
     }
 
+    els.projectsEmpty.textContent =
+      PROJECTS_EMPTY_TEXT;
+
     if (!projects.length) {
+
+      els.projectList.innerHTML = "";
 
       els.projectsEmpty.hidden = false;
 
       return;
     }
+
+    els.projectsEmpty.hidden = true;
 
     const liveCounts = new Map();
 
@@ -1773,9 +1902,15 @@ async function loadAndRenderProjects() {
         (liveCounts.get(a.project_id) || 0)
     );
 
+    if (stale()) {
+      return;
+    }
+
+    const rows = document.createDocumentFragment();
+
     projects.forEach(project => {
 
-      els.projectList.appendChild(
+      rows.appendChild(
         renderProjectRow(
           project,
           liveCounts.get(project.project_id) || 0
@@ -1783,9 +1918,17 @@ async function loadAndRenderProjects() {
       );
     });
 
+    els.projectList.replaceChildren(rows);
+
   } catch (error) {
 
+    if (stale()) {
+      return;
+    }
+
     console.error(error);
+
+    els.projectList.innerHTML = "";
 
     els.projectsEmpty.hidden = false;
 
@@ -1817,6 +1960,11 @@ async function showProjects(team) {
 
   els.projectJoinMsg.textContent = "";
 
+  if (els.projectList.dataset.teamId !== String(team.team_id)) {
+    els.projectList.innerHTML = "";
+    els.projectList.dataset.teamId = String(team.team_id);
+  }
+
   renderTopbarRight();
 
   await loadAndRenderProjects();
@@ -1834,6 +1982,14 @@ async function openProject(project) {
   // Fresh project -- don't fire notifications for runs that already
   // existed before this dashboard session opened it.
   notifyBaseline = null;
+
+  activeSessionId = null;
+
+  els.sessionList.innerHTML = "";
+
+  els.activeConsole.innerHTML = "";
+
+  renderStats([]);
 
   els.workspaceTitle.textContent =
     getProjectName(project);
@@ -1917,9 +2073,11 @@ async function loadTeamIntegration() {
    * accessible to Edge Functions.
    */
 
+  const team = currentTeam;
+
   const rows =
     await pgGet("team_integrations", {
-      team_id: `eq.${currentTeam.team_id}`,
+      team_id: `eq.${team.team_id}`,
 
       select: [
         "team_id",
@@ -1934,6 +2092,11 @@ async function loadTeamIntegration() {
         "updated_at"
       ].join(",")
     });
+
+  // Another workspace was opened while this loaded.
+  if (currentTeam?.team_id !== team.team_id) {
+    return;
+  }
 
   teamIntegration =
     rows[0] || null;
@@ -1999,7 +2162,8 @@ function browserPushStatusText() {
 
 function sendBrowserNotification(
   title,
-  body
+  body,
+  tag = `pulse-${Date.now()}-${Math.random().toString(36).slice(2)}`
 ) {
 
   if (
@@ -2014,7 +2178,7 @@ function sendBrowserNotification(
     new Notification(title, {
       body,
       icon: PULSE_BOT_ICON_DATA_URI,
-      tag: "pulse-notifications"
+      tag
     });
 
   } catch (error) {
@@ -2194,6 +2358,9 @@ function renderDiscordIntegrationRow() {
           </option>
         `;
 
+        // opening the list again tries again
+        select.dataset.loaded = "";
+
         els.notifSaveStatus.textContent =
           `Couldn't load Discord channels: ${
             error.message
@@ -2224,8 +2391,8 @@ function renderDiscordIntegrationRow() {
         await setDiscordChannel(
           option.value,
           option.textContent
-            .replace(/^#\s*/, "")
             .trim()
+            .replace(/^#\s*/, "")
         );
 
         await loadTeamIntegration();
@@ -2302,7 +2469,8 @@ async function setDiscordChannel(
 
       updated_at:
         new Date().toISOString()
-    }
+    },
+    { expectRows: true }
   );
 }
 
@@ -2585,7 +2753,8 @@ async function disconnectIntegration(
 
         updated_at:
           new Date().toISOString()
-      }
+      },
+      { expectRows: true }
     );
 
 
@@ -2950,8 +3119,10 @@ async function dispatchNotification({
         channel:
           "Browser",
 
+        // nothing is shown without the browser's permission
         ok:
-          true
+          typeof Notification !== "undefined" &&
+          Notification.permission === "granted"
       })
     );
   }
@@ -3591,7 +3762,9 @@ function renderRunWorkspace(session) {
   const step = findMetric(session, ["step", "global_step", "epoch"]);
   const live = isLive(session);
   const telemetry = session.telemetry || [];
-  const latest = latestTelemetry(session);
+  // the latest snapshot of the run's state (other entries: the environment, ...)
+  const latest = [...telemetry].reverse().find(entry => Array.isArray(entry?.findings)) ||
+    latestTelemetry(session);
   const metricKeys = new Set();
   telemetry.forEach(entry => {
     if (entry?.type === "env_info" || entry?.script || entry?.gpu_name || entry?.python_version || entry?.python) {
@@ -3626,7 +3799,12 @@ function renderRunWorkspace(session) {
     .find(entry => entry.status)?.status || [...(session.incidents || [])]
       .reverse()
       .find(incident => String(incident.kind || "").startsWith("run_"))?.status;
-  const runStatus = latestRunStatus || (live ? "live" : "stopped");
+  // What the runner last said, unless it has gone quiet since: a run last seen "live" whose
+  // runner stopped reporting is not live any more.
+  const runStatus = live
+    ? (latestRunStatus || "live")
+    : (["live", "stalled", "paused"].includes(String(latestRunStatus || "").toLowerCase())
+        ? "stopped" : (latestRunStatus || "stopped"));
   const stepRate = telemetryStepRate(telemetry);
   const startedAt = session.created_at
     ? Date.parse(session.created_at) / 1000
@@ -3643,29 +3821,53 @@ function renderRunWorkspace(session) {
     (currentTeam?.admin_ids || []).includes(currentUser.id)
   ));
 
-  const entries = logs.map(entry => ({
-    at: Number(entry.t || 0),
-    html: `
+  // A prompt sent from here is shown with its state and what the runner answered; the agent
+  // turn it caused is the same exchange, so it is not shown twice.
+  const commandTimes = commands.map(command => ({
+    text: command.command,
+    from: command.created_at ? Date.parse(command.created_at) / 1000 - 5 : 0,
+    to: command.completed_at ? Date.parse(command.completed_at) / 1000 + 120 : Infinity
+  }));
+  const isCommandTurn = entry => commandTimes.some(c =>
+    c.text === entry.question && Number(entry.t || 0) >= c.from && Number(entry.t || 0) <= c.to);
+  const commandState = command => {
+    const status = command.status || "pending";
+    if (status === "pending") return live ? "waiting" : "waiting · run not connected";
+    if (status === "processing") return "running";
+    if (status === "completed") return "done";
+    return status;
+  };
+
+  const entries = logs.filter(entry => !isCommandTurn(entry)).map(entry => {
+    // turns Pulse started itself (a crash, a finding, an audit) are not the user's words
+    const automatic = entry.who === "pulse" || (!entry.who && entry.traceback_signature);
+    const question = automatic
+      ? `<details class="console-message is-user"><summary>${escapeHtml(String(entry.question || "").split("\n")[0].slice(0, 140))}</summary><pre>${escapeHtml(entry.question || "")}</pre></details>`
+      : `<pre class="console-message is-user">${escapeHtml(entry.question || "")}</pre>`;
+    return {
+      at: Number(entry.t || 0),
+      html: `
       <article class="console-exchange">
-        <div class="console-speaker">YOU <time>${fmtRelativeTime(entry.t || 0)}</time></div>
-        <pre class="console-message is-user">${escapeHtml(entry.question || "")}</pre>
+        <div class="console-speaker">${automatic ? "PULSE · ON ITS OWN" : entry.who === "dashboard" ? "YOU · FROM HERE" : "YOU"} <time>${fmtRelativeTime(entry.t || 0)}</time></div>
+        ${question}
         <div class="console-speaker">PULSE</div>
         <pre class="console-message">${escapeHtml(entry.answer || "")}</pre>
       </article>
     `
-  }));
+    };
+  });
 
-  commands.filter(command => !logs.some(entry => entry.question === command.command)).forEach(command => {
+  commands.forEach(command => {
     entries.push({
       at: command.created_at ? Date.parse(command.created_at) / 1000 : 0,
       html: `
         <article class="console-exchange">
           <div class="console-speaker">YOU
             <time>${fmtRelativeTime(command.created_at ? Date.parse(command.created_at) / 1000 : 0)}</time>
-            <span class="command-state is-${escapeHtml(command.status || "pending")}">${escapeHtml(command.status || "pending")}</span>
+            <span class="command-state is-${escapeHtml(command.status || "pending")}">${escapeHtml(commandState(command))}</span>
           </div>
           <pre class="console-message is-user">${escapeHtml(command.command || "")}</pre>
-          ${command.result ? `<pre class="console-message">${escapeHtml(command.result)}</pre>` : ""}
+          ${command.result ? `<div class="console-speaker">PULSE</div><pre class="console-message">${escapeHtml(command.result)}</pre>` : ""}
         </article>
       `
     });
@@ -3739,7 +3941,9 @@ function renderRunWorkspace(session) {
           placeholder="Ask about this run or enter a /command…" ${canSend ? "" : "disabled"} required></textarea>
         </div>
         <div class="command-composer-foot">
-          <span class="command-status" role="status">${canSend ? "Enter to send · commands execute on the runner" : "Only the run owner or workspace admins can send commands"}</span>
+          <span class="command-status" role="status">${!canSend ? "Only the run owner or workspace admins can send commands"
+            : live ? "Enter to send · runs on the machine Pulse is watching it from"
+            : "This run's Pulse is not connected: a prompt waits until it is"}</span>
           <button type="submit" title="Send command" ${canSend ? "" : "disabled"}>Send <span aria-hidden="true">↗</span></button>
         </div>
       </form>
@@ -4400,12 +4604,12 @@ function renderLegacySessions() {
 
 async function refreshSessions() {
 
-  if (
-    !currentProject ||
-    refreshInFlight
-  ) {
+  if (!currentProject) {
     return;
   }
+
+  // A newer refresh (another project opened, a command sent) supersedes this one.
+  const generation = ++refreshGeneration;
 
   refreshInFlight = true;
 
@@ -4429,8 +4633,8 @@ async function refreshSessions() {
 
     await loadCommands(rows);
 
-    // Switched project while this was loading.
-    if (project !== currentProject) {
+    // Switched project, or a newer refresh started, while this was loading.
+    if (project !== currentProject || generation !== refreshGeneration) {
       return;
     }
 
@@ -4451,12 +4655,20 @@ async function refreshSessions() {
 
   } catch (error) {
 
+    if (generation !== refreshGeneration) {
+      return;
+    }
+
     console.error(error);
 
     els.refreshLabel.textContent =
       "Update failed";
 
   } finally {
+
+    if (generation !== refreshGeneration) {
+      return;
+    }
 
     refreshInFlight = false;
 
@@ -4684,6 +4896,11 @@ els.activeConsole.addEventListener("keydown", event => {
   }
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
+    const typed = event.target.value.trim().toLowerCase();
+    if (menu && !menu.hidden && matches.length && !matches.some(([command]) => command === typed)) {
+      chooseCommandSuggestion(matches[commandSuggestionIndex][0]);
+      return;
+    }
     event.target.form.requestSubmit();
   }
 });
@@ -4894,6 +5111,9 @@ try {
     currentAccessToken =
       saved.access_token;
 
+    currentRefreshToken =
+      saved.refresh_token || null;
+
     showWorkspaces().then(
       resumeAfterOAuthRedirect
     );
@@ -4928,6 +5148,37 @@ setInterval(
 
   },
   30000
+);
+
+
+// While a prompt sent from here is waiting or running, its state and answer are fetched
+// every few seconds (the full refresh is every 30 s).
+let commandPollInFlight = false;
+
+setInterval(
+  async () => {
+
+    if (els.viewDashboard.hidden || commandPollInFlight || !currentProject) return;
+
+    const waiting = currentSessions.filter(session =>
+      (session.commands || []).some(command => ["pending", "processing"].includes(command.status)));
+    if (!waiting.length) return;
+
+    commandPollInFlight = true;
+    const project = currentProject;
+    const before = JSON.stringify(waiting.map(session => session.commands.map(c => [c.id, c.status])));
+    try {
+      await loadCommands(waiting);
+      if (project !== currentProject) return;
+      const after = JSON.stringify(waiting.map(session => session.commands.map(c => [c.id, c.status])));
+      renderSessions();
+      // finished: the agent's turn and anything else it changed are on the run's row now
+      if (after !== before) refreshSessions();
+    } finally {
+      commandPollInFlight = false;
+    }
+  },
+  3000
 );
 
 
