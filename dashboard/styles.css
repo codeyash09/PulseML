@@ -3403,3 +3403,98 @@ main {
   background: var(--bg);
   white-space: pre;
 }
+
+/* The live view: what Pulse is doing right now */
+.console-exchange.is-live {
+  border-left: 2px solid var(--accent);
+  padding-left: 12px;
+}
+
+.live-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin: 0 4px 1px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: live-pulse 1.2s ease-in-out infinite;
+}
+
+.live-doing {
+  color: var(--tertiary);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.live-line {
+  margin: 6px 0;
+  color: var(--fg);
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.live-line.is-thinking {
+  color: var(--amber);
+  font-style: italic;
+  opacity: .85;
+}
+
+.live-line.is-tool {
+  color: var(--secondary);
+  font-weight: 600;
+}
+
+.live-line.is-user {
+  color: var(--fg);
+}
+
+.live-line.is-user::before {
+  content: "YOU  ";
+  color: var(--tertiary);
+  font-size: 10px;
+}
+
+.live-line.is-note {
+  color: var(--tertiary);
+}
+
+.live-line.is-error {
+  color: var(--red);
+}
+
+.live-caret {
+  display: inline-block;
+  width: 7px;
+  height: 13px;
+  margin-left: 2px;
+  vertical-align: -2px;
+  background: currentColor;
+  animation: live-blink 1s steps(2) infinite;
+}
+
+.question-context {
+  margin: 6px 0 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--secondary);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .25; }
+}
+
+@keyframes live-blink {
+  0% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-dot, .live-caret { animation: none; }
+}

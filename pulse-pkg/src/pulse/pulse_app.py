@@ -36,6 +36,7 @@ import contextlib
 import ctypes
 import getpass
 import io
+import json
 import math
 import os
 import re
@@ -207,8 +208,8 @@ class CommandQueue:
                 continue
             for command in claimed:
                 text = str(command.get("command") or "").strip()
-                if text.startswith(self._cloud.QUESTION_PREFIX.strip()):
-                    continue                     # a question this runner asked (DashboardQuestion)
+                if text.startswith((self._cloud.QUESTION_PREFIX.strip(), self._cloud.LIVE_PREFIX)):
+                    continue                     # a row this runner opened (a question, the live feed)
                 if not text or len(text) > 8000:
                     self._finish(command, "failed", "A command is 1 to 8000 characters.")
                     continue
@@ -320,6 +321,79 @@ class DashboardQuestion:
                     pass
 
         threading.Thread(target=finish, daemon=True, name="pulse-dashboard-question-close").start()
+
+
+class LiveFeed:
+    """What the app is doing right now, for the dashboard: a Commands row of its own
+    ("pulse:live", left processing) whose result is rewritten as it changes -- the agent's
+    reasoning, tool calls and words as they stream, what is running, the run's step and
+    latest values. At most about once a second, and every 15 s at least, so the page knows
+    the app is still there. It follows the row in hand (the open run's, else the app's own)."""
+
+    EVERY = 0.8
+    HEARTBEAT = 15.0
+    RETRY = 30.0
+
+    def __init__(self, app: "App") -> None:
+        from . import pulse_supabase as cloud
+        self._cloud = cloud
+        self.app = app
+        self._target: Optional[Tuple[str, str, str]] = None
+        self.id: Optional[str] = None
+        self._last = ""
+        self._sent_at = 0.0
+        self._retry_at = 0.0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="pulse-live-feed")
+
+    def start(self) -> "LiveFeed":
+        self._thread.start()
+        return self
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._end()
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.EVERY):
+            try:
+                self.tick()
+            except Exception:
+                self._retry_at = time.monotonic() + self.RETRY
+
+    def tick(self) -> None:
+        now = time.monotonic()
+        if now < self._retry_at:
+            return
+        target = self.app._live_target()
+        if target != self._target:
+            self._end()
+            self._target = target
+        if target is None:
+            return
+        if self.id is None:
+            self.id = self._cloud.open_runner_row(*target, self._cloud.LIVE_PREFIX)
+            self._last = ""
+            if self.id is None:
+                self._retry_at = now + self.RETRY
+                return
+        state = self.app._live_state()
+        body = json.dumps(state, sort_keys=True, default=str)
+        if body == self._last and now - self._sent_at < self.HEARTBEAT:
+            return
+        self._cloud.update_runner_row(self.id, json.dumps(dict(state, t=time.time()), default=str))
+        self._last, self._sent_at = body, now
+
+    def _end(self) -> None:
+        """The row is done with: the page stops showing it as live."""
+        row, self.id = self.id, None
+        if row:
+            try:
+                self._cloud.finish_command(row, "completed", json.dumps({"ended": True, "t": time.time()}))
+            except Exception:
+                pass
 
 
 class RunLog:
@@ -602,6 +676,8 @@ class App:
         self._remote_pending: "collections.deque[Dict[str, Any]]" = collections.deque()
         self._remote_active: Optional[Dict[str, Any]] = None
         self._home_commands: Optional[CommandQueue] = None   # the dashboard's prompts to the app's own row
+        self._live: Optional[LiveFeed] = None                # what the app is doing, streamed to the dashboard
+        self._job_from = 0
         self._last_ctrl_c = 0.0
         self._ui_thread = threading.current_thread()
         # the run that is open (DEBUG), if any
@@ -758,15 +834,74 @@ class App:
             raise KeyboardInterrupt
         return question.answer
 
-    def _post_question(self, question: _Question) -> Optional[DashboardQuestion]:
-        """Put `question` on the dashboard page of the run in hand (or of the app's own row):
-        an answer there answers it here. Not a secret (a key, a password), never."""
+    def _live_target(self) -> Optional[Tuple[str, str, str]]:
+        """(row, project, user) of the dashboard row in hand: the open run's, else the app's own."""
         cli = self.cli
         row = (getattr(self.runlog, "id", None) if self.runlog is not None else None) \
             or getattr(cli, "debug_session_id", None)
         user, project = getattr(cli, "user_id", None), getattr(cli, "project_id", None)
-        if getattr(question, "secret", False) or not (row and user and project):
+        return (str(row), str(project), str(user)) if row and user and project else None
+
+    @staticmethod
+    def _entry_words(entry: tui.Entry, limit: int = 1500) -> str:
+        if entry.kind in ("tool", "edit"):
+            text = "\n".join(entry.calls) + (("\n" + entry.text) if entry.text else "")
+        else:
+            text = entry.text
+        text = tui._SGR_RE.sub("", str(text or "")).strip()
+        # the thinking streams at its end; anything else is read from its start
+        return ("…" + text[-limit:] if len(text) > limit else text) if entry.kind == "thinking" else \
+            (text[:limit] + "…" if len(text) > limit else text)
+
+    def _live_state(self) -> Dict[str, Any]:
+        """What the dashboard's live view shows: what the job in hand has shown so far (its
+        reasoning streaming in), what is running, and the run's step and latest values."""
+        with self.lock:
+            view = self.view
+            busy = bool(view.busy)
+            activity: List[Dict[str, str]] = []
+            if busy:
+                for entry in view.entries[self._job_from:]:
+                    words = self._entry_words(entry)
+                    if words:
+                        activity.append({"kind": entry.kind, "text": words,
+                                         **({"live": "1"} if getattr(entry, "live", False) else {})})
+                partial = tui._SGR_RE.sub("", view.partial or "").strip()
+                if partial:
+                    activity.append({"kind": "text", "text": partial[-800:], "live": "1"})
+            state: Dict[str, Any] = {
+                "busy": busy, "activity": activity[-30:],
+                "doing": tui._SGR_RE.sub("", str(view.live or "")).strip() if busy else "",
+                "asking": self._question is not None,
+            }
+            console, status = self.console, self._status
+        if console is not None:
+            run: Dict[str, Any] = {"status": status}
+            try:
+                with console._brain_lock:
+                    run["step"] = console.brain.step
+                    values = {}
+                    for name, history in list(console.brain.histories.items())[:16]:
+                        last = history[-1] if history else None
+                        if isinstance(last, (int, float)) and not isinstance(last, bool) and math.isfinite(last):
+                            values[name] = last
+                    run["values"] = values
+            except Exception:
+                pass
+            state["run"] = run
+        return state
+
+    def _start_live_feed(self) -> None:
+        if self._live is None and getattr(self.cli, "user_id", None):
+            self._live = LiveFeed(self).start()
+
+    def _post_question(self, question: _Question) -> Optional[DashboardQuestion]:
+        """Put `question` on the dashboard page of the run in hand (or of the app's own row):
+        an answer there answers it here. Not a secret (a key, a password), never."""
+        target = self._live_target()
+        if getattr(question, "secret", False) or target is None:
             return None
+        row, project, user = target
         options = getattr(question, "options", None)
 
         def answered(text: str) -> None:
@@ -788,6 +923,12 @@ class App:
         payload: Dict[str, Any] = {
             "label": label[:3000] or "Pulse is asking you to choose:",
             "options": [tui._SGR_RE.sub("", str(o.label))[:300] for o in options] if options else None}
+        with self.lock:                              # what was said just before it: the command, why
+            recent = [self._entry_words(e, 600) for e in self.view.entries[-8:]
+                      if e.kind not in ("thinking", "user")]
+        context = "\n".join(w for w in recent if w)[-2500:]
+        if context:
+            payload["context"] = context
         edit = self._edit_pending
         if edit is not None and edit.output:             # "Apply this change?": the change itself
             diff = tui._SGR_RE.sub("", str(edit.output))
@@ -1016,6 +1157,7 @@ class App:
     def _start(self, work: Callable[..., None], *args: Any) -> None:
         with self.lock:
             self.view.busy, self.view.status, self.dirty = True, "", True
+            self._job_from = len(self.view.entries)  # what this job shows starts here (the live feed)
         self._job = threading.Thread(target=self._run_job, args=(work, args), daemon=True, name="pulse-app-job")
         self._job.start()
 
@@ -2421,6 +2563,7 @@ class App:
             self.install()
             self.up.set()
             self._start_home_commands()
+            self._start_live_feed()
             try:
                 size = (0, 0)
                 last_frame = 0.0
@@ -2480,6 +2623,8 @@ class App:
                 self.parked.clear()
                 if self._home_commands is not None:
                     self._home_commands.close()
+                if self._live is not None:
+                    self._live.close()
                 if self._monitor is not None:
                     try:
                         self._monitor.stop()

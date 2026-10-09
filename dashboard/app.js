@@ -965,10 +965,38 @@ function questionOf(command) {
     return {
       label: String(parsed.label || "Pulse is asking:"),
       options: Array.isArray(parsed.options) ? parsed.options.map(String) : null,
-      detail: parsed.detail ? String(parsed.detail) : ""
+      detail: parsed.detail ? String(parsed.detail) : "",
+      context: parsed.context ? String(parsed.context) : ""
     };
   } catch {
-    return { label: text.slice(QUESTION_PREFIX.length), options: null, detail: "" };
+    return { label: text.slice(QUESTION_PREFIX.length), options: null, detail: "", context: "" };
+  }
+}
+
+// What Pulse is doing right now on the machine: a row of its own, "pulse:live", whose result
+// the runner rewrites about once a second (the agent's reasoning and tool calls as they
+// stream, what is running, the run's step and values) and at least every 15 s.
+const LIVE_PREFIX = "pulse:live";
+const LIVE_FRESH_SECONDS = 45;
+
+function isLiveRow(command) {
+  return String(command?.command || "").startsWith(LIVE_PREFIX);
+}
+
+function isRunnerRow(command) {
+  return isLiveRow(command) || Boolean(questionOf(command));
+}
+
+// The newest live state of a session that is still fresh, or null.
+function liveStateOf(session) {
+  const row = (session.commands || []).filter(command => isLiveRow(command) && command.status === "processing").at(-1);
+  if (!row || !row.result) return null;
+  try {
+    const state = JSON.parse(row.result);
+    if (!state || state.ended || Date.now() / 1000 - Number(state.t || 0) > LIVE_FRESH_SECONDS) return null;
+    return state;
+  } catch {
+    return null;
   }
 }
 
@@ -1093,6 +1121,10 @@ function fmtRelativeTime(seconds) {
 ============================================================ */
 
 function isLive(session) {
+
+  if (liveStateOf(session)) {
+    return true;
+  }
 
   const timestamps = [
 
@@ -3794,7 +3826,7 @@ function renderRunWorkspace(session) {
 
   const logs = (session.agentLogs || []).filter(entry => entry && typeof entry === "object");
   const questions = (session.commands || []).filter(command => questionOf(command));
-  const commands = (session.commands || []).filter(command => !questionOf(command));
+  const commands = (session.commands || []).filter(command => !isRunnerRow(command));
   const openQuestion = questions.filter(command => command.status === "processing").at(-1);
   const step = findMetric(session, ["step", "global_step", "epoch"]);
   const live = isLive(session);
@@ -3826,7 +3858,7 @@ function renderRunWorkspace(session) {
     return `
       <div class="run-metric-row">
         <span class="run-metric-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
-        <strong>${escapeHtml(metricValue(values.at(-1)))}</strong>
+        <strong data-live-metric="${escapeHtml(name)}">${escapeHtml(metricValue(values.at(-1)))}</strong>
         <span class="run-metric-spark" aria-label="Recent ${escapeHtml(name)} values">${escapeHtml(metricSparkline(values))}</span>
       </div>
     `;
@@ -3947,7 +3979,7 @@ function renderRunWorkspace(session) {
   const statsPane = hasRunStats ? `
     <aside class="run-side-panel" aria-label="Run telemetry">
       <div class="run-side-heading">RUN STATE</div>
-      <div class="run-side-stat"><span>STEP</span><strong>${escapeHtml(metricValue(step))}</strong></div>
+      <div class="run-side-stat"><span>STEP</span><strong data-live-step>${escapeHtml(metricValue(step))}</strong></div>
       <div class="run-side-stat"><span>RATE</span><strong>${escapeHtml(stepRate || "—")}</strong></div>
       <div class="run-side-stat"><span>ELAPSED</span><strong>${escapeHtml(elapsed)}</strong></div>
       ${Number(latest.gaps) > 0 ? `<div class="run-side-stat"><span>DROPPED</span><strong>${escapeHtml(String(latest.gaps))} samples</strong></div>` : ""}
@@ -3989,7 +4021,7 @@ function renderRunWorkspace(session) {
       </header>
       <div class="run-window-body ${hasRunStats ? "has-run-stats" : "is-conversation-only"}">
         ${statsPane}
-        <section class="run-transcript" aria-label="Agent transcript">${transcript}</section>
+        <section class="run-transcript" aria-label="Agent transcript">${transcript}<div class="run-live" aria-live="polite"></div></section>
       </div>
       ${openQuestion ? renderOpenQuestion(openQuestion, canSend) : ""}
       <form class="command-composer" data-run-id="${escapeHtml(session.id)}">
@@ -4032,6 +4064,7 @@ function renderOpenQuestion(command, canSend) {
   return `
     <section class="run-question" aria-label="Pulse is asking">
       <div class="console-speaker">PULSE IS ASKING <span class="command-state is-processing">waiting for you</span></div>
+      ${asked.context ? `<pre class="question-context">${escapeHtml(asked.context)}</pre>` : ""}
       <pre class="console-message">${escapeHtml(asked.label)}</pre>
       ${asked.detail ? `<details class="question-detail" open><summary>The change</summary><pre>${escapeHtml(asked.detail)}</pre></details>` : ""}
       <div class="question-choices">${choices}</div>
@@ -5290,38 +5323,130 @@ function announceQuestions(sessions) {
   }));
 }
 
-// While a prompt sent from here is waiting or running, its state and answer are fetched
-// every few seconds (the full refresh is every 30 s).
-let commandPollInFlight = false;
+// The live view: what Pulse is doing right now, drawn in place (the rest of the console is not
+// redrawn, so nothing typed or scrolled is lost) every time the live row changes.
+let lastLiveHtml = "";
+
+function renderLive() {
+  const box = els.activeConsole.querySelector(".run-live");
+  const session = currentSessions.find(item => item.id === activeSessionId);
+  if (!box || !session) return;
+  const state = liveStateOf(session);
+
+  const run = state?.run;
+  if (run) {
+    const stepEl = els.activeConsole.querySelector("[data-live-step]");
+    if (stepEl && run.step !== undefined) stepEl.textContent = metricValue(run.step);
+    const picker = [...els.sessionList.querySelectorAll("[data-live-picker]")].find(node => node.dataset.livePicker === session.id);
+    const loss = ["loss", "train_loss", "loss_value", "current_loss"].map(name => run.values?.[name]).find(value => value !== undefined);
+    if (picker && run.step !== undefined) {
+      picker.innerHTML = `step ${escapeHtml(metricValue(run.step))} <i>·</i> loss ${escapeHtml(metricValue(loss ?? findMetric(session, ["loss", "train_loss", "loss_value", "current_loss"])))}`;
+    }
+    Object.entries(run.values || {}).forEach(([name, value]) => {
+      const el = [...els.activeConsole.querySelectorAll("[data-live-metric]")].find(node => node.dataset.liveMetric === name);
+      if (el) el.textContent = metricValue(value);
+    });
+  }
+
+  let html = "";
+  if (state?.busy) {
+    const lines = (state.activity || []).map(item => {
+      const text = escapeHtml(item.text || "");
+      const streaming = item.live ? `<span class="live-caret" aria-hidden="true"></span>` : "";
+      switch (item.kind) {
+        case "thinking": return `<div class="live-line is-thinking">${text}${streaming}</div>`;
+        case "tool":
+        case "edit": return `<div class="live-line is-tool">${text}</div>`;
+        case "user": return `<div class="live-line is-user">${text}</div>`;
+        case "note": return `<div class="live-line is-note">${text}</div>`;
+        case "error": return `<div class="live-line is-error">${text}</div>`;
+        default: return `<div class="live-line">${text}${streaming}</div>`;
+      }
+    }).join("");
+    const doing = state.asking ? "waiting for an answer" : (state.doing || "working");
+    html = `
+      <article class="console-exchange is-live">
+        <div class="console-speaker">PULSE <span class="live-dot" aria-hidden="true"></span> <span class="live-doing">${escapeHtml(doing)}</span></div>
+        ${lines || `<div class="live-line is-note">starting…</div>`}
+      </article>
+    `;
+  }
+  if (html === lastLiveHtml && box.innerHTML.trim() === html.trim()) return;
+  const transcript = box.closest(".run-transcript");
+  const atBottom = !transcript || transcript.scrollHeight - transcript.clientHeight - transcript.scrollTop < 48;
+  box.innerHTML = html;
+  lastLiveHtml = html;
+  if (transcript && atBottom) transcript.scrollTop = transcript.scrollHeight;
+}
+
+
+// The run on screen is polled every second while its Pulse is there (the live view, a
+// question coming up, a prompt sent from here); other runs with a prompt on its way every
+// 3 s. The full refresh is every 30 s.
+let livePollInFlight = false;
+let livePollTick = 0;
+const liveWasBusy = new Map();
+
+async function pollOpenRows(session) {
+  const rows = await pgGet("Commands", {
+    run_id: `eq.${session.id}`,
+    status: "in.(pending,processing)",
+    select: "id,run_id,user_id,command,status,result,created_at,completed_at",
+    order: "created_at.asc",
+    limit: "50"
+  });
+  const before = session.commands || [];
+  const isOpen = command => ["pending", "processing"].includes(command.status) && !String(command.id).startsWith("local-");
+  const vanished = before.filter(isOpen).some(command => !rows.some(row => row.id === command.id));
+  if (vanished) {
+    await loadCommands([session]);                 // something finished: its final state
+  } else {
+    session.commands = before.filter(command => !isOpen(command))
+      .filter(command => !String(command.id).startsWith("local-") || !rows.some(row => row.command === command.command))
+      .concat(rows)
+      .sort((a, b) => Date.parse(a.created_at || 0) - Date.parse(b.created_at || 0));
+  }
+}
 
 setInterval(
   async () => {
 
-    if (els.viewDashboard.hidden || commandPollInFlight || !currentProject) return;
+    if (els.viewDashboard.hidden || livePollInFlight || !currentProject) return;
+    livePollTick++;
 
-    // the run on screen, while it is live (a question can come up at any moment), and any
-    // run with a prompt on its way
-    const waiting = currentSessions.filter(session =>
-      (session.id === activeSessionId && isLive(session)) ||
-      (session.commands || []).some(command => ["pending", "processing"].includes(command.status)));
-    if (!waiting.length) return;
+    const hasOpen = session => (session.commands || []).some(command =>
+      ["pending", "processing"].includes(command.status));
+    const active = currentSessions.find(session => session.id === activeSessionId);
+    const others = livePollTick % 3 === 0
+      ? currentSessions.filter(session => session !== active && (session.commands || []).some(command =>
+          ["pending", "processing"].includes(command.status) && !isLiveRow(command)))
+      : [];
+    const pollActive = active && (isLive(active) || hasOpen(active));
+    if (!pollActive && !others.length) return;
 
-    commandPollInFlight = true;
+    livePollInFlight = true;
     const project = currentProject;
-    const before = JSON.stringify(waiting.map(session => session.commands.map(c => [c.id, c.status])));
     try {
-      await loadCommands(waiting);
+      const before = lastRenderedSignature;
+      if (pollActive) await pollOpenRows(active);
+      if (others.length) await loadCommands(others);
       if (project !== currentProject) return;
-      const after = JSON.stringify(waiting.map(session => session.commands.map(c => [c.id, c.status])));
-      announceQuestions(waiting);
-      renderSessions();
-      // finished: the agent's turn and anything else it changed are on the run's row now
-      if (after !== before) refreshSessions();
+      announceQuestions([active, ...others].filter(Boolean));
+      renderSessions();                              // redraws only when something besides the live view changed
+      if (lastRenderedSignature === before) renderLive();
+      if (active) {
+        // a turn just ended: its answer is in the run's agent log now
+        const busy = Boolean(liveStateOf(active)?.busy);
+        if (liveWasBusy.get(active.id) && !busy) refreshSessions();
+        liveWasBusy.set(active.id, busy);
+      }
+    } catch (error) {
+      console.warn("Live update failed:", error);
     } finally {
-      commandPollInFlight = false;
+      livePollInFlight = false;
     }
   },
-  3000
+  1000
 );
 
 
@@ -5368,7 +5493,7 @@ function renderRunPickerItem(session) {
       <span class="run-picker-dot ${live ? "is-live" : ""}" aria-hidden="true"></span>
       <span class="run-picker-copy">
         <strong>${escapeHtml(runLabel(session))}</strong>
-        <span>step ${escapeHtml(metricValue(step))} <i>·</i> loss ${escapeHtml(metricValue(loss))}</span>
+        <span data-live-picker="${escapeHtml(session.id)}">step ${escapeHtml(metricValue(step))} <i>·</i> loss ${escapeHtml(metricValue(loss))}</span>
       </span>
       <span class="run-picker-arrow" aria-hidden="true">›</span>
     </button>
@@ -5406,7 +5531,7 @@ function renderSessions() {
       session.incidents?.length || 0,
       session.telemetry?.at(-1),
       session.agentLogs?.at(-1)?.t,
-      session.commands?.map(command => [command.id, command.status, command.result]),
+      session.commands?.map(command => isLiveRow(command) ? [command.id, command.status] : [command.id, command.status, command.result]),
       isLive(session)
     ])
   ]);
@@ -5439,6 +5564,8 @@ function renderSessions() {
   if (transcript) {
     transcript.scrollTop = transcriptAtBottom ? transcript.scrollHeight : oldTranscriptScroll;
   }
+
+  renderLive();
 
   const field = els.activeConsole.querySelector(".command-field");
   if (field) {

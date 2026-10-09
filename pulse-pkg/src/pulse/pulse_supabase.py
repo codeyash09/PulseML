@@ -1820,16 +1820,26 @@ def claim_commands(run_id: str, runner_id: str, limit: int = 5) -> List[Dict[str
 # machine (the runner completes it, saying so). The runner's own claim never takes it: it
 # is never "pending" for long, and CommandQueue skips it if it does.
 QUESTION_PREFIX = "pulse:ask "
+# What the app is doing right now (the agent's reasoning and tool calls as they stream, the
+# run's step and values): a row of its own, "pulse:live", whose result is rewritten as it changes.
+LIVE_PREFIX = "pulse:live"
 
 
 def open_question(run_id: str, project_id: str, user_id: str, question: Dict[str, Any]) -> Optional[str]:
-    """Put `question` ({"label", "options"}) on run `run_id`'s dashboard page; its row id."""
+    """Put `question` ({"label", "options", "detail", "context"}) on run `run_id`'s dashboard
+    page; its row id."""
+    return open_runner_row(run_id, project_id, user_id, QUESTION_PREFIX + json.dumps(question))
+
+
+def open_runner_row(run_id: str, project_id: str, user_id: str, command: str) -> Optional[str]:
+    """A Commands row the runner opens for itself, left "processing" (never claimed as a
+    command): a question, or the live feed. Its id."""
     if not is_valid_uuid(run_id) or not is_valid_uuid(user_id) or not project_id:
         return None
     rows = _request(
         "POST", "Commands",
         body={"run_id": run_id, "project_id": project_id, "user_id": user_id, "status": "pending",
-              "command": QUESTION_PREFIX + json.dumps(question)},
+              "command": command},
         prefer="return=representation", timeout=_TIMEOUT_BACKGROUND,
     ) or []
     command_id = str((rows[0] if rows else {}).get("id") or "")
@@ -1843,6 +1853,16 @@ def open_question(run_id: str, project_id: str, user_id: str, question: Dict[str
         prefer="return=minimal", timeout=_TIMEOUT_BACKGROUND,
     )
     return command_id
+
+
+def update_runner_row(command_id: str, result: str) -> None:
+    """Rewrite an open runner row's result (the live feed)."""
+    _request(
+        "PATCH", "Commands",
+        params={"id": f"eq.{command_id}", "status": "eq.processing"},
+        body={"result": scrub_secrets(result)},
+        prefer="return=minimal", timeout=_TIMEOUT_BACKGROUND,
+    )
 
 
 def read_command(command_id: str) -> Optional[Dict[str, Any]]:

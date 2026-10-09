@@ -60,6 +60,7 @@ def test_finish_command_persists_only_terminal_states(monkeypatch):
 # ---------------------------------------------------------------------------------- the runner's side
 
 import io
+import json
 import threading
 import time
 import types
@@ -343,3 +344,70 @@ def test_apply_this_change_carries_the_diff_to_the_dashboard(tmp_path, monkeypat
     table.answer("n")
     thread.join(5)
     assert table.opened[0][1]["detail"] == "-lr = 1\n+lr = 0.1"
+
+
+# ---------------------------------------------------------------------------------- the live feed
+
+class LiveRows:
+    def __init__(self, monkeypatch):
+        self.opened, self.updates, self.finished = [], [], []
+        monkeypatch.setattr(cloud, "open_runner_row", self.open)
+        monkeypatch.setattr(cloud, "update_runner_row", lambda cid, result: self.updates.append((cid, json.loads(result))))
+        monkeypatch.setattr(cloud, "finish_command", lambda cid, status, result: self.finished.append((cid, status)))
+
+    def open(self, run_id, project_id, user_id, command):
+        self.opened.append((run_id, command))
+        return f"live{len(self.opened)}"
+
+
+def test_the_live_feed_streams_what_the_agent_is_doing(tmp_path, monkeypatch):
+    rows = LiveRows(monkeypatch)
+    app = appmod.App(SignedInCli(), str(tmp_path))
+    feed = appmod.LiveFeed(app)
+    feed.tick()
+    assert rows.opened == [(RUN_ID, cloud.LIVE_PREFIX)]
+    assert rows.updates[-1][1]["busy"] is False
+    sent = len(rows.updates)
+    feed.tick()
+    assert len(rows.updates) == sent                             # nothing changed, nothing sent
+    with app.lock:
+        app.view.busy = True
+        app._job_from = len(app.view.entries)
+        app.view.entries.append(appmod.tui.Entry("thinking", "The loss went NaN at step 40, so", live=True))
+        app.view.entries.append(appmod.tui.Entry("tool", "", calls=["READ train.py"]))
+    feed.tick()
+    state = rows.updates[-1][1]
+    assert state["busy"] is True and state["t"]
+    assert [(a["kind"], a["text"]) for a in state["activity"]] == [
+        ("thinking", "The loss went NaN at step 40, so"), ("tool", "READ train.py")]
+    assert state["activity"][0].get("live") == "1"
+    feed.close()
+    assert rows.finished == [("live1", "completed")]
+
+
+def test_the_live_feed_follows_the_row_in_hand(tmp_path, monkeypatch):
+    rows = LiveRows(monkeypatch)
+    app = appmod.App(SignedInCli(), str(tmp_path))
+    feed = appmod.LiveFeed(app)
+    feed.tick()
+    app.runlog = types.SimpleNamespace(id="44444444-4444-4444-8444-444444444444")   # a run opened
+    feed.tick()
+    assert [r for r, _c in rows.opened] == [RUN_ID, "44444444-4444-4444-8444-444444444444"]
+    assert rows.finished == [("live1", "completed")]             # the app's own row's feed ended
+
+
+def test_no_live_feed_when_not_signed_in(tmp_path, monkeypatch):
+    rows = LiveRows(monkeypatch)
+    app = appmod.App(FakeCli(), str(tmp_path))
+    appmod.LiveFeed(app).tick()
+    assert not rows.opened
+
+
+def test_a_question_carries_what_was_said_just_before_it(tmp_path, monkeypatch):
+    table = Questions(monkeypatch)
+    app = appmod.App(SignedInCli(), str(tmp_path))
+    app.note("[Pulse] ⚠ This command can delete files: rm -rf build/")
+    thread, box = asking(app, lambda: app.ask("Run it anyway? (y/N)"))
+    table.answer("n")
+    thread.join(5)
+    assert "rm -rf build/" in table.opened[0][1]["context"]

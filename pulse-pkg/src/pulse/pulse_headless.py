@@ -425,6 +425,7 @@ def supervise(argv: List[str]) -> int:
                   "but nothing will be fixed.")
     _sign_in(cli, app, team_id, project_id)
     app.install()
+    app._start_live_feed()                           # what it is doing, live on the dashboard
     try:
         if attach:
             from . import pulse_console as con
@@ -443,6 +444,11 @@ def supervise(argv: List[str]) -> int:
         app.done = True                              # a dashboard prompt still waiting is failed, not left hanging
         try:
             app._close_all()
+        except Exception:
+            pass
+        try:
+            if app._live is not None:
+                app._live.close()
         except Exception:
             pass
         app.uninstall()
