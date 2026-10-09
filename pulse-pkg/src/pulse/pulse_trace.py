@@ -1305,9 +1305,11 @@ def _render_inventory(graph: Graph, paint: _Paint) -> List[str]:
             marks.append(f"u{node.depth_up}")
         if node.depth_down is not None and node.key != graph.root:
             marks.append(f"d{node.depth_down}")
-        mark = paint.dim(",".join(marks) or "-")
+        mark_text = ",".join(marks) or "-"
+        mark = paint.dim(mark_text)
         scope = "" if node.scope == MODULE_SCOPE else f" in {node.scope}"
-        lines.append(f"    {mark:<12} {paint.var(node.name)}{paint.dim(scope)}   {_where(graph, node, paint)}")
+        mark_padding = " " * max(0, 12 - len(mark_text))
+        lines.append(f"    {mark}{mark_padding} {paint.var(node.name)}{paint.dim(scope)}   {_where(graph, node, paint)}")
     return lines
 
 

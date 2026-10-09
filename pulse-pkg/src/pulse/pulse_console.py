@@ -799,6 +799,12 @@ class Console:
             return
         script = self.session.get("script")
         files = trace_engine.project_files(self.workdir, entry=script)
+        from . import pulse_ui as _ui
+        host = _ui.host()
+        trace_output = getattr(host, "trace_output", None)
+        if callable(trace_output):
+            trace_output(trace_engine.trace(files, arg, color=True))
+            return
         print()
         print(trace_engine.trace(files, arg, color=_COLOR))
         print()

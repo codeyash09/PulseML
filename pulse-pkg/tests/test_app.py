@@ -843,7 +843,11 @@ def test_run_starts_the_script_under_pulse_and_opens_it(real_app, tmp_path, monk
     argv, kw = started[0]
     assert argv[1] == "-c" and "runpy.run_module('pulse'" in argv[2]
     assert argv[3:6] == ["run", "--stream", "--again"] and argv[6:] == [script, "--epochs", "3"]
-    assert kw["cwd"] == real_app.home_root and kw["start_new_session"] is True
+    assert kw["cwd"] == real_app.home_root
+    if os.name == "nt":
+        assert kw["creationflags"] & appmod.subprocess.CREATE_NO_WINDOW
+    else:
+        assert kw["start_new_session"] is True
     assert kw["env"]["PULSE_NONINTERACTIVE"] == "1"
     info = real_app.launched["train"]
     assert info["argv"] == [script, "--epochs", "3"] and os.path.dirname(info["log"]).endswith("app-runs")

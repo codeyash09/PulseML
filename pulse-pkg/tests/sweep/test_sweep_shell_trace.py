@@ -4,6 +4,7 @@ test_bug_* assert the CORRECT behaviour and fail on the current code.
 test_ok_* are regression coverage for behaviour verified to work.
 """
 import os
+import re
 import sys
 import textwrap
 
@@ -258,6 +259,26 @@ def test_ok_assignment_chain_and_multiple_sites():
     assert "total" in downs
     text = PT.render(g)
     assert "loss.backward()" in text
+
+
+def test_ok_color_does_not_shift_trace_inventory_columns():
+    graph = PT.build([F("train.py", """
+        def train(x):
+            logits = model(x)
+            hidden = layer(logits)
+            loss = loss_fn(hidden)
+            return loss
+    """)], "loss")
+
+    text = PT.render(graph, color=True)
+    ansi = re.compile(r"\033\[[0-9;]*m")
+    lines = [ansi.sub("", line) for line in text.splitlines()]
+    start = lines.index("  all connected variables") + 2
+    inventory = [line for line in lines[start:] if line.startswith("    ")]
+
+    assert len(inventory) > 1
+    assert all(line.startswith("    ") and len(line) > 17 for line in inventory)
+    assert all(line[16] == " " for line in inventory)
 
 
 def test_ok_self_attribute_shared_across_methods():

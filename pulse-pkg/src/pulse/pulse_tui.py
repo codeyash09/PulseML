@@ -96,6 +96,7 @@ def wrap(text: str, width: int, indent: str = "") -> List[str]:
     active: List[str] = []          # colours in force at the cursor
     line: List[str] = []            # tokens of the line being built
     col = 0
+    continuation_indent = 0
     break_at: Optional[int] = None  # index in `line` of the last space
     break_col = 0
     indent_w = visible_len(indent)
@@ -121,6 +122,8 @@ def wrap(text: str, width: int, indent: str = "") -> List[str]:
         if col + w > width and col > 0:
             if break_at is not None and token != " ":
                 carry = line[break_at + 1:]
+                while carry and carry[0] == " ":
+                    carry = carry[1:]
                 # the colours in force where the carried text begins
                 active_before_carry = []
                 for t in line[:break_at + 1]:
@@ -128,16 +131,19 @@ def wrap(text: str, width: int, indent: str = "") -> List[str]:
                         active_before_carry = [] if _is_reset(t) else active_before_carry + [t]
                 flush(line[:break_at])
                 line, col = start(carry)
+                continuation_indent = indent_w
             else:
                 active_before_carry = list(active)
                 flush(line)
                 line, col = start([])
+                continuation_indent = indent_w
                 if token == " ":
                     break_at = None
                     continue
             break_at = None
         if token == " ":
-            break_at, break_col = len(line), col
+            if col > continuation_indent:
+                break_at, break_col = len(line), col
         line.append(token)
         col += w
     flush(line)
@@ -301,6 +307,37 @@ def _edit_head(entry: Entry) -> str:
     return _cmd(head, entry) + s(counts + (f"  · {status}" if status else ""), "dim")
 
 
+_TREE_BRANCH_RE = re.compile(r"^(?P<indent>  (?:(?:\|   |    ))*)(?P<branch>\|-- |`-- |\|-> |`-> )")
+_TRACE_LINE_BRANCH_RE = re.compile(r"^(?P<indent>\s*)(?P<branch>\|-- |`-- |\|-> |`-> )(.*)$")
+_TRACE_INVENTORY_RE = re.compile(r"^ {4}.{12} (.+?) {3}(.+)$")
+_TRACE_ANSI_RE = re.compile(r"\033\[([0-9;]*)m")
+_TRACE_ANSI_COLORS = {
+    "0": RESET,
+    "1": "\033[1m",
+    "2": "\033[2m",
+    "33": "\033[38;5;214m",
+    "36": "\033[38;5;208m",
+}
+
+
+def _trace_colors(text: str) -> str:
+    return _TRACE_ANSI_RE.sub(lambda match: _TRACE_ANSI_COLORS.get(match.group(1), ""), text)
+
+
+def _text_continuation_indent(text: str, width: int) -> str:
+    """Keep wrapped trace-tree lines under their branch instead of column zero."""
+    match = _TREE_BRANCH_RE.match(text)
+    if match:
+        branch_indent = "|   " if match.group("branch").startswith("|") else "    "
+        indent = match.group("indent") + branch_indent
+        return indent if len(indent) <= width // 2 else " " * (width // 2)
+    inventory = _TRACE_INVENTORY_RE.match(text)
+    if inventory:
+        return " " * min(inventory.start(2), width // 2)
+    leading = len(text) - len(text.lstrip(" "))
+    return " " * min(leading, width // 2)
+
+
 def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
     """The entry as finished screen lines, each at most `width` columns. `expanded` is the
     screen-wide Ctrl+O state; an entry that was clicked keeps its own."""
@@ -387,6 +424,34 @@ def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
         pieces = wrap(entry.text, max(1, width - visible_len(mark)), indent="")
         out.append(s(mark, style, "bold") + pieces[0])
         out.extend(" " * visible_len(mark) + p for p in pieces[1:])
+    elif kind == "trace":
+        for part in entry.text.strip("\n").split("\n"):
+            bare = _SGR_RE.sub("", part)
+            if not bare.strip():
+                out.append("")
+                continue
+            header = re.match(r"^TRACE\s+(.+?)\s{2,}(.*)$", bare)
+            if header:
+                out.append(s("TRACE", "bold", "accent") + "  " + s(header.group(1), "bold")
+                           + "  " + s(header.group(2), "dim"))
+                continue
+            if bare.startswith(("  what feeds ", "  what ")) or bare.startswith("  all connected variables"):
+                title, separator, explanation = bare.partition("  (")
+                out.append(s(title.strip(), "accent", "bold") +
+                           ("  " + s("(" + explanation, "dim") if separator else ""))
+                continue
+            if set(bare.strip()) == {"-"}:
+                out.append(s("  " + g("rule") * max(1, width - 2), "dim"))
+                continue
+            indent = _text_continuation_indent(bare, width)
+            branch = _TRACE_LINE_BRANCH_RE.match(bare)
+            if branch:
+                branch_end = len(branch.group("indent")) + len(branch.group("branch"))
+                colored = s(branch.group("indent") + branch.group("branch"), "dim") + \
+                    _trace_colors(part[branch_end:])
+            else:
+                colored = _trace_colors(part)
+            out.extend(wrap(colored, width, indent=indent))
     elif kind == "note":
         for part in entry.text.split("\n"):
             out.extend(s(piece, "dim") for piece in wrap(part, width))
@@ -401,9 +466,10 @@ def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
         # the pipelines paint for a plain terminal are dropped here.
         for part in entry.text.strip("\n").split("\n"):
             bare = _SGR_RE.sub("", part)
-            lead = min(len(bare) - len(bare.lstrip(" ")), width // 2)
             style = "red" if _RED_SGR_RE.search(part) else "dim"
-            out.extend(s(piece, style) for piece in wrap(bare, width, indent=" " * lead))
+            out.extend(s(piece, style) for piece in wrap(
+                bare, width, indent=_text_continuation_indent(bare, width)
+            ))
     entry._cache = {key: out}       # one frame size at a time is all that is ever asked for
     return out
 

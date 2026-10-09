@@ -4095,6 +4095,7 @@ class PulseCLI:
         self.debug_session_id: Optional[str] = None
         self._remote_command_stop = threading.Event()
         self._remote_command_thread: Optional[threading.Thread] = None
+        self._remote_command_error_reported = False
         self._cloud_sync = cloud.BackgroundSync(on_error=self._on_cloud_error)
         self._cloud_warned = False
         # Local mirrors of the three array columns on Debug_Sessions. Kept
@@ -4778,6 +4779,7 @@ class PulseCLI:
         # something worth flagging happens (a read error, or the
         # auto-intervention check in update() finding real trouble).
         self.continuous = True
+        self._start_remote_command_listener()
 
     def _print_ready_summary(self) -> None:
         """One clean, glanceable block at the end of setup instead of
@@ -5124,7 +5126,6 @@ class PulseCLI:
                     )
 
         self._load_history_context()
-        self._start_remote_command_listener()
 
     def _start_remote_command_listener(self) -> None:
         """Poll this run's RLS-protected queue and handle prompts as user turns."""
@@ -5134,10 +5135,14 @@ class PulseCLI:
 
         def listen() -> None:
             from . import pulse_supabase as cloud
-            while not self._remote_command_stop.wait(2.0):
+            while not self._remote_command_stop.is_set():
                 try:
                     commands = cloud.claim_commands(self.debug_session_id, self.user_id)
-                except Exception:
+                except Exception as exc:
+                    if not self._remote_command_error_reported:
+                        self._remote_command_error_reported = True
+                        cprint(f"[Pulse] Dashboard command listener unavailable: {exc}", color=_YELLOW)
+                    self._remote_command_stop.wait(5.0)
                     continue
                 for queued in commands:
                     command_id = str(queued.get("id") or "")
@@ -5150,8 +5155,11 @@ class PulseCLI:
                     except Exception as exc:
                         try:
                             cloud.finish_command(command_id, "failed", f"{type(exc).__name__}: {exc}")
-                        except Exception:
-                            pass
+                        except Exception as finish_error:
+                            if not self._remote_command_error_reported:
+                                self._remote_command_error_reported = True
+                                cprint(f"[Pulse] Could not save dashboard command result: {finish_error}", color=_YELLOW)
+                self._remote_command_stop.wait(2.0)
 
         self._remote_command_thread = threading.Thread(
             target=listen, daemon=True, name="pulse-cli-commands"
