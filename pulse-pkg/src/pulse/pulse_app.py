@@ -207,6 +207,8 @@ class CommandQueue:
                 continue
             for command in claimed:
                 text = str(command.get("command") or "").strip()
+                if text.startswith(self._cloud.QUESTION_PREFIX.strip()):
+                    continue                     # a question this runner asked (DashboardQuestion)
                 if not text or len(text) > 8000:
                     self._finish(command, "failed", "A command is 1 to 8000 characters.")
                     continue
@@ -259,6 +261,65 @@ class CommandQueue:
         except Exception:
             pass
 
+
+
+class DashboardQuestion:
+    """A question asked here, put on the run's dashboard page too: whoever answers first --
+    at the machine or on the dashboard -- answers it. `on_answer` gets the dashboard's answer
+    (the option's "#index", or the text typed); `close` says how it ended, if it was here."""
+
+    POLL_EVERY = 1.5
+
+    def __init__(self, row_id: str, project_id: str, user_id: str, question: Dict[str, Any],
+                 on_answer: Callable[[str], None]) -> None:
+        from . import pulse_supabase as cloud
+        self._cloud = cloud
+        self._ids = (row_id, project_id, user_id)
+        self._question = question
+        self._on_answer = on_answer
+        self.id: Optional[str] = None
+        self.answered_there = False
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="pulse-dashboard-question")
+
+    def start(self) -> "DashboardQuestion":
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        try:
+            self.id = self._cloud.open_question(*self._ids, self._question)
+        except Exception:
+            return
+        while self.id and not self._stop.wait(self.POLL_EVERY):
+            try:
+                row = self._cloud.read_command(self.id)
+            except Exception:
+                continue
+            status = (row or {}).get("status")
+            if status == "completed" and not self._stop.is_set():
+                self.answered_there = True
+                self._on_answer(str((row or {}).get("result") or ""))
+                return
+            if status in ("completed", "failed", None):
+                return
+
+    def close(self, status: str, result: str) -> None:
+        """The question is over here: its row says how (unless the dashboard answered it).
+        In the background -- the row may still be being opened."""
+        self._stop.set()
+        if self.answered_there:
+            return
+
+        def finish() -> None:
+            self._thread.join(15.0)
+            if self.id and not self.answered_there:
+                try:
+                    self._cloud.finish_command(self.id, status, result)
+                except Exception:
+                    pass
+
+        threading.Thread(target=finish, daemon=True, name="pulse-dashboard-question-close").start()
 
 
 class RunLog:
@@ -665,12 +726,6 @@ class App:
                 self._edit_pending.touch()
         if threading.current_thread() is self._ui_thread:
             raise _ui.Unavailable("a question cannot be asked from the drawing thread")
-        remote = self._remote_active
-        if remote is not None and threading.current_thread() is self._job:
-            # a prompt from the dashboard: nobody may be at this machine to answer, so the
-            # question is not left waiting on the screen -- it is declined, and the dashboard told
-            remote["asked"] = str(question.label or "a question")
-            raise EOFError("a question only the person at the machine can answer")
         with self.lock:
             held = self._hushed.get(threading.get_ident())
             if held:
@@ -689,6 +744,7 @@ class App:
                 view.options = [(str(o.label), str(o.detail or ""), str(o.tag or "")) for o in question.options]
                 view.option_ids = list(range(len(view.options)))
             self.dirty = True
+        posted = self._post_question(question)       # on the dashboard too: the first answer wins
         question.done.wait()
         with self.lock:
             view = self.view
@@ -697,9 +753,66 @@ class App:
             view.editor.set(self._draft)
             self._question = None
             self.dirty = True
+        self._settle_question(question, posted)
         if question.cancelled:
             raise KeyboardInterrupt
         return question.answer
+
+    def _post_question(self, question: _Question) -> Optional[DashboardQuestion]:
+        """Put `question` on the dashboard page of the run in hand (or of the app's own row):
+        an answer there answers it here. Not a secret (a key, a password), never."""
+        cli = self.cli
+        row = (getattr(self.runlog, "id", None) if self.runlog is not None else None) \
+            or getattr(cli, "debug_session_id", None)
+        user, project = getattr(cli, "user_id", None), getattr(cli, "project_id", None)
+        if getattr(question, "secret", False) or not (row and user and project):
+            return None
+        options = getattr(question, "options", None)
+
+        def answered(text: str) -> None:
+            with self.lock:
+                if question.done.is_set():
+                    return
+                if options is not None:
+                    match = re.match(r"#(\d+)", text.strip())
+                    index = int(match.group(1)) if match else -1
+                    if not 0 <= index < len(options):
+                        return
+                    question.answer = index
+                else:
+                    question.answer = text
+                question.from_dashboard = True     # type: ignore[attr-defined]
+                question.done.set()
+
+        label = tui._SGR_RE.sub("", str(question.label or "")).strip()
+        payload: Dict[str, Any] = {
+            "label": label[:3000] or "Pulse is asking you to choose:",
+            "options": [tui._SGR_RE.sub("", str(o.label))[:300] for o in options] if options else None}
+        edit = self._edit_pending
+        if edit is not None and edit.output:             # "Apply this change?": the change itself
+            diff = tui._SGR_RE.sub("", str(edit.output))
+            payload["detail"] = diff[:6000] + ("\n…" if len(diff) > 6000 else "")
+        try:
+            return DashboardQuestion(str(row), str(project), str(user), payload, answered).start()
+        except Exception:
+            return None
+
+    def _settle_question(self, question: _Question, posted: Optional[DashboardQuestion]) -> None:
+        if getattr(question, "from_dashboard", False):
+            self.note("Answered on the dashboard.")
+            return
+        if posted is None:
+            return
+        if question.cancelled:
+            posted.close("failed", "No longer asked: cancelled at the machine.")
+            return
+        answer = question.answer
+        if question.options is not None:
+            shown = str(question.options[answer].label) if isinstance(answer, int) and 0 <= answer < len(
+                question.options) else "nothing chosen"
+        else:
+            shown = str(answer or "") or "(Enter)"
+        posted.close("completed", f"Answered at the machine: {tui._SGR_RE.sub('', shown)}")
 
     def ask(self, label: str, secret: bool = False, placeholder: Optional[str] = None, **_ignored: Any) -> str:
         question = _Question(label + (f"  [{placeholder}]" if placeholder else ""), secret=secret)
@@ -1033,10 +1146,6 @@ class App:
             elif entry.text:
                 lines.append(entry.text)
         text = tui._SGR_RE.sub("", "\n".join(lines)).strip()
-        if remote.get("asked"):
-            text = (text + "\n\n" if text else "") + (
-                f"It stopped at a question only the person at the machine can answer "
-                f"({remote['asked']}), so that was declined.")
         if len(text) > 20000:
             text = text[:20000].rstrip() + "\n…"
         return text or "Done (nothing to show)."

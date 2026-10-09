@@ -1814,6 +1814,46 @@ def claim_commands(run_id: str, runner_id: str, limit: int = 5) -> List[Dict[str
     return claimed
 
 
+# A question Pulse asks (apply this change? run this command?) is put on the dashboard as a
+# Commands row of its own: "pulse:ask {json}", opened by the runner and left "processing"
+# until it is answered -- on the dashboard (the row is completed with the answer) or at the
+# machine (the runner completes it, saying so). The runner's own claim never takes it: it
+# is never "pending" for long, and CommandQueue skips it if it does.
+QUESTION_PREFIX = "pulse:ask "
+
+
+def open_question(run_id: str, project_id: str, user_id: str, question: Dict[str, Any]) -> Optional[str]:
+    """Put `question` ({"label", "options"}) on run `run_id`'s dashboard page; its row id."""
+    if not is_valid_uuid(run_id) or not is_valid_uuid(user_id) or not project_id:
+        return None
+    rows = _request(
+        "POST", "Commands",
+        body={"run_id": run_id, "project_id": project_id, "user_id": user_id, "status": "pending",
+              "command": QUESTION_PREFIX + json.dumps(question)},
+        prefer="return=representation", timeout=_TIMEOUT_BACKGROUND,
+    ) or []
+    command_id = str((rows[0] if rows else {}).get("id") or "")
+    if not command_id:
+        return None
+    _request(
+        "PATCH", "Commands",
+        params={"id": f"eq.{command_id}", "status": "eq.pending"},
+        body={"status": "processing", "claimed_by": user_id,
+              "started_at": datetime.now(timezone.utc).isoformat()},
+        prefer="return=minimal", timeout=_TIMEOUT_BACKGROUND,
+    )
+    return command_id
+
+
+def read_command(command_id: str) -> Optional[Dict[str, Any]]:
+    rows = _request(
+        "GET", "Commands",
+        params={"id": f"eq.{command_id}", "select": "id,status,result"},
+        timeout=_TIMEOUT_BACKGROUND,
+    ) or []
+    return rows[0] if rows else None
+
+
 def finish_command(command_id: str, status: str, result: str) -> None:
     """Save a command's terminal state and scrubbed result for the dashboard."""
     if status not in ("completed", "failed"):

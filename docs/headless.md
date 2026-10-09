@@ -26,3 +26,7 @@ From a script: `auto_track(mode="headless")`.
 - Live: `pulse`, then `/monitor`
 - Online: the [dashboard](https://pulsedashb.netlify.app/)
 - Undo a fix: `/undo <id>` in `pulse` (the id is in the log)
+
+If Pulse needs a yes/no from you (a change the reviewer would not approve), the question
+shows on the run's dashboard page; with no answer in 15 minutes it is a no
+(`PULSE_HEADLESS_ANSWER_SECONDS` changes the wait).

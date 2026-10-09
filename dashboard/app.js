@@ -952,6 +952,41 @@ async function loadCommands(sessions) {
 }
 
 
+// A question Pulse asked on the machine (apply this change? run this command?) is a Commands
+// row of its own, "pulse:ask {json}", left "processing" until someone answers -- here, or at
+// the machine. Answering here completes the row with the answer.
+const QUESTION_PREFIX = "pulse:ask ";
+
+function questionOf(command) {
+  const text = String(command?.command || "");
+  if (!text.startsWith(QUESTION_PREFIX)) return null;
+  try {
+    const parsed = JSON.parse(text.slice(QUESTION_PREFIX.length));
+    return {
+      label: String(parsed.label || "Pulse is asking:"),
+      options: Array.isArray(parsed.options) ? parsed.options.map(String) : null,
+      detail: parsed.detail ? String(parsed.detail) : ""
+    };
+  } catch {
+    return { label: text.slice(QUESTION_PREFIX.length), options: null, detail: "" };
+  }
+}
+
+// "Apply this change? [y/N]" and the like: Yes / No buttons send what the terminal takes.
+function isYesNo(label) {
+  return /\[\s*y\s*\/\s*n\s*\]|\(\s*y\s*\/\s*n\s*\)/i.test(label);
+}
+
+async function answerQuestion(commandId, answer) {
+  await pgPatch(
+    "Commands",
+    { id: `eq.${commandId}`, status: "eq.processing" },
+    { status: "completed", result: answer, completed_at: new Date().toISOString() },
+    { expectRows: true }
+  );
+}
+
+
 /* ============================================================
    FORMATTING
 ============================================================ */
@@ -3758,7 +3793,9 @@ function initLossChart(scopeEl) {
 function renderRunWorkspace(session) {
 
   const logs = (session.agentLogs || []).filter(entry => entry && typeof entry === "object");
-  const commands = session.commands || [];
+  const questions = (session.commands || []).filter(command => questionOf(command));
+  const commands = (session.commands || []).filter(command => !questionOf(command));
+  const openQuestion = questions.filter(command => command.status === "processing").at(-1);
   const step = findMetric(session, ["step", "global_step", "epoch"]);
   const live = isLive(session);
   const telemetry = session.telemetry || [];
@@ -3873,6 +3910,27 @@ function renderRunWorkspace(session) {
     });
   });
 
+  questions.filter(command => command !== openQuestion).forEach(command => {
+    const asked = questionOf(command);
+    const outcome = command.status === "completed"
+      ? (String(command.result || "").startsWith("Answered at the machine")
+          ? command.result
+          : `Answered here: ${asked.options && /^#\d+/.test(command.result || "")
+              ? asked.options[Number(String(command.result).slice(1).split(" ")[0])] ?? command.result
+              : command.result || "(Enter)"}`)
+      : command.result || "No longer asked.";
+    entries.push({
+      at: command.created_at ? Date.parse(command.created_at) / 1000 : 0,
+      html: `
+        <article class="console-exchange">
+          <div class="console-speaker">PULSE ASKED <time>${fmtRelativeTime(command.created_at ? Date.parse(command.created_at) / 1000 : 0)}</time></div>
+          <pre class="console-message is-user">${escapeHtml(asked.label)}</pre>
+          <pre class="console-message">${escapeHtml(outcome)}</pre>
+        </article>
+      `
+    });
+  });
+
   entries.sort((a, b) => a.at - b.at);
   if (!entries.length) {
     entries.push({ html: `<p class="console-empty">No conversation yet. Send a prompt to this run.</p>` });
@@ -3933,6 +3991,7 @@ function renderRunWorkspace(session) {
         ${statsPane}
         <section class="run-transcript" aria-label="Agent transcript">${transcript}</section>
       </div>
+      ${openQuestion ? renderOpenQuestion(openQuestion, canSend) : ""}
       <form class="command-composer" data-run-id="${escapeHtml(session.id)}">
         <label class="sr-only" for="command-${escapeHtml(session.id)}">Send a prompt to this run</label>
         <div class="command-input-wrap">
@@ -3949,6 +4008,62 @@ function renderRunWorkspace(session) {
       </form>
     </section>
   `;
+}
+
+
+function renderOpenQuestion(command, canSend) {
+  const asked = questionOf(command);
+  const id = escapeHtml(command.id);
+  let choices;
+  if (asked.options) {
+    choices = asked.options.map((option, index) =>
+      `<button type="button" class="question-answer" data-question-id="${id}" data-answer="#${index} ${escapeHtml(option)}" ${canSend ? "" : "disabled"}>${escapeHtml(option)}</button>`
+    ).join("");
+  } else {
+    choices = `
+      ${isYesNo(asked.label) ? `
+        <button type="button" class="question-answer" data-question-id="${id}" data-answer="y" ${canSend ? "" : "disabled"}>Yes</button>
+        <button type="button" class="question-answer" data-question-id="${id}" data-answer="n" ${canSend ? "" : "disabled"}>No</button>` : ""}
+      <form class="question-text" data-question-id="${id}">
+        <input type="text" name="answer" placeholder="${isYesNo(asked.label) ? "or type an answer" : "Your answer"}" ${canSend ? "" : "disabled"}>
+        <button type="submit" ${canSend ? "" : "disabled"}>Answer</button>
+      </form>`;
+  }
+  return `
+    <section class="run-question" aria-label="Pulse is asking">
+      <div class="console-speaker">PULSE IS ASKING <span class="command-state is-processing">waiting for you</span></div>
+      <pre class="console-message">${escapeHtml(asked.label)}</pre>
+      ${asked.detail ? `<details class="question-detail" open><summary>The change</summary><pre>${escapeHtml(asked.detail)}</pre></details>` : ""}
+      <div class="question-choices">${choices}</div>
+      <p class="question-status" role="status">${canSend ? "The first answer, here or at the machine, is the one used." : "Only the run owner or workspace admins can answer."}</p>
+    </section>
+  `;
+}
+
+
+async function sendQuestionAnswer(commandId, answer) {
+  const panel = els.activeConsole.querySelector(".run-question");
+  const status = panel?.querySelector(".question-status");
+  panel?.querySelectorAll("button, input").forEach(element => { element.disabled = true; });
+  if (status) status.textContent = "Sending…";
+  try {
+    await answerQuestion(commandId, answer);
+    currentSessions.forEach(session => (session.commands || []).forEach(command => {
+      if (command.id === commandId) {
+        command.status = "completed";
+        command.result = answer;
+      }
+    }));
+    lastRenderedSignature = "";
+    renderSessions();
+  } catch (error) {
+    console.warn("Could not answer:", error);
+    if (status) status.textContent = /admin/.test(error.message)
+      ? "Already answered (at the machine), or you can't answer this run's questions."
+      : "Could not send the answer. Try again.";
+    panel?.querySelectorAll("button, input").forEach(element => { element.disabled = false; });
+    if (/admin/.test(error.message)) refreshSessions();
+  }
 }
 
 
@@ -4863,6 +4978,8 @@ els.activeConsole.addEventListener("input", event => {
 els.activeConsole.addEventListener("click", event => {
   const suggestion = event.target.closest(".command-suggestion");
   if (suggestion) chooseCommandSuggestion(suggestion.dataset.command);
+  const answer = event.target.closest(".question-answer");
+  if (answer && !answer.disabled) sendQuestionAnswer(answer.dataset.questionId, answer.dataset.answer);
 });
 
 
@@ -4907,6 +5024,14 @@ els.activeConsole.addEventListener("keydown", event => {
 
 
 els.activeConsole.addEventListener("submit", async event => {
+
+  const questionForm = event.target.closest(".question-text");
+  if (questionForm) {
+    event.preventDefault();
+    const answer = questionForm.elements.answer.value;
+    sendQuestionAnswer(questionForm.dataset.questionId, answer);
+    return;
+  }
 
   const form = event.target.closest(".command-composer");
   if (!form) return;
@@ -5151,6 +5276,20 @@ setInterval(
 );
 
 
+// A new question from Pulse: a browser notification (if they are on), once per question.
+const announcedQuestions = new Set();
+
+function announceQuestions(sessions) {
+  sessions.forEach(session => (session.commands || []).forEach(command => {
+    const asked = questionOf(command);
+    if (!asked || command.status !== "processing" || announcedQuestions.has(command.id)) return;
+    announcedQuestions.add(command.id);
+    if (notificationSettings.browserPush) {
+      sendBrowserNotification(`Pulse is asking (${runLabel(session)})`, asked.label.slice(0, 200), `pulse-ask-${command.id}`);
+    }
+  }));
+}
+
 // While a prompt sent from here is waiting or running, its state and answer are fetched
 // every few seconds (the full refresh is every 30 s).
 let commandPollInFlight = false;
@@ -5160,7 +5299,10 @@ setInterval(
 
     if (els.viewDashboard.hidden || commandPollInFlight || !currentProject) return;
 
+    // the run on screen, while it is live (a question can come up at any moment), and any
+    // run with a prompt on its way
     const waiting = currentSessions.filter(session =>
+      (session.id === activeSessionId && isLive(session)) ||
       (session.commands || []).some(command => ["pending", "processing"].includes(command.status)));
     if (!waiting.length) return;
 
@@ -5171,6 +5313,7 @@ setInterval(
       await loadCommands(waiting);
       if (project !== currentProject) return;
       const after = JSON.stringify(waiting.map(session => session.commands.map(c => [c.id, c.status])));
+      announceQuestions(waiting);
       renderSessions();
       // finished: the agent's turn and anything else it changed are on the run's row now
       if (after !== before) refreshSessions();

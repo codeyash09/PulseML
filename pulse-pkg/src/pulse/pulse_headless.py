@@ -42,6 +42,8 @@ DASHBOARD_URL = "https://pulsedashb.netlify.app/"
 # Seconds a finished run is kept after the last thing happened (a fix being written, the
 # closing audit), before the supervisor stops.
 _GRACE_SECONDS = float(os.environ.get("PULSE_HEADLESS_GRACE", "20"))
+# How long a question waits for an answer on the dashboard before it is declined.
+_ANSWER_SECONDS = float(os.environ.get("PULSE_HEADLESS_ANSWER_SECONDS", "900"))
 # terminal control sequences (colours, "clear to end of line"): not for a log file
 _CONTROL_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
 
@@ -306,7 +308,18 @@ class HeadlessApp(pulse_app.App):
 
     def _ask(self, question: Any) -> Any:
         # "Apply this change?" when the reviewer could not answer, a y/N for a command...: with
-        # nobody here the answer is no -- the pipelines read EOF as "no terminal to confirm on"
+        # nobody here it goes on the run's dashboard page and waits there for a while; with no
+        # answer the answer is no -- the pipelines read EOF as "no terminal to confirm on"
+        posted = self._post_question(question)
+        if posted is not None:
+            minutes = max(1, round(_ANSWER_SECONDS / 60))
+            self.write(f"  (asked {question.label!r}: waiting up to {minutes} min for an answer on the dashboard)")
+            if question.done.wait(_ANSWER_SECONDS):
+                self.write(f"  (answered on the dashboard: {question.answer!r})")
+                return question.answer
+            posted.close("failed", f"Nobody answered within {minutes} min, so the answer was no.")
+            self.write(f"  (no answer in {minutes} min: no)")
+            raise EOFError
         self.write(f"  (asked {question.label!r} with nobody to answer: no)")
         raise EOFError
 

@@ -3320,3 +3320,86 @@ main {
     grid-template-columns: 70px minmax(0, 1fr);
   }
 }
+
+
+/* A question Pulse asked on the machine, answerable here */
+.run-question {
+  padding: 12px 14px 10px;
+  border-top: 1px solid var(--line);
+  border-left: 2px solid var(--accent);
+  background: #0f0b06;
+}
+
+.run-question .console-message {
+  margin: 6px 0 10px;
+}
+
+.question-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.question-choices button,
+.question-text button {
+  padding: 6px 12px;
+  border: 1px solid var(--line-strong);
+  background: var(--raised);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.question-choices button:hover:not(:disabled),
+.question-text button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.question-choices button:disabled,
+.question-text input:disabled {
+  opacity: .5;
+  cursor: default;
+}
+
+.question-text {
+  display: flex;
+  gap: 8px;
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.question-text input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+}
+
+.question-status {
+  margin: 8px 0 0;
+  color: var(--tertiary);
+  font-size: 11px;
+}
+
+.question-detail {
+  margin: 0 0 10px;
+  color: var(--secondary);
+  font-size: 11px;
+}
+
+.question-detail pre {
+  max-height: 240px;
+  overflow: auto;
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  white-space: pre;
+}
