@@ -379,11 +379,10 @@ def test_the_live_feed_streams_what_the_agent_is_doing(tmp_path, monkeypatch):
     feed.tick()
     state = rows.updates[-1][1]
     assert state["busy"] is True and state["t"]
-    assert [(a["kind"], a["text"]) for a in state["activity"]] == [
-        ("thinking", "The loss went NaN at step 40, so"), ("tool", "READ train.py"),
-        ("trace", "weight <- train.py:40")]
-    assert state["activity"][0].get("live") == "1"
-    assert state["activity"][2]["ansi"] == "\033[36mweight\033[0m <- train.py:40"
+    assert state["activity"] == [
+        {"kind": "thinking", "text": "The loss went NaN at step 40, so", "live": True},
+        {"kind": "tool", "calls": ["READ train.py"], "text": "", "output": ""},
+        {"kind": "trace", "text": "weight <- train.py:40", "ansi": "\033[36mweight\033[0m <- train.py:40"}]
     feed.close()
     assert rows.finished == [("live1", "completed")]
 
@@ -414,3 +413,36 @@ def test_a_question_carries_what_was_said_just_before_it(tmp_path, monkeypatch):
     table.answer("n")
     thread.join(5)
     assert "rm -rf build/" in table.opened[0][1]["context"]
+
+
+def test_a_finished_turn_is_kept_on_the_page(tmp_path, monkeypatch):
+    rows = LiveRows(monkeypatch)
+    finished = []
+    monkeypatch.setattr(cloud, "finish_command", lambda cid, status, result: finished.append((cid, status, json.loads(result))))
+    app = appmod.App(SignedInCli(), str(tmp_path))
+    app._live = feed = appmod.LiveFeed(app)
+    feed.tick()                                                  # the idle feed's row: live1
+    app.view.entries.append(appmod.tui.Entry("user", "why is the loss flat?"))
+
+    def work():
+        with app.lock:
+            thinking = appmod.tui.Entry("thinking", "Check the scheduler.")
+            thinking.seconds = 3.2
+            app.view.entries.append(thinking)
+            app.view.entries.append(appmod.tui.Entry("tool", "Looking at the curve.", calls=["CURVE lr"], output="1e-3 ... 1e-7"))
+            app.view.entries.append(appmod.tui.Entry("text", "The scheduler drops the rate"))
+            app.view.entries.append(appmod.tui.Entry("text", "at step 1500."))
+
+    app._start(work)
+    assert wait_for(lambda: app._job is None)
+    feed.tick()                                                  # the turn completes live1; a new row follows
+    turn = finished[0][2]
+    assert finished[0][:2] == ("live1", "completed")
+    assert turn["turn"] is True and turn["who"] == "you" and turn["prompt"] == "why is the loss flat?"
+    assert turn["activity"] == [
+        {"kind": "thinking", "text": "Check the scheduler.", "seconds": 3.2},
+        {"kind": "tool", "calls": ["CURVE lr"], "text": "Looking at the curve.", "output": "1e-3 ... 1e-7"},
+        {"kind": "text", "text": "The scheduler drops the rate\nat step 1500."}]
+    assert turn["ended"] >= turn["started"] > 0
+    assert [r for r, _c in rows.opened] == [RUN_ID, RUN_ID]      # the feed goes on in a new row
+    assert rows.updates[-1][1]["busy"] is False

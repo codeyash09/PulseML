@@ -343,6 +343,7 @@ class LiveFeed:
         self._last = ""
         self._sent_at = 0.0
         self._retry_at = 0.0
+        self._turns: "collections.deque[Dict[str, Any]]" = collections.deque()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="pulse-live-feed")
 
@@ -350,10 +351,19 @@ class LiveFeed:
         self._thread.start()
         return self
 
+    def turn_ended(self, record: Dict[str, Any]) -> None:
+        """A job finished: its row is completed with the whole turn (the page keeps it), and
+        the feed goes on in a new row."""
+        self._turns.append(record)
+
     def close(self) -> None:
         self._stop.set()
         if self._thread.is_alive():
             self._thread.join(timeout=2.0)
+        try:
+            self._flush_turns()
+        except Exception:
+            pass
         self._end()
 
     def _loop(self) -> None:
@@ -373,6 +383,8 @@ class LiveFeed:
             self._target = target
         if target is None:
             return
+        if self._turns:
+            self._flush_turns()
         if self.id is None:
             self.id = self._cloud.open_runner_row(*target, self._cloud.LIVE_PREFIX)
             self._last = ""
@@ -385,6 +397,19 @@ class LiveFeed:
             return
         self._cloud.update_runner_row(self.id, json.dumps(dict(state, t=time.time()), default=str))
         self._last, self._sent_at = body, now
+
+    def _flush_turns(self) -> None:
+        """Each finished turn completes the row that streamed it (one is opened if the job
+        was too quick for one)."""
+        target = self._target or self.app._live_target()
+        while self._turns and target is not None:
+            record = self._turns[0]
+            row = self.id or self._cloud.open_runner_row(*target, self._cloud.LIVE_PREFIX)
+            if not row:
+                return
+            self._cloud.finish_command(row, "completed", json.dumps(dict(record, t=time.time()), default=str))
+            self._turns.popleft()
+            self.id, self._last = None, ""
 
     def _end(self) -> None:
         """The row is done with: the page stops showing it as live."""
@@ -679,6 +704,7 @@ class App:
         self._home_commands: Optional[CommandQueue] = None   # the dashboard's prompts to the app's own row
         self._live: Optional[LiveFeed] = None                # what the app is doing, streamed to the dashboard
         self._job_from = 0
+        self._job_started = 0.0
         self._last_ctrl_c = 0.0
         self._ui_thread = threading.current_thread()
         # the run that is open (DEBUG), if any
@@ -859,31 +885,89 @@ class App:
         return ("…" + text[-limit:] if len(text) > limit else text) if entry.kind == "thinking" else \
             (text[:limit] + "…" if len(text) > limit else text)
 
+    @staticmethod
+    def _clip(text: Any, limit: int, tail: bool = False) -> str:
+        text = tui._SGR_RE.sub("", str(text or "")).replace("\r", "").strip()
+        if len(text) <= limit:
+            return text
+        return "…" + text[-limit:] if tail else text[:limit] + "…"
+
+    def _activity(self, final: bool = False) -> List[Dict[str, Any]]:
+        """The job in hand as the dashboard draws it: its reasoning, tool calls (with what the
+        agent said as it reached for them, and their output), changes (with the diff), its
+        words (consecutive lines as one block), notes. With the lock held. `final`: the whole
+        turn, kept on the page; otherwise the latest part, sent every second while it runs."""
+        items: List[Dict[str, Any]] = []
+        think, text, out = (8000, 12000, 2000) if final else (3000, 4000, 600)
+        for entry in self.view.entries[self._job_from:]:
+            kind, live = entry.kind, bool(getattr(entry, "live", False))
+            if kind == "thinking":
+                item: Dict[str, Any] = {"kind": "thinking", "text": self._clip(entry.text, think, tail=True)}
+                if entry.seconds:
+                    item["seconds"] = round(float(entry.seconds), 1)
+            elif kind == "tool":
+                item = {"kind": "tool", "calls": [self._clip(c, 300) for c in entry.calls[:12]],
+                        "text": self._clip(entry.text, 800), "output": self._clip(entry.output, out, tail=True)}
+            elif kind == "edit":
+                item = {"kind": "edit", "calls": [self._clip(c, 300) for c in entry.calls[:12]],
+                        "text": self._clip(entry.text, 300), "diff": self._clip(entry.output, out * 3)}
+            elif kind in ("text", "say", "note", "error", "user", "trace", "finding"):
+                words = self._clip(entry.text, text)
+                if not words:
+                    continue
+                if kind == "text" and items and items[-1]["kind"] == "text" and not items[-1].get("live"):
+                    items[-1]["text"] = self._clip(items[-1]["text"] + "\n" + words, text)
+                    continue
+                item = {"kind": kind, "text": words}
+                if kind == "trace":     # the dependency trace keeps its colours for the page
+                    item["ansi"] = tui.clean(entry.text)[:1500]
+            else:
+                continue
+            if live:
+                item["live"] = True
+            items.append(item)
+        partial = self._clip(self.view.partial, 800, tail=True)
+        if partial:
+            items.append({"kind": "text", "text": partial, "live": True})
+        return items[-150:] if final else items[-40:]
+
+    def _turn_prompt(self) -> str:
+        """What started the job in hand: the line typed (here or on the dashboard) just before
+        it, or the request Pulse made itself (a crash, a finding). With the lock held."""
+        entries = self.view.entries
+        if 0 < self._job_from <= len(entries) and entries[self._job_from - 1].kind == "user":
+            return self._clip(entries[self._job_from - 1].text, 4000)
+        return ""
+
+    def _turn_record(self) -> Dict[str, Any]:
+        """A finished job, for the page to keep. With the lock held."""
+        who = "dashboard" if self._remote_active is not None else (
+            "pulse" if self._auto_turn_session is not None else "you")
+        activity = self._activity(final=True)
+        if len(json.dumps(activity, default=str)) > 250_000:     # a very long turn: each part shorter
+            for item in activity:
+                for key in ("text", "output", "diff"):
+                    if item.get(key):
+                        item[key] = self._clip(item[key], 1500, tail=item["kind"] == "thinking")
+        return {"turn": True, "who": who, "prompt": self._turn_prompt(), "activity": activity,
+                "started": self._job_started, "ended": time.time()}
+
     def _live_state(self) -> Dict[str, Any]:
         """What the dashboard's live view shows: what the job in hand has shown so far (its
         reasoning streaming in), what is running, and the run's step and latest values."""
         with self.lock:
             view = self.view
             busy = bool(view.busy)
-            activity: List[Dict[str, str]] = []
-            if busy:
-                for entry in view.entries[self._job_from:]:
-                    words = self._entry_words(entry)
-                    if words:
-                        item = {"kind": entry.kind, "text": words}
-                        if entry.kind == "trace":
-                            item["ansi"] = tui.clean(entry.text)[:1500]
-                        if getattr(entry, "live", False):
-                            item["live"] = "1"
-                        activity.append(item)
-                partial = tui._SGR_RE.sub("", view.partial or "").strip()
-                if partial:
-                    activity.append({"kind": "text", "text": partial[-800:], "live": "1"})
             state: Dict[str, Any] = {
-                "busy": busy, "activity": activity[-30:],
+                "busy": busy, "activity": self._activity() if busy else [],
                 "doing": tui._SGR_RE.sub("", str(view.live or "")).strip() if busy else "",
                 "asking": self._question is not None,
             }
+            if busy:
+                state["started"] = self._job_started
+                state["prompt"] = self._turn_prompt()
+                state["who"] = "dashboard" if self._remote_active is not None else (
+                    "pulse" if self._auto_turn_session is not None else "you")
             console, status = self.console, self._status
         if console is not None:
             run: Dict[str, Any] = {"status": status}
@@ -1168,6 +1252,7 @@ class App:
         with self.lock:
             self.view.busy, self.view.status, self.dirty = True, "", True
             self._job_from = len(self.view.entries)  # what this job shows starts here (the live feed)
+            self._job_started = time.time()
         self._job = threading.Thread(target=self._run_job, args=(work, args), daemon=True, name="pulse-app-job")
         self._job.start()
 
@@ -1185,6 +1270,13 @@ class App:
         finally:
             with self.lock:
                 self._flush_partial()
+                if self._live is not None:
+                    try:
+                        record = self._turn_record()
+                        if record["activity"]:
+                            self._live.turn_ended(record)    # kept on the dashboard page
+                    except Exception:
+                        pass
                 self.view.busy, self.view.live, self.view.status = False, "", ""
                 self._job = None
                 self._auto_turn_session = None

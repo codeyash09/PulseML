@@ -3893,78 +3893,72 @@ function renderRunWorkspace(session) {
     (currentTeam?.admin_ids || []).includes(currentUser.id)
   ));
 
-  // A prompt sent from here is shown with its state and what the runner answered; the agent
-  // turn it caused is the same exchange, so it is not shown twice.
-  const commandTimes = commands.map(command => ({
-    text: command.command,
-    from: command.created_at ? Date.parse(command.created_at) / 1000 - 5 : 0,
-    to: command.completed_at ? Date.parse(command.completed_at) / 1000 + 120 : Infinity
-  }));
-  const isCommandTurn = entry => commandTimes.some(c =>
-    c.text === entry.question && Number(entry.t || 0) >= c.from && Number(entry.t || 0) <= c.to);
+  // The conversation, oldest first: finished turns as Pulse showed them (reasoning, tools,
+  // answer), prompts sent from here, and older agent-log entries no turn record covers.
+  const turns = (session.commands || []).map(turnOf).filter(Boolean);
+  const covered = t => turns.some(turn => t >= turn.started - 2 && t <= turn.ended + 10);
+  const promptCovered = command => {
+    const at = command.created_at ? Date.parse(command.created_at) / 1000 : 0;
+    const done = command.completed_at ? Date.parse(command.completed_at) / 1000 : Infinity;
+    return turns.some(turn => turn.prompt.trim() === String(command.command || "").trim() &&
+      turn.started >= at - 5 && turn.started <= done + 5);
+  };
   const commandState = command => {
     const status = command.status || "pending";
-    if (status === "pending") return live ? "waiting" : "waiting · run not connected";
+    if (status === "pending") return live ? "waiting" : "waiting · Pulse not connected";
     if (status === "processing") return "running";
     if (status === "completed") return "done";
     return status;
   };
 
-  const entries = logs.filter(entry => !isCommandTurn(entry)).map(entry => {
-    // turns Pulse started itself (a crash, a finding, an audit) are not the user's words
+  const entries = [];
+
+  turns.forEach(turn => entries.push({ at: turn.started, html: renderTurn(turn) }));
+
+  logs.filter(entry => !covered(Number(entry.t || 0))).forEach(entry => {
     const automatic = entry.who === "pulse" || (!entry.who && entry.traceback_signature);
-    const question = automatic
-      ? `<details class="console-message is-pulse-prompt"><summary>${escapeHtml(String(entry.question || "").split("\n")[0].slice(0, 140))}</summary><pre>${escapeHtml(entry.question || "")}</pre></details>`
-      : `<pre class="console-message is-user">${escapeHtml(entry.question || "")}</pre>`;
-    return {
+    entries.push({
       at: Number(entry.t || 0),
-      html: `
-      <article class="console-exchange">
-        <div class="console-speaker">${automatic ? "PULSE · ON ITS OWN" : entry.who === "dashboard" ? "YOU · FROM HERE" : "YOU"} <time>${fmtRelativeTime(entry.t || 0)}</time></div>
-        ${question}
-        <div class="console-speaker">PULSE</div>
-        <pre class="console-message is-agent">${renderCliText(entry.answer || "")}</pre>
-      </article>
-    `
-    };
+      html: renderTurn({
+        who: automatic ? "pulse" : (entry.who || "you"),
+        prompt: String(entry.question || ""),
+        started: Number(entry.t || 0),
+        ended: Number(entry.t || 0),
+        activity: [{ kind: "text", text: String(entry.answer || "") }],
+        fromLog: true
+      })
+    });
   });
 
-  commands.forEach(command => {
+  commands.filter(command => !promptCovered(command)).forEach(command => {
+    const at = command.created_at ? Date.parse(command.created_at) / 1000 : 0;
+    const finished = ["completed", "failed"].includes(command.status);
     entries.push({
-      at: command.created_at ? Date.parse(command.created_at) / 1000 : 0,
+      at,
       html: `
-        <article class="console-exchange">
-          <div class="console-speaker">YOU
-            <time>${fmtRelativeTime(command.created_at ? Date.parse(command.created_at) / 1000 : 0)}</time>
-            <span class="command-state is-${escapeHtml(command.status || "pending")}">${escapeHtml(commandState(command))}</span>
+        <article class="turn is-prompt-only">
+          <div class="turn-prompt">
+            <div class="turn-label">YOU · FROM HERE <time>${fmtRelativeTime(at)}</time>
+              <span class="command-state is-${escapeHtml(command.status || "pending")}">${escapeHtml(commandState(command))}</span></div>
+            <div class="turn-prompt-text">${escapeHtml(command.command || "")}</div>
           </div>
-          <pre class="console-message is-user is-command">${renderCliText(command.command || "")}</pre>
-          ${command.result ? `<div class="console-speaker">PULSE</div><pre class="console-message is-pulse-output">${renderCliText(command.result)}</pre>` : ""}
+          ${finished && command.result ? `<div class="turn-body"><div class="t-text ${command.status === "failed" ? "is-error" : ""}">${renderCliText(command.result)}</div></div>` : ""}
         </article>
       `
     });
   });
 
   questions.filter(command => command !== openQuestion).forEach(command => {
+    const at = command.created_at ? Date.parse(command.created_at) / 1000 : 0;
+    if (covered(at)) return;                 // the turn it belongs to shows the question and answer
     const asked = questionOf(command);
-    const answer = String(command.result || "");
-    const answerText = /^y(?:es)?$/i.test(answer.trim()) ? "Yes"
-      : /^n(?:o)?$/i.test(answer.trim()) ? "No"
-        : asked.options && /^#\d+/.test(answer)
-          ? asked.options[Number(answer.slice(1).split(" ")[0])] ?? answer
-          : answer || "(Enter)";
-    const outcome = command.status === "completed"
-      ? (String(command.result || "").startsWith("Answered at the machine")
-          ? command.result
-          : `Answered here: ${answerText}`)
-      : command.result || "No longer asked.";
     entries.push({
-      at: command.created_at ? Date.parse(command.created_at) / 1000 : 0,
+      at,
       html: `
-        <article class="console-exchange">
-          <div class="console-speaker">PULSE ASKED <time>${fmtRelativeTime(command.created_at ? Date.parse(command.created_at) / 1000 : 0)}</time></div>
-          <pre class="console-message is-pulse-prompt">${renderCliText(asked.label)}</pre>
-          <pre class="console-message is-pulse-output">${renderCliText(outcome)}</pre>
+        <article class="turn is-prompt-only">
+          <div class="turn-body">
+            <div class="t-note">Pulse asked: ${escapeHtml(asked.label)} — ${escapeHtml(questionOutcome(command, asked))}</div>
+          </div>
         </article>
       `
     });
@@ -3972,7 +3966,7 @@ function renderRunWorkspace(session) {
 
   entries.sort((a, b) => a.at - b.at);
   if (!entries.length) {
-    entries.push({ html: `<p class="console-empty">No conversation yet. Send a prompt to this run.</p>` });
+    entries.push({ at: 0, html: `<p class="console-empty">No conversation yet. Send a prompt to this run.</p>` });
   }
 
   const incidents = session.incidents || [];
@@ -4073,42 +4067,229 @@ function renderRunWorkspace(session) {
 }
 
 
+// What a question is about, read from what Pulse said just before asking it:
+// "[Pulse] ⚠ This command can delete files: rm -rf build/" -> the command and why.
+function questionSubject(asked) {
+  const lines = String(asked.context || "").split("\n").map(line => line.replace(/^\[Pulse\]\s*/, "").trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const match = lines[i].match(/^(?:⚠\s*)?This command (.+?):\s+(.+)$/);
+    if (match) return { kind: "command", why: match[1], command: match[2] };
+  }
+  if (asked.detail) return { kind: "change" };
+  return { kind: "other", context: lines.slice(-4).join("\n") };
+}
+
+function questionOutcome(command, asked) {
+  const result = String(command.result || "");
+  if (command.status !== "completed") return result || "no longer asked";
+  if (result.startsWith("Answered at the machine")) return result.replace(/^Answered at the machine:\s*/, "answered at the machine: ");
+  if (asked.options && /^#\d+/.test(result)) return `answered here: ${asked.options[Number(result.slice(1).split(" ")[0])] ?? result}`;
+  return `answered here: ${result || "(Enter)"}`;
+}
+
+function renderDiff(diff) {
+  return String(diff || "").split("\n").map(line => {
+    const kind = line.startsWith("+++") || line.startsWith("---") ? "is-file"
+      : line.startsWith("+") ? "is-add" : line.startsWith("-") ? "is-del" : line.startsWith("@@") ? "is-hunk" : "";
+    return `<span class="diff-line ${kind}">${escapeHtml(line) || " "}</span>`;
+  }).join("");
+}
+
 function renderOpenQuestion(command, canSend) {
   const asked = questionOf(command);
+  const subject = questionSubject(asked);
   const id = escapeHtml(command.id);
   const titleId = `question-title-${id}`;
   const promptId = `question-prompt-${id}`;
+  const off = canSend ? "" : "disabled";
+  const yesNo = isYesNo(asked.label);
+  const label = asked.label.replace(/\s*[\[(]\s*y\s*\/\s*n\s*[\])]\s*>?\s*$/i, "").trim();
+  const at = command.created_at ? Date.parse(command.created_at) / 1000 : 0;
+
+  let title = "Pulse is asking";
+  let body = "";
+  let yes = "Yes";
+  let no = "No";
+  if (subject.kind === "command") {
+    title = "Pulse wants to run a command";
+    body = `
+      <div class="ask-why">Flagged: it ${escapeHtml(subject.why)}</div>
+      <pre class="ask-code">${escapeHtml(subject.command)}</pre>`;
+    yes = "Run it";
+    no = "Don't run";
+  } else if (subject.kind === "change") {
+    title = "Pulse wants to change your code";
+    body = `<pre class="ask-diff">${renderDiff(asked.detail)}</pre>`;
+    yes = "Apply";
+    no = "Don't apply";
+  } else if (subject.context) {
+    body = `<pre class="ask-context">${escapeHtml(subject.context)}</pre>`;
+  }
+
   let choices;
   if (asked.options) {
     choices = asked.options.map((option, index) =>
-      `<button type="button" class="question-answer" data-question-id="${id}" data-answer="#${index} ${escapeHtml(option)}" ${canSend ? "" : "disabled"}>${escapeHtml(option)}</button>`
+      `<button type="button" class="question-answer" data-question-id="${id}" data-answer="#${index} ${escapeHtml(option)}" ${off}>${escapeHtml(option)}</button>`
     ).join("");
-  } else if (isYesNo(asked.label)) {
+  } else if (yesNo) {
     choices = `
-      <button type="button" class="question-answer is-primary" data-question-id="${id}" data-answer="y" ${canSend ? "" : "disabled"}>Yes</button>
-      <button type="button" class="question-answer" data-question-id="${id}" data-answer="n" ${canSend ? "" : "disabled"}>No</button>`;
+      <button type="button" class="question-answer is-primary" data-question-id="${id}" data-answer="y" ${off}>${yes}</button>
+      <button type="button" class="question-answer" data-question-id="${id}" data-answer="n" ${off}>${no}</button>`;
   } else {
-    choices = `<form class="question-text" data-question-id="${id}">
-      <input type="text" name="answer" placeholder="Your answer" ${canSend ? "" : "disabled"}>
-      <button type="submit" ${canSend ? "" : "disabled"}>Answer</button>
-    </form>`;
+    choices = `
+      <form class="question-text" data-question-id="${id}">
+        <input type="text" name="answer" placeholder="Your answer" ${off}>
+        <button type="submit" ${off}>Answer</button>
+      </form>`;
   }
+
   return `
     <div class="${canSend ? "run-question-backdrop" : "run-question-readonly"}">
       <section class="run-question" role="${canSend ? "alertdialog" : "region"}" ${canSend ? 'aria-modal="true"' : ""}
         aria-labelledby="${titleId}" aria-describedby="${promptId}" ${canSend ? 'tabindex="-1"' : ""}>
-        <div class="approval-eyebrow"><span class="approval-indicator"></span> PULSE NEEDS YOUR APPROVAL</div>
-        <h2 id="${titleId}">Approval request</h2>
-        <p class="question-prompt" id="${promptId}">${escapeHtml(displayQuestionLabel(asked.label))}</p>
-        ${asked.context ? `<details class="approval-context"><summary>Recent context</summary><pre>${escapeHtml(asked.context)}</pre></details>` : ""}
-        ${asked.detail ? `<details class="question-detail"><summary>Review the change</summary><pre>${escapeHtml(asked.detail)}</pre></details>` : ""}
+        <div class="ask-head">
+          <span class="ask-title" id="${titleId}"><span class="live-dot" aria-hidden="true"></span>${escapeHtml(title)}</span>
+          <time>asked ${fmtRelativeTime(at)}</time>
+        </div>
+        ${body}
+        <div class="ask-question" id="${promptId}">${escapeHtml(label || "Pulse is asking you to choose:")}</div>
         <div class="question-choices">${choices}</div>
         <p class="question-status" role="status">${canSend
-          ? isYesNo(asked.label) ? "Choose Yes or No, or press Y / N."
-            : "Your answer will be sent to Pulse on the machine."
+          ? (yesNo ? "Press Y or N, or click. Whichever answers first, here or at the machine, is used."
+            : "Whichever answers first, here or at the machine, is used.")
           : "Only the run owner or workspace admins can answer."}</p>
       </section>
     </div>
+  `;
+}
+
+
+// A finished turn kept by the runner: a completed live row with {"turn": true, ...}.
+function turnOf(command) {
+  if (!isLiveRow(command) || command.status !== "completed" || !command.result) return null;
+  try {
+    const record = JSON.parse(command.result);
+    if (!record || !record.turn) return null;
+    return {
+      who: record.who || "you",
+      prompt: String(record.prompt || ""),
+      started: Number(record.started || record.t || 0),
+      ended: Number(record.ended || record.t || 0),
+      activity: Array.isArray(record.activity) ? record.activity : []
+    };
+  } catch {
+    return null;
+  }
+}
+
+function fmtSeconds(seconds) {
+  const s = Math.max(0, Math.round(Number(seconds) || 0));
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
+// One turn -- what started it, then what Pulse did, in order: reasoning (folded once done),
+// tool calls, changes, its words. `live`: still going, drawn as it streams.
+function renderTurn(turn, { live = false, asking = false, doing = "" } = {}) {
+  const activity = (turn.activity || []).filter(item =>
+    !(item.kind === "note" && /^From the dashboard:?$/.test(String(item.text || "").trim())) &&
+    !(item.kind === "user" && String(item.text || "").trim() === turn.prompt.trim()));
+  const tools = activity.filter(item => item.kind === "tool" || item.kind === "edit").reduce((n, item) => n + Math.max(1, (item.calls || []).length), 0);
+
+  // "⚠ This command can delete files: X", "Run it anyway? (y/N)  y", "Answered on the
+  // dashboard." -> one permission line
+  const merged = [];
+  for (let i = 0; i < activity.length; i++) {
+    const item = activity[i];
+    const flagged = item.kind === "note" && String(item.text || "").replace(/^\[Pulse\]\s*/, "").match(/^(?:⚠\s*)?This command (.+?):\s+(.+)$/);
+    if (!flagged) {
+      merged.push(item);
+      continue;
+    }
+    const permission = { kind: "permission", why: flagged[1], command: flagged[2], answer: null, where: "" };
+    let j = i + 1;
+    const reply = activity[j]?.kind === "note" && String(activity[j].text || "").match(/\(y\/n\)\s*>?\s+(\S+)\s*$/i);
+    if (reply) {
+      permission.answer = /^y/i.test(reply[1]) ? "yes" : "no";
+      j++;
+    }
+    if (activity[j]?.kind === "note" && /^Answered on the dashboard\.?$/.test(String(activity[j].text || "").trim())) {
+      permission.where = "on the dashboard";
+      j++;
+    }
+    merged.push(permission);
+    i = j - 1;
+  }
+
+  const blocks = merged.map((item, index) => {
+    const caret = live && item.live ? `<span class="live-caret" aria-hidden="true"></span>` : "";
+    const text = escapeHtml(item.text || "");
+    switch (item.kind) {
+      case "thinking": {
+        const streaming = live && item.live;
+        const preview = escapeHtml(String(item.text || "").replace(/\s+/g, " ").replace(/^…/, "").slice(0, 110));
+        return `
+          <details class="t-think" data-key="think-${index}" ${streaming ? `open data-streaming="1"` : ""}>
+            <summary><span class="t-think-title">${streaming ? "Thinking" : `Thought${item.seconds ? ` for ${fmtSeconds(item.seconds)}` : ""}`}</span><span class="t-think-preview">${preview}</span></summary>
+            <div class="t-think-body">${text}${caret}</div>
+          </details>`;
+      }
+      case "tool":
+        return `
+          <div class="t-tool">
+            ${item.text ? `<div class="t-said">${text}</div>` : ""}
+            ${(item.calls || []).map(call => `<div class="t-call"><span class="t-glyph">›</span><code>${escapeHtml(call)}</code></div>`).join("")}
+            ${item.output ? `<details class="t-out" data-key="out-${index}"><summary>output</summary><pre>${escapeHtml(item.output)}</pre></details>` : ""}
+          </div>`;
+      case "edit":
+        return `
+          <div class="t-tool is-edit">
+            ${(item.calls || []).map(call => `<div class="t-call"><span class="t-glyph">✎</span><code>${escapeHtml(call)}</code>${item.text ? `<span class="t-status">${text}</span>` : ""}</div>`).join("")}
+            ${item.diff ? `<details class="t-out" data-key="diff-${index}"><summary>diff</summary><pre class="ask-diff">${renderDiff(item.diff)}</pre></details>` : ""}
+          </div>`;
+      case "permission": {
+        const answer = item.answer === "yes" ? `allowed${item.where ? ` ${item.where}` : ""}`
+          : item.answer === "no" ? `not allowed${item.where ? ` ${item.where}` : ""}` : (live ? "waiting for your answer" : "not answered");
+        return `
+          <div class="t-permission">
+            <span class="t-perm-label">Asked to run</span><code>${escapeHtml(item.command)}</code>
+            <span class="t-perm-why">(it ${escapeHtml(item.why)})</span>
+            <span class="t-perm-answer ${item.answer === "no" ? "is-no" : item.answer ? "" : "is-open"}">${escapeHtml(answer)}</span>
+          </div>`;
+      }
+      case "note":
+        return `<div class="t-note">${escapeHtml(String(item.text || "").replace(/^\[Pulse\]\s*/gm, ""))}</div>`;
+      case "error":
+        return `<div class="t-note is-error">${text}</div>`;
+      case "finding":
+        return `<div class="t-note is-finding">${text}</div>`;
+      case "trace":
+        return `<pre class="t-trace">${renderCliText(item.ansi || item.text || "")}</pre>`;
+      case "user":
+        return `<div class="t-note">${text}</div>`;
+      default:
+        return `<div class="t-text">${renderCliText(item.text || "")}${caret}</div>`;
+    }
+  }).join("");
+
+  const who = turn.who === "pulse" ? "PULSE · ON ITS OWN" : turn.who === "dashboard" ? "YOU · FROM HERE" : "YOU";
+  const prompt = turn.prompt ? `
+    <div class="turn-prompt">
+      <div class="turn-label">${who} <time>${fmtRelativeTime(turn.started)}</time></div>
+      <div class="turn-prompt-text ${turn.who === "pulse" ? "is-auto" : ""}">${escapeHtml(turn.prompt)}</div>
+    </div>` : "";
+  const meta = live
+    ? `<span class="live-dot" aria-hidden="true"></span><span class="turn-doing">${escapeHtml(asking ? "waiting for your answer" : (doing || "working"))}</span>`
+    : turn.fromLog ? "" : `<span>${fmtSeconds(turn.ended - turn.started)}${tools ? ` · ${tools} tool call${tools === 1 ? "" : "s"}` : ""}</span>`;
+
+  return `
+    <article class="turn ${live ? "is-live" : ""}">
+      ${prompt}
+      <div class="turn-head"><span class="turn-who">PULSE</span>${meta}</div>
+      <div class="turn-body">
+        ${blocks || (live ? `<div class="t-note">starting…</div>` : "")}
+        ${live && asking ? `<div class="t-asking">Waiting for your answer — below ↓</div>` : ""}
+      </div>
+    </article>
   `;
 }
 
@@ -5537,31 +5718,23 @@ function renderLive() {
 
   let html = "";
   if (state?.busy) {
-    const lines = (state.activity || []).map(item => {
-      const text = renderCliText(item.ansi || item.text || "");
-      const streaming = item.live ? `<span class="live-caret" aria-hidden="true"></span>` : "";
-      switch (item.kind) {
-        case "thinking": return `<div class="live-line is-thinking">${text}${streaming}</div>`;
-        case "tool":
-        case "edit": return `<div class="live-line is-tool">${text}</div>`;
-        case "user": return `<div class="live-line is-user">${text}</div>`;
-        case "note": return `<div class="live-line is-note">${text}</div>`;
-        case "error": return `<div class="live-line is-error">${text}</div>`;
-        default: return `<div class="live-line">${text}${streaming}</div>`;
-      }
-    }).join("");
-    const doing = state.asking ? "waiting for an answer" : (state.doing || "working");
-    html = `
-      <article class="console-exchange is-live">
-        <div class="console-speaker">PULSE <span class="live-dot" aria-hidden="true"></span> <span class="live-doing">${escapeHtml(doing)}</span></div>
-        ${lines || `<div class="live-line is-note">starting…</div>`}
-      </article>
-    `;
+    html = renderTurn({
+      who: state.who || "you",
+      prompt: String(state.prompt || ""),
+      started: Number(state.started || state.t || 0),
+      ended: Number(state.t || 0),
+      activity: state.activity || []
+    }, { live: true, asking: Boolean(state.asking), doing: state.doing });
   }
   if (html === lastLiveHtml && box.innerHTML.trim() === html.trim()) return;
   const transcript = box.closest(".run-transcript");
   const atBottom = !transcript || transcript.scrollHeight - transcript.clientHeight - transcript.scrollTop < 48;
+  // what the reader opened or closed stays so through the updates
+  const folds = new Map([...box.querySelectorAll("details[data-key]:not([data-streaming])")].map(node => [node.dataset.key, node.open]));
   box.innerHTML = html;
+  box.querySelectorAll("details[data-key]").forEach(node => {
+    if (folds.has(node.dataset.key)) node.open = folds.get(node.dataset.key);
+  });
   lastLiveHtml = html;
   if (transcript && atBottom) transcript.scrollTop = transcript.scrollHeight;
 }

@@ -46,6 +46,14 @@
 
   --max: 1240px;
 
+  /* prose in the conversation (answers, prompts, reasoning): easier to read than mono */
+  --read:
+    "Inter",
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    sans-serif;
+
   --shadow:
     0 20px 60px rgba(0, 0, 0, 0.5),
     0 2px 8px rgba(0, 0, 0, 0.35);
@@ -7763,3 +7771,347 @@ body.dashboard-active .run-window-shell .cli-action-name {
   color: #56575b;
   font-weight: 700;
 }
+
+
+/* ============================================================
+   CONVERSATION: turns
+============================================================ */
+.turn {
+  margin: 0 0 22px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.turn:last-child { border-bottom: 0; }
+
+.turn-prompt {
+  margin-bottom: 14px;
+}
+
+.turn-label,
+.turn-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--tertiary);
+  font-size: 9.5px;
+  letter-spacing: .08em;
+}
+
+.turn-label time,
+.turn-head time {
+  color: var(--dim);
+  letter-spacing: 0;
+}
+
+.turn-prompt-text {
+  margin-top: 6px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  background: var(--raised);
+  color: var(--fg);
+  font-family: var(--read);
+  font-size: 13.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.turn-prompt-text.is-auto {
+  max-height: 7.5em;
+  overflow: auto;
+  color: var(--secondary);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.turn-who {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.turn-head span:not(.turn-who):not(.live-dot) {
+  color: var(--dim);
+  letter-spacing: 0;
+}
+
+.turn-doing { color: var(--tertiary) !important; }
+
+.turn-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  margin-top: 8px;
+  padding-left: 12px;
+  border-left: 1px solid var(--line);
+}
+
+.turn.is-live .turn-body { border-left-color: var(--accent); }
+
+.turn.is-prompt-only .turn-prompt { margin-bottom: 0; }
+.turn.is-prompt-only .turn-body { margin-top: 10px; }
+
+/* reasoning: one quiet line once done, open while it streams */
+.t-think summary {
+  display: flex;
+  min-width: 0;
+  overflow: hidden;
+  gap: 10px;
+  align-items: baseline;
+  cursor: pointer;
+  list-style: none;
+  color: var(--amber);
+  font-size: 11px;
+}
+
+.t-think summary::-webkit-details-marker { display: none; }
+
+.t-think summary::before {
+  content: "▸";
+  color: var(--dim);
+}
+
+.t-think[open] summary::before { content: "▾"; }
+
+.t-think-title {
+  flex: none;
+  font-style: italic;
+}
+
+.t-think-preview {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--dim);
+  font-style: italic;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.t-think[open] .t-think-preview { display: none; }
+
+.t-think-body {
+  margin: 6px 0 2px 16px;
+  max-height: 260px;
+  overflow: auto;
+  color: rgba(255, 179, 64, .78);
+  font-family: var(--read);
+  font-size: 12.5px;
+  font-style: italic;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* tools and changes */
+.t-tool {
+  display: grid;
+  gap: 3px;
+}
+
+.t-said {
+  color: var(--tertiary);
+  font-family: var(--read);
+  font-size: 12px;
+}
+
+.t-call {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  min-width: 0;
+}
+
+.t-glyph {
+  flex: none;
+  color: var(--accent);
+}
+
+.t-call code {
+  min-width: 0;
+  color: var(--secondary);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.t-status {
+  margin-left: auto;
+  flex: none;
+  color: var(--dim);
+  font-size: 10px;
+}
+
+.t-out summary {
+  margin-left: 16px;
+  cursor: pointer;
+  color: var(--dim);
+  font-size: 10px;
+}
+
+.t-out pre {
+  margin: 4px 0 0 16px;
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--tertiary);
+  font-size: 10.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* words */
+.t-text {
+  color: var(--fg);
+  font-family: var(--read);
+  font-size: 14px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.t-text.is-error { color: var(--red); }
+
+.t-note {
+  color: var(--dim);
+  font-size: 10.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.t-note.is-error { color: var(--red); }
+.t-note.is-finding { color: var(--amber); }
+
+.t-trace {
+  margin: 0;
+  color: var(--secondary);
+  font-size: 10.5px;
+  white-space: pre;
+  overflow: auto;
+}
+
+.t-asking {
+  color: var(--accent);
+  font-size: 11px;
+}
+
+/* diffs */
+.ask-diff {
+  margin: 0;
+  max-height: 300px;
+  overflow: auto;
+  padding: 8px 0;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.diff-line {
+  display: block;
+  padding: 0 10px;
+  white-space: pre;
+  color: var(--tertiary);
+}
+
+.diff-line.is-add { color: #7ee2a0; background: rgba(50, 215, 75, .08); }
+.diff-line.is-del { color: #ff8a80; background: rgba(255, 69, 58, .08); }
+.diff-line.is-hunk { color: var(--dim); }
+.diff-line.is-file { color: var(--secondary); font-weight: 600; }
+
+/* ============================================================
+   PERMISSION CARD (the approval dialog's contents)
+============================================================ */
+.run-question {
+  display: grid;
+  gap: 12px;
+}
+
+.run-question .question-choices { margin-top: 6px; }
+
+.ask-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ask-title {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+
+.ask-head time {
+  color: var(--dim);
+  font-size: 10px;
+}
+
+.ask-why {
+  color: var(--secondary);
+  font-family: var(--read);
+  font-size: 12.5px;
+}
+
+.ask-code {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ask-context {
+  margin: 0;
+  color: var(--tertiary);
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ask-question {
+  color: var(--fg);
+  font-family: var(--read);
+  font-size: 14px;
+}
+
+.question-status { margin: 0 !important; }
+
+/* a permission asked during a turn, and how it was answered: one line */
+.t-permission {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: baseline;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  background: var(--raised);
+  font-size: 11px;
+}
+
+.t-permission .t-perm-label { color: var(--tertiary); }
+
+.t-permission code {
+  color: var(--fg);
+  font-family: var(--mono);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.t-permission .t-perm-why { color: var(--dim); }
+
+.t-permission .t-perm-answer { margin-left: auto; color: var(--up); }
+.t-permission .t-perm-answer.is-no { color: var(--red); }
+.t-permission .t-perm-answer.is-open { color: var(--accent); }
