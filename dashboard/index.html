@@ -139,133 +139,6 @@
 
 
   <!-- =========================================================
-       WORKSPACES
-  ========================================================== -->
-
-  <section id="view-workspaces" class="view" hidden>
-
-    <div class="page-shell">
-
-      <div class="page-header workspace-header">
-
-        <div>
-
-          <div class="section-eyebrow">
-            YOUR PULSE
-          </div>
-
-          <h1>Your workspaces.</h1>
-
-          <p>
-            Training environments you're connected to.
-          </p>
-
-        </div>
-
-      </div>
-
-      <div
-        id="workspace-list"
-        class="workspace-list"
-      ></div>
-
-      <p
-        id="workspaces-empty"
-        class="empty-state"
-        hidden
-      >
-        No workspaces yet. Join or create one from the
-        Pulse CLI first.
-      </p>
-
-    </div>
-
-  </section>
-
-
-  <!-- =========================================================
-       PROJECTS  (workspace -> project -> run)
-  ========================================================== -->
-
-  <section id="view-projects" class="view" hidden>
-
-    <div class="page-shell">
-
-      <div class="page-header workspace-header">
-
-        <div>
-
-          <div class="section-eyebrow" id="projects-workspace">
-            WORKSPACE
-          </div>
-
-          <h1>Your projects.</h1>
-
-          <p>
-            Pick a project to see its runs. Secret projects only
-            appear for workspace admins and people who joined with
-            the project's join code.
-          </p>
-
-        </div>
-
-        <button
-          class="icon-btn"
-          id="projects-notifications-btn"
-          type="button"
-          aria-haspopup="dialog"
-          aria-controls="notifications-modal"
-          title="Notification settings for this workspace"
-        >
-          <span aria-hidden="true">🔔</span>
-          Notifications
-        </button>
-
-      </div>
-
-      <div
-        id="project-list"
-        class="workspace-list"
-      ></div>
-
-      <p
-        id="projects-empty"
-        class="empty-state"
-        hidden
-      >
-        No projects in this workspace yet. Create one from the
-        Pulse CLI, or join a secret project with its code below.
-      </p>
-
-      <form
-        id="project-join-form"
-        class="login-form project-join-form"
-        autocomplete="off"
-      >
-        <input
-          id="project-join-code"
-          type="text"
-          placeholder="Secret project join code"
-          aria-label="Secret project join code"
-          spellcheck="false"
-          autocapitalize="characters"
-          maxlength="24"
-        />
-        <button type="submit">Join project</button>
-      </form>
-
-      <p
-        id="project-join-msg"
-        class="project-join-msg"
-        role="alert"
-      ></p>
-
-    </div>
-
-  </section>
-
-
-  <!-- =========================================================
        DASHBOARD
   ========================================================== -->
 
@@ -281,11 +154,54 @@
         <div class="project-console-controls">
           <span class="project-console-connection"><i></i> CONNECTED</span>
           <span id="refresh-label">Updated just now</span>
-          <button class="console-control-btn" id="refresh-btn" type="button" title="Refresh run data">Refresh</button>
+          <button class="console-control-btn" id="refresh-btn" type="button"
+            aria-label="Refresh run data" title="Refresh run data">
+            <svg viewBox="0 0 20 20" aria-hidden="true">
+              <path d="M16.2 8A6.5 6.5 0 0 0 4.8 5.5L3 7.3M3.8 12A6.5 6.5 0 0 0 15.2 14.5l1.8-1.8M3 3.8v3.5h3.5M17 16.2v-3.5h-3.5"
+                fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
           <button class="console-control-btn" id="notifications-btn" type="button"
-            aria-haspopup="dialog" aria-controls="notifications-modal" title="Notification settings">Notifications</button>
+            aria-label="Notification settings" aria-haspopup="dialog" aria-controls="notifications-modal"
+            title="Notification settings">
+            <svg viewBox="0 0 20 20" aria-hidden="true">
+              <path d="M15 7.8a5 5 0 0 0-10 0c0 5-2 5.5-2 6.7h14c0-1.2-2-1.7-2-6.7ZM8 17h4"
+                fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
         </div>
       </header>
+
+      <aside id="workspace-sidebar" class="workspace-sidebar" aria-label="Workspace and project navigation" hidden>
+        <div class="sidebar-brand">
+          <span class="sidebar-section-label">WORKSPACES</span>
+          <button id="sidebar-toggle" class="sidebar-toggle workspace-sidebar-toggle" type="button"
+            aria-label="Close workspace menu" aria-expanded="true" title="Close workspace menu">
+            <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+              <path d="m5 5 10 10M15 5 5 15" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+        <div id="workspace-list" class="sidebar-list sidebar-workspaces" role="list"></div>
+        <p id="workspaces-empty" class="sidebar-empty" hidden>No workspaces found.</p>
+
+        <div class="sidebar-project-heading">
+          <span class="sidebar-section-label">PROJECTS</span>
+          <span id="projects-workspace" class="sidebar-current-workspace"></span>
+        </div>
+        <div id="project-list" class="sidebar-list sidebar-projects" role="list"></div>
+        <p id="projects-empty" class="sidebar-empty" hidden>Select a workspace to view its projects.</p>
+
+        <div class="sidebar-join">
+          <form id="project-join-form" class="sidebar-join-form" autocomplete="off">
+            <label class="sr-only" for="project-join-code">Private project code</label>
+            <input id="project-join-code" type="text" placeholder="Project invite code"
+              aria-label="Private project code" spellcheck="false" autocapitalize="characters" maxlength="24">
+            <button type="submit" title="Join private project" aria-label="Join private project">+</button>
+          </form>
+          <p id="project-join-msg" class="project-join-msg" role="alert"></p>
+        </div>
+      </aside>
 
       <div class="project-console-layout">
         <aside class="run-sidebar" aria-label="Project runs">
@@ -299,6 +215,8 @@
 
         <section id="active-console" class="active-console" aria-label="Selected run console"></section>
       </div>
+
+      <div id="sidebar-context-menu" class="sidebar-context-menu" role="menu" hidden></div>
 
     </div>
 
@@ -399,10 +317,9 @@
 
     <span>pulse.</span>
 
-    <div>
-      <span>RUNTIME OBSERVABILITY</span>
-      <span>SHARED WORKSPACE</span>
-      <span>LOCAL-FIRST</span>
+    <div class="footer-account" id="footer-account" hidden>
+      <span id="footer-user"></span>
+      <button type="button" id="footer-sign-out">Sign out</button>
     </div>
 
   </div>

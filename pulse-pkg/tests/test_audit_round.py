@@ -60,7 +60,8 @@ def test_run_tools_are_offered_only_inside_the_app():
     names = {t["function"]["name"] for t in native._tools()}
     assert not names & native._RUN_TOOLS
     prompt = native._system_prompt(types.SimpleNamespace())
-    assert "start_run starts a script" not in prompt and "pulse run --stream" in prompt
+    assert "You can run the user's project yourself with start_run" not in prompt
+    assert "pulse run --stream" in prompt
 
     class Host:
         def run_actions(self):
@@ -68,7 +69,9 @@ def test_run_tools_are_offered_only_inside_the_app():
     ui.set_host(Host())
     try:
         assert native._RUN_TOOLS <= {t["function"]["name"] for t in native._tools()}
-        assert "start_run starts a script" in native._system_prompt(types.SimpleNamespace())
+        assert "You can run the user's project yourself with start_run" in native._system_prompt(
+            types.SimpleNamespace()
+        )
     finally:
         ui.set_host(None)
 

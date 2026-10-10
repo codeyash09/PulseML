@@ -1287,6 +1287,17 @@ def test_pipeline_colours_are_dropped_but_an_error_stays_red(monkeypatch):
     assert "\033[31m" in r_line and "\033[2m" not in r_line
 
 
+def test_shared_status_palette_matches_the_terminal_theme(monkeypatch, capsys):
+    monkeypatch.setattr(ui, "color_enabled", lambda: True)
+    ui.ok("Ready")
+    ui.warn("Needs attention")
+    ui.fail("Failed")
+    lines = capsys.readouterr().out.splitlines()
+    assert "\033[2m" in lines[0] and "\033[32m" not in lines[0]
+    assert "\033[38;5;208m" in lines[1] and "\033[33m" not in lines[1]
+    assert "\033[31m" in lines[2]
+
+
 def test_only_a_live_tag_is_orange_in_a_picker(app, monkeypatch):
     monkeypatch.setattr(ui, "color_enabled", lambda: True)
     app.view.options = [("train.py", "step 10", "live"), ("train.py", "step 9", "ended 2h ago"),

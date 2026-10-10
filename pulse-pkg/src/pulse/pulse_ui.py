@@ -121,8 +121,8 @@ def _g(name):
 
 
 # --------------------------------------------------------------------------------------
-# Styling. One accent (Pulse orange, the same 256-colour orange the rest of the CLI uses);
-# green / amber / red are reserved for success / warning / failure.
+# Styling. Pulse orange marks active and warning states; quiet success and secondary detail
+# stay dim, while failures remain red.
 # --------------------------------------------------------------------------------------
 
 _RESET = "\033[0m"
@@ -131,12 +131,12 @@ _CODES = {
     "bold": "\033[1m",
     "dim": "\033[2m",
     "italic": "\033[3m",
-    "green": "\033[32m",
-    "amber": "\033[33m",
+    "green": "\033[2m",
+    "amber": "\033[38;5;208m",
     "red": "\033[31m",
     "grey": "\033[38;5;248m",      # a command in the app's transcript: grey, in bold
     "glow": "\033[38;5;255m",      # the same, under the mouse: it lights up
-    "glow_accent": "\033[38;5;214m",   # a thought under the mouse: a brighter orange
+    "glow_accent": "\033[38;5;214m",  # a thought under the mouse: a brighter orange
 }
 
 

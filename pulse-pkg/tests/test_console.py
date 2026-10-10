@@ -30,6 +30,36 @@ TRAIN = textwrap.dedent("""\
 """)
 
 
+class PresentationTest(unittest.TestCase):
+    def test_status_colours_match_the_terminal_theme(self):
+        import contextlib
+        import io
+        import unittest.mock as mock
+
+        with mock.patch.object(console, "_COLOR", True):
+            self.assertEqual(console.orange("live"), "\033[38;5;208mlive\033[0m")
+            self.assertEqual(console.yellow("warning"), "\033[38;5;208mwarning\033[0m")
+            self.assertEqual(console.green("healthy"), "\033[2mhealthy\033[0m")
+            self.assertEqual(console.red("failed"), "\033[91mfailed\033[0m")
+            output = io.StringIO()
+            sessions = [
+                {"session_id": "live", "status": "live", "script": "train.py", "step": 1},
+                {"session_id": "stalled", "status": "stalled", "script": "train.py", "step": 1},
+                {"session_id": "crashed", "status": "crashed", "script": "train.py", "step": 1,
+                 "last_seen": 0},
+                {"session_id": "finished", "status": "finished", "script": "train.py", "step": 1,
+                 "last_seen": 0},
+            ]
+            with contextlib.redirect_stdout(output):
+                console.render_session_list(sessions)
+
+        lines = output.getvalue().splitlines()
+        self.assertIn("\033[38;5;208mlive", lines[0])
+        self.assertIn("\033[38;5;208mstalled", lines[1])
+        self.assertIn("\033[91mcrashed", lines[2])
+        self.assertIn("\033[2mfinished", lines[3])
+
+
 def _remove_tree(path):
     """rmtree, retried: a child being killed can recreate files under the directory
     between the walk and the unlink -- its spool, or a font cache in the fake HOME --

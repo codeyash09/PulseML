@@ -70,7 +70,7 @@ _READ_MAX_LINES = 1500
 _RESULT_MAX_CHARS = 24_000       # one tool result sent back to the model
 _LIST_MAX = 300
 _REPEAT_LIMIT = 3                # identical consecutive tool calls before the model is told it is looping
-_MAX_NUDGES = 2                  # times a stop is overruled because work looks unfinished
+_MAX_NUDGES = 2                  # retries for non-outline completion nudges
 
 _COMPACT_AT_CHARS = 360_000      # conversation size (chars, ~90k tokens) that triggers compaction
 _KEEP_RECENT = 14                # messages kept verbatim by compaction
@@ -89,7 +89,8 @@ SYSTEM_PROMPT = """You are Pulse Code, an autonomous coding agent working in the
 # How you work
 - Work autonomously. Do not stop to ask permission or to announce a plan and wait. If the request is clear enough to act on, act. Ask a question only when you are genuinely blocked on something only the user can decide, and say exactly what.
 - Keep going until the whole request is implemented AND checked. One edit is rarely the end: wire the pieces together, update callers, then run the project's tests / linter / the code itself and fix what the output shows. Never claim something works unless you ran it and saw it work; report real exit codes and output.
-- For anything with more than ~2 steps, use todo_write to create a hierarchical outline before coding: top-level phases with concrete child subtasks. Keep the outline current as you work, with exactly one unfinished leaf subtask in_progress. Complete each subtask only after its work/check is done; do not finish until the full outline is completed.
+- When the user asks to run, launch, train, or try the completed script/change, start it with start_run when that tool is available. This is Pulse's monitored `/run`: provide the project script and its arguments, then check run_status when useful. Do not substitute run_command for a training run; use run_command only for short checks and tests.
+- For anything with more than ~2 steps, todo_write is required before coding. Build a recursive outline: phases can contain subtasks, and any subtask can itself contain smaller subtasks at any depth. Make the leaves concrete actions, include verification, and keep exactly one unfinished leaf in_progress. After completing a leaf, call todo_write to mark it completed and activate the next leaf before moving on. If active work turns out to need decomposition, add children under it and continue at the new leaf level. Do not give a final answer while any leaf remains unfinished; the outline gate will keep the turn open.
 - Read before you write. Never guess at signatures, imports, names or file layout.
 - Make the change the request needs, matching the surrounding style. Don't reformat, rename or "improve" unrelated code. If you notice a separate bug, mention it in your final answer instead of fixing it.
 - Prefer small, targeted edits (edit_file) or replace_symbol for rewriting a whole function/class. Use write_file for new files. Make independent tool calls in the same turn when you can.
@@ -123,7 +124,8 @@ When the work is done and verified, reply with a short summary: what you changed
 # Run control exists only inside the Pulse app, which owns the runs on screen. Outside it the
 # tools are not offered at all (offered, every call came back "only available inside the app").
 _RUNS_SECTION = """# Training runs
-start_run starts a script under Pulse: it runs in the background, Pulse watches it (step, every metric's curve, the detectors' findings) and shows it to the user. When the user asks to run, start, launch or train, or to try the change, that is the tool -- not run_command. run_status returns the run's current numbers and findings; restart_run stops the run and starts it again (after a fix); stop_run stops it (the user is asked first).
+You can run the user's project yourself with start_run -- it is the same monitored launch as `/run <script> [args]`. When the user asks to run, start, launch, train, or try the completed change, choose the actual project script and its required arguments and call start_run; do not merely tell the user to run it. The script runs in the background under Pulse, which watches its steps, metrics and findings. Use run_status to check the run after launch or when reporting progress. Use run_command only for short bounded checks and tests, never to launch a training run.
+restart_run stops the watched script and starts it again with current code after a fix; stop_run asks the user before stopping it.
 
 """
 _NO_RUNS_SECTION = """# Training runs
@@ -228,9 +230,11 @@ TOOLS = [
         {"probe": _S, "expect": {"type": "object", "additionalProperties": _S}, "suite": {"type": "boolean"},
          "timeout": _I}),
     _fn("start_run",
-        "Start a script under Pulse: it runs in the background, Pulse watches it and shows it to the user, and "
-        "run_status can read its numbers. This -- not run_command -- is how a training run is started. "
-        "`args` is the script's command line, if any.",
+        "Start the user's project script under Pulse, the same monitored launch as `/run <script> [args]`. "
+        "Call this when the user asks you to run, launch, train, or try the completed change: choose the actual "
+        "script path from the project and include its needed command-line arguments. Pulse runs it in the "
+        "background, watches its steps/metrics/findings, and shows it to the user. Then use run_status to "
+        "inspect progress when useful. Do not use run_command for a training run; reserve that for short checks.",
         {"script": _S, "args": _S}, ["script"]),
     _fn("run_status",
         "The watched run right now: step, every tracked value's curve, the detectors' findings, recent events.",
@@ -247,11 +251,13 @@ TOOLS = [
         "other tool calls.",
         {"message": _S}, ["message"]),
     _fn("todo_write",
-        "Replace your task outline. Each item is {id, parent_id, content, status}; parent_id is null for a "
-        "top-level phase or the id of its parent phase/subtask. Use parent phases to group concrete subtasks. "
-        "Statuses are pending | in_progress | completed. Parent statuses are derived from their children; "
-        "keep exactly one unfinished leaf subtask in_progress, and complete a parent only by completing all "
-        "its children.",
+        "Required for requests with more than about two steps: create and maintain the task outline before coding. "
+        "Replace the full outline each time. Each item is {id, parent_id, content, status}; parent_id is null "
+        "for a top-level phase or the id of any parent task. The hierarchy is recursive: phases contain subtasks, "
+        "and subtasks may contain their own subtasks at any depth. Break broad work into concrete leaf actions, "
+        "including verification. Statuses are pending | in_progress | completed. Parent statuses are derived from "
+        "their children. Keep exactly one unfinished leaf in_progress. After completing a leaf, update the outline "
+        "before moving on; do not finish while any leaf is unfinished.",
         {"todos": {"type": "array", "items": {"type": "object", "properties": {
             "id": _S, "parent_id": {"type": ["string", "null"]}, "content": _S,
             "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}},
@@ -1433,14 +1439,6 @@ _INTENT_RE = re.compile(
 
 def _nudge(state, reply_text=""):
     """A reason the agent should not stop yet, or None."""
-    if (reply_text and not state.calls_made and not state.changes
-            and _INTENT_RE.search(reply_text.strip()[-300:]) and len(reply_text) < 1500):
-        # It ended by announcing what it would do and stopped (no tool was called). Doing is
-        # the job. Only the end of the reply counts: an answer that mentions "let me know" or
-        # suggests a next step in its middle is still an answer.
-        return ("Your reply ended by saying what you would do, without doing it. If it needs doing, do it "
-                "now, in this reply, with the tools (read, grep, edit, run_command, start_run...). If that "
-                "reply was your complete answer, repeat it on its own.")
     open_items = [t for t in state.todos if t["status"] != "completed"]
     if open_items:
         depth = {}
@@ -1454,12 +1452,27 @@ def _nudge(state, reply_text=""):
 
         for todo in state.todos:
             task_depth(todo["id"])
-        return ("You stopped, but your todo list still has unfinished items:\n"
+        active = next((todo for todo in open_items
+                       if not any(child.get("parent_id") == todo["id"] for child in state.todos)
+                       and todo["status"] == "in_progress"), None)
+        active_text = (f"The active leaf is {active['content']!r}. Finish it, mark it completed, "
+                       "and activate the next unfinished leaf with todo_write. "
+                       if active else "")
+        return ("Your task outline still has unfinished work. " + active_text
+                + "Continue the outline before giving a final answer. If the active item is too broad, "
+                "replace it with concrete child subtasks at any depth using todo_write.\n"
                 + "\n".join(
                     f"{'  ' * depth[t['id']]}- {t['content']} ({t['status']})"
                     for t in open_items
-                )
-                + "\nContinue with the unfinished subtasks, or update the outline if a task is no longer needed.")
+                ))
+    if (reply_text and not state.calls_made and not state.changes
+            and _INTENT_RE.search(reply_text.strip()[-300:]) and len(reply_text) < 1500):
+        # It ended by announcing what it would do and stopped (no tool was called). Doing is
+        # the job. Only the end of the reply counts: an answer that mentions "let me know" or
+        # suggests a next step in its middle is still an answer.
+        return ("Your reply ended by saying what you would do, without doing it. If it needs doing, do it "
+                "now, in this reply, with the tools (read, grep, edit, run_command, start_run...). If that "
+                "reply was your complete answer, repeat it on its own.")
     if state.dirty:
         if state.smoke_ok is False:
             return ("Your last smoke_test failed and you have not fixed it. Read what it reported. If your change "
@@ -1522,7 +1535,9 @@ def run_native_turn(cli, request, evidence=None):
                 if reply.finish == "length":
                     messages.append({"role": "user", "content": "Your reply was cut off. Continue where you left off."})
                     continue
-                reason = _nudge(state, reply.text) if state.nudges < _MAX_NUDGES else None
+                has_unfinished_tasks = any(todo["status"] != "completed" for todo in state.todos)
+                reason = (_nudge(state, reply.text)
+                          if has_unfinished_tasks or state.nudges < _MAX_NUDGES else None)
                 if reason:
                     state.nudges += 1
                     cprint("[Pulse Code] Not finished yet -- continuing.", color=_YELLOW)

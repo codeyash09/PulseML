@@ -19,8 +19,8 @@ a `View` into the exact lines of one frame, `Editor` turns keys into text, `wrap
 ANSI-coloured text. That is what the tests exercise. The two impure pieces are small:
 `Screen` (alternate screen, diffed redraw) and `KeyReader` (cbreak mode, key names).
 
-stdlib only, like pulse_ui, and the same visual language: one accent (Pulse orange), dim
-for what is secondary, green / amber / red for success / warning / failure.
+stdlib only, like pulse_ui, and the same visual language: orange for active and warning
+states, dim for success and secondary detail, and red for failures.
 """
 from __future__ import annotations
 
@@ -227,10 +227,10 @@ class Entry:
         return expanded if self.open is None else self.open
 
 
-# One colour: Pulse's orange is for what is live, selected or worth a look; red is for what
-# is wrong; everything else is a shade of grey. Nothing green or yellow. In the transcript
-# the model's thinking is orange, a command it ran (a tool call, an edit) is bold grey,
-# Pulse's own output is dim, and the agent's words to the person are plain.
+# Orange marks what is live, selected or worth a look; red is for what is wrong;
+# everything else is a shade of grey. In the transcript the model's thinking is orange,
+# a command it ran (a tool call, an edit) is bold grey, Pulse's own output is dim, and the
+# agent's words to the person are plain.
 _SEVERITY_STYLE = {"critical": "red", "error": "red", "warning": "accent", "info": "dim"}
 _RED_SGR_RE = re.compile(r"\033\[(?:[0-9;]*;)?(?:31|91)(?:;[0-9;]*)?m")
 _QUIET_KINDS = {"thinking", "tool", "edit", "note"}
@@ -707,7 +707,7 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
     # into the bottom-right cell) scrolls the whole screen up a line, and the input line
     # was the one that vanished. The frame is drawn one row shorter than the screen.
     width, height = max(20, width), max(8, height) - 1
-    rule = s(g("rule") * width, "dim")
+    rule = pad(s(g("rule") * min(width, 40), "dim"), width)
     title = s("PULSE", "bold", "accent") + (s(" / ", "dim") + s(view.area.upper(), "bold") if view.area else "")
     if view.context:
         title += s("   " + view.context, "dim")
@@ -781,11 +781,10 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
         footer = view.status
     if view.scroll:
         footer = f"{g('up')} scrolled back {view.scroll} lines · End returns · " + footer
-    # the field sits between two rules, the key hints under the lower one
-    block.append(s(g("rule") * right_w, "dim"))
+    # Keep one quiet divider above the composer; the footer stays in the same visual group.
     block.append(s(_ui._clip(footer, right_w), "dim"))
-    block = block[-max(3, body_h - len(strip) - 2):]
-    field_row_in_block = len(block) - 3
+    block = block[-max(2, body_h - len(strip) - 2):]
+    field_row_in_block = len(block) - 2
 
     # ---- the transcript above it
     room = body_h - len(strip) - len(block) - 1          # -1: the rule over the input
@@ -803,7 +802,7 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
     first_row = 2 + len(strip)
     view.first_row, view.room, view.pane_w = first_row, room, right_w
     view.row_entries = {first_row + top_pad + i: owner for i, owner in enumerate(shown_owners) if owner is not None}
-    right = visible + [s(g("rule") * right_w, "dim")] + block
+    right = visible + [pad(s(g("rule") * min(right_w, 20), "dim"), right_w)] + block
 
     # ---- put the columns together
     frame.extend(strip)
@@ -940,7 +939,7 @@ class Screen:
         if not self._console.enter(output=True, keys=False):
             raise _ui.Unavailable("this console cannot show escape sequences")
         # alternate screen, cursor home, bracketed paste on, and the cursor as an orange bar
-        # (Pulse's accent) -- terminals that cannot recolour it keep their own
+        # -- terminals that cannot recolour it keep their own
         self.write("\033[?1049h\033[H\033[2J\033[?2004h\033]12;#ff8700\007\033[5 q")
         self._active = True
         self.set_mouse(self.mouse)

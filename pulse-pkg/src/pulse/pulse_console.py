@@ -70,12 +70,16 @@ def red(text: str) -> str:
     return _paint(text, "91")
 
 
+def orange(text: str) -> str:
+    return _paint(text, "38;5;208")
+
+
 def yellow(text: str) -> str:
-    return _paint(text, "93")
+    return orange(text)
 
 
 def green(text: str) -> str:
-    return _paint(text, "92")
+    return _paint(text, "2")
 
 
 def severity_colour(severity: str) -> Callable[[str], str]:
@@ -1290,7 +1294,7 @@ def confirm(question: str) -> bool:
 
 
 def render_session_list(sessions: List[Dict[str, Any]], attached: Optional[str] = None) -> None:
-    status_paint = {"live": green, "stalled": yellow, "crashed": red}
+    status_paint = {"live": orange, "stalled": yellow, "crashed": red}
     for index, session in enumerate(sessions, 1):
         marker = "*" if session["session_id"] == attached else " "
         paint = status_paint.get(session["status"], dim)
@@ -1384,7 +1388,7 @@ def run_console(session: Dict[str, Any], sessions: List[Dict[str, Any]],
     # yesterday -- the detectors are right, there is nothing wrong with the data, it
     # is just finished.
     status = session.get("status")
-    over = "" if status in ("live", "stalled", None) else f"  {yellow(status)}"
+    over = "" if status in ("live", "stalled", None) else f"  {dim(status)}"
     if over and session.get("last_seen"):
         over += dim(f" {ago(session['last_seen'])}")
     print(f"\nAttached to {bold(os.path.basename(script))}  {dim(directory)}{over}")

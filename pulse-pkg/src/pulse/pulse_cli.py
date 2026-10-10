@@ -1037,18 +1037,17 @@ def _enable_windows_ansi() -> None:
 _enable_windows_ansi()
 
 # ---- minimal terminal styling ------------------------------------------
-# Kept deliberately small: "Pulse" is always orange, error/warning text is
-# always red, and code patches/diffs are always blue. Nothing else in the
-# CLI is colored.
+# Kept deliberately small: Pulse and warnings use orange; code patches use off-white;
+# errors stay red and healthy details are subdued.
 # no-color.org: only a non-empty NO_COLOR disables colour; TERM=dumb can't show it.
 _COLOR_ENABLED = (sys.stdout.isatty() and not os.environ.get("NO_COLOR")
                   and os.environ.get("TERM", "").lower() != "dumb")
 _ORANGE = "\033[38;5;208m"
 _RED = "\033[91m"
-_GREEN = "\033[92m"
-_BLUE = "\033[94m"
+_GREEN = "\033[2m"
+_BLUE = "\033[97m"
 _RESET = "\033[0m"
-_YELLOW = "\033[93m"
+_YELLOW = "\033[38;5;208m"
 _PULSE_RE = re.compile(r"Pulse(?:\s(?:CLI|AI))?")
 
 
@@ -1116,16 +1115,16 @@ For licensing inquiries, contact: codeyash09@gmail.com
 
 def _highlight_pulse(text: str, base_color: Optional[str] = None) -> str:
     """Color every occurrence of 'Pulse' (and 'Pulse CLI'/'Pulse AI') orange,
-    resuming `base_color` afterward so nesting inside a red/blue line works."""
+    resuming `base_color` afterward so nesting inside a colored line works."""
     if not _COLOR_ENABLED:
         return text
     resume = base_color or ""
-    return _PULSE_RE.sub(lambda m: f"{_ORANGE}{m.group(0)}{_RESET}{resume}", text)
+    return _PULSE_RE.sub(lambda m: f"{_OFFWHITE}{m.group(0)}{_RESET}{resume}", text)
 
 
 def cprint(text: str = "", color: Optional[str] = None) -> None:
-    """print() that always highlights 'Pulse' in orange and, if `color` is
-    given (_RED for errors/warnings, _BLUE for code patches), paints the
+    """print() that always highlights 'Pulse' orange and, if `color` is
+    given (_RED for errors, _YELLOW for warnings), paints the
     rest of the line in that color."""
     text = str(text)
     if not _COLOR_ENABLED:

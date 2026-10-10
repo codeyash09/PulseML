@@ -24,6 +24,13 @@ const LIVE_WINDOW_MS = 5 * 60 * 1000;
 const LS_NOTIF_KEY =
   "pulse-dashboard:notification-settings";
 
+const LS_PINNED_RUNS_PREFIX =
+  "pulse-dashboard:pinned-runs:";
+const LS_UNPINNED_LIVE_RUNS_PREFIX =
+  "pulse-dashboard:unpinned-live-runs:";
+const LS_SIDEBAR_COLLAPSED_KEY =
+  "pulse-dashboard:sidebar-collapsed";
+
 const SS_PENDING_OAUTH_TEAM_KEY =
   "pulse-dashboard:pending-oauth-team";
 
@@ -51,8 +58,15 @@ let currentUser = null;
 let currentTeam = null;
 let currentProject = null;
 let currentSessions = [];
+let workspaceRecords = new Map();
+let sidebarContextTeam = null;
 
 let activeSessionId = null;
+let autoSelectLiveRun = false;
+let pinnedRunIds = new Set();
+let unpinnedLiveRunIds = new Set();
+let observedLiveRunIds = new Set();
+let pinnedRunsProjectId = null;
 let commandDrafts = new Map();
 let commandSuggestionIndex = 0;
 
@@ -126,9 +140,10 @@ const DEBUG_COMMANDS = [
 
 const els = {
   viewLogin: document.getElementById("view-login"),
-  viewWorkspaces: document.getElementById("view-workspaces"),
-  viewProjects: document.getElementById("view-projects"),
   viewDashboard: document.getElementById("view-dashboard"),
+  workspaceSidebar: document.getElementById("workspace-sidebar"),
+  sidebarToggle: document.getElementById("sidebar-toggle"),
+  sidebarContextMenu: document.getElementById("sidebar-context-menu"),
 
   loginForm: document.getElementById("login-form"),
   loginUsername: document.getElementById("login-username"),
@@ -138,9 +153,13 @@ const els = {
   homeBtn: document.getElementById("home-btn"),
   topbarRight: document.getElementById("topbar-right"),
   topbarWorkspace: document.getElementById("topbar-workspace"),
+  footerAccount: document.getElementById("footer-account"),
+  footerUser: document.getElementById("footer-user"),
+  footerSignOut: document.getElementById("footer-sign-out"),
 
   workspaceList: document.getElementById("workspace-list"),
   workspacesEmpty: document.getElementById("workspaces-empty"),
+  projectsWorkspace: document.getElementById("projects-workspace"),
 
   workspaceTitle: document.getElementById("workspace-title"),
 
@@ -162,7 +181,6 @@ const els = {
   refreshLabel: document.getElementById("refresh-label"),
 
   notificationsBtn: document.getElementById("notifications-btn"),
-  projectsNotificationsBtn: document.getElementById("projects-notifications-btn"),
   notificationsModal: document.getElementById("notifications-modal"),
   notificationsCloseBtn: document.getElementById("notifications-close-btn"),
   notificationsSaveBtn: document.getElementById("notifications-save-btn"),
@@ -1006,6 +1024,12 @@ function isYesNo(label) {
   return /\[\s*y\s*\/\s*n\s*\]|\(\s*y\s*\/\s*n\s*\)/i.test(label);
 }
 
+function displayQuestionLabel(label) {
+  return String(label || "")
+    .replace(/\s*(?:\[\s*y\s*\/\s*n\s*\]|\(\s*y\s*\/\s*n\s*\))\s*$/i, "")
+    .trim();
+}
+
 async function answerQuestion(commandId, answer) {
   await pgPatch(
     "Commands",
@@ -1245,92 +1269,17 @@ function renderTopbarRight() {
   if (!currentUser) {
 
     els.topbarRight.innerHTML = "";
-
     els.topbarWorkspace.textContent = "";
+    els.footerAccount.hidden = true;
+    document.body.classList.remove("dashboard-active");
 
     return;
   }
 
-  const dashboardOpen =
-    !els.viewDashboard.hidden;
-
-  const pieces = [];
-
-  pieces.push(
-    `<span>${escapeHtml(currentUser.email)}</span>`
-  );
-
-  const projectsOpen =
-    !els.viewProjects.hidden;
-
-  if (dashboardOpen) {
-
-    pieces.push(
-      `<button
-        type="button"
-        id="switch-project-btn"
-      >
-        Switch project
-      </button>`
-    );
-  }
-
-  if (dashboardOpen || projectsOpen) {
-
-    pieces.push(
-      `<button
-        type="button"
-        id="switch-workspace-btn"
-      >
-        Switch workspace
-      </button>`
-    );
-  }
-
-  pieces.push(
-    `<button
-      type="button"
-      id="sign-out-btn"
-    >
-      Sign out
-    </button>`
-  );
-
-  els.topbarRight.innerHTML =
-    pieces.join("");
-
-  const switchButton =
-    document.getElementById(
-      "switch-workspace-btn"
-    );
-
-  if (switchButton) {
-
-    switchButton.addEventListener(
-      "click",
-      showWorkspaces
-    );
-  }
-
-  const switchProjectButton =
-    document.getElementById(
-      "switch-project-btn"
-    );
-
-  if (switchProjectButton) {
-
-    switchProjectButton.addEventListener(
-      "click",
-      () => showProjects(currentTeam)
-    );
-  }
-
-  document
-    .getElementById("sign-out-btn")
-    .addEventListener(
-      "click",
-      signOut
-    );
+  els.topbarRight.innerHTML = "";
+  document.body.classList.add("dashboard-active");
+  els.footerUser.textContent = currentUser.email;
+  els.footerAccount.hidden = false;
 
   if (currentTeam && currentProject) {
 
@@ -1346,6 +1295,8 @@ function renderTopbarRight() {
   }
 }
 
+els.footerSignOut.addEventListener("click", signOut);
+
 
 /* ============================================================
    VIEWS
@@ -1354,9 +1305,10 @@ function renderTopbarRight() {
 function showLogin() {
 
   els.viewLogin.hidden = false;
-  els.viewWorkspaces.hidden = true;
-  els.viewProjects.hidden = true;
   els.viewDashboard.hidden = true;
+  els.workspaceSidebar.hidden = true;
+  els.footerAccount.hidden = true;
+  document.body.classList.remove("dashboard-active");
 
   els.topbarRight.innerHTML = "";
   els.topbarWorkspace.textContent = "";
@@ -1366,27 +1318,114 @@ function showLogin() {
 async function showWorkspaces() {
 
   els.viewLogin.hidden = true;
-  els.viewWorkspaces.hidden = false;
-  els.viewProjects.hidden = true;
-  els.viewDashboard.hidden = true;
-
-  currentTeam = null;
-  currentProject = null;
+  els.viewDashboard.hidden = false;
+  setWorkspaceSidebarOpen(
+    localStorage.getItem(LS_SIDEBAR_COLLAPSED_KEY) !== "true"
+  );
+  if (!currentProject) {
+    renderWorkspaceSelection();
+  }
 
   renderTopbarRight();
 
   await loadAndRenderWorkspaces();
+
+  if (currentTeam) {
+    await loadAndRenderProjects();
+  }
 }
 
 
 function showDashboard() {
 
   els.viewLogin.hidden = true;
-  els.viewWorkspaces.hidden = true;
-  els.viewProjects.hidden = true;
   els.viewDashboard.hidden = false;
+  if (!currentProject) {
+    renderWorkspaceSelection();
+  }
 
   renderTopbarRight();
+}
+
+
+function setWorkspaceSidebarOpen(isOpen) {
+
+  els.workspaceSidebar.hidden = !isOpen;
+  localStorage.setItem(LS_SIDEBAR_COLLAPSED_KEY, String(!isOpen));
+
+  const shell =
+    els.activeConsole.querySelector(".run-window-shell");
+
+  if (shell) {
+    shell.classList.toggle("sidebar-menu-closed", !isOpen);
+    shell.querySelectorAll(".workspace-menu-toggle").forEach(button => {
+      button.setAttribute("aria-expanded", String(isOpen));
+      button.setAttribute(
+        "aria-label",
+        isOpen ? "Close workspace menu" : "Open workspace menu"
+      );
+      button.title = isOpen ? "Close workspace menu" : "Open workspace menu";
+    });
+  }
+
+  els.sidebarToggle.setAttribute("aria-expanded", String(isOpen));
+  els.sidebarToggle.setAttribute(
+    "aria-label",
+    isOpen ? "Close workspace menu" : "Open workspace menu"
+  );
+  els.sidebarToggle.title = isOpen ? "Close workspace menu" : "Open workspace menu";
+}
+
+
+function mountWorkspaceNavigation(shell) {
+
+  const layout = shell.querySelector(".run-window-layout");
+  if (!layout) return;
+
+  layout.prepend(els.workspaceSidebar);
+  shell.append(els.sidebarContextMenu);
+  shell.classList.toggle("sidebar-menu-closed", els.workspaceSidebar.hidden);
+  shell.querySelectorAll(".workspace-menu-toggle").forEach(button => {
+    button.setAttribute("aria-expanded", String(!els.workspaceSidebar.hidden));
+    button.setAttribute(
+      "aria-label",
+      els.workspaceSidebar.hidden ? "Open workspace menu" : "Close workspace menu"
+    );
+  });
+}
+
+
+function renderWorkspaceSelection() {
+
+  els.activeConsole.innerHTML = `
+    <div class="run-window-shell">
+      <nav class="run-tab-bar" aria-label="Training runs">
+        ${renderWorkspaceMenuToggle()}
+        <div class="run-tab-pills"></div>
+      </nav>
+      <div class="run-window-layout">
+        <section class="run-window-content console-empty-state" aria-label="Workspace selection">
+          <span>PULSE / WORKSPACE</span>
+          <p>Select a workspace and project to open its training runs.</p>
+        </section>
+      </div>
+    </div>
+  `;
+
+  mountWorkspaceNavigation(els.activeConsole.querySelector(".run-window-shell"));
+}
+
+
+function renderWorkspaceMenuToggle() {
+  const isOpen = !els.workspaceSidebar.hidden;
+  return `
+    <button class="workspace-menu-toggle" type="button" aria-expanded="${isOpen}"
+      aria-label="${isOpen ? "Close" : "Open"} workspace menu" title="${isOpen ? "Close" : "Open"} workspace menu">
+      <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+        <path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+    </button>
+  `;
 }
 
 
@@ -1399,6 +1438,7 @@ function signOut() {
   currentAccessToken = null;
   currentRefreshToken = null;
   activeSessionId = null;
+  autoSelectLiveRun = false;
   commandDrafts = new Map();
   lastRenderedSignature = "";
   teamIntegration = null;
@@ -1410,6 +1450,11 @@ function signOut() {
     closeNotificationsModal();
   }
 
+  workspaceRecords.clear();
+  sidebarContextTeam = null;
+  els.workspaceList.replaceChildren();
+  els.projectList.replaceChildren();
+  els.sidebarContextMenu.hidden = true;
   els.sessionList.innerHTML = "";
   els.activeConsole.innerHTML = "";
 
@@ -1440,134 +1485,24 @@ function renderWorkspaceRow(
   team,
   liveCount = 0
 ) {
-
-  const isAdmin =
-    (team.admin_ids || [])
-      .includes(currentUser.id);
-
-  const isOwner =
-    team.owner_id === currentUser.id;
-
-  const role =
-    isOwner
-      ? "owner"
-      : isAdmin
-        ? "admin"
-        : "member";
-
-  // A plain div, not a button -- admins/owners get a real nested
-  // <button> for renaming (see below), and a <button> can't contain
-  // another interactive button per the HTML spec.
   const row =
-    document.createElement("div");
+    document.createElement("button");
 
-  row.className = "workspace-row";
-  row.setAttribute("role", "button");
-  row.setAttribute("tabindex", "0");
-
+  const name = getWorkspaceName(team);
+  row.type = "button";
+  row.className = "sidebar-nav-item sidebar-workspace-item";
+  row.dataset.teamId = String(team.team_id);
+  row.title = `${name}${liveCount ? ` · ${liveCount} live runs` : ""}`;
+  row.setAttribute(
+    "aria-pressed",
+    String(currentTeam?.team_id === team.team_id)
+  );
   row.innerHTML = `
-
-    <span class="workspace-main">
-
-      <span class="workspace-name">
-        ${escapeHtml(
-          getWorkspaceName(team)
-        )}
-      </span>
-
-      <span class="workspace-meta">
-
-        <span>
-          ${(team.members || []).length}
-          member${
-            (team.members || []).length === 1
-              ? ""
-              : "s"
-          }
-        </span>
-
-        <span>
-          ${escapeHtml(
-            team.plan || "free"
-          )} plan
-        </span>
-
-        ${
-          liveCount > 0
-            ? `
-              <span class="workspace-live">
-                <span class="workspace-live-dot"></span>
-                ${liveCount}
-                LIVE
-                ${liveCount === 1 ? "RUN" : "RUNS"}
-              </span>
-            `
-            : `
-              <span class="workspace-no-live">
-                No live runs
-              </span>
-            `
-        }
-
-      </span>
-
-    </span>
-
-    <span
-      class="workspace-role ${
-        isAdmin ? "is-admin" : ""
-      }"
-    >
-      ${role}
-    </span>
-
+    <span class="sidebar-item-mark" aria-hidden="true">${escapeHtml(name.slice(0, 1).toUpperCase())}</span>
+    <span class="sidebar-item-label">${escapeHtml(name)}</span>
+    ${liveCount ? `<span class="sidebar-live-count">${liveCount}</span>` : ""}
   `;
-
-  row.addEventListener(
-    "click",
-    () => openWorkspace(team)
-  );
-
-  // Keyboard equivalent of the <button> activation this div gave up.
-  row.addEventListener(
-    "keydown",
-    event => {
-
-      if (event.key === "Enter" || event.key === " ") {
-
-        event.preventDefault();
-
-        openWorkspace(team);
-      }
-    }
-  );
-
-  if (isAdmin || isOwner) {
-
-    const renameBtn =
-      document.createElement("button");
-
-    renameBtn.type = "button";
-    renameBtn.className = "icon-btn workspace-rename-btn";
-    renameBtn.title = "Rename workspace";
-
-    renameBtn.innerHTML =
-      `<span aria-hidden="true">✏️</span> Rename`;
-
-    renameBtn.addEventListener(
-      "click",
-      event => {
-
-        // Don't also trigger the row's own click (which would open
-        // the workspace).
-        event.stopPropagation();
-
-        renameWorkspace(team, row);
-      }
-    );
-
-    row.appendChild(renameBtn);
-  }
+  row.addEventListener("click", () => openWorkspace(team));
 
   return row;
 }
@@ -1630,13 +1565,21 @@ async function renameWorkspace(team, row) {
   team.name = trimmed;
 
   const nameEl =
-    row.querySelector(".workspace-name");
+    row.querySelector(".sidebar-item-label");
 
   if (nameEl) {
 
     nameEl.textContent =
       getWorkspaceName(team);
   }
+
+  const mark = row.querySelector(".sidebar-item-mark");
+  if (mark) {
+    mark.textContent = getWorkspaceName(team).slice(0, 1).toUpperCase();
+  }
+  row.title = getWorkspaceName(team);
+  els.projectsWorkspace.textContent =
+    getWorkspaceName(currentTeam || team);
 
   // Keep the topbar/crumbs in sync if this is the open workspace.
   if (currentTeam && currentTeam.team_id === team.team_id) {
@@ -1675,6 +1618,7 @@ async function loadAndRenderWorkspaces() {
 
     if (!teams.length) {
 
+      workspaceRecords.clear();
       els.workspaceList.innerHTML = "";
 
       els.workspacesEmpty.hidden = false;
@@ -1779,6 +1723,9 @@ async function loadAndRenderWorkspaces() {
 
     if (generation !== viewGeneration || !currentUser) return;
 
+    workspaceRecords = new Map(
+      workspaceStates.map(({ team }) => [String(team.team_id), team])
+    );
     const rows = document.createDocumentFragment();
 
     workspaceStates.forEach(
@@ -1812,17 +1759,38 @@ async function loadAndRenderWorkspaces() {
 
 async function openWorkspace(team) {
 
-  currentTeam = team;
-  currentProject = null;
+  const workspaceChanged =
+    currentTeam?.team_id !== team.team_id;
 
-  // Fresh workspace -- don't show a stale integration status from
-  // whatever workspace was open before. (Notifications are configured
-  // per workspace, so they load here, not per project.)
-  notifyBaseline = null;
-  teamIntegration = null;
+  currentTeam = team;
+  els.projectsWorkspace.textContent =
+    getWorkspaceName(team);
+  els.projectJoinMsg.textContent = "";
+
+  if (workspaceChanged) {
+    currentProject = null;
+    currentSessions = [];
+    activeSessionId = null;
+    lastRenderedSignature = "";
+    notifyBaseline = null;
+    teamIntegration = null;
+    els.sessionList.replaceChildren();
+    els.activeConsole.replaceChildren();
+    els.projectList.replaceChildren();
+    els.projectList.dataset.teamId = String(team.team_id);
+    els.projectsEmpty.hidden = false;
+    els.projectsEmpty.textContent = "Loading projects…";
+    renderStats([]);
+  }
+
+  els.workspaceList.querySelectorAll(".sidebar-workspace-item").forEach(item => {
+    item.setAttribute("aria-pressed", String(item.dataset.teamId === String(team.team_id)));
+  });
+
+  showDashboard();
 
   await Promise.all([
-    showProjects(team),
+    loadAndRenderProjects(),
     loadTeamIntegration().catch(error => {
       console.warn("Could not load notification integrations:", error);
     })
@@ -1835,60 +1803,27 @@ function renderProjectRow(
   liveCount = 0
 ) {
 
-  const repo =
-    getRepoName(project.repo);
-
   const row =
     document.createElement("button");
 
   row.type = "button";
-  row.className = "workspace-row";
+  row.className = "sidebar-nav-item sidebar-project-item";
+  row.dataset.projectId = String(project.project_id);
+  row.title = `${getProjectName(project)}${liveCount ? ` · ${liveCount} live runs` : ""}`;
+  row.setAttribute(
+    "aria-current",
+    currentProject?.project_id === project.project_id ? "page" : "false"
+  );
 
   row.innerHTML = `
-
-    <span class="workspace-main">
-
-      <span class="workspace-name">
-        ${escapeHtml(getProjectName(project))}
-      </span>
-
-      <span class="workspace-meta">
-
-        ${
-          repo
-            ? `<span>${escapeHtml(repo)}</span>`
-            : ""
-        }
-
-        ${
-          liveCount > 0
-            ? `
-              <span class="workspace-live">
-                <span class="workspace-live-dot"></span>
-                ${liveCount}
-                LIVE
-                ${liveCount === 1 ? "RUN" : "RUNS"}
-              </span>
-            `
-            : `
-              <span class="workspace-no-live">
-                No live runs
-              </span>
-            `
-        }
-
-      </span>
-
+    <span class="sidebar-project-mark" aria-hidden="true">
+      <svg viewBox="0 0 20 20" fill="none">
+        <path d="M3.5 6h5l1.5 1.7h6.5v7.8h-13V6Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+      </svg>
     </span>
-
-    <span
-      class="workspace-role ${
-        project.is_secret ? "is-admin" : ""
-      }"
-    >
-      ${project.is_secret ? "secret" : "project"}
-    </span>
-
+    <span class="sidebar-item-label">${escapeHtml(getProjectName(project))}</span>
+    ${project.is_secret ? `<span class="sidebar-private-mark" title="Private project">●</span>` : ""}
+    ${liveCount ? `<span class="sidebar-live-count">${liveCount}</span>` : ""}
   `;
 
   row.addEventListener(
@@ -1910,6 +1845,9 @@ async function loadAndRenderProjects() {
     generation !== viewGeneration || team !== currentTeam;
 
   if (!team) return;
+
+  els.projectsEmpty.hidden = false;
+  els.projectsEmpty.textContent = "Loading projects…";
 
   try {
 
@@ -2006,42 +1944,13 @@ async function loadAndRenderProjects() {
 }
 
 
-async function showProjects(team) {
-
-  if (!team) {
-
-    await showWorkspaces();
-
-    return;
-  }
-
-  currentTeam = team;
-  currentProject = null;
-
-  els.viewLogin.hidden = true;
-  els.viewWorkspaces.hidden = true;
-  els.viewDashboard.hidden = true;
-  els.viewProjects.hidden = false;
-
-  els.projectsWorkspace.textContent =
-    getWorkspaceName(team).toUpperCase();
-
-  els.projectJoinMsg.textContent = "";
-
-  if (els.projectList.dataset.teamId !== String(team.team_id)) {
-    els.projectList.innerHTML = "";
-    els.projectList.dataset.teamId = String(team.team_id);
-  }
-
-  renderTopbarRight();
-
-  await loadAndRenderProjects();
-}
-
-
 async function openProject(project) {
 
   currentProject = project;
+  autoSelectLiveRun = true;
+  els.projectList.querySelectorAll(".sidebar-project-item").forEach(item => {
+    item.setAttribute("aria-current", String(item.dataset.projectId === String(project.project_id) ? "page" : "false"));
+  });
 
   currentSessions = [];
 
@@ -2067,6 +1976,9 @@ async function openProject(project) {
       .toUpperCase();
 
   showDashboard();
+  if (window.matchMedia("(max-width: 600px)").matches) {
+    setWorkspaceSidebarOpen(false);
+  }
 
   await refreshSessions();
 }
@@ -2193,13 +2105,6 @@ function renderNotificationsButtonState() {
     configured
   );
 
-  if (els.projectsNotificationsBtn) {
-
-    els.projectsNotificationsBtn.classList.toggle(
-      "is-configured",
-      configured
-    );
-  }
 }
 
 
@@ -3788,8 +3693,8 @@ function initLossChart(scopeEl) {
       datasets: [{
         label: "Loss",
         data: payload.losses,
-        borderColor: "#0071e3",
-        backgroundColor: "rgba(0, 113, 227, 0.05)",
+        borderColor: "#ed8a32",
+        backgroundColor: "rgba(237, 138, 50, 0.08)",
         borderWidth: 2,
         fill: true,
         tension: 0.1,
@@ -3949,12 +3854,16 @@ function renderRunWorkspace(session) {
 
   questions.filter(command => command !== openQuestion).forEach(command => {
     const asked = questionOf(command);
+    const answer = String(command.result || "");
+    const answerText = /^y(?:es)?$/i.test(answer.trim()) ? "Yes"
+      : /^n(?:o)?$/i.test(answer.trim()) ? "No"
+        : asked.options && /^#\d+/.test(answer)
+          ? asked.options[Number(answer.slice(1).split(" ")[0])] ?? answer
+          : answer || "(Enter)";
     const outcome = command.status === "completed"
       ? (String(command.result || "").startsWith("Answered at the machine")
           ? command.result
-          : `Answered here: ${asked.options && /^#\d+/.test(command.result || "")
-              ? asked.options[Number(String(command.result).slice(1).split(" ")[0])] ?? command.result
-              : command.result || "(Enter)"}`)
+          : `Answered here: ${answerText}`)
       : command.result || "No longer asked.";
     entries.push({
       at: command.created_at ? Date.parse(command.created_at) / 1000 : 0,
@@ -4055,13 +3964,15 @@ function renderRunWorkspace(session) {
         <div class="command-input-wrap">
         <div class="command-suggestions" role="listbox" aria-label="Pulse commands" hidden></div>
         <textarea class="command-field" id="command-${escapeHtml(session.id)}" name="command" rows="2" maxlength="8000"
-          placeholder="Ask about this run or enter a /command…" ${canSend ? "" : "disabled"} required></textarea>
+          placeholder="${openQuestion ? "Answer the question above before sending another prompt" : "Ask about this run or enter a /command…"}"
+          ${canSend && !openQuestion ? "" : "disabled"} required></textarea>
         </div>
         <div class="command-composer-foot">
           <span class="command-status" role="status">${!canSend ? "Only the run owner or workspace admins can send commands"
+            : openQuestion ? "Respond to the pending question above to continue"
             : live ? "Enter to send · runs on the machine Pulse is watching it from"
             : "This run's Pulse is not connected: a prompt waits until it is"}</span>
-          <button type="submit" title="Send command" ${canSend ? "" : "disabled"}>Send <span aria-hidden="true">↗</span></button>
+          <button type="submit" title="Send command" ${canSend && !openQuestion ? "" : "disabled"}>Send <span aria-hidden="true">↗</span></button>
         </div>
       </form>
     </section>
@@ -4072,30 +3983,39 @@ function renderRunWorkspace(session) {
 function renderOpenQuestion(command, canSend) {
   const asked = questionOf(command);
   const id = escapeHtml(command.id);
+  const titleId = `question-title-${id}`;
+  const promptId = `question-prompt-${id}`;
   let choices;
   if (asked.options) {
     choices = asked.options.map((option, index) =>
       `<button type="button" class="question-answer" data-question-id="${id}" data-answer="#${index} ${escapeHtml(option)}" ${canSend ? "" : "disabled"}>${escapeHtml(option)}</button>`
     ).join("");
-  } else {
+  } else if (isYesNo(asked.label)) {
     choices = `
-      ${isYesNo(asked.label) ? `
-        <button type="button" class="question-answer" data-question-id="${id}" data-answer="y" ${canSend ? "" : "disabled"}>Yes</button>
-        <button type="button" class="question-answer" data-question-id="${id}" data-answer="n" ${canSend ? "" : "disabled"}>No</button>` : ""}
-      <form class="question-text" data-question-id="${id}">
-        <input type="text" name="answer" placeholder="${isYesNo(asked.label) ? "or type an answer" : "Your answer"}" ${canSend ? "" : "disabled"}>
-        <button type="submit" ${canSend ? "" : "disabled"}>Answer</button>
-      </form>`;
+      <button type="button" class="question-answer is-primary" data-question-id="${id}" data-answer="y" ${canSend ? "" : "disabled"}>Yes</button>
+      <button type="button" class="question-answer" data-question-id="${id}" data-answer="n" ${canSend ? "" : "disabled"}>No</button>`;
+  } else {
+    choices = `<form class="question-text" data-question-id="${id}">
+      <input type="text" name="answer" placeholder="Your answer" ${canSend ? "" : "disabled"}>
+      <button type="submit" ${canSend ? "" : "disabled"}>Answer</button>
+    </form>`;
   }
   return `
-    <section class="run-question" aria-label="Pulse is asking">
-      <div class="console-speaker">PULSE IS ASKING <span class="command-state is-processing">waiting for you</span></div>
-      ${asked.context ? `<pre class="question-context">${escapeHtml(asked.context)}</pre>` : ""}
-      <pre class="console-message">${escapeHtml(asked.label)}</pre>
-      ${asked.detail ? `<details class="question-detail" open><summary>The change</summary><pre>${escapeHtml(asked.detail)}</pre></details>` : ""}
-      <div class="question-choices">${choices}</div>
-      <p class="question-status" role="status">${canSend ? "The first answer, here or at the machine, is the one used." : "Only the run owner or workspace admins can answer."}</p>
-    </section>
+    <div class="${canSend ? "run-question-backdrop" : "run-question-readonly"}">
+      <section class="run-question" role="${canSend ? "alertdialog" : "region"}" ${canSend ? 'aria-modal="true"' : ""}
+        aria-labelledby="${titleId}" aria-describedby="${promptId}" ${canSend ? 'tabindex="-1"' : ""}>
+        <div class="approval-eyebrow"><span class="approval-indicator"></span> PULSE NEEDS YOUR APPROVAL</div>
+        <h2 id="${titleId}">Approval request</h2>
+        <p class="question-prompt" id="${promptId}">${escapeHtml(displayQuestionLabel(asked.label))}</p>
+        ${asked.context ? `<details class="approval-context"><summary>Recent context</summary><pre>${escapeHtml(asked.context)}</pre></details>` : ""}
+        ${asked.detail ? `<details class="question-detail"><summary>Review the change</summary><pre>${escapeHtml(asked.detail)}</pre></details>` : ""}
+        <div class="question-choices">${choices}</div>
+        <p class="question-status" role="status">${canSend
+          ? isYesNo(asked.label) ? "Choose Yes or No, or press Y / N."
+            : "Your answer will be sent to Pulse on the machine."
+          : "Only the run owner or workspace admins can answer."}</p>
+      </section>
+    </div>
   `;
 }
 
@@ -4976,6 +4896,80 @@ els.homeBtn.addEventListener(
   }
 );
 
+els.sidebarToggle.addEventListener("click", () => {
+  setWorkspaceSidebarOpen(els.workspaceSidebar.hidden);
+});
+
+els.workspaceList.addEventListener("contextmenu", event => {
+  const row = event.target.closest(".sidebar-workspace-item");
+  if (!row) return;
+
+  const team = workspaceRecords.get(row.dataset.teamId);
+  if (!team) return;
+
+  event.preventDefault();
+  sidebarContextTeam = team;
+  const canRename =
+    team.owner_id === currentUser?.id || isTeamAdmin(team);
+  els.sidebarContextMenu.innerHTML = `
+    <button type="button" role="menuitem" data-sidebar-action="open">Open workspace</button>
+    ${canRename ? `<button type="button" role="menuitem" data-sidebar-action="rename">Rename workspace</button>` : ""}
+  `;
+  els.sidebarContextMenu.hidden = false;
+  const menu = els.sidebarContextMenu;
+  const x = event.clientX || row.getBoundingClientRect().left;
+  const y = event.clientY || row.getBoundingClientRect().bottom;
+  menu.style.left = `${Math.min(x, window.innerWidth - menu.offsetWidth - 8)}px`;
+  menu.style.top = `${Math.min(y, window.innerHeight - menu.offsetHeight - 8)}px`;
+  menu.querySelector("[role=menuitem]")?.focus();
+});
+
+els.workspaceList.addEventListener("keydown", event => {
+  if (!["ContextMenu", "F10"].includes(event.key) || (event.key === "F10" && !event.shiftKey)) return;
+  const row = event.target.closest(".sidebar-workspace-item");
+  if (!row) return;
+  event.preventDefault();
+  const bounds = row.getBoundingClientRect();
+  row.dispatchEvent(new MouseEvent("contextmenu", {
+    bubbles: true,
+    clientX: bounds.left,
+    clientY: bounds.bottom
+  }));
+});
+
+els.sidebarContextMenu.addEventListener("click", async event => {
+  const action = event.target.closest("[data-sidebar-action]")?.dataset.sidebarAction;
+  if (!action || !sidebarContextTeam) return;
+
+  const team = sidebarContextTeam;
+  const row = els.workspaceList.querySelector(
+    `.sidebar-workspace-item[data-team-id="${CSS.escape(String(team.team_id))}"]`
+  );
+  els.sidebarContextMenu.hidden = true;
+  sidebarContextTeam = null;
+
+  if (action === "open") {
+    await openWorkspace(team);
+  } else if (action === "rename" && row) {
+    await renameWorkspace(team, row);
+    row.focus();
+  }
+});
+
+document.addEventListener("click", event => {
+  if (!els.sidebarContextMenu.hidden && !event.target.closest("#sidebar-context-menu")) {
+    els.sidebarContextMenu.hidden = true;
+    sidebarContextTeam = null;
+  }
+});
+
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && !els.sidebarContextMenu.hidden) {
+    els.sidebarContextMenu.hidden = true;
+    sidebarContextTeam = null;
+  }
+});
+
 
 els.projectJoinForm.addEventListener(
   "submit",
@@ -5004,6 +4998,7 @@ els.projectJoinForm.addEventListener(
 
       els.projectJoinCode.value = "";
 
+      await loadAndRenderProjects();
       await openProject(project);
 
     } catch (error) {
@@ -5027,6 +5022,10 @@ els.sessionList.addEventListener("click", event => {
 
 
 els.activeConsole.addEventListener("input", event => {
+  if (event.target.matches(".run-menu-search")) {
+    filterRunMenu(event.target.value);
+    return;
+  }
   if (!event.target.matches(".command-field")) return;
   commandDrafts.set(activeSessionId, event.target.value);
   commandSuggestionIndex = 0;
@@ -5035,6 +5034,38 @@ els.activeConsole.addEventListener("input", event => {
 
 
 els.activeConsole.addEventListener("click", event => {
+  const workspaceMenuToggle = event.target.closest(".workspace-menu-toggle");
+  if (workspaceMenuToggle) {
+    setWorkspaceSidebarOpen(els.workspaceSidebar.hidden);
+    return;
+  }
+
+  const menuToggle = event.target.closest(".run-menu-toggle");
+  if (menuToggle) {
+    const menu = els.activeConsole.querySelector(".run-menu");
+    const isOpen = menuToggle.getAttribute("aria-expanded") === "true";
+    menuToggle.setAttribute("aria-expanded", String(!isOpen));
+    menu.hidden = isOpen;
+    if (!isOpen) menu.querySelector(".run-menu-search")?.focus();
+    return;
+  }
+  const pinToggle = event.target.closest(".run-pin-toggle");
+  if (pinToggle) {
+    togglePinnedRun(pinToggle.dataset.sessionId);
+    return;
+  }
+  const runTab = event.target.closest(".run-tab-pill, .run-picker-item");
+  if (runTab) {
+    const menu = els.activeConsole.querySelector(".run-menu");
+    if (menu) menu.hidden = true;
+    els.activeConsole.querySelector(".run-menu-toggle")?.setAttribute("aria-expanded", "false");
+    if (runTab.dataset.sessionId !== activeSessionId) {
+      activeSessionId = runTab.dataset.sessionId;
+      lastRenderedSignature = "";
+      renderSessions();
+    }
+    return;
+  }
   const suggestion = event.target.closest(".command-suggestion");
   if (suggestion) chooseCommandSuggestion(suggestion.dataset.command);
   const answer = event.target.closest(".question-answer");
@@ -5042,7 +5073,37 @@ els.activeConsole.addEventListener("click", event => {
 });
 
 
+document.addEventListener("click", event => {
+  const menu = els.activeConsole.querySelector(".run-menu");
+  const toggle = els.activeConsole.querySelector(".run-menu-toggle");
+  if (!menu || menu.hidden || event.target.closest(".run-tab-bar")) return;
+  menu.hidden = true;
+  toggle?.setAttribute("aria-expanded", "false");
+});
+
+
 els.activeConsole.addEventListener("keydown", event => {
+  if (event.key === "Escape") {
+    const menu = els.activeConsole.querySelector(".run-menu");
+    if (menu && !menu.hidden) {
+      menu.hidden = true;
+      els.activeConsole.querySelector(".run-menu-toggle")?.setAttribute("aria-expanded", "false");
+      els.activeConsole.querySelector(".run-menu-toggle")?.focus();
+      event.preventDefault();
+      return;
+    }
+  }
+  const approvalDialog = event.target.closest(".run-question-backdrop .run-question");
+  if (approvalDialog && !event.altKey && !event.ctrlKey && !event.metaKey) {
+    const answer = event.key.toLowerCase() === "y" ? "y"
+      : event.key.toLowerCase() === "n" ? "n" : null;
+    const button = answer && approvalDialog.querySelector(`.question-answer[data-answer="${answer}"]`);
+    if (button && !button.disabled) {
+      event.preventDefault();
+      button.click();
+    }
+    return;
+  }
   if (!event.target.matches(".command-field")) return;
   const matches = matchingCommands(event.target.value.trim());
   const menu = els.activeConsole.querySelector(".command-suggestions");
@@ -5103,6 +5164,21 @@ els.activeConsole.addEventListener("submit", async event => {
   const command = field.value.trim();
   if (!session || !command || !currentUser) return;
 
+  const pendingQuestion = (session.commands || []).find(item =>
+    item.status === "processing" && questionOf(item)
+  );
+  if (pendingQuestion) {
+    const question = questionOf(pendingQuestion);
+    const yesNoAnswer = /^(y|yes|n|no)$/i.exec(command);
+    if (!question.options && isYesNo(question.label) && yesNoAnswer) {
+      sendQuestionAnswer(pendingQuestion.id, /^[yn]/i.test(yesNoAnswer[0]) ? "y" : "n");
+      field.value = "";
+      return;
+    }
+    status.textContent = "Respond to the pending question above before sending another prompt.";
+    return;
+  }
+
   button.disabled = true;
   status.textContent = "Sending to runner…";
   try {
@@ -5144,14 +5220,6 @@ els.notificationsBtn.addEventListener(
   "click",
   openNotificationsModal
 );
-
-if (els.projectsNotificationsBtn) {
-
-  els.projectsNotificationsBtn.addEventListener(
-    "click",
-    openNotificationsModal
-  );
-}
 
 els.notificationsCloseBtn.addEventListener(
   "click",
@@ -5480,7 +5548,6 @@ setInterval(
   () => {
 
     if (
-      !els.viewProjects.hidden &&
       currentUser &&
       currentTeam
     ) {
@@ -5503,8 +5570,97 @@ if (!currentUser) {
 
 function runLabel(session) {
   const script = session.env?.script || session.env?.pulse_session || session.script_name;
-  if (script) return String(script).split(/[\\/]/).pop();
-  return `run ${String(session.id || "").slice(0, 8)}`;
+  const name = script ? String(script).split(/[\\/]/).pop() : `run ${String(session.id || "").slice(0, 8)}`;
+  const duplicates = currentSessions.filter(item => {
+    const itemScript = item.env?.script || item.env?.pulse_session || item.script_name;
+    const itemName = itemScript
+      ? String(itemScript).split(/[\\/]/).pop()
+      : `run ${String(item.id || "").slice(0, 8)}`;
+    return itemName === name;
+  });
+  return duplicates.length > 1 ? `${name} · ${String(session.id || "").slice(0, 8)}` : name;
+}
+
+
+function ensurePinnedRunsLoaded() {
+  const projectId = String(currentProject?.project_id || "");
+  if (pinnedRunsProjectId === projectId) return;
+  pinnedRunsProjectId = projectId;
+  pinnedRunIds = new Set();
+  unpinnedLiveRunIds = new Set();
+  observedLiveRunIds = new Set();
+  if (!projectId) return;
+  const saved = localStorage.getItem(`${LS_PINNED_RUNS_PREFIX}${projectId}`);
+  if (saved) {
+    try {
+      const ids = JSON.parse(saved);
+      if (!Array.isArray(ids) || ids.some(id => typeof id !== "string")) {
+        throw new TypeError("Pinned run data must be an array of run IDs.");
+      }
+      pinnedRunIds = new Set(ids);
+    } catch (error) {
+      console.warn("Could not load pinned runs:", error);
+    }
+  }
+  const unpinnedLive = localStorage.getItem(`${LS_UNPINNED_LIVE_RUNS_PREFIX}${projectId}`);
+  if (unpinnedLive) {
+    try {
+      const ids = JSON.parse(unpinnedLive);
+      if (!Array.isArray(ids) || ids.some(id => typeof id !== "string")) {
+        throw new TypeError("Unpinned live run data must be an array of run IDs.");
+      }
+      unpinnedLiveRunIds = new Set(ids);
+    } catch (error) {
+      console.warn("Could not load unpinned live runs:", error);
+    }
+  }
+}
+
+
+function togglePinnedRun(sessionId) {
+  if (!sessionId || !currentProject?.project_id) return;
+  ensurePinnedRunsLoaded();
+  const existingMenu = els.activeConsole.querySelector(".run-menu");
+  const wasMenuOpen = Boolean(existingMenu && !existingMenu.hidden);
+  const searchQuery = els.activeConsole.querySelector(".run-menu-search")?.value || "";
+  const session = currentSessions.find(item => item.id === sessionId);
+  if (pinnedRunIds.has(sessionId)) {
+    pinnedRunIds.delete(sessionId);
+    if (session && isLive(session)) unpinnedLiveRunIds.add(sessionId);
+  } else {
+    pinnedRunIds.add(sessionId);
+    unpinnedLiveRunIds.delete(sessionId);
+  }
+  localStorage.setItem(
+    `${LS_PINNED_RUNS_PREFIX}${currentProject.project_id}`,
+    JSON.stringify([...pinnedRunIds])
+  );
+  localStorage.setItem(
+    `${LS_UNPINNED_LIVE_RUNS_PREFIX}${currentProject.project_id}`,
+    JSON.stringify([...unpinnedLiveRunIds])
+  );
+  lastRenderedSignature = "";
+  renderSessions();
+  if (wasMenuOpen) {
+    const menu = els.activeConsole.querySelector(".run-menu");
+    const toggle = els.activeConsole.querySelector(".run-menu-toggle");
+    const search = els.activeConsole.querySelector(".run-menu-search");
+    if (menu && toggle && search) {
+      menu.hidden = false;
+      toggle.setAttribute("aria-expanded", "true");
+      search.value = searchQuery;
+      search.dispatchEvent(new Event("input", { bubbles: true }));
+      search.focus();
+    }
+  }
+}
+
+
+function filterRunMenu(value) {
+  const query = value.trim().toLowerCase();
+  els.activeConsole.querySelectorAll(".run-menu-item").forEach(item => {
+    item.hidden = !item.textContent.toLowerCase().includes(query);
+  });
 }
 
 
@@ -5513,37 +5669,66 @@ function renderRunPickerItem(session) {
   const loss = findMetric(session, ["loss", "train_loss", "loss_value", "current_loss"]);
   const step = findMetric(session, ["step", "global_step", "epoch"]);
   const selected = session.id === activeSessionId;
+  const pinned = pinnedRunIds.has(session.id);
+  const label = runLabel(session);
   return `
-    <button class="run-picker-item ${selected ? "is-selected" : ""}" type="button"
-      data-session-id="${escapeHtml(session.id)}" aria-pressed="${selected}">
-      <span class="run-picker-dot ${live ? "is-live" : ""}" aria-hidden="true"></span>
-      <span class="run-picker-copy">
-        <strong>${escapeHtml(runLabel(session))}</strong>
-        <span data-live-picker="${escapeHtml(session.id)}">step ${escapeHtml(metricValue(step))} <i>·</i> loss ${escapeHtml(metricValue(loss))}</span>
-      </span>
-      <span class="run-picker-arrow" aria-hidden="true">›</span>
-    </button>
+    <div class="run-menu-item ${selected ? "is-selected" : ""}" role="listitem">
+      <button class="run-picker-item ${live ? "is-live-run" : "is-stale-run"}" type="button"
+        data-session-id="${escapeHtml(session.id)}" aria-pressed="${selected}" aria-label="Open ${escapeHtml(label)}" title="${escapeHtml(label)}">
+        <span class="run-picker-dot ${live ? "is-live" : ""}" aria-hidden="true"></span>
+        <span class="run-picker-copy">
+          <strong>${escapeHtml(label)}</strong>
+          <span data-live-picker="${escapeHtml(session.id)}">${live ? "Live" : "Past run"} <i>·</i> step ${escapeHtml(metricValue(step))} <i>·</i> loss ${escapeHtml(metricValue(loss))}</span>
+        </span>
+      </button>
+      <button class="run-pin-toggle ${pinned ? "is-pinned" : ""}" type="button" data-session-id="${escapeHtml(session.id)}"
+        aria-pressed="${pinned}" aria-label="${pinned ? "Unpin" : "Pin"} ${escapeHtml(label)}" title="${pinned ? "Unpin run" : "Pin run"}">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10.8 1.8 14 5l-2.2.5-2.1 2.1.4 2.4-.8.8-2.5-2.5-3.5 3.5-.8-.8L6 7.5 3.5 5l.8-.8 2.4.4 2.1-2.1.5-2.2Z" /></svg>
+      </button>
+    </div>
   `;
 }
 
 
-function renderRunGroup(label, sessions) {
-  if (!sessions.length) return "";
+function renderRunTab(session) {
+  const live = isLive(session);
+  const selected = session.id === activeSessionId;
+  const label = runLabel(session);
   return `
-    <section class="run-group">
-      <h2><span>${label}</span><b>${sessions.length}</b></h2>
-      <div class="run-group-items">${sessions.map(renderRunPickerItem).join("")}</div>
-    </section>
+    <button class="run-tab-pill ${selected ? "is-selected" : ""} ${live ? "is-live" : ""}" type="button"
+      data-session-id="${escapeHtml(session.id)}" aria-pressed="${selected}" aria-label="Open ${escapeHtml(label)}" title="${escapeHtml(label)}">
+      <span class="run-picker-dot ${live ? "is-live" : ""}" aria-hidden="true"></span>
+      <span>${escapeHtml(label)}</span>
+    </button>
   `;
 }
 
 
 function renderSessions() {
 
+  ensurePinnedRunsLoaded();
   const liveRuns = currentSessions.filter(isLive);
-  const stoppedRuns = currentSessions.filter(session => !isLive(session));
-  if (!currentSessions.some(session => session.id === activeSessionId)) {
-    activeSessionId = (liveRuns[0] || stoppedRuns[0])?.id || null;
+  let defaultPinsChanged = false;
+  for (const run of liveRuns) {
+    if (observedLiveRunIds.has(run.id)) continue;
+    observedLiveRunIds.add(run.id);
+    if (!unpinnedLiveRunIds.has(run.id) && !pinnedRunIds.has(run.id)) {
+      pinnedRunIds.add(run.id);
+      defaultPinsChanged = true;
+    }
+  }
+  if (defaultPinsChanged && currentProject?.project_id) {
+    localStorage.setItem(
+      `${LS_PINNED_RUNS_PREFIX}${currentProject.project_id}`,
+      JSON.stringify([...pinnedRunIds])
+    );
+  }
+  if (autoSelectLiveRun) {
+    const initialRun = liveRuns[0] || currentSessions[0];
+    activeSessionId = initialRun?.id || null;
+    autoSelectLiveRun = false;
+  } else if (!currentSessions.some(session => session.id === activeSessionId)) {
+    activeSessionId = (liveRuns[0] || currentSessions[0])?.id || null;
   }
 
   const signature = JSON.stringify([
@@ -5567,12 +5752,7 @@ function renderSessions() {
   renderStats(currentSessions);
   els.emptyState.hidden = currentSessions.length > 0;
   els.emptyState.textContent = "No runs have been logged for this project yet.";
-  const sidebarScrollTop = els.sessionList.scrollTop;
-  els.sessionList.innerHTML = [
-    renderRunGroup("LIVE", liveRuns),
-    renderRunGroup("STOPPED", stoppedRuns)
-  ].join("");
-  els.sessionList.scrollTop = sidebarScrollTop;
+  els.sessionList.replaceChildren();
 
   const session = currentSessions.find(item => item.id === activeSessionId);
   const oldField = els.activeConsole.querySelector(".command-field");
@@ -5582,9 +5762,57 @@ function renderSessions() {
   const transcriptAtBottom = !oldTranscript ||
     oldTranscript.scrollHeight - oldTranscript.clientHeight - oldTranscript.scrollTop < 32;
   const draft = commandDrafts.get(activeSessionId) || "";
-  els.activeConsole.innerHTML = session
+  const oldRunMenu = els.activeConsole.querySelector(".run-menu");
+  const runMenuWasOpen = oldRunMenu && !oldRunMenu.hidden;
+  const runMenuSearchValue = els.activeConsole.querySelector(".run-menu-search")?.value || "";
+  const visibleRuns = currentSessions.filter(item =>
+    item.id === activeSessionId || pinnedRunIds.has(item.id)
+  );
+  const hiddenRunCount = currentSessions.length - visibleRuns.length;
+  const runContent = session
     ? renderRunWorkspace(session)
-    : `<div class="console-empty-state"><span>PULSE / DEBUG</span><p>Select a run to open its console.</p></div>`;
+    : `<div class="console-empty-state"><span>PULSE / DEBUG</span><p>${currentProject ? "Select a run to open its console." : "Select a workspace and project to open its training runs."}</p></div>`;
+
+  els.activeConsole.innerHTML = `
+      <div class="run-window-shell">
+        <nav class="run-tab-bar" aria-label="Training runs">
+          ${renderWorkspaceMenuToggle()}
+          <div class="run-tab-pills">${visibleRuns.map(renderRunTab).join("")}</div>
+          ${currentSessions.length ? `
+            <button class="run-menu-toggle" type="button" aria-haspopup="dialog" aria-expanded="false"
+              aria-label="Browse all ${currentSessions.length} runs, ${hiddenRunCount} hidden">+${hiddenRunCount}
+            </button>
+            <section class="run-menu" role="dialog" aria-label="All runs" hidden>
+              <header class="run-menu-header">
+                <div><strong>All runs</strong><span>${currentSessions.length} runs</span></div>
+                <input class="run-menu-search" type="search" placeholder="Find a run..." aria-label="Find a run">
+              </header>
+              <div class="run-menu-list" role="list">${currentSessions.map(item => renderRunPickerItem(item)).join("")}</div>
+            </section>
+          ` : ""}
+        </nav>
+        <div class="run-window-layout">
+          <section class="run-window-content">${runContent}</section>
+        </div>
+        </div>`;
+
+  mountWorkspaceNavigation(els.activeConsole.querySelector(".run-window-shell"));
+
+  const runMenu = els.activeConsole.querySelector(".run-menu");
+  const runMenuToggle = els.activeConsole.querySelector(".run-menu-toggle");
+  const runMenuSearch = els.activeConsole.querySelector(".run-menu-search");
+  if (runMenuWasOpen && runMenu && runMenuToggle && runMenuSearch) {
+    runMenu.hidden = false;
+    runMenuToggle.setAttribute("aria-expanded", "true");
+    runMenuSearch.value = runMenuSearchValue;
+    filterRunMenu(runMenuSearchValue);
+  }
+
+  const approvalDialog = els.activeConsole.querySelector(".run-question-backdrop .run-question");
+  if (approvalDialog) {
+    const defaultAnswer = approvalDialog.querySelector('.question-answer[data-answer="n"]:not(:disabled)');
+    (defaultAnswer || approvalDialog.querySelector(".question-answer:not(:disabled)") || approvalDialog).focus();
+  }
 
   const transcript = els.activeConsole.querySelector(".run-transcript");
   if (transcript) {
@@ -5596,7 +5824,7 @@ function renderSessions() {
   const field = els.activeConsole.querySelector(".command-field");
   if (field) {
     field.value = draft;
-    if (wasFocused) field.focus();
+    if (wasFocused && !approvalDialog) field.focus();
     updateCommandSuggestions();
   }
 }

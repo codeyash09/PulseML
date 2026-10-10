@@ -136,18 +136,32 @@ def test_pulse_code_todo_outline_tracks_nested_subtasks_and_derived_parent_statu
     state = types.SimpleNamespace(todos=[], cli=cli)
     todos = [
         {"id": "implement", "parent_id": None, "content": "Implement the feature", "status": "pending"},
-        {"id": "inspect", "parent_id": "implement", "content": "Inspect the current flow", "status": "completed"},
-        {"id": "change", "parent_id": "implement", "content": "Make the change", "status": "in_progress"},
-        {"id": "verify", "parent_id": "implement", "content": "Run focused tests", "status": "pending"},
+        {"id": "build", "parent_id": "implement", "content": "Build the change", "status": "pending"},
+        {"id": "implementation", "parent_id": "build", "content": "Implement and verify", "status": "pending"},
+        {"id": "inspect", "parent_id": "implementation", "content": "Inspect the current flow", "status": "completed"},
+        {"id": "change", "parent_id": "implementation", "content": "Make the change", "status": "in_progress"},
+        {"id": "verify", "parent_id": "implementation", "content": "Run focused tests", "status": "pending"},
     ]
 
     result = native._t_todo_write(state, {"todos": todos})
 
     assert result.startswith("Task outline updated:")
     assert "[~] Implement the feature" in result
-    assert "  [x] Inspect the current flow" in result
+    assert "    [~] Implement and verify" in result
+    assert "      [x] Inspect the current flow" in result
     assert state.todos[0]["status"] == "in_progress"
     assert cli._todos == state.todos
+
+
+def test_pulse_code_prompt_and_tool_describe_recursive_required_outlines():
+    tool = next(tool for tool in native.TOOLS if tool["function"]["name"] == "todo_write")
+    prompt = native.SYSTEM_PROMPT
+    description = tool["function"]["description"]
+
+    assert "required before coding" in prompt
+    assert "any subtask can itself contain smaller subtasks at any depth" in prompt
+    assert "After completing a leaf, call todo_write" in prompt
+    assert "subtasks may contain their own subtasks at any depth" in description
 
 
 def test_pulse_code_does_not_allow_agent_to_finish_with_open_subtasks():
@@ -155,7 +169,7 @@ def test_pulse_code_does_not_allow_agent_to_finish_with_open_subtasks():
     state = types.SimpleNamespace(
         todos=[
             {"id": "feature", "parent_id": None, "content": "Build feature", "status": "in_progress"},
-            {"id": "tests", "parent_id": "feature", "content": "Add tests", "status": "pending"},
+            {"id": "tests", "parent_id": "feature", "content": "Add tests", "status": "in_progress"},
         ],
         changes={},
         dirty=False,
@@ -165,8 +179,43 @@ def test_pulse_code_does_not_allow_agent_to_finish_with_open_subtasks():
 
     reason = native._nudge(state, "Implemented.")
 
-    assert "unfinished items" in reason
-    assert "Add tests (pending)" in reason
+    assert "unfinished work" in reason
+    assert "The active leaf is 'Add tests'" in reason
+    assert "Add tests (in_progress)" in reason
+
+
+def test_native_turn_keeps_nudging_until_every_nested_task_is_completed(cli, monkeypatch):
+    outline = [
+        {"id": "feature", "parent_id": None, "content": "Build feature", "status": "pending"},
+        {"id": "implementation", "parent_id": "feature", "content": "Implement phase", "status": "pending"},
+        {"id": "work", "parent_id": "implementation", "content": "Implementation work", "status": "pending"},
+        {"id": "inspect", "parent_id": "work", "content": "Inspect existing code", "status": "in_progress"},
+        {"id": "change", "parent_id": "work", "content": "Implement the change", "status": "pending"},
+        {"id": "verify", "parent_id": "work", "content": "Run focused tests", "status": "pending"},
+    ]
+    completed = [{**task, "status": "completed"} for task in outline]
+    answers = iter([
+        native_reply("", [call("todo_write", {"todos": outline}, "outline")]),
+        native_reply("Implemented everything."),
+        native_reply("Done."),
+        native_reply("All finished."),
+        native_reply("", [call("todo_write", {"todos": completed}, "complete")]),
+        native_reply("The requested work is complete."),
+    ])
+    sent = []
+
+    def completion(**kwargs):
+        sent.append(kwargs)
+        return next(answers)
+
+    monkeypatch.setattr(native.litellm, "completion", completion)
+
+    assert native.run_native_turn(cli, "implement and test this multi-step feature") == "answered"
+    assert len(sent) == 6
+    third_nudge = sent[3]["messages"][-1]["content"]
+    assert "unfinished work" in third_nudge
+    assert "The active leaf is 'Inspect existing code'" in third_nudge
+    assert "Run focused tests" in third_nudge
 
 
 def test_pulse_code_cannot_clear_an_unfinished_outline():
@@ -476,6 +525,37 @@ def test_the_agents_run_tools_are_the_apps_run_control(cli, monkeypatch):
     assert seen == [("launch", "train.py --epochs 2")]
     assert "Started train.py under Pulse" in out and "run_status" in out
     assert [e.kind for e in app.view.entries] == ["tool"] and app.view.entries[0].calls == ["START_RUN: train.py --epochs 2"]
+
+
+def test_pulse_code_starts_the_requested_script_with_monitored_run_tool(cli, monkeypatch):
+    app = appmod.App(cli, cli._project_root)
+    launches, requests = [], []
+    app._launch = lambda arg: launches.append(arg) or setattr(app, "console", object()) \
+        or setattr(app, "session", {"session_id": "s2", "script": os.path.join(cli._project_root, "train.py")})
+    responses = iter([
+        native_reply("", [call("start_run", {"script": "train.py", "args": "--epochs 2"}, "run")]),
+        native_reply("Started the requested training script under Pulse."),
+    ])
+
+    def completion(**kwargs):
+        requests.append(kwargs)
+        return next(responses)
+
+    monkeypatch.setattr(native.litellm, "completion", completion)
+    app.install()
+    try:
+        outcome = native.run_native_turn(cli, "Run train.py for 2 epochs.")
+    finally:
+        app.uninstall()
+
+    assert outcome == "answered"
+    assert launches == ["train.py --epochs 2"]
+    tool_results = [message for message in requests[1]["messages"] if message.get("role") == "tool"]
+    assert "Started train.py under Pulse" in tool_results[0]["content"]
+    assert "same monitored launch as `/run <script> [args]`" in next(
+        tool["function"]["description"] for tool in native.TOOLS
+        if tool["function"]["name"] == "start_run"
+    )
 
 
 def test_run_tools_outside_the_app_say_so(cli):

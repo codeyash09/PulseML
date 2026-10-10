@@ -531,12 +531,12 @@ pulse.check_shape(x, "(B, 3, 224, 224)", raise_on_mismatch=True)
 
 ### Multi-step task outlines
 
-For requests with several steps, Pulse Code keeps a hierarchical task outline while it works:
-top-level phases contain concrete subtasks, parent status follows the state of its children,
-and only one unfinished leaf subtask can be active at a time. Pulse Code is prompted to make
-the outline before editing, update it as work progresses, and finish all remaining subtasks
-before giving its final answer. This helps larger changes continue beyond their first
-implementation step.
+For requests with several steps, Pulse Code creates a recursive task outline before editing:
+phases can contain subtasks, and subtasks can contain further subtasks at any depth. The
+outline tracks concrete leaf actions, including verification; parent status follows its
+children, and only one unfinished leaf can be active at a time. Pulse Code updates the
+outline as it completes each leaf. An unfinished outline keeps the turn open until all leaf
+work is complete or the turn reaches its safety limit.
 
 ### Auto mode: no stopping to ask
 
