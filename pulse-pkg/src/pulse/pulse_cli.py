@@ -34,6 +34,7 @@ import tempfile
 import atexit
 import numpy as np
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from pulse.pulse_backend import (
@@ -1370,11 +1371,11 @@ def _ui_key_screen(chosen: str, openrouter: bool = False) -> None:
     _ui.kv("Model", chosen, indent=0)
     if openrouter:
         _ui.note("No key yet? Press Enter to sign in to OpenRouter -- or create an account -- in "
-                 "your browser; Pulse keeps that key so you stay signed in.")
+                 "your browser. Pulse asks whether to save that key for future sign-ins.")
         _ui.note("A key you paste is used only to call the model and is never written to disk.")
     else:
         _ui.note("Used only to call the model you selected. "
-                 + ("Kept in ~/.pulse/keys.json, readable by you only, so you are not asked again "
+                 + ("Saved in ~/.pulse/keys.json only if you consent, so you are not asked again "
                     "(/config remember_keys off: never kept)." if _settings.on("remember_keys")
                     else "Pulse does not keep it (/config remember_keys on to keep it)."))
         _ui.note("No key? Press Enter: Pulse can sign you in to OpenRouter and use one of its "
@@ -1540,6 +1541,17 @@ SYSTEM_PROMPT = (
     "among tracked variables that recomputes the current loss -- if none exists, Pulse will say so.\n"
     "    REPLAY: <n_steps> -- replay the last n_steps from an isolated checkpoint (with a zero-arg "
     "`train_step` callable you define) and report the resulting loss curve, then restore live state.\n"
+    "    EXPERIMENT: <spec.json|status [id]|cancel <id>> -- start, inspect, or cancel isolated "
+    "proxy-model branches from a project-relative JSON spec. Pulse first requires repeated "
+    "unmodified proxies to reproduce an evidenced failure; otherwise it adjusts proxy scale and "
+    "refuses to rank interventions. Candidate and control runs execute only in temporary copies. "
+    "See docs/parallel-experiments.md.\n"
+    "    For a diagnosed training failure, state competing hypotheses and use an experiment only "
+    "when the run has measurable original evidence and a project-local runner/config. Define a "
+    "specific failure signature from the live readings, include an unchanged control, and treat "
+    "an inconclusive reproduction gate as no evidence for or against any intervention. Never "
+    "describe proxy results as a live-run fix; preserve candidate changes for the ordinary approval "
+    "and verification workflow.\n"
     "    MESSAGE: <one line> -- say something to the user right now, while you keep working: what you "
     "found so far, what you are about to check, a heads-up. It is not a tool: it gets no result back and "
     "does not end your turn, so put it in the same reply as the directives you are issuing. Text around "
@@ -6715,6 +6727,9 @@ class PulseCLI:
                 ("/chart [var]", "ASCII loss/metric curve for a tracked scalar (defaults to the main loss)"),
                 ("/trace <var>", "the variable's whole influence graph: what feeds it, and what it feeds"),
             ]),
+            ("Experiments", [
+                ("/experiment <spec.json>", "run isolated proxy baselines, gate on failure reproduction, then compare candidate fixes"),
+            ]),
             ("Auto-fix & sensitivity", [
                 ("/autofix on|off", f"toggle auto-intervention (currently {'ON' if self.auto_intervene else 'OFF'})"),
                 ("/sensitivity [value]", f"how eagerly spikes/plateaus/oscillation trigger it (currently {self.sensitivity:.2f} -- run with no argument for details)"),
@@ -7060,11 +7075,10 @@ class PulseCLI:
         return True
 
     def _pick_agent_and_remember(self, initial: bool = False) -> bool:
-        """Ask for the agent, and keep the answer in the settings (and its key, if keys are
-        remembered) so the next start does not ask again."""
+        """Ask for the agent, and keep the selected model in the settings."""
         ok = self._select_agent_provider_and_key(initial=initial)
         if ok and not getattr(self, "non_interactive", False):
-            _settings.remember_agent(self)
+            _settings.remember_agent(self, remember_key=getattr(self, "_remember_agent_key", False))
         return ok
 
     def _select_agent_provider_and_key(self, initial: bool = False) -> bool:
@@ -7345,6 +7359,24 @@ class PulseCLI:
         self.agent_model_string = None
         self.agent_api_base = None
         os.environ[env_var] = key
+        self._remember_agent_key = False
+        if key != "local" and _settings.on("remember_keys"):
+            saved = _settings.saved_key(env_var)
+            if env_var == _openrouter.ENV_KEY and not saved:
+                saved = _openrouter.saved_key() or ""
+            if key != saved and not getattr(self, "non_interactive", False):
+                keep_key = _prompt_text(
+                    "Save this API key in Pulse's private device key store so you stay signed in? (y/N) > ",
+                    label="Save this API key in Pulse's private device key store?  (y/N)",
+                ).strip().lower() in ("y", "yes")
+                if keep_key:
+                    stored = _settings.save_key(env_var, key)
+                    if env_var == _openrouter.ENV_KEY:
+                        stored = _openrouter.save_key(key) or stored
+                    self._remember_agent_key = stored
+                    if not stored:
+                        cprint("[Pulse] The API key was not saved; it is available for this session only.",
+                               color=_YELLOW)
         # Switching providers mid-conversation would send one provider's turns
         # to another; start a fresh history so context isn't mixed across models.
         self.agent_history = []
@@ -7459,10 +7491,8 @@ class PulseCLI:
                     signal.signal(signal.SIGINT, handler)
                 except (ValueError, TypeError):
                     pass
-        kept = _openrouter.save_key(key)
-        _say(f"✓ Signed in to OpenRouter (key {_openrouter.tail(key)})"
-             + (" -- saved on this machine, so you stay signed in; `pulse openrouter logout` removes it."
-                if kept else " -- for this session only (it could not be saved)."),
+        _say(f"✓ Signed in to OpenRouter (key {_openrouter.tail(key)})."
+             " Pulse will ask whether to save it in the private device config.",
              "OpenRouter", f"signed in  (key {_openrouter.tail(key)})")
         info = _openrouter.key_info(key)
         if info and info.get("is_free_tier"):
@@ -8823,6 +8853,7 @@ class PulseCLI:
         "dryrun": re.compile(r"^\s*DRYRUN:[ \t]*(.+)$", re.MULTILINE),
         "repl": re.compile(r"^\s*REPL:[ \t]*(.+)$", re.MULTILINE),
         "replay": re.compile(r"^\s*REPLAY:[ \t]*(.+)$", re.MULTILINE),
+        "experiment": re.compile(r"^\s*EXPERIMENT:[ \t]*(.+)$", re.MULTILINE),
         "terminal": re.compile(r"^\s*TERMINAL:[ \t]*(.+)$", re.MULTILINE),
         "message": re.compile(r"^\s*MESSAGE:[ \t]*(.+)$", re.MULTILINE),
         "gradcheck": re.compile(r"^\s*GRADCHECK:[ \t]*(.+)$", re.MULTILINE),
@@ -9484,6 +9515,8 @@ class PulseCLI:
         """y/N for a flagged command: the auto-mode approver when there is one, else the
         person. Why a command was declined is kept per thread (a check-in worker and the
         training thread can both be here) -- see _terminal_denial_reason."""
+        if getattr(self, "_always_allow_terminal_commands", False):
+            return True
         why = _terminal.describe_classification(flags)
         cprint(f"[Pulse] ⚠ This command {why}: {command}", color=_YELLOW)
         _terminal_denial.reason = None
@@ -9534,12 +9567,39 @@ class PulseCLI:
                     # repeat which command the question is about.
                     cprint(f"[Pulse] (background check-in) {command}", color=_YELLOW)
                 _flush_stdin()
-                resp = _prompt_text(f"Run it anyway? (y/N) > ", label="Run it anyway? (y/N)").strip().lower()
+                options = [
+                    _ui.Option("Do not run this command", key="n"),
+                    _ui.Option("Run this command once", key="y"),
+                    _ui.Option("Always allow flagged commands this session", key="a"),
+                ]
+                choice = _ui.choose(
+                    options, initial=0, title=f"Run flagged command? {command[:180]}",
+                    hotkeys={"a": "always"},
+                )
         except (EOFError, KeyboardInterrupt) as exc:
             if isinstance(exc, EOFError):
                 _terminal_denial.reason = "not run -- it needs the user's OK and there is no user to ask (no input)"
             return False
-        return resp in ("y", "yes")
+        except _ui.Unavailable:
+            try:
+                resp = _prompt_text(
+                    "Run it anyway? (y/N/a=always this session) > ",
+                    label="Run it anyway?  (y/N/a=always this session)",
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt) as exc:
+                if isinstance(exc, EOFError):
+                    _terminal_denial.reason = "not run -- it needs the user's OK and there is no user to ask (no input)"
+                return False
+            if resp in ("a", "all", "always"):
+                self._always_allow_terminal_commands = True
+                cprint("[Pulse] Flagged command approvals are off for this session.", color=_YELLOW)
+                return True
+            return resp in ("y", "yes")
+        if choice == "always" or choice == 2:
+            self._always_allow_terminal_commands = True
+            cprint("[Pulse] Flagged command approvals are off for this session.", color=_YELLOW)
+            return True
+        return choice == 1
 
     @staticmethod
     def _terminal_denial_reason() -> str:
@@ -9886,6 +9946,84 @@ class PulseCLI:
         if failed:
             parts.append(f"ROLLBACK: failed to restore {len(failed)} file(s): " + ", ".join(f"{os.path.basename(p)} ({err})" for p, err in failed))
         return "\n".join(parts)
+
+    def _run_experiment(self, arg: str) -> str:
+        """Start, inspect, or cancel an isolated experiment without touching the live project."""
+        from pulse import pulse_experiments
+
+        text = arg.strip()
+        action, _, job_id = text.partition(" ")
+        action = action.lower()
+        jobs = self.__dict__.setdefault("_experiment_jobs", {})
+        lock = self.__dict__.setdefault("_experiment_jobs_lock", threading.RLock())
+        if action == "status":
+            with lock:
+                identifier = job_id.strip()
+                selected = [jobs[identifier]] if identifier in jobs else list(jobs.values()) if not identifier else []
+                if not selected:
+                    return f"EXPERIMENT: no job found for {job_id!r}."
+                return "\n".join(
+                    f"EXPERIMENT {job['id']}: {job['state']}"
+                    + (f"\n{json.dumps(job['report'], ensure_ascii=True, sort_keys=True)}" if job.get("report") else "")
+                    + (f"\nError: {job['error']}" if job.get("error") else "")
+                    for job in selected
+                )
+        if action == "cancel":
+            identifier = job_id.strip()
+            with lock:
+                job = jobs.get(identifier)
+                if not job:
+                    return f"EXPERIMENT: no job found for {identifier!r}."
+                if job["state"] != "running":
+                    return f"EXPERIMENT {job['id']}: already {job['state']}."
+                job["cancel"].set()
+            return f"EXPERIMENT {job['id']}: cancellation requested; running subprocesses are stopping."
+        if not text:
+            return "EXPERIMENT: usage: /experiment <spec.json>, /experiment status [id], or /experiment cancel <id>."
+        project_root = Path(getattr(self, "_project_root", os.getcwd())).resolve()
+        spec_path = pulse_experiments._relative_file(project_root, text, "experiment spec")
+        spec = pulse_experiments._read_json_object(spec_path, "experiment spec")
+        signature = spec.get("failure_signature", {})
+        metric = signature.get("metric") if isinstance(signature, dict) else None
+        if metric and not spec.get("original_metrics"):
+            history = getattr(self, "scalar_histories", {}).get(metric)
+            if history:
+                spec["original_metrics"] = [value for value in history if value is not None]
+        with lock:
+            if any(job["state"] == "running" for job in jobs.values()):
+                return "EXPERIMENT: one experiment is already running; use /experiment status or /experiment cancel <id>."
+            job_id = uuid.uuid4().hex[:10]
+            job = {"id": job_id, "state": "running", "cancel": threading.Event(),
+                   "report": None, "error": None}
+            jobs[job_id] = job
+
+        def execute() -> None:
+            try:
+                report = pulse_experiments.run_experiment(project_root, spec, job["cancel"])
+                summary = (
+                    f"Parallel proxy experiment {report['id']}: {report['status']} "
+                    f"(reproduction confidence "
+                    f"{report.get('reproduction', {}).get('confidence', 0):.0%})."
+                )
+                with lock:
+                    job["report"] = report
+                    job["state"] = report["status"]
+                try:
+                    self._log_incident("experiment", summary, experiment=report)
+                except Exception as exc:
+                    _pulse_log(f"EXPERIMENT incident logging failed: {exc!r}")
+                _ui.message(f"{summary} Inspect it with /experiment status {job_id}.")
+            except Exception as exc:
+                with lock:
+                    job["state"] = "failed"
+                    job["error"] = f"{type(exc).__name__}: {exc}"
+                _pulse_log(f"EXPERIMENT {job_id} failed: {exc!r}")
+                _ui.message(f"Proxy experiment {job_id} failed: {type(exc).__name__}: {exc}")
+
+        thread = threading.Thread(target=execute, name=f"pulse-experiment-{job_id}", daemon=True)
+        job["thread"] = thread
+        thread.start()
+        return f"EXPERIMENT {job_id} started. Use /experiment status {job_id} to inspect or /experiment cancel {job_id} to stop it."
 
     def _run_mllint(self) -> str:
         """MLLINT: -- a small set of high-confidence, AST-detectable ML
@@ -10353,6 +10491,8 @@ class PulseCLI:
             notes.append(self._safe_tool("REPL", arg, self._run_exec_repl, arg))
         for arg in requests.get("replay", []):
             notes.append(self._safe_tool("REPLAY", arg, self._run_exec_replay, arg))
+        for arg in requests.get("experiment", []):
+            notes.append(self._safe_tool("EXPERIMENT", arg, self._run_experiment, arg))
         for arg in requests.get("terminal", []):
             notes.append(self._safe_tool("TERMINAL", arg, self._run_terminal, arg))
         for arg in requests.get("gradcheck", []):
@@ -15476,6 +15616,15 @@ class PulseCLI:
                 self._cmd_autofix(
                     cmd[8:].strip()
                 )
+                continue
+
+            if cmd_lower.startswith("/experiment"):
+                argument = cmd[len("/experiment"):].strip()
+                if not argument:
+                    cprint("[Pulse] usage: /experiment <project-relative-spec.json>", color=_YELLOW)
+                else:
+                    result = self._safe_tool("EXPERIMENT", argument, self._run_experiment, argument)
+                    cprint(result)
                 continue
 
             if cmd_lower.startswith("/sensitivity"):

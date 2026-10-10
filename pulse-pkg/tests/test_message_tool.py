@@ -5,11 +5,14 @@ pipeline and the dashboard. A message is shown at once, goes back to the model a
 is an entry of its own."""
 import json
 import os
+from pathlib import Path
 import re
 import sys
 import types
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import pulse.pulse_cli as pc
 from pulse import pulse as core
@@ -126,6 +129,105 @@ def test_the_prompts_tell_every_agent_about_it():
     assert "MESSAGE: <one line>" in core.SYSTEM_PROMPT
     assert "message_user" in native.SYSTEM_PROMPT
     assert any(t["function"]["name"] == "message_user" for t in native.TOOLS)
+
+
+def test_pulse_code_todo_outline_tracks_nested_subtasks_and_derived_parent_status():
+    cli = types.SimpleNamespace(_todos=[])
+    state = types.SimpleNamespace(todos=[], cli=cli)
+    todos = [
+        {"id": "implement", "parent_id": None, "content": "Implement the feature", "status": "pending"},
+        {"id": "inspect", "parent_id": "implement", "content": "Inspect the current flow", "status": "completed"},
+        {"id": "change", "parent_id": "implement", "content": "Make the change", "status": "in_progress"},
+        {"id": "verify", "parent_id": "implement", "content": "Run focused tests", "status": "pending"},
+    ]
+
+    result = native._t_todo_write(state, {"todos": todos})
+
+    assert result.startswith("Task outline updated:")
+    assert "[~] Implement the feature" in result
+    assert "  [x] Inspect the current flow" in result
+    assert state.todos[0]["status"] == "in_progress"
+    assert cli._todos == state.todos
+
+
+def test_pulse_code_does_not_allow_agent_to_finish_with_open_subtasks():
+    cli = types.SimpleNamespace(_todos=[])
+    state = types.SimpleNamespace(
+        todos=[
+            {"id": "feature", "parent_id": None, "content": "Build feature", "status": "in_progress"},
+            {"id": "tests", "parent_id": "feature", "content": "Add tests", "status": "pending"},
+        ],
+        changes={},
+        dirty=False,
+        calls_made=1,
+        nudges=0,
+    )
+
+    reason = native._nudge(state, "Implemented.")
+
+    assert "unfinished items" in reason
+    assert "Add tests (pending)" in reason
+
+
+def test_pulse_code_cannot_clear_an_unfinished_outline():
+    existing = [{"id": "test", "parent_id": None, "content": "Run tests", "status": "in_progress"}]
+    state = types.SimpleNamespace(todos=existing, cli=types.SimpleNamespace(_todos=existing))
+
+    result = native._t_todo_write(state, {"todos": []})
+
+    assert "cannot clear" in result
+    assert state.todos == existing
+
+
+def test_code_change_approval_offers_always_for_the_current_session(cli, monkeypatch, tmp_path):
+    from pulse import pulse_code
+
+    cli.review = True
+    cli._review_change_with_approver = lambda *args: None
+    monkeypatch.setattr(pulse_code, "render_diff", lambda *args: "diff")
+    monkeypatch.setattr(ui, "show_change", lambda *args: None)
+    seen = []
+
+    def choose(options, **kwargs):
+        seen.extend(option.label for option in options)
+        return 1
+
+    monkeypatch.setattr(ui, "choose", choose)
+    state = types.SimpleNamespace(cli=cli, request="make a change", root=str(tmp_path))
+
+    assert native._confirm(state, "train.py", "old", "new", False)
+    assert not cli.review
+    assert any("Always apply" in label and "this session" in label for label in seen)
+
+
+@pytest.mark.parametrize(
+    "todos, expected",
+    [
+        ([{"id": "a", "parent_id": "missing", "content": "A", "status": "in_progress"}], "missing parent"),
+        ([{"id": "a", "parent_id": "a", "content": "A", "status": "in_progress"}], "own parent"),
+        ([
+            {"id": "a", "parent_id": "b", "content": "A", "status": "pending"},
+            {"id": "b", "parent_id": "a", "content": "B", "status": "pending"},
+        ], "cycle"),
+        ([
+            {"id": "a", "parent_id": None, "content": "A", "status": "in_progress"},
+            {"id": "b", "parent_id": None, "content": "B", "status": "in_progress"},
+        ], "exactly one"),
+        ([
+            {"id": "a", "parent_id": None, "content": "A", "status": "in_progress"},
+            {"id": "b", "parent_id": None, "content": "B", "status": "pending"},
+            {"id": "c", "parent_id": None, "content": "C", "status": "pending"},
+        ], "group a multi-step task"),
+    ],
+)
+def test_pulse_code_rejects_invalid_task_outline(todos, expected):
+    state = types.SimpleNamespace(todos=[], cli=types.SimpleNamespace(_todos=[]))
+
+    result = native._t_todo_write(state, {"todos": todos})
+
+    assert expected in result
+    assert state.todos == []
+    assert state.cli._todos == []
 
 
 # ---- the text pipeline ---------------------------------------------------------------------

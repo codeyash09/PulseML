@@ -666,6 +666,7 @@ class App:
         self.up = threading.Event()               # set once the screen is up and output is captured
         self._height = 30
         self._question: Optional[_Question] = None
+        self._question_lock = threading.Lock()
         self._draft = ""
         self._hushed: Dict[int, List[str]] = {}      # thread id -> what it printed while hushed
         self._live_thinking: Optional[tui.Entry] = None
@@ -794,14 +795,19 @@ class App:
                     self._hushed[ident] = outer
 
     def _ask(self, question: _Question) -> Any:
+        if threading.current_thread() is self._ui_thread:
+            raise _ui.Unavailable("a question cannot be asked from the drawing thread")
+        with self._question_lock:
+            return self._ask_one(question)
+
+    def _ask_one(self, question: _Question) -> Any:
+        """Present one question at a time: all hosted prompts share the same input field."""
         if self._edit_pending is not None:
             # a question while a change is on the table ("Apply this change?") is about that
             # change: open its diff so the person sees what they are answering
             with self.lock:
                 self._edit_pending.open = True
                 self._edit_pending.touch()
-        if threading.current_thread() is self._ui_thread:
-            raise _ui.Unavailable("a question cannot be asked from the drawing thread")
         with self.lock:
             held = self._hushed.get(threading.get_ident())
             if held:

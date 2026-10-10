@@ -2457,6 +2457,31 @@ main {
   border-top: 1px solid var(--line);
 }
 
+.run-side-experiment {
+  padding: 7px 0;
+  border-top: 1px solid var(--line);
+}
+
+.run-side-experiment > span,
+.run-side-experiment small {
+  display: block;
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 8px;
+  line-height: 1.5;
+}
+
+.run-side-experiment p {
+  margin: 4px 0;
+  color: var(--secondary);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.run-side-experiment small {
+  color: var(--tertiary);
+}
+
 .run-side-incident span {
   color: var(--red);
   font-family: var(--mono);
@@ -2569,6 +2594,7 @@ main {
   .run-side-heading,
   .run-side-rule,
   .run-side-incident,
+  .run-side-experiment,
   .run-side-quiet {
     grid-column: 1 / -1;
   }
@@ -3262,6 +3288,7 @@ main {
   .run-side-heading,
   .run-side-rule,
   .run-side-incident,
+  .run-side-experiment,
   .run-side-quiet {
     grid-column: 1 / -1;
   }

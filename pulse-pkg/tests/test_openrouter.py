@@ -233,7 +233,8 @@ def test_saved_key_is_private_and_can_be_forgotten():
     assert orr.save_key(KEY)
     path = cloud.CACHE_PATH.parent / "openrouter.json"
     assert json.loads(path.read_text())["key"] == KEY
-    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
     assert orr.saved_key() == KEY
     assert orr.forget_key() is True and orr.saved_key() is None and not path.exists()
 
@@ -274,13 +275,26 @@ def test_key_is_rejected_only_when_openrouter_says_so(monkeypatch):
 
 # ---- `pulse openrouter` -------------------------------------------------------------------
 
-def test_cli_login_saves_the_key_and_never_prints_it(monkeypatch, capsys):
+def test_cli_login_asks_before_saving_the_key_and_never_prints_it(monkeypatch, capsys):
     fake_openrouter(monkeypatch)
     monkeypatch.setattr(orr, "sign_in", lambda **k: KEY)
+    answers = iter(["y"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers))
     assert entry.main(["openrouter"]) == 0
     out = capsys.readouterr().out
     assert orr.saved_key() == KEY and KEY not in out and "Signed in to OpenRouter" in out
     assert "free models" in out
+
+
+def test_cli_login_does_not_save_when_the_user_declines(monkeypatch, capsys):
+    fake_openrouter(monkeypatch)
+    monkeypatch.setattr(orr, "sign_in", lambda **k: KEY)
+    monkeypatch.setattr("builtins.input", lambda *a: "n")
+
+    assert entry.main(["openrouter"]) == 0
+
+    assert orr.saved_key() is None
+    assert "not saved" in capsys.readouterr().out
 
 
 def test_cli_status_and_logout(monkeypatch, capsys):
@@ -342,18 +356,19 @@ def pick(monkeypatch, name=OR_MODEL):
 
 def test_setup_pasting_a_key_still_works_and_saves_nothing(cli, monkeypatch):
     pick(monkeypatch)
-    shown = scripted(monkeypatch, ["sk-or-v1-pasted"])
+    shown = scripted(monkeypatch, ["sk-or-v1-pasted", "n"])
     monkeypatch.setattr(orr, "sign_in", lambda **k: pytest.fail("a pasted key needs no sign-in"))
     assert cli._select_agent_provider_and_key(initial=True)
     assert cli.agent_provider == OR_MODEL and cli.agent_key == "sk-or-v1-pasted"
     assert os.environ[orr.ENV_KEY] == "sk-or-v1-pasted" and orr.saved_key() is None
     assert "sign in" in shown[0] and "sign up" in shown[0]
+    assert "private device key store" in shown[1]
 
 
 def test_setup_enter_signs_in_and_keeps_the_key(cli, monkeypatch, capsys):
     fake_openrouter(monkeypatch)
     pick(monkeypatch)
-    scripted(monkeypatch, [""])
+    scripted(monkeypatch, ["", "y"])
     monkeypatch.setattr(orr, "sign_in", lambda **k: KEY)
     assert cli._select_agent_provider_and_key(initial=True)
     assert cli.agent_key == KEY and os.environ[orr.ENV_KEY] == KEY and orr.saved_key() == KEY
@@ -375,7 +390,7 @@ def test_setup_a_deleted_saved_key_is_forgotten_and_asked_again(cli, monkeypatch
     orr.save_key(KEY)
     monkeypatch.setattr(orr, "key_is_rejected", lambda key: True)
     pick(monkeypatch)
-    scripted(monkeypatch, ["y", "sk-or-v1-new"])
+    scripted(monkeypatch, ["y", "sk-or-v1-new", "n"])
     assert cli._select_agent_provider_and_key(initial=True)
     assert cli.agent_key == "sk-or-v1-new" and orr.saved_key() is None
 
@@ -384,7 +399,7 @@ def test_setup_an_environment_key_is_offered_first(cli, monkeypatch):
     monkeypatch.setenv(orr.ENV_KEY, "sk-or-v1-from-env")
     orr.save_key(KEY)
     pick(monkeypatch)
-    shown = scripted(monkeypatch, ["y"])
+    shown = scripted(monkeypatch, ["y", "n"])
     assert cli._select_agent_provider_and_key(initial=True)
     assert cli.agent_key == "sk-or-v1-from-env" and "already set" in shown[0]
 
@@ -407,10 +422,10 @@ def test_other_providers_are_asked_for_a_key_as_before(cli, monkeypatch):
                  if info.get("env_key") and info["env_key"] != orr.ENV_KEY and not info.get("local"))
     monkeypatch.delenv(pc.PROVIDERS[other]["env_key"], raising=False)
     pick(monkeypatch, other)
-    shown = scripted(monkeypatch, ["some-key"])
+    shown = scripted(monkeypatch, ["some-key", "n"])
     monkeypatch.setattr(orr, "sign_in", lambda **k: pytest.fail("not an OpenRouter model"))
     assert cli._select_agent_provider_and_key(initial=True)
-    assert cli.agent_key == "some-key" and shown == [pc._KEY_PROMPT]
+    assert cli.agent_key == "some-key" and shown[0] == pc._KEY_PROMPT
     assert "OpenRouter" in pc._KEY_PROMPT and "Enter" in pc._KEY_PROMPT
 
 
@@ -431,7 +446,7 @@ def test_no_key_for_another_provider_offers_openrouter_instead(cli, monkeypatch)
     fake_openrouter(monkeypatch)
     pick(monkeypatch, other_provider(monkeypatch))
     # no key -> yes, sign in with OpenRouter -> first model -> Enter = sign in
-    shown = scripted(monkeypatch, ["", "y", "", ""])
+    shown = scripted(monkeypatch, ["", "y", "", "", "y"])
     monkeypatch.setattr(orr, "sign_in", lambda **k: KEY)
     assert cli._select_agent_provider_and_key(initial=True)
     assert cli.agent_provider == openrouter_names()[0] and cli.agent_key == KEY
@@ -451,7 +466,7 @@ def test_the_offer_can_pick_any_openrouter_model_and_take_a_pasted_key(cli, monk
     pick(monkeypatch, other_provider(monkeypatch))
     names = openrouter_names()
     any_model = str(1 + next(i for i, n in enumerate(names) if pc.PROVIDERS[n].get("openrouter")))
-    scripted(monkeypatch, ["", "y", any_model, "qwen/qwen-9", "sk-or-v1-pasted"])
+    scripted(monkeypatch, ["", "y", any_model, "qwen/qwen-9", "sk-or-v1-pasted", "n"])
     assert cli._select_agent_provider_and_key(initial=True)
     assert cli.agent_provider == "OpenRouter: qwen/qwen-9" and cli.agent_key == "sk-or-v1-pasted"
     assert orr.saved_key() is None
@@ -461,7 +476,7 @@ def test_an_openrouter_model_typed_as_a_custom_model_gets_the_sign_in(cli, monke
     fake_openrouter(monkeypatch)
     custom = next(n for n, info in pc.PROVIDERS.items() if info.get("custom"))
     pick(monkeypatch, custom)
-    shown = scripted(monkeypatch, ["openrouter/qwen/qwen-9", ""])
+    shown = scripted(monkeypatch, ["openrouter/qwen/qwen-9", "", "n"])
     monkeypatch.setattr(orr, "sign_in", lambda **k: KEY)
     assert cli._select_agent_provider_and_key(initial=True)
     assert cli.agent_provider == "OpenRouter: qwen/qwen-9" and cli.agent_key == KEY
@@ -485,15 +500,16 @@ def test_console_offers_the_sign_in_for_an_openrouter_model_without_a_key(monkey
     fake_openrouter(monkeypatch)
     monkeypatch.setattr(orr, "sign_in", lambda **k: KEY)
     said, asked = [], []
+    answers = iter(("", "y"))
 
     def ask(prompt):
         asked.append(prompt)
-        return ""                                         # Enter = yes
+        return next(answers)
 
     assert orr.offer_sign_in_for("anthropic/claude-sonnet-5", ask=ask, say=said.append) is None
     assert asked == []
     assert orr.offer_sign_in_for("openrouter/qwen/qwen-9", ask=ask, say=said.append) == KEY
-    assert orr.saved_key() == KEY and len(asked) == 1 and KEY not in "\n".join(said)
+    assert orr.saved_key() == KEY and len(asked) == 2 and KEY not in "\n".join(said)
     assert orr.offer_sign_in_for("openrouter/qwen/qwen-9", ask=lambda p: pytest.fail("has a key")) == KEY
 
 
@@ -574,6 +590,10 @@ def test_dashboard_picks_up_the_saved_sign_in(panel):
 
 def test_dashboard_sign_in_keeps_the_key_and_says_so(panel, monkeypatch):
     name = dashboard_openrouter_provider()
+    prompts = []
+    monkeypatch.setattr(core, "messagebox", types.SimpleNamespace(
+        askyesno=lambda *a, **k: prompts.append((a, k)) or True,
+    ), raising=False)
 
     def sign_in(ask=None, say=print, browser=None, **k):
         assert ask is None and browser is True
@@ -583,8 +603,23 @@ def test_dashboard_sign_in_keeps_the_key_and_says_so(panel, monkeypatch):
     monkeypatch.setattr(orr, "sign_in", sign_in)
     panel._openrouter_sign_in(name).join(10)
     assert panel.session_keys[name] == KEY and os.environ[orr.ENV_KEY] == KEY and orr.saved_key() == KEY
+    assert prompts and prompts[0][0][0] == "Save API key?" and prompts[0][1]["default"] == "no"
     text = "\n".join(panel.appended)
     assert "https://openrouter.ai/auth" in text and "Signed in to OpenRouter" in text and KEY not in text
+
+
+def test_dashboard_sign_in_keeps_key_only_for_session_without_consent(panel, monkeypatch):
+    name = dashboard_openrouter_provider()
+    monkeypatch.setattr(core, "messagebox", types.SimpleNamespace(
+        askyesno=lambda *a, **k: False,
+    ), raising=False)
+    monkeypatch.setattr(orr, "sign_in", lambda **k: KEY)
+
+    panel._openrouter_sign_in(name).join(10)
+
+    assert panel.session_keys[name] == KEY and os.environ[orr.ENV_KEY] == KEY
+    assert orr.saved_key() is None
+    assert "not saved" in "\n".join(panel.appended)
 
 
 def test_dashboard_sign_in_failure_is_shown(panel, monkeypatch):

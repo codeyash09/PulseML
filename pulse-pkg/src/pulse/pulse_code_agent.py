@@ -89,7 +89,7 @@ SYSTEM_PROMPT = """You are Pulse Code, an autonomous coding agent working in the
 # How you work
 - Work autonomously. Do not stop to ask permission or to announce a plan and wait. If the request is clear enough to act on, act. Ask a question only when you are genuinely blocked on something only the user can decide, and say exactly what.
 - Keep going until the whole request is implemented AND checked. One edit is rarely the end: wire the pieces together, update callers, then run the project's tests / linter / the code itself and fix what the output shows. Never claim something works unless you ran it and saw it work; report real exit codes and output.
-- For anything with more than ~2 steps, keep a todo list with todo_write and update it as you go. Do not finish with unfinished todos.
+- For anything with more than ~2 steps, use todo_write to create a hierarchical outline before coding: top-level phases with concrete child subtasks. Keep the outline current as you work, with exactly one unfinished leaf subtask in_progress. Complete each subtask only after its work/check is done; do not finish until the full outline is completed.
 - Read before you write. Never guess at signatures, imports, names or file layout.
 - Make the change the request needs, matching the surrounding style. Don't reformat, rename or "improve" unrelated code. If you notice a separate bug, mention it in your final answer instead of fixing it.
 - Prefer small, targeted edits (edit_file) or replace_symbol for rewriting a whole function/class. Use write_file for new files. Make independent tool calls in the same turn when you can.
@@ -247,11 +247,15 @@ TOOLS = [
         "other tool calls.",
         {"message": _S}, ["message"]),
     _fn("todo_write",
-        "Replace your todo list. Each item: {content, status} with status pending | in_progress | completed. "
-        "Keep exactly one item in_progress.",
+        "Replace your task outline. Each item is {id, parent_id, content, status}; parent_id is null for a "
+        "top-level phase or the id of its parent phase/subtask. Use parent phases to group concrete subtasks. "
+        "Statuses are pending | in_progress | completed. Parent statuses are derived from their children; "
+        "keep exactly one unfinished leaf subtask in_progress, and complete a parent only by completing all "
+        "its children.",
         {"todos": {"type": "array", "items": {"type": "object", "properties": {
-            "content": _S, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}},
-            "required": ["content", "status"]}}}, ["todos"]),
+            "id": _S, "parent_id": {"type": ["string", "null"]}, "content": _S,
+            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}},
+            "required": ["id", "content", "status"]}}}, ["todos"]),
 ]
 
 # ---------------------------------------------------------------------------------------
@@ -487,11 +491,26 @@ def _confirm(state, path, before, after, created):
     if reviewed is not None:
         return reviewed
     try:
-        answer = _prompt_text("Apply this change? (Y/n/a=apply all from now on) > ",
-                              label="Apply this change?  (Y/n/a=always)").strip().lower()
-    except EOFError:
-        cprint("[Pulse Code] No terminal to confirm on -- not applied (use -y to apply without asking).",
-               color=_YELLOW)
+        options = [
+            _ui.Option("Apply this change", key="y"),
+            _ui.Option("Always apply code changes this session", key="a"),
+            _ui.Option("Reject this change", key="n"),
+        ]
+        choice = _ui.choose(options, title="Apply this change?", hotkeys={"a": "always"})
+        if choice == "always" or choice == 1:
+            cli.review = False
+            cprint("[Pulse Code] Review is now OFF for this session (/review on to re-enable).", color=_YELLOW)
+            return True
+        if isinstance(choice, int):
+            return choice == 0
+        return False
+    except _ui.Unavailable:
+        pass
+    try:
+        answer = _prompt_text("Apply this change? (Y/n/a=always this session) > ",
+                              label="Apply this change?  (Y/n/a=always this session)").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        cprint("[Pulse Code] No approval received -- change not applied.", color=_YELLOW)
         return False
     if answer in ("a", "all", "always"):
         cli.review = False
@@ -961,15 +980,106 @@ _STATUS_MARK = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]"}
 def _t_todo_write(state, a):
     todos = a.get("todos")
     if not isinstance(todos, list):
-        return "todos must be a list of {content, status}."
-    clean = []
-    for t in todos:
-        if isinstance(t, dict) and isinstance(t.get("content"), str):
-            status = t.get("status") if t.get("status") in _STATUS_MARK else "pending"
-            clean.append({"content": t["content"], "status": status})
+        return "todos must be an outline of {id, parent_id, content, status} items."
+    if not todos:
+        if any(todo["status"] != "completed" for todo in state.todos):
+            return "cannot clear an unfinished task outline; finish it or replace it with the remaining work."
+        state.todos = []
+        state.cli._todos = []
+        return "Task outline cleared."
+    if len(todos) > _LIST_MAX:
+        return f"task outline is too large ({len(todos)} items); keep it to {_LIST_MAX} focused items."
+    clean, by_id = [], {}
+    for index, item in enumerate(todos, 1):
+        if not isinstance(item, dict):
+            return f"todo item {index} must be an object."
+        task_id = item.get("id")
+        content = item.get("content")
+        status = item.get("status")
+        parent_id = item.get("parent_id")
+        if not isinstance(task_id, str) or not task_id.strip():
+            return f"todo item {index} needs a non-empty id."
+        task_id = task_id.strip()
+        if task_id in by_id:
+            return f"todo id {task_id!r} is duplicated."
+        if not isinstance(content, str) or not content.strip():
+            return f"todo {task_id!r} needs non-empty content."
+        if not isinstance(status, str) or status not in _STATUS_MARK:
+            return f"todo {task_id!r} status must be pending, in_progress, or completed."
+        if parent_id is not None and (not isinstance(parent_id, str) or not parent_id.strip()):
+            return f"todo {task_id!r} parent_id must be null or a non-empty todo id."
+        task = {
+            "id": task_id, "parent_id": parent_id.strip() if isinstance(parent_id, str) else None,
+            "content": content.strip(), "status": status,
+        }
+        clean.append(task)
+        by_id[task_id] = task
+
+    children = {task_id: [] for task_id in by_id}
+    roots = []
+    for task in clean:
+        parent_id = task["parent_id"]
+        if parent_id is None:
+            roots.append(task["id"])
+            continue
+        if parent_id not in by_id:
+            return f"todo {task['id']!r} refers to missing parent {parent_id!r}."
+        if parent_id == task["id"]:
+            return f"todo {task['id']!r} cannot be its own parent."
+        children[parent_id].append(task["id"])
+
+    visiting, visited = set(), set()
+
+    def derive_status(task_id):
+        if task_id in visiting:
+            raise ValueError(f"todo outline contains a parent cycle at {task_id!r}.")
+        if task_id in visited:
+            return by_id[task_id]["status"]
+        visiting.add(task_id)
+        descendants = children[task_id]
+        if descendants:
+            statuses = [derive_status(child_id) for child_id in descendants]
+            status = ("completed" if all(value == "completed" for value in statuses)
+                      else "in_progress" if any(value == "in_progress" for value in statuses)
+                      else "pending")
+            by_id[task_id]["status"] = status
+        else:
+            status = by_id[task_id]["status"]
+        visiting.remove(task_id)
+        visited.add(task_id)
+        return status
+
+    try:
+        for root_id in roots:
+            derive_status(root_id)
+    except ValueError as exc:
+        return str(exc)
+    if len(visited) != len(clean):
+        return "todo outline contains a cycle or a disconnected parent chain."
+    if len(clean) >= 3 and not any(children.values()):
+        return "group a multi-step task into top-level phases with concrete child subtasks."
+    active_leaves = [task for task in clean
+                     if not children[task["id"]] and task["status"] == "in_progress"]
+    unfinished_leaves = [task for task in clean
+                         if not children[task["id"]] and task["status"] != "completed"]
+    if len(active_leaves) > 1:
+        return "keep exactly one unfinished leaf subtask in_progress."
+    if unfinished_leaves and not active_leaves:
+        return "mark exactly one unfinished leaf subtask in_progress before continuing."
+
+    def render(task_id, depth=0):
+        task = by_id[task_id]
+        lines = [f"{'  ' * depth}{_STATUS_MARK[task['status']]} {task['content']}"]
+        for child_id in children[task_id]:
+            lines.extend(render(child_id, depth + 1))
+        return lines
+
+    clean = [by_id[task["id"]] for task in clean]
     state.todos = clean
     state.cli._todos = clean
-    return "Todo list updated:\n" + "\n".join(f"{_STATUS_MARK[t['status']]} {t['content']}" for t in clean)
+    return "Task outline updated:\n" + "\n".join(
+        line for root_id in roots for line in render(root_id)
+    )
 
 
 def _run_action(name, **args):
@@ -1333,9 +1443,23 @@ def _nudge(state, reply_text=""):
                 "reply was your complete answer, repeat it on its own.")
     open_items = [t for t in state.todos if t["status"] != "completed"]
     if open_items:
+        depth = {}
+        by_id = {todo["id"]: todo for todo in state.todos}
+
+        def task_depth(task_id):
+            if task_id not in depth:
+                parent_id = by_id[task_id].get("parent_id")
+                depth[task_id] = task_depth(parent_id) + 1 if parent_id else 0
+            return depth[task_id]
+
+        for todo in state.todos:
+            task_depth(todo["id"])
         return ("You stopped, but your todo list still has unfinished items:\n"
-                + "\n".join(f"- {t['content']} ({t['status']})" for t in open_items)
-                + "\nContinue with them, or update the list if they are no longer needed.")
+                + "\n".join(
+                    f"{'  ' * depth[t['id']]}- {t['content']} ({t['status']})"
+                    for t in open_items
+                )
+                + "\nContinue with the unfinished subtasks, or update the outline if a task is no longer needed.")
     if state.dirty:
         if state.smoke_ok is False:
             return ("Your last smoke_test failed and you have not fixed it. Read what it reported. If your change "

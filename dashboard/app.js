@@ -100,6 +100,7 @@ const HOME_COMMANDS = [
 ];
 
 const DEBUG_COMMANDS = [
+  ["/experiment", "run isolated proxy experiments: /experiment experiments/spec.json"],
   ["/findings", "what the detectors currently believe, worst first"],
   ["/curve", "one value's history: /curve val_loss"],
   ["/vars", "every value being tracked"],
@@ -3883,8 +3884,12 @@ function renderRunWorkspace(session) {
     : fmtDuration(session.uptime_seconds || 0);
   const findings = Array.isArray(latest.findings) ? latest.findings : [];
   const tensors = Object.entries(latest.tensors || {}).slice(0, 5);
+  const experiments = (session.incidents || [])
+    .filter(incident => incident.kind === "experiment" && incident.experiment)
+    .slice(-3)
+    .reverse();
   const hasRunStats = Number(step) > 0 || metricKeys.size > 0 || findings.length > 0 ||
-    tensors.length > 0 || Number(session.uptime_seconds || 0) > 0;
+    tensors.length > 0 || experiments.length > 0 || Number(session.uptime_seconds || 0) > 0;
   const canSend = Boolean(currentUser && (
     currentUser.id === session.user_id ||
     (currentTeam?.admin_ids || []).includes(currentUser.id)
@@ -3993,6 +3998,27 @@ function renderRunWorkspace(session) {
           <p>${escapeHtml(finding.message || "")}</p>
         </div>
       `).join("") : `<span class="run-side-quiet">${latest.step ? "Nothing the checks can see" : "Waiting for the first steps"}</span>`}
+      ${experiments.length ? `
+        <div class="run-side-rule"></div>
+        <div class="run-side-heading">PROXY EXPERIMENTS <b>${experiments.length}</b></div>
+        ${experiments.map(incident => {
+          const result = incident.experiment;
+          const reproduction = result.reproduction || {};
+          const confidence = Number(reproduction.confidence || 0);
+          const branches = (result.branches || []).filter(branch => branch.name !== "control");
+          return `
+            <div class="run-side-experiment">
+              <span>${escapeHtml(String(result.status || "unknown").toUpperCase())} · ${escapeHtml(result.id || "")}</span>
+              <p>${escapeHtml(result.conclusion || incident.summary || "")}</p>
+              <small>Reproduction: ${escapeHtml(reproduction.passed ? "passed" : "not established")} · ${escapeHtml(`${Math.round(confidence * 100)}% confidence`)}</small>
+              ${branches.slice(0, 3).map(branch => `
+                <small>${escapeHtml(branch.name)}: ${escapeHtml(`${Math.round(Number(branch.success_rate || 0) * 100)}% healthy`)} · ${escapeHtml(branch.hypothesis || "")}</small>
+                <small>Mean objective: ${escapeHtml(metricValue(branch.mean_metric))} · ${escapeHtml(`${Number(branch.resource_seconds || 0).toFixed(1)}s compute`)}${branch.validated ? " · source-scale validated" : ""}</small>
+              `).join("")}
+            </div>
+          `;
+        }).join("")}
+      ` : ""}
       ${tensors.length ? `
         <div class="run-side-rule"></div>
         <div class="run-side-heading">TENSORS</div>

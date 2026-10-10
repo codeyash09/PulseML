@@ -72,9 +72,10 @@ Your browser opens on OpenRouter; sign in or sign up, click Authorize, and Pulse
 an API key made for it. Over SSH or in a container there is no browser to open, so Pulse
 prints a link to open on any device and asks you to paste the code OpenRouter shows.
 
-- The key from a sign-in is saved on your machine (`~/.pulse/openrouter.json`, readable
-  only by you), so you stay signed in. `pulse openrouter logout` removes it;
-  `pulse openrouter status` shows what it has used.
+- After sign-in, Pulse asks whether to save the key in its private device key store
+  (`~/.pulse/openrouter.json`) so you stay signed in. Choose no to use it only for this
+  session. `pulse config remember_keys off` disables saving and removes saved keys;
+  `pulse openrouter logout` removes the OpenRouter key.
 - A new account can use the free models straight away. Paid models need credits, bought
   on openrouter.ai.
 - Unattended runs use the saved sign-in when you ask for an OpenRouter model
@@ -442,6 +443,20 @@ Here is why it caused the failure.
 Here is the smallest necessary fix."
 ```
 
+### Parallel Proxy Experiments
+
+Pulse can run competing interventions against progressively larger proxy models in
+isolated project copies. Candidate branches are held behind a mandatory baseline gate:
+the unmodified proxy must repeatedly reproduce an evidenced failure signal before Pulse
+tests or ranks any fix. Failed reproduction is reported as inconclusive. Candidate runs
+include an unchanged control, repeated metrics, resource time, and optional source-scale
+validation; no experiment automatically changes the watched training process or project.
+
+Configure a runner and its measurable failure signature, then use `/experiment
+experiments/spec.json`. The framework-neutral runner consumes JSON model configs and
+`PULSE_METRICS:` JSON output; details, limitations, and a complete example are in
+[the parallel experiments guide](../docs/parallel-experiments.md).
+
 ### Minimal Fixes by Default
 
 Pulse's debugging pipeline is designed to prefer the **smallest correct change**.
@@ -513,6 +528,15 @@ pulse.check_shape(logits, "(B, 10)")
 pulse.check_shapes({"x": (x, "(B, 784)"), "y": (y, "(B,)")})   # one B for both
 pulse.check_shape(x, "(B, 3, 224, 224)", raise_on_mismatch=True)
 ```
+
+### Multi-step task outlines
+
+For requests with several steps, Pulse Code keeps a hierarchical task outline while it works:
+top-level phases contain concrete subtasks, parent status follows the state of its children,
+and only one unfinished leaf subtask can be active at a time. Pulse Code is prompted to make
+the outline before editing, update it as work progresses, and finish all remaining subtasks
+before giving its final answer. This helps larger changes continue beyond their first
+implementation step.
 
 ### Auto mode: no stopping to ask
 

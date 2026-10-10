@@ -35,7 +35,8 @@ def test_defaults_set_and_unset(home):
 def test_a_key_is_kept_owner_only_and_never_beats_the_environment(home, monkeypatch):
     assert settings.save_key("DEEPSEEK_API_KEY", "sk-saved")
     mode = stat.S_IMODE(os.stat(home / "keys.json").st_mode)
-    assert mode == 0o600
+    if os.name != "nt":
+        assert mode == 0o600
     assert "sk-saved" not in (home / "settings.json").read_text() if (home / "settings.json").exists() else True
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-from-env")
     settings.load_keys_into_environment()

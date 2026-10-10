@@ -14,9 +14,9 @@ models, and lets an app ask for a key on the user's behalf (OAuth with PKCE):
     4. Pulse trades code + verifier for an API key. The code alone is useless to anyone
        else: only this process knows the verifier.
 
-The key from a sign-in is saved (owner-only file, next to Pulse's own credentials) so the
-person stays signed in; `pulse openrouter logout` removes it. A key that is *pasted* is
-never written to disk -- that promise is unchanged.
+After sign-in, Pulse asks whether to save the key in its owner-only device key store;
+`pulse openrouter logout` removes the saved key. A key that is *pasted* is never written
+to disk without the user's consent.
 
 Nothing here talks to a model. The only requests are the code exchange and, for
 `pulse openrouter status`, a read of the key's own usage.
@@ -342,6 +342,12 @@ def _register(key: str) -> None:
 def save_key(key: str) -> bool:
     """Keep a signed-in key for next time, readable by the owner only."""
     try:
+        from . import pulse_settings
+        if not pulse_settings.on("remember_keys"):
+            return False
+    except ImportError:
+        pass
+    try:
         from . import pulse_supabase as cloud
         path = _store_path()
         cloud._ensure_private_dir(path.parent)
@@ -412,12 +418,15 @@ def offer_sign_in_for(model: Optional[str], *, ask: Optional[Callable[[str], str
     except SignInError as error:
         say(f"OpenRouter sign-in did not finish: {error}")
         return None
-    kept = save_key(key)
+    try:
+        keep = ask("Save this API key in Pulse's private device key store so you stay signed in? (y/N)").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        keep = ""
+    kept = save_key(key) if keep in ("y", "yes") else False
     say(f"Signed in to OpenRouter (key {tail(key)})"
         + (" -- saved on this machine; `pulse openrouter logout` removes it." if kept
-           else " -- for this session only (it could not be saved)."))
-    if not kept:
-        os.environ[ENV_KEY] = key
+           else " -- not saved; it is available for this session only."))
+    os.environ[ENV_KEY] = key
     return key
 
 
@@ -486,6 +495,18 @@ def main(argv: List[str]) -> int:
     except KeyboardInterrupt:
         print("\nCancelled.")
         return 130
+    try:
+        keep = input("Save this API key in Pulse's private device key store so you stay signed in? (y/N) > ").strip().lower()
+    except EOFError:
+        print("\nNot saved.")
+        return 1
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        return 130
+    if keep not in ("y", "yes"):
+        print(f"Signed in to OpenRouter, but the key was not saved. Key {tail(key)} is available only for this session.")
+        print(f"Save it later by running `pulse openrouter` again or use `pulse config remember_keys on`.")
+        return 0
     if not save_key(key):
         print(f"Signed in, but the key could not be saved under {_store_path().parent} "
               "(is that folder writable?).")

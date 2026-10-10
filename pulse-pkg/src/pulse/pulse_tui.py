@@ -753,7 +753,9 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
         field, cursor_col = _field(s("Search ", "dim") + s(g("cursor") + " ", "accent"), view.editor.text,
                                    view.editor.pos, right_w, False)
         block.append(field)
-        footer = f"{g('up')}{g('down')} move · Enter select · type to filter · Esc cancel"
+        footer = (f"{g('up')}{g('down')} · Enter · type to filter · Esc"
+                  if right_w < 56 else
+                  f"{g('up')}{g('down')} move · Enter select · type to filter · Esc cancel")
     else:
         if view.question:
             block.extend(s(piece, "bold") for piece in wrap(view.question, right_w)[:3])
@@ -765,10 +767,16 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
         if view.question:
             footer = "Enter answer · Esc cancel"
         elif view.busy:
-            footer = "working · Ctrl+C cancel · drag to copy · click or Ctrl+O to expand · wheel scrolls"
+            footer = "Working · Ctrl+C cancel · Ctrl+O details"
+            if right_w >= 72:
+                footer += " · scroll · drag to copy"
         else:
-            footer = "Enter send · / commands · drag to copy · click or Ctrl+O to expand · wheel scrolls" + (
-                " · Esc back to the agent" if view.side is not None else "")
+            footer = ("Enter · / commands · Ctrl+O" if right_w < 56 else
+                      "Enter send · / commands · Ctrl+O details")
+            if right_w >= 72:
+                footer += " · scroll · drag to copy"
+            if view.side is not None and right_w >= 72:
+                footer += " · Esc back"
     if view.status:
         footer = view.status
     if view.scroll:

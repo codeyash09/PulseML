@@ -116,11 +116,12 @@ def unset(name: str) -> bool:
 
 def reset() -> None:
     """Forget every setting and every saved key: the next start asks again."""
-    for file in (path(), keys_path()):
+    for file in (path(),):
         try:
             file.unlink()
         except OSError:
             pass
+    forget_keys()
 
 
 def check(name: str, value: str) -> Optional[str]:
@@ -155,6 +156,11 @@ def forget_keys() -> None:
         keys_path().unlink()
     except OSError:
         pass
+    try:
+        from . import pulse_openrouter
+        pulse_openrouter.forget_key()
+    except ImportError:
+        pass
 
 
 def load_keys_into_environment() -> List[str]:
@@ -170,7 +176,7 @@ def load_keys_into_environment() -> List[str]:
 
 # ---------------------------------------------------------------------------------- the agent
 
-def remember_agent(cli: Any) -> None:
+def remember_agent(cli: Any, *, remember_key: bool = True) -> None:
     """What the agent is now, so the next start uses it without asking (and its key, if keys
     are remembered). Called after the person picked one."""
     from .pulse_cli import PROVIDERS
@@ -188,7 +194,8 @@ def remember_agent(cli: Any) -> None:
         if info.get("env_key"):
             record["env_key"] = info["env_key"]
     set("agent", record)
-    save_key(info.get("env_key"), getattr(cli, "agent_key", None))
+    if remember_key:
+        save_key(info.get("env_key"), getattr(cli, "agent_key", None))
 
 
 def describe_agent(record: Any) -> str:

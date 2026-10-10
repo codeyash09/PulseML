@@ -4430,9 +4430,25 @@ def _chat_panel_class():
                          "If your browser did not open, use this link:\n" + line.strip())
 
             def finish(key):
-                self.session_keys[provider_name] = key
-                os.environ["OPENROUTER_API_KEY"] = key
-                self._update_status_indicator()
+                try:
+                    keep = messagebox.askyesno(
+                        "Save API key?",
+                        "Save this API key in Pulse's private device key store so you stay signed in?",
+                        parent=self, default="no",
+                    )
+                    kept = pulse_openrouter.save_key(key) if keep else False
+                    self.session_keys[provider_name] = key
+                    os.environ["OPENROUTER_API_KEY"] = key
+                    self._update_status_indicator()
+                    self._append(
+                        "Pulse",
+                        "Signed in to OpenRouter"
+                        + (" -- the key is saved on this machine, so you stay signed in"
+                           if kept else " -- the key was not saved; it is available for this session")
+                        + ". Send your message again.",
+                    )
+                finally:
+                    self._openrouter_signing_in = False
 
             def work():
                 try:
@@ -4440,15 +4456,9 @@ def _chat_panel_class():
                 except pulse_openrouter.SignInError as exc:
                     tell(f"OpenRouter sign-in did not finish: {exc}. Send your message again to "
                          "retry, or paste an API key instead.")
-                    return
-                finally:
                     self._openrouter_signing_in = False
-                kept = pulse_openrouter.save_key(key)
+                    return
                 self.after(0, lambda: finish(key))
-                tell("Signed in to OpenRouter"
-                     + (" -- the key is saved on this machine, so you stay signed in"
-                        if kept else " for this session")
-                     + ". Send your message again.")
 
             worker = threading.Thread(target=work, daemon=True, name="pulse-openrouter-sign-in")
             worker.start()
@@ -4562,7 +4572,7 @@ def _chat_panel_class():
                     choice = messagebox.askyesnocancel(
                         "OpenRouter",
                         "Sign in to OpenRouter -- or create an account -- in your browser?\n\n"
-                        "Yes: open the browser. Pulse keeps the key, so you stay signed in.\n"
+                        "Yes: open the browser. Afterward, Pulse asks whether to save the key.\n"
                         "No: paste an API key instead.",
                         parent=self)
                     if choice is None:

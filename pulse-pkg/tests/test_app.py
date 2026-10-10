@@ -190,6 +190,13 @@ def test_a_frame_fills_the_terminal_but_its_last_row(width, height):
     assert plain(frame[row]).rstrip().endswith("❯")              # the cursor sits on the input line
 
 
+def test_compact_layout_uses_short_unclipped_footer_hints():
+    view = demo_view()
+    frame = [plain(line) for line in tui.compose(view, 40, 12)[0]]
+    footer = next(line for line in frame if "Enter · / commands" in line)
+    assert "Ctrl+O" in footer and "click or Ctrl+O to expand" not in footer
+
+
 def test_the_screen_splits_only_when_a_run_is_open_and_there_is_room():
     view = demo_view()
     home = [plain(line) for line in tui.compose(view, 100, 22)[0]]
@@ -449,6 +456,24 @@ def test_the_ui_primitives_go_through_the_host(app):
         assert app.view.live == ""
     finally:
         app.uninstall()
+
+
+def test_concurrent_questions_are_serialized_in_the_shared_input_field(app):
+    first, first_box = on_thread(lambda: app.ask("First permission?"))
+    assert wait_for(lambda: app.view.question == "First permission?")
+    second, second_box = on_thread(lambda: app.ask("Second permission?"))
+    time.sleep(0.05)
+    assert app.view.question == "First permission?"
+
+    press(app, "first answer", "enter")
+    assert wait_for(lambda: app.view.question == "Second permission?")
+    press(app, "second answer", "enter")
+    first.join(5)
+    second.join(5)
+
+    assert first_box["value"] == "first answer"
+    assert second_box["value"] == "second answer"
+    assert not first.is_alive() and not second.is_alive()
 
 
 def test_tool_progress_is_held_back_unless_a_question_needs_it(app):
@@ -892,6 +917,8 @@ def test_the_app_needs_a_real_terminal_and_can_be_switched_off(monkeypatch):
     assert appmod.usable() is False                              # pytest: no terminal
     monkeypatch.setattr(ui, "enabled", lambda: True)
     monkeypatch.setattr(os, "get_terminal_size", lambda fd: os.terminal_size((120, 40)))
+    if os.name == "nt":
+        monkeypatch.setattr(tui, "windows_console_ready", lambda: True)
     assert appmod.usable() is True
     monkeypatch.setenv("PULSE_CLASSIC", "1")
     assert appmod.usable() is False

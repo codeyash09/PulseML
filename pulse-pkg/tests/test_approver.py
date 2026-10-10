@@ -108,6 +108,11 @@ def cli_with_approver(monkeypatch, tmp_path, answer):
     monkeypatch.setattr(pc, "_prompt_text", lambda *a, **k: asked.append(1) or "n")
     monkeypatch.setattr(pc, "_flush_stdin", lambda: None)
 
+    def unavailable(*args, **kwargs):
+        raise pc._ui.Unavailable()
+
+    monkeypatch.setattr(pc._ui, "choose", unavailable)
+
     class Executor:
         default_cwd = str(tmp_path)
     cli._get_terminal_executor = lambda: Executor()
@@ -139,6 +144,24 @@ def test_without_auto_mode_the_person_is_asked(monkeypatch, tmp_path):
     monkeypatch.delenv(ap.APPROVER_ENV)
     cli._confirm_terminal_command("rm x", {"deletes_files": True})
     assert asked == [1] and seen == []
+
+
+def test_terminal_approval_always_is_scoped_to_the_cli_session(monkeypatch, tmp_path):
+    cli, _seen, _asked = cli_with_approver(monkeypatch, tmp_path, "unused")
+    monkeypatch.delenv(ap.APPROVER_ENV)
+    offered = []
+
+    def choose(options, **kwargs):
+        offered.extend(option.label for option in options)
+        return 2
+
+    monkeypatch.setattr(pc._ui, "choose", choose)
+    assert cli._confirm_terminal_command("rm x", {"deletes_files": True}) is True
+    assert cli._always_allow_terminal_commands is True
+    assert any("Always allow" in label and "this session" in label for label in offered)
+
+    monkeypatch.setattr(pc._ui, "choose", lambda *args, **kwargs: pytest.fail("asked again"))
+    assert cli._confirm_terminal_command("rm y", {"deletes_files": True}) is True
 
 
 def test_config_file_turns_auto_mode_on(monkeypatch, tmp_path):
