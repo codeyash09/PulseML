@@ -375,12 +375,15 @@ def test_the_live_feed_streams_what_the_agent_is_doing(tmp_path, monkeypatch):
         app._job_from = len(app.view.entries)
         app.view.entries.append(appmod.tui.Entry("thinking", "The loss went NaN at step 40, so", live=True))
         app.view.entries.append(appmod.tui.Entry("tool", "", calls=["READ train.py"]))
+        app.view.entries.append(appmod.tui.Entry("trace", "\033[36mweight\033[0m <- train.py:40"))
     feed.tick()
     state = rows.updates[-1][1]
     assert state["busy"] is True and state["t"]
     assert [(a["kind"], a["text"]) for a in state["activity"]] == [
-        ("thinking", "The loss went NaN at step 40, so"), ("tool", "READ train.py")]
+        ("thinking", "The loss went NaN at step 40, so"), ("tool", "READ train.py"),
+        ("trace", "weight <- train.py:40")]
     assert state["activity"][0].get("live") == "1"
+    assert state["activity"][2]["ansi"] == "\033[36mweight\033[0m <- train.py:40"
     feed.close()
     assert rows.finished == [("live1", "completed")]
 

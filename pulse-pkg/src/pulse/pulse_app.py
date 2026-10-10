@@ -870,8 +870,12 @@ class App:
                 for entry in view.entries[self._job_from:]:
                     words = self._entry_words(entry)
                     if words:
-                        activity.append({"kind": entry.kind, "text": words,
-                                         **({"live": "1"} if getattr(entry, "live", False) else {})})
+                        item = {"kind": entry.kind, "text": words}
+                        if entry.kind == "trace":
+                            item["ansi"] = tui.clean(entry.text)[:1500]
+                        if getattr(entry, "live", False):
+                            item["live"] = "1"
+                        activity.append(item)
                 partial = tui._SGR_RE.sub("", view.partial or "").strip()
                 if partial:
                     activity.append({"kind": "text", "text": partial[-800:], "live": "1"})

@@ -7504,3 +7504,262 @@ body.dashboard-active .run-menu-toggle {
     padding: 0 9px;
   }
 }
+
+/* The sign-in screen shares the dashboard's full-page light workspace. */
+body.login-active {
+  min-height: 100dvh;
+  overflow-x: hidden;
+  background: #fff;
+  color: #202124;
+}
+
+body.login-active .topbar {
+  display: none;
+}
+
+body.login-active main,
+body.login-active #view-login {
+  height: calc(100dvh - 44px);
+  min-height: 0;
+}
+
+body.login-active #view-login {
+  width: 100%;
+  padding: 0;
+}
+
+body.login-active .login-page {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  padding: 32px 24px 56px;
+  justify-content: center;
+  overflow-x: hidden;
+  background: #fff;
+}
+
+body.login-active .login-glow,
+body.login-active .login-footer {
+  display: none;
+}
+
+body.login-active .login-content {
+  width: min(660px, 100%);
+  margin: auto;
+}
+
+body.login-active .login-eyebrow {
+  margin-bottom: 16px;
+  color: #77787c;
+}
+
+body.login-active .login-eyebrow .status-indicator {
+  background: #ed8a32;
+  box-shadow: 0 0 0 4px rgba(237, 138, 50, .12);
+}
+
+body.login-active .login-content h1 {
+  max-width: 620px;
+  color: #202124;
+  font-size: clamp(36px, 5.2vw, 58px);
+  letter-spacing: -.055em;
+  line-height: 1.04;
+}
+
+body.login-active .login-content h1 span {
+  color: #77787c;
+}
+
+body.login-active .login-description {
+  max-width: 520px;
+  margin: 20px 0 28px;
+  color: #66676b;
+  font-size: 15px;
+  line-height: 1.65;
+}
+
+body.login-active .login-form {
+  width: min(440px, 100%);
+  flex-direction: column;
+  gap: 10px;
+}
+
+body.login-active .login-form input {
+  flex: 0 0 auto;
+  width: 100%;
+  height: 48px;
+  padding: 0 14px;
+  border: 1px solid rgba(32, 33, 36, .12);
+  border-radius: 11px;
+  background: #f5f5f2;
+  box-shadow:
+    inset 2px 2px 5px rgba(0, 0, 0, .08),
+    inset -1px -1px 3px rgba(255, 255, 255, .9);
+  color: #202124;
+}
+
+body.login-active .login-form input::placeholder {
+  color: #77787c;
+}
+
+body.login-active .login-form input:focus {
+  border-color: rgba(237, 138, 50, .55);
+  background: #fff;
+  box-shadow:
+    0 0 0 3px rgba(237, 138, 50, .1),
+    inset 1px 1px 3px rgba(0, 0, 0, .04);
+}
+
+body.login-active .login-form button {
+  width: 100%;
+  height: 48px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(32, 33, 36, .12);
+  border-radius: 11px;
+  background: #ededeb;
+  box-shadow:
+    0 2px 6px rgba(0, 0, 0, .08),
+    inset 0 1px 0 rgba(255, 255, 255, .85);
+  color: #202124;
+}
+
+body.login-active .login-form button:hover {
+  background: #e4e4e1;
+}
+
+body.login-active .login-error {
+  color: #b53a31;
+}
+
+body.login-active .footer {
+  position: fixed;
+  z-index: 120;
+  right: auto;
+  bottom: 0;
+  left: 0;
+  width: auto;
+  height: 44px;
+  border: 0;
+  background: transparent;
+}
+
+body.login-active .footer-inner {
+  width: auto;
+  height: 100%;
+  min-height: 0;
+  margin: 0;
+  padding: 0 16px;
+  justify-content: flex-start;
+  color: #68696d;
+}
+
+body.login-active .footer-inner > span:first-child {
+  color: #28292c;
+  font-size: 14px;
+}
+
+@media (max-width: 600px) {
+  body.login-active .login-page {
+    padding: 24px 20px 56px;
+  }
+
+  body.login-active .login-content h1 {
+    font-size: clamp(34px, 10vw, 46px);
+  }
+
+  body.login-active .login-description {
+    margin: 16px 0 24px;
+    font-size: 14px;
+  }
+}
+
+/* Match the TUI transcript: user input, tool activity, and Pulse output stay distinct. */
+body.dashboard-active .run-window-shell .console-message.is-agent {
+  color: #55565a;
+}
+
+body.dashboard-active .run-window-shell .console-message.is-user {
+  padding-left: 10px;
+  border-left: 2px solid #ed8a32;
+  color: #28292c;
+  font-weight: 600;
+}
+
+body.dashboard-active .run-window-shell .console-message.is-command {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+body.dashboard-active .run-window-shell .console-message.is-pulse-output {
+  color: #85868a;
+  font-size: 12px;
+}
+
+body.dashboard-active .run-window-shell .console-message.is-pulse-prompt {
+  color: #b66318;
+  font-weight: 600;
+}
+
+body.dashboard-active .run-window-shell .console-message.is-pulse-prompt summary {
+  cursor: pointer;
+}
+
+body.dashboard-active .run-window-shell .live-line {
+  color: #55565a;
+}
+
+body.dashboard-active .run-window-shell .live-line.is-thinking {
+  color: #b66318;
+  font-style: italic;
+}
+
+body.dashboard-active .run-window-shell .live-line.is-tool,
+body.dashboard-active .run-window-shell .live-line.is-edit {
+  color: #66676b;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+body.dashboard-active .run-window-shell .live-line.is-user {
+  color: #28292c;
+  font-weight: 600;
+}
+
+body.dashboard-active .run-window-shell .live-line.is-note {
+  color: #85868a;
+}
+
+body.dashboard-active .run-window-shell .live-line.is-error {
+  color: #c43e36;
+}
+
+body.dashboard-active .run-window-shell .cli-ansi-blue {
+  color: #2878bd;
+}
+
+body.dashboard-active .run-window-shell .cli-ansi-orange {
+  color: #b66318;
+}
+
+body.dashboard-active .run-window-shell .cli-ansi-red {
+  color: #c43e36;
+}
+
+body.dashboard-active .run-window-shell .cli-ansi-bold {
+  font-weight: 700;
+}
+
+body.dashboard-active .run-window-shell .cli-ansi-dim {
+  opacity: .68;
+}
+
+body.dashboard-active .run-window-shell .cli-ansi-italic {
+  font-style: italic;
+}
+
+body.dashboard-active .run-window-shell .cli-action-name {
+  color: #56575b;
+  font-weight: 700;
+}

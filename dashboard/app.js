@@ -1055,6 +1055,96 @@ function escapeHtml(value) {
     .replace(/'/g, "&#39;");
 }
 
+const CLI_ACTION_NAMES = new Set([
+  "AMPSTATUS", "CALC", "CALLERS", "CHECK_SHAPE", "CORR", "CREATE", "DEP_GRAPH",
+  "DIFFSTATS", "DOC_LOOKUP", "DRYRUN", "EDIT", "EDIT_FILE", "FIND_DEFINITION",
+  "FIND_REFERENCES", "GPUSTATUS", "GREP", "GRADCHECK", "HARDEXAMPLES", "HISTOGRAM",
+  "LAYERSTATS", "LIST_FILES", "MLLINT", "OUTLIER", "OUTLINE", "PASTFIX", "READ_FILE",
+  "REPL", "REPLACE_SYMBOL", "REPLAY", "RESTART", "RESTART_RUN", "ROLLBACK", "RUN",
+  "RUNCOMPARE", "RUN_COMMAND", "RUN_STATUS", "RUNSTATUS", "SEEDCHECK", "SHAPETRACE",
+  "SMOKE_TEST", "STOP", "STOP_RUN", "TERMINAL", "TODO_WRITE", "TRACE", "TRACE_VARIABLE",
+  "VIEW", "WRITE_FILE"
+]);
+
+function renderCliText(value) {
+  const text = String(value ?? "");
+  const ansi = /\u001b\[([0-9;]*)m/g;
+  const result = [];
+  let active = new Set();
+  let position = 0;
+  let match;
+
+  const appendRaw = segment => {
+    if (!segment) return;
+    const classes = [...active];
+    result.push(classes.length
+      ? `<span class="${classes.join(" ")}">${escapeHtml(segment)}</span>`
+      : escapeHtml(segment));
+  };
+  const append = segment => {
+    segment.split(/(\n)/).forEach((line, index) => {
+      if (index % 2) {
+        appendRaw(line);
+        return;
+      }
+      const action = /^(\s*)([A-Z][A-Z0-9_]{2,})(:)(?=\s|$)/.exec(line);
+      if (action && CLI_ACTION_NAMES.has(action[2])) {
+        appendRaw(action[1]);
+        result.push(`<span class="cli-action-name">${escapeHtml(action[2] + action[3])}</span>`);
+        appendRaw(line.slice(action[0].length));
+      } else {
+        appendRaw(line);
+      }
+    });
+  };
+
+  while ((match = ansi.exec(text))) {
+    append(text.slice(position, match.index));
+
+    const codes = (match[1] || "0").split(";").map(code => Number(code || 0));
+    for (let index = 0; index < codes.length; index += 1) {
+      let code = codes[index];
+      let extendedColor = false;
+      if (code === 38 && codes[index + 1] === 5 && codes[index + 2] !== undefined) {
+        code = codes[index + 2];
+        extendedColor = true;
+        index += 2;
+      }
+      if (code === 0) active = new Set();
+      else if (code === 1) active.add("cli-ansi-bold");
+      else if (code === 2) active.add("cli-ansi-dim");
+      else if (code === 3) active.add("cli-ansi-italic");
+      else if (code === 22) {
+        active.delete("cli-ansi-bold");
+        active.delete("cli-ansi-dim");
+      } else if (code === 23) active.delete("cli-ansi-italic");
+      else if ([31, 91].includes(code)) {
+        active.delete("cli-ansi-orange");
+        active.delete("cli-ansi-blue");
+        active.add("cli-ansi-red");
+      } else if ((!extendedColor && [33, 93].includes(code)) ||
+                 (extendedColor && [208, 214].includes(code))) {
+        active.delete("cli-ansi-red");
+        active.delete("cli-ansi-blue");
+        active.add("cli-ansi-orange");
+      } else if ((!extendedColor && [36, 96].includes(code)) ||
+                 (extendedColor && [33, 39].includes(code))) {
+        active.delete("cli-ansi-red");
+        active.delete("cli-ansi-orange");
+        active.add("cli-ansi-blue");
+      } else if (code === 39) {
+        active.delete("cli-ansi-red");
+        active.delete("cli-ansi-orange");
+        active.delete("cli-ansi-blue");
+      }
+    }
+    position = ansi.lastIndex;
+  }
+
+  append(text.slice(position));
+  return result.join("");
+}
+
 
 function fmtDuration(seconds) {
 
@@ -1272,11 +1362,13 @@ function renderTopbarRight() {
     els.topbarWorkspace.textContent = "";
     els.footerAccount.hidden = true;
     document.body.classList.remove("dashboard-active");
+    document.body.classList.add("login-active");
 
     return;
   }
 
   els.topbarRight.innerHTML = "";
+  document.body.classList.remove("login-active");
   document.body.classList.add("dashboard-active");
   els.footerUser.textContent = currentUser.email;
   els.footerAccount.hidden = false;
@@ -1309,6 +1401,7 @@ function showLogin() {
   els.workspaceSidebar.hidden = true;
   els.footerAccount.hidden = true;
   document.body.classList.remove("dashboard-active");
+  document.body.classList.add("login-active");
 
   els.topbarRight.innerHTML = "";
   els.topbarWorkspace.textContent = "";
@@ -3821,7 +3914,7 @@ function renderRunWorkspace(session) {
     // turns Pulse started itself (a crash, a finding, an audit) are not the user's words
     const automatic = entry.who === "pulse" || (!entry.who && entry.traceback_signature);
     const question = automatic
-      ? `<details class="console-message is-user"><summary>${escapeHtml(String(entry.question || "").split("\n")[0].slice(0, 140))}</summary><pre>${escapeHtml(entry.question || "")}</pre></details>`
+      ? `<details class="console-message is-pulse-prompt"><summary>${escapeHtml(String(entry.question || "").split("\n")[0].slice(0, 140))}</summary><pre>${escapeHtml(entry.question || "")}</pre></details>`
       : `<pre class="console-message is-user">${escapeHtml(entry.question || "")}</pre>`;
     return {
       at: Number(entry.t || 0),
@@ -3830,7 +3923,7 @@ function renderRunWorkspace(session) {
         <div class="console-speaker">${automatic ? "PULSE · ON ITS OWN" : entry.who === "dashboard" ? "YOU · FROM HERE" : "YOU"} <time>${fmtRelativeTime(entry.t || 0)}</time></div>
         ${question}
         <div class="console-speaker">PULSE</div>
-        <pre class="console-message">${escapeHtml(entry.answer || "")}</pre>
+        <pre class="console-message is-agent">${renderCliText(entry.answer || "")}</pre>
       </article>
     `
     };
@@ -3845,8 +3938,8 @@ function renderRunWorkspace(session) {
             <time>${fmtRelativeTime(command.created_at ? Date.parse(command.created_at) / 1000 : 0)}</time>
             <span class="command-state is-${escapeHtml(command.status || "pending")}">${escapeHtml(commandState(command))}</span>
           </div>
-          <pre class="console-message is-user">${escapeHtml(command.command || "")}</pre>
-          ${command.result ? `<div class="console-speaker">PULSE</div><pre class="console-message">${escapeHtml(command.result)}</pre>` : ""}
+          <pre class="console-message is-user is-command">${renderCliText(command.command || "")}</pre>
+          ${command.result ? `<div class="console-speaker">PULSE</div><pre class="console-message is-pulse-output">${renderCliText(command.result)}</pre>` : ""}
         </article>
       `
     });
@@ -3870,8 +3963,8 @@ function renderRunWorkspace(session) {
       html: `
         <article class="console-exchange">
           <div class="console-speaker">PULSE ASKED <time>${fmtRelativeTime(command.created_at ? Date.parse(command.created_at) / 1000 : 0)}</time></div>
-          <pre class="console-message is-user">${escapeHtml(asked.label)}</pre>
-          <pre class="console-message">${escapeHtml(outcome)}</pre>
+          <pre class="console-message is-pulse-prompt">${renderCliText(asked.label)}</pre>
+          <pre class="console-message is-pulse-output">${renderCliText(outcome)}</pre>
         </article>
       `
     });
@@ -5445,7 +5538,7 @@ function renderLive() {
   let html = "";
   if (state?.busy) {
     const lines = (state.activity || []).map(item => {
-      const text = escapeHtml(item.text || "");
+      const text = renderCliText(item.ansi || item.text || "");
       const streaming = item.live ? `<span class="live-caret" aria-hidden="true"></span>` : "";
       switch (item.kind) {
         case "thinking": return `<div class="live-line is-thinking">${text}${streaming}</div>`;
