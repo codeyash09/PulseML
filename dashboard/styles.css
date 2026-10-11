@@ -8115,3 +8115,28 @@ body.dashboard-active .run-window-shell .cli-action-name {
 .t-permission .t-perm-answer { margin-left: auto; color: var(--up); }
 .t-permission .t-perm-answer.is-no { color: var(--red); }
 .t-permission .t-perm-answer.is-open { color: var(--accent); }
+
+/* The run window is light: the conversation's warm and green accents need darker shades to read
+   on white. The approval dialog stays dark, so it gets its own light-on-dark text colours. */
+.run-window-shell .t-think summary,
+.run-window-shell .t-think-body,
+.run-window-shell .t-note.is-finding { color: #8a5310; }
+.run-window-shell .t-think-preview { color: #6f7074; }
+.run-window-shell .t-permission .t-perm-answer { color: #1d7a34; }
+.run-window-shell .t-permission .t-perm-answer.is-no { color: #b8322a; }
+.run-window-shell .t-permission .t-perm-answer.is-open { color: #b35f0f; }
+.run-window-shell .turn.is-live .turn-body { border-left-color: #ed8a32; }
+
+.run-question {
+  --fg: #f2f1ed;
+  --secondary: #c9cac6;
+  --tertiary: #a2a3a0;
+  --dim: #8a8b8e;
+  --line: rgba(255, 255, 255, .10);
+  --line-strong: rgba(255, 255, 255, .20);
+  --bg: #08090a;
+  --raised: #1b1d20;
+  color: var(--fg);
+}
+
+.run-question-readonly .run-question { background: #111; }
