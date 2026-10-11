@@ -339,14 +339,19 @@ def _register(key: str) -> None:
         pass
 
 
-def save_key(key: str) -> bool:
-    """Keep a signed-in key for next time, readable by the owner only."""
+def _remembering_keys() -> bool:
+    """False when the person turned saving keys off (`pulse config remember_keys off`)."""
     try:
         from . import pulse_settings
-        if not pulse_settings.on("remember_keys"):
-            return False
+        return pulse_settings.on("remember_keys")
     except ImportError:
-        pass
+        return True
+
+
+def save_key(key: str) -> bool:
+    """Keep a signed-in key for next time, readable by the owner only."""
+    if not _remembering_keys():
+        return False
     try:
         from . import pulse_supabase as cloud
         path = _store_path()
@@ -374,12 +379,22 @@ def saved_key() -> Optional[str]:
 
 
 def forget_key() -> bool:
-    """Sign out on this machine. True when there was a saved key to remove."""
+    """Sign out on this machine. True when there was a saved key to remove.
+
+    A key saved from the agent picker is also in pulse_settings' keys.json (as ENV_KEY),
+    which fills the environment at the next start: it goes too, or the key comes back."""
+    removed = False
     try:
         _store_path().unlink()
-        return True
+        removed = True
     except OSError:
-        return False
+        pass
+    try:
+        from . import pulse_settings
+        removed = pulse_settings.forget_key(ENV_KEY) or removed
+    except ImportError:
+        pass
+    return removed
 
 
 def key_for(model: Optional[str]) -> Optional[str]:
@@ -487,6 +502,13 @@ def main(argv: List[str]) -> int:
         print(f"pulse openrouter: unknown command {action!r}\n")
         print(USAGE)
         return 1
+    if not _remembering_keys():
+        # This command exists to keep the key; with saving off, a sign-in would mint a key
+        # nothing can use. (`pulse` itself still signs in for one session.)
+        print("Saving keys is off on this machine (`pulse config remember_keys off`), so a sign-in here "
+              "could not be kept. `pulse config remember_keys on` turns saving back on; or sign in "
+              "from `pulse` to use a key for that session only.")
+        return 1
     try:
         key = sign_in(ask=lambda prompt: input(prompt + " > "))
     except SignInError as error:
@@ -504,8 +526,10 @@ def main(argv: List[str]) -> int:
         print("\nCancelled.")
         return 130
     if keep not in ("y", "yes"):
-        print(f"Signed in to OpenRouter, but the key was not saved. Key {tail(key)} is available only for this session.")
-        print(f"Save it later by running `pulse openrouter` again or use `pulse config remember_keys on`.")
+        # This command ends here, so an unsaved key is gone with it.
+        print(f"Signed in to OpenRouter, but key {tail(key)} was not saved, so nothing on this machine "
+              "can use it. Sign in again from `pulse` (or `pulse openrouter`) when you want to use it; "
+              f"the unused key can be deleted at {KEYS_PAGE}")
         return 0
     if not save_key(key):
         print(f"Signed in, but the key could not be saved under {_store_path().parent} "

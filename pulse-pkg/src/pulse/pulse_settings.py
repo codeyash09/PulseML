@@ -151,6 +151,15 @@ def save_key(env_var: Optional[str], key: Optional[str]) -> bool:
     return _write(keys_path(), keys, private=True)
 
 
+def forget_key(env_var: str) -> bool:
+    """Drop one saved key. True when there was one to drop."""
+    keys = _read(keys_path())
+    if env_var not in keys:
+        return False
+    keys.pop(env_var)
+    return _write(keys_path(), keys, private=True)
+
+
 def forget_keys() -> None:
     try:
         keys_path().unlink()

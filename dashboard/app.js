@@ -78,6 +78,8 @@ let refreshInFlight = false;
 let viewGeneration = 0;
 let refreshGeneration = 0;
 let lastRenderedSignature = "";
+let minimisedQuestionId = null;      // the question put off with Esc / Later: a card, not a dialog
+let focusedQuestionId = null;        // the dialog the safe answer was focused in, once
 
 // Only the browser-push toggle lives in localStorage now -- Discord/Slack
 // connections are shared per-workspace, stored in team_integrations.
@@ -941,31 +943,55 @@ async function loadSessions(projectIds) {
 }
 
 
-async function loadCommands(sessions) {
+// The open run's Commands come in full (its history: kept turns can be large); for the
+// other runs only what is still open (a prompt on its way, a question, the live row), which
+// is all their tabs and the polls need. `openId`: the open run, or a function picking it once
+// the open rows are in (which runs are live depends on them).
+const COMMAND_SELECT = "id,run_id,user_id,command,status,result,created_at,completed_at";
+
+async function loadCommands(sessions, openId = null) {
 
   const ids = sessions.map(session => session.id).filter(Boolean);
   if (!ids.length) return;
 
   try {
-    const rows = await pgGet("Commands", {
-      run_id: `in.(${ids.join(",")})`,
-      select: "id,run_id,user_id,command,status,result,created_at,completed_at",
-      order: "created_at.desc",
-      limit: "200"
-    });
-    const byRun = new Map();
-    rows.reverse().forEach(row => {
-      const commands = byRun.get(row.run_id) || [];
-      commands.push(row);
-      byRun.set(row.run_id, commands);
-    });
-    sessions.forEach(session => {
-      session.commands = byRun.get(session.id) || [];
-    });
+    const lightIds = typeof openId === "function" ? ids : ids.filter(id => id !== openId);
+    if (lightIds.length) {
+      const rows = await pgGet("Commands", {
+        run_id: `in.(${lightIds.join(",")})`,
+        status: "in.(pending,processing)",
+        select: COMMAND_SELECT,
+        order: "created_at.desc",
+        limit: "200"
+      });
+      const byRun = new Map();
+      rows.reverse().forEach(row => {
+        const commands = byRun.get(row.run_id) || [];
+        commands.push(row);
+        byRun.set(row.run_id, commands);
+      });
+      sessions.forEach(session => {
+        if (!lightIds.includes(session.id)) return;
+        session.commands = byRun.get(session.id) || [];
+        session.commandsFull = false;
+      });
+    }
+    const id = typeof openId === "function" ? openId() : openId;
+    const open = sessions.find(session => session.id === id);
+    if (open) {
+      const rows = await pgGet("Commands", {
+        run_id: `eq.${open.id}`,
+        select: COMMAND_SELECT,
+        order: "created_at.desc",
+        limit: "200"
+      });
+      open.commands = rows.reverse();
+      open.commandsFull = true;
+    }
   } catch (error) {
     console.warn("Could not load run commands:", error);
     sessions.forEach(session => {
-      session.commands = [];
+      session.commands = session.commands || [];
     });
   }
 }
@@ -1488,7 +1514,12 @@ function mountWorkspaceNavigation(shell) {
 }
 
 
-function renderWorkspaceSelection() {
+// The console without a run: the workspace sidebar lives inside it (mountWorkspaceNavigation),
+// so emptying the console must go through here, never `innerHTML = ""`.
+function renderWorkspaceSelection(
+  heading = "PULSE / WORKSPACE",
+  message = "Select a workspace and project to open its training runs."
+) {
 
   els.activeConsole.innerHTML = `
     <div class="run-window-shell">
@@ -1498,8 +1529,8 @@ function renderWorkspaceSelection() {
       </nav>
       <div class="run-window-layout">
         <section class="run-window-content console-empty-state" aria-label="Workspace selection">
-          <span>PULSE / WORKSPACE</span>
-          <p>Select a workspace and project to open its training runs.</p>
+          <span>${escapeHtml(heading)}</span>
+          <p>${escapeHtml(message)}</p>
         </section>
       </div>
     </div>
@@ -1522,6 +1553,13 @@ function renderWorkspaceMenuToggle() {
 }
 
 
+// No project open: the header must not keep naming the last one.
+function resetProjectHeader(team) {
+  els.workspaceTitle.textContent = team ? "Select a project" : "—";
+  els.projectCrumb.textContent = team ? `${getWorkspaceName(team)} / PROJECT`.toUpperCase() : "PULSE / PROJECT";
+}
+
+
 function signOut() {
 
   currentUser = null;
@@ -1537,6 +1575,7 @@ function signOut() {
   teamIntegration = null;
   notifyBaseline = null;
   viewGeneration++;
+  projectsGeneration++;
   refreshGeneration++;
 
   if (!els.notificationsModal.hidden) {
@@ -1550,6 +1589,7 @@ function signOut() {
   els.sidebarContextMenu.hidden = true;
   els.sessionList.innerHTML = "";
   els.activeConsole.innerHTML = "";
+  resetProjectHeader(null);
 
   sessionStorage.removeItem(
     SS_SESSION_KEY
@@ -1874,6 +1914,7 @@ async function openWorkspace(team) {
     els.projectsEmpty.hidden = false;
     els.projectsEmpty.textContent = "Loading projects…";
     renderStats([]);
+    resetProjectHeader(team);
   }
 
   els.workspaceList.querySelectorAll(".sidebar-workspace-item").forEach(item => {
@@ -1928,19 +1969,25 @@ function renderProjectRow(
 }
 
 
-async function loadAndRenderProjects() {
+// `background`: the periodic refresh -- no "Loading…" flash, and it never cancels a load the
+// person started (projects have their own generation, so the workspace list is not cut short).
+let projectsGeneration = 0;
+
+async function loadAndRenderProjects({ background = false } = {}) {
 
   const team = currentTeam;
 
-  const generation = ++viewGeneration;
+  const generation = ++projectsGeneration;
 
   const stale = () =>
-    generation !== viewGeneration || team !== currentTeam;
+    generation !== projectsGeneration || team !== currentTeam;
 
   if (!team) return;
 
-  els.projectsEmpty.hidden = false;
-  els.projectsEmpty.textContent = "Loading projects…";
+  if (!background) {
+    els.projectsEmpty.hidden = false;
+    els.projectsEmpty.textContent = "Loading projects…";
+  }
 
   try {
 
@@ -2027,6 +2074,8 @@ async function loadAndRenderProjects() {
 
     console.error(error);
 
+    if (background) return;        // keep what is shown; the next refresh tries again
+
     els.projectList.innerHTML = "";
 
     els.projectsEmpty.hidden = false;
@@ -2057,7 +2106,7 @@ async function openProject(project) {
 
   els.sessionList.innerHTML = "";
 
-  els.activeConsole.innerHTML = "";
+  renderWorkspaceSelection("PULSE / DEBUG", "Loading this project's runs…");
 
   renderStats([]);
 
@@ -3826,7 +3875,8 @@ function renderRunWorkspace(session) {
   const logs = (session.agentLogs || []).filter(entry => entry && typeof entry === "object");
   const questions = (session.commands || []).filter(command => questionOf(command));
   const commands = (session.commands || []).filter(command => !isRunnerRow(command));
-  const openQuestion = questions.filter(command => command.status === "processing").at(-1);
+  // a question still open on a run whose Pulse is gone waits for nobody: a note, not a dialog
+  const openQuestion = liveStateOf(session) ? questions.filter(command => command.status === "processing").at(-1) : null;
   const step = findMetric(session, ["step", "global_step", "epoch"]);
   const live = isLive(session);
   const telemetry = session.telemetry || [];
@@ -4045,7 +4095,7 @@ function renderRunWorkspace(session) {
         ${statsPane}
         <section class="run-transcript" aria-label="Agent transcript">${transcript}<div class="run-live" aria-live="polite"></div></section>
       </div>
-      ${openQuestion ? renderOpenQuestion(openQuestion, canSend) : ""}
+      ${openQuestion ? renderOpenQuestion(openQuestion, canSend, openQuestion.id !== minimisedQuestionId) : ""}
       <form class="command-composer" data-run-id="${escapeHtml(session.id)}">
         <label class="sr-only" for="command-${escapeHtml(session.id)}">Send a prompt to this run</label>
         <div class="command-input-wrap">
@@ -4071,16 +4121,36 @@ function renderRunWorkspace(session) {
 // "[Pulse] ⚠ This command can delete files: rm -rf build/" -> the command and why.
 function questionSubject(asked) {
   const lines = String(asked.context || "").split("\n").map(line => line.replace(/^\[Pulse\]\s*/, "").trim()).filter(Boolean);
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const match = lines[i].match(/^(?:⚠\s*)?This command (.+?):\s+(.+)$/);
-    if (match) return { kind: "command", why: match[1], command: match[2] };
+  const flagged = () => {
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const match = lines[i].match(/^(?:⚠\s*)?This command (.+?):\s+(.+)$/);
+      if (match) return match;
+    }
+    return null;
+  };
+  // "Run flagged command? <command>": the command is in the label; why, in the context
+  const labelled = String(asked.label || "").match(/^Run flagged command\?\s*(.*)$/s);
+  if (labelled) {
+    const match = flagged();
+    return { kind: "command", why: match ? match[1] : "", command: labelled[1].trim() || match?.[2] || "" };
   }
+  // a change on the table ("Apply this change?") comes with its diff: an older flagged
+  // command still in the context is not what this is about
   if (asked.detail) return { kind: "change" };
+  const match = flagged();
+  if (match) return { kind: "command", why: match[1], command: match[2] };
   return { kind: "other", context: lines.slice(-4).join("\n") };
+}
+
+// The answer that does nothing: what a stray Enter may press.
+function isSafeAnswer(button) {
+  return button.dataset.answer === "n" ||
+    /^#\d+\s+(?:Do not|Don['’]t|Reject|No)\b/i.test(button.dataset.answer || "");
 }
 
 function questionOutcome(command, asked) {
   const result = String(command.result || "");
+  if (command.status === "processing") return "no longer waiting (the run is not live)";
   if (command.status !== "completed") return result || "no longer asked";
   if (result.startsWith("Answered at the machine")) return result.replace(/^Answered at the machine:\s*/, "answered at the machine: ");
   if (asked.options && /^#\d+/.test(result)) return `answered here: ${asked.options[Number(result.slice(1).split(" ")[0])] ?? result}`;
@@ -4095,15 +4165,25 @@ function renderDiff(diff) {
   }).join("");
 }
 
-function renderOpenQuestion(command, canSend) {
+// The question Pulse is waiting on: a dialog over the page while the run is live (`modal`),
+// else -- put off with Esc / Later, or not the person's to answer -- a card above the composer.
+// While an answer is on its way the buttons stay off, whatever redraws the page.
+const answeringQuestions = new Set();
+const questionDrafts = new Map();
+
+function renderOpenQuestion(command, canSend, modal = true) {
   const asked = questionOf(command);
   const subject = questionSubject(asked);
   const id = escapeHtml(command.id);
   const titleId = `question-title-${id}`;
   const promptId = `question-prompt-${id}`;
-  const off = canSend ? "" : "disabled";
+  const sending = answeringQuestions.has(command.id);
+  const off = canSend && !sending ? "" : "disabled";
   const yesNo = isYesNo(asked.label);
-  const label = asked.label.replace(/\s*[\[(]\s*y\s*\/\s*n\s*[\])]\s*>?\s*$/i, "").trim();
+  const label = subject.kind === "command" && /^Run flagged command\?/.test(asked.label)
+    ? "Run this command?"
+    : asked.label.replace(/\s*[\[(]\s*y\s*\/\s*n\s*[\])]\s*>?\s*$/i, "").trim();
+  modal = modal && canSend;
   const at = command.created_at ? Date.parse(command.created_at) / 1000 : 0;
 
   let title = "Pulse is asking";
@@ -4113,7 +4193,7 @@ function renderOpenQuestion(command, canSend) {
   if (subject.kind === "command") {
     title = "Pulse wants to run a command";
     body = `
-      <div class="ask-why">Flagged: it ${escapeHtml(subject.why)}</div>
+      ${subject.why ? `<div class="ask-why">Flagged: it ${escapeHtml(subject.why)}</div>` : ""}
       <pre class="ask-code">${escapeHtml(subject.command)}</pre>`;
     yes = "Run it";
     no = "Don't run";
@@ -4138,26 +4218,26 @@ function renderOpenQuestion(command, canSend) {
   } else {
     choices = `
       <form class="question-text" data-question-id="${id}">
-        <input type="text" name="answer" placeholder="Your answer" ${off}>
+        <input type="text" name="answer" placeholder="Your answer" value="${escapeHtml(questionDrafts.get(command.id) || "")}" ${off}>
         <button type="submit" ${off}>Answer</button>
       </form>`;
   }
 
   return `
-    <div class="${canSend ? "run-question-backdrop" : "run-question-readonly"}">
-      <section class="run-question" role="${canSend ? "alertdialog" : "region"}" ${canSend ? 'aria-modal="true"' : ""}
+    <div class="${modal ? "run-question-backdrop" : `run-question-inline ${canSend ? "" : "is-readonly"}`}">
+      <section class="run-question" data-question-id="${id}" role="${modal ? "alertdialog" : "region"}" ${modal ? 'aria-modal="true"' : ""}
         aria-labelledby="${titleId}" aria-describedby="${promptId}" ${canSend ? 'tabindex="-1"' : ""}>
         <div class="ask-head">
           <span class="ask-title" id="${titleId}"><span class="live-dot" aria-hidden="true"></span>${escapeHtml(title)}</span>
           <time>asked ${fmtRelativeTime(at)}</time>
+          ${modal ? `<button type="button" class="question-later" data-question-id="${id}" title="Answer later (Esc)">Later</button>` : ""}
         </div>
         ${body}
         <div class="ask-question" id="${promptId}">${escapeHtml(label || "Pulse is asking you to choose:")}</div>
         <div class="question-choices">${choices}</div>
-        <p class="question-status" role="status">${canSend
-          ? (yesNo ? "Press Y or N, or click. Whichever answers first, here or at the machine, is used."
-            : "Whichever answers first, here or at the machine, is used.")
-          : "Only the run owner or workspace admins can answer."}</p>
+        <p class="question-status" role="status">${!canSend ? "Only the run owner or workspace admins can answer."
+          : sending ? "Sending…"
+          : (yesNo ? "Press Y or N, or click. " : "") + "Whichever answers first, here or at the machine, is used."}</p>
       </section>
     </div>
   `;
@@ -4187,6 +4267,13 @@ function fmtSeconds(seconds) {
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
 }
 
+function hashText(value) {
+  let hash = 5381;
+  const text = String(value || "");
+  for (let i = 0; i < text.length; i++) hash = ((hash << 5) + hash + text.charCodeAt(i)) | 0;
+  return (hash >>> 0).toString(36);
+}
+
 // One turn -- what started it, then what Pulse did, in order: reasoning (folded once done),
 // tool calls, changes, its words. `live`: still going, drawn as it streams.
 function renderTurn(turn, { live = false, asking = false, doing = "" } = {}) {
@@ -4195,8 +4282,9 @@ function renderTurn(turn, { live = false, asking = false, doing = "" } = {}) {
     !(item.kind === "user" && String(item.text || "").trim() === turn.prompt.trim()));
   const tools = activity.filter(item => item.kind === "tool" || item.kind === "edit").reduce((n, item) => n + Math.max(1, (item.calls || []).length), 0);
 
-  // "⚠ This command can delete files: X", "Run it anyway? (y/N)  y", "Answered on the
-  // dashboard." -> one permission line
+  // "⚠ This command can delete files: X", then how it was answered -- "Answered on the
+  // dashboard." and "› Run this command once" (the choice), or the older "Run it anyway?
+  // (y/N)  y" -- and "Flagged command approvals are off for this session." -> one permission line
   const merged = [];
   for (let i = 0; i < activity.length; i++) {
     const item = activity[i];
@@ -4205,20 +4293,40 @@ function renderTurn(turn, { live = false, asking = false, doing = "" } = {}) {
       merged.push(item);
       continue;
     }
-    const permission = { kind: "permission", why: flagged[1], command: flagged[2], answer: null, where: "" };
+    const permission = { kind: "permission", why: flagged[1], command: flagged[2], answer: null, where: "", always: false };
     let j = i + 1;
-    const reply = activity[j]?.kind === "note" && String(activity[j].text || "").match(/\(y\/n\)\s*>?\s+(\S+)\s*$/i);
-    if (reply) {
-      permission.answer = /^y/i.test(reply[1]) ? "yes" : "no";
-      j++;
-    }
-    if (activity[j]?.kind === "note" && /^Answered on the dashboard\.?$/.test(String(activity[j].text || "").trim())) {
-      permission.where = "on the dashboard";
-      j++;
+    for (; activity[j]?.kind === "note"; j++) {
+      const note = String(activity[j].text || "").replace(/^\[Pulse\]\s*/, "").trim();
+      const reply = note.match(/\(y\/n(?:\/a[^)]*)?\)\s*>?\s+(\S+)\s*$/i);
+      const chosen = note.match(/^[›>]\s*(.+)$/);
+      if (reply && permission.answer === null) {
+        permission.answer = /^[ya]/i.test(reply[1]) ? "yes" : "no";
+        permission.always = /^a/i.test(reply[1]);
+      } else if (chosen && permission.answer === null) {
+        permission.answer = /^(?:Do not|Don['’]t|No|Reject)\b/i.test(chosen[1]) ? "no" : "yes";
+        permission.always = /^Always\b/i.test(chosen[1]);
+      } else if (/^Answered on the dashboard\.?$/.test(note)) {
+        permission.where = "on the dashboard";
+      } else if (/^Flagged command approvals are off for this session\.?$/.test(note)) {
+        permission.always = permission.always || permission.answer === null;
+        if (permission.answer === null) permission.answer = "yes";
+      } else {
+        break;
+      }
     }
     merged.push(permission);
     i = j - 1;
   }
+
+  // what the reader opened or closed is kept by these keys (see foldState): what the item is,
+  // in this turn, not where it sits in a list that slides as the turn goes on
+  const keyCounts = new Map();
+  const foldKey = (kind, basis) => {
+    const key = `${Math.round(Number(turn.started || 0) * 1000)}:${kind}:${hashText(basis)}`;
+    const seen = keyCounts.get(key) || 0;
+    keyCounts.set(key, seen + 1);
+    return seen ? `${key}:${seen}` : key;
+  };
 
   const blocks = merged.map((item, index) => {
     const caret = live && item.live ? `<span class="live-caret" aria-hidden="true"></span>` : "";
@@ -4228,7 +4336,7 @@ function renderTurn(turn, { live = false, asking = false, doing = "" } = {}) {
         const streaming = live && item.live;
         const preview = escapeHtml(String(item.text || "").replace(/\s+/g, " ").replace(/^…/, "").slice(0, 110));
         return `
-          <details class="t-think" data-key="think-${index}" ${streaming ? `open data-streaming="1"` : ""}>
+          <details class="t-think" data-key="${escapeHtml(foldKey("think", streaming ? "live" : item.text))}" ${streaming ? `open data-streaming="1"` : ""}>
             <summary><span class="t-think-title">${streaming ? "Thinking" : `Thought${item.seconds ? ` for ${fmtSeconds(item.seconds)}` : ""}`}</span><span class="t-think-preview">${preview}</span></summary>
             <div class="t-think-body">${text}${caret}</div>
           </details>`;
@@ -4238,16 +4346,16 @@ function renderTurn(turn, { live = false, asking = false, doing = "" } = {}) {
           <div class="t-tool">
             ${item.text ? `<div class="t-said">${text}</div>` : ""}
             ${(item.calls || []).map(call => `<div class="t-call"><span class="t-glyph">›</span><code>${escapeHtml(call)}</code></div>`).join("")}
-            ${item.output ? `<details class="t-out" data-key="out-${index}"><summary>output</summary><pre>${escapeHtml(item.output)}</pre></details>` : ""}
+            ${item.output ? `<details class="t-out" data-key="${escapeHtml(foldKey("out", (item.calls || [])[0] || item.text))}"><summary>output</summary><pre>${escapeHtml(item.output)}</pre></details>` : ""}
           </div>`;
       case "edit":
         return `
           <div class="t-tool is-edit">
             ${(item.calls || []).map(call => `<div class="t-call"><span class="t-glyph">✎</span><code>${escapeHtml(call)}</code>${item.text ? `<span class="t-status">${text}</span>` : ""}</div>`).join("")}
-            ${item.diff ? `<details class="t-out" data-key="diff-${index}"><summary>diff</summary><pre class="ask-diff">${renderDiff(item.diff)}</pre></details>` : ""}
+            ${item.diff ? `<details class="t-out" data-key="${escapeHtml(foldKey("diff", (item.calls || [])[0] || item.text))}"><summary>diff</summary><pre class="ask-diff">${renderDiff(item.diff)}</pre></details>` : ""}
           </div>`;
       case "permission": {
-        const answer = item.answer === "yes" ? `allowed${item.where ? ` ${item.where}` : ""}`
+        const answer = item.answer === "yes" ? `allowed${item.where ? ` ${item.where}` : ""}${item.always ? " · always, this session" : ""}`
           : item.answer === "no" ? `not allowed${item.where ? ` ${item.where}` : ""}` : (live ? "waiting for your answer" : "not answered");
         return `
           <div class="t-permission">
@@ -4295,6 +4403,8 @@ function renderTurn(turn, { live = false, asking = false, doing = "" } = {}) {
 
 
 async function sendQuestionAnswer(commandId, answer) {
+  if (answeringQuestions.has(commandId)) return;     // one answer per question
+  answeringQuestions.add(commandId);
   const panel = els.activeConsole.querySelector(".run-question");
   const status = panel?.querySelector(".question-status");
   panel?.querySelectorAll("button, input").forEach(element => { element.disabled = true; });
@@ -4311,10 +4421,13 @@ async function sendQuestionAnswer(commandId, answer) {
     renderSessions();
   } catch (error) {
     console.warn("Could not answer:", error);
-    if (status) status.textContent = /admin/.test(error.message)
+    answeringQuestions.delete(commandId);
+    const panelNow = els.activeConsole.querySelector(".run-question");
+    const statusNow = panelNow?.querySelector(".question-status");
+    if (statusNow) statusNow.textContent = /admin/.test(error.message)
       ? "Already answered (at the machine), or you can't answer this run's questions."
       : "Could not send the answer. Try again.";
-    panel?.querySelectorAll("button, input").forEach(element => { element.disabled = false; });
+    panelNow?.querySelectorAll(".question-answer, .question-later, .question-text input, .question-text button").forEach(element => { element.disabled = false; });
     if (/admin/.test(error.message)) refreshSessions();
   }
 }
@@ -4999,7 +5112,11 @@ async function refreshSessions() {
         project.project_id
       );
 
-    await loadCommands(rows);
+    // the run that will be open (as renderSessions picks it) gets its history in full
+    await loadCommands(rows, () =>
+      (!autoSelectLiveRun && rows.some(session => session.id === activeSessionId))
+        ? activeSessionId
+        : (rows.filter(isLive)[0] || rows[0])?.id);
 
     // Switched project, or a newer refresh started, while this was loading.
     if (project !== currentProject || generation !== refreshGeneration) {
@@ -5031,6 +5148,10 @@ async function refreshSessions() {
 
     els.refreshLabel.textContent =
       "Update failed";
+
+    if (!currentSessions.length) {
+      renderWorkspaceSelection("PULSE / DEBUG", "Couldn't load this project's runs. Try refreshing.");
+    }
 
   } finally {
 
@@ -5337,6 +5458,15 @@ els.activeConsole.addEventListener("click", event => {
       activeSessionId = runTab.dataset.sessionId;
       lastRenderedSignature = "";
       renderSessions();
+      // other runs carry only their open rows: fetch this one's history
+      const opened = currentSessions.find(item => item.id === activeSessionId);
+      if (opened && !opened.commandsFull) {
+        loadCommands([opened], opened.id).then(() => {
+          if (opened.id !== activeSessionId || !currentSessions.includes(opened)) return;
+          lastRenderedSignature = "";
+          renderSessions();
+        });
+      }
     }
     return;
   }
@@ -5344,6 +5474,21 @@ els.activeConsole.addEventListener("click", event => {
   if (suggestion) chooseCommandSuggestion(suggestion.dataset.command);
   const answer = event.target.closest(".question-answer");
   if (answer && !answer.disabled) sendQuestionAnswer(answer.dataset.questionId, answer.dataset.answer);
+  const later = event.target.closest(".question-later");
+  if (later) minimiseQuestion(later.dataset.questionId);
+});
+
+// Esc / Later: the dialog becomes a card above the composer (still answerable there) until
+// Pulse asks something else.
+function minimiseQuestion(questionId) {
+  minimisedQuestionId = questionId;
+  lastRenderedSignature = "";
+  renderSessions();
+}
+
+els.activeConsole.addEventListener("input", event => {
+  const form = event.target.closest(".question-text");
+  if (form && event.target.name === "answer") questionDrafts.set(form.dataset.questionId, event.target.value);
 });
 
 
@@ -5368,6 +5513,11 @@ els.activeConsole.addEventListener("keydown", event => {
     }
   }
   const approvalDialog = event.target.closest(".run-question-backdrop .run-question");
+  if (approvalDialog && event.key === "Escape") {
+    event.preventDefault();
+    minimiseQuestion(approvalDialog.dataset.questionId);
+    return;
+  }
   if (approvalDialog && !event.altKey && !event.ctrlKey && !event.metaKey) {
     const answer = event.key.toLowerCase() === "y" ? "y"
       : event.key.toLowerCase() === "n" ? "n" : null;
@@ -5438,9 +5588,16 @@ els.activeConsole.addEventListener("submit", async event => {
   const command = field.value.trim();
   if (!session || !command || !currentUser) return;
 
-  const pendingQuestion = (session.commands || []).find(item =>
+  // "pulse:..." rows are the runner's own (its questions, the live view): it would take such a
+  // prompt for one of them and never finish it
+  if (/^pulse:/i.test(command)) {
+    status.textContent = "A prompt can't start with \"pulse:\" (Pulse uses that for its own messages). Reword it.";
+    return;
+  }
+
+  const pendingQuestion = liveStateOf(session) && (session.commands || []).filter(item =>
     item.status === "processing" && questionOf(item)
-  );
+  ).at(-1);
   if (pendingQuestion) {
     const question = questionOf(pendingQuestion);
     const yesNoAnswer = /^(y|yes|n|no)$/i.exec(command);
@@ -5695,6 +5852,20 @@ function announceQuestions(sessions) {
 // redrawn, so nothing typed or scrolled is lost) every time the live row changes.
 let lastLiveHtml = "";
 
+// What the reader opened or closed (reasoning, outputs, diffs) stays so through redraws.
+const foldState = new Map();
+
+function restoreFolds(root) {
+  root.querySelectorAll("details[data-key]:not([data-streaming])").forEach(node => {
+    if (foldState.has(node.dataset.key)) node.open = foldState.get(node.dataset.key);
+  });
+}
+
+els.activeConsole.addEventListener("toggle", event => {
+  const node = event.target;
+  if (node.matches?.("details[data-key]:not([data-streaming])")) foldState.set(node.dataset.key, node.open);
+}, true);
+
 function renderLive() {
   const box = els.activeConsole.querySelector(".run-live");
   const session = currentSessions.find(item => item.id === activeSessionId);
@@ -5705,7 +5876,7 @@ function renderLive() {
   if (run) {
     const stepEl = els.activeConsole.querySelector("[data-live-step]");
     if (stepEl && run.step !== undefined) stepEl.textContent = metricValue(run.step);
-    const picker = [...els.sessionList.querySelectorAll("[data-live-picker]")].find(node => node.dataset.livePicker === session.id);
+    const picker = [...els.activeConsole.querySelectorAll("[data-live-picker]")].find(node => node.dataset.livePicker === session.id);
     const loss = ["loss", "train_loss", "loss_value", "current_loss"].map(name => run.values?.[name]).find(value => value !== undefined);
     if (picker && run.step !== undefined) {
       picker.innerHTML = `step ${escapeHtml(metricValue(run.step))} <i>·</i> loss ${escapeHtml(metricValue(loss ?? findMetric(session, ["loss", "train_loss", "loss_value", "current_loss"])))}`;
@@ -5729,12 +5900,8 @@ function renderLive() {
   if (html === lastLiveHtml && box.innerHTML.trim() === html.trim()) return;
   const transcript = box.closest(".run-transcript");
   const atBottom = !transcript || transcript.scrollHeight - transcript.clientHeight - transcript.scrollTop < 48;
-  // what the reader opened or closed stays so through the updates
-  const folds = new Map([...box.querySelectorAll("details[data-key]:not([data-streaming])")].map(node => [node.dataset.key, node.open]));
   box.innerHTML = html;
-  box.querySelectorAll("details[data-key]").forEach(node => {
-    if (folds.has(node.dataset.key)) node.open = folds.get(node.dataset.key);
-  });
+  restoreFolds(box);
   lastLiveHtml = html;
   if (transcript && atBottom) transcript.scrollTop = transcript.scrollHeight;
 }
@@ -5751,7 +5918,7 @@ async function pollOpenRows(session) {
   const rows = await pgGet("Commands", {
     run_id: `eq.${session.id}`,
     status: "in.(pending,processing)",
-    select: "id,run_id,user_id,command,status,result,created_at,completed_at",
+    select: COMMAND_SELECT,
     order: "created_at.asc",
     limit: "50"
   });
@@ -5759,7 +5926,7 @@ async function pollOpenRows(session) {
   const isOpen = command => ["pending", "processing"].includes(command.status) && !String(command.id).startsWith("local-");
   const vanished = before.filter(isOpen).some(command => !rows.some(row => row.id === command.id));
   if (vanished) {
-    await loadCommands([session]);                 // something finished: its final state
+    await loadCommands([session], session.id);     // something finished: its final state
   } else {
     session.commands = before.filter(command => !isOpen(command))
       .filter(command => !String(command.id).startsWith("local-") || !rows.some(row => row.command === command.command))
@@ -5815,13 +5982,16 @@ setInterval(
 
     if (
       currentUser &&
-      currentTeam
+      currentTeam &&
+      !els.viewDashboard.hidden &&
+      !els.workspaceSidebar.hidden &&
+      !document.hidden
     ) {
-      loadAndRenderProjects();
+      loadAndRenderProjects({ background: true });
     }
 
   },
-  15000
+  60000                     // the live counts in the sidebar: every project's runs, so not often
 );
 
 
@@ -6009,7 +6179,8 @@ function renderSessions() {
       session.telemetry?.at(-1),
       session.agentLogs?.at(-1)?.t,
       session.commands?.map(command => isLiveRow(command) ? [command.id, command.status] : [command.id, command.status, command.result]),
-      isLive(session)
+      isLive(session),
+      session.id === activeSessionId && Boolean(liveStateOf(session))
     ])
   ]);
   if (signature === lastRenderedSignature) return;
@@ -6031,13 +6202,24 @@ function renderSessions() {
   const oldRunMenu = els.activeConsole.querySelector(".run-menu");
   const runMenuWasOpen = oldRunMenu && !oldRunMenu.hidden;
   const runMenuSearchValue = els.activeConsole.querySelector(".run-menu-search")?.value || "";
+  // where the focus was in the question card: it comes back to the same control
+  const oldAsk = els.activeConsole.querySelector(".run-question");
+  const askFocus = oldAsk && oldAsk.contains(document.activeElement) ? document.activeElement : null;
+  const askFocusId = oldAsk?.dataset.questionId;
+  const askFocusSelector = !askFocus ? null
+    : askFocus.matches("input") ? "input"
+    : askFocus.dataset.answer !== undefined ? `.question-answer[data-answer="${CSS.escape(askFocus.dataset.answer)}"]`
+    : askFocus.matches(".question-later") ? ".question-later" : "";
+  const askCaret = askFocus?.matches("input") ? askFocus.selectionStart : null;
   const visibleRuns = currentSessions.filter(item =>
     item.id === activeSessionId || pinnedRunIds.has(item.id)
   );
   const hiddenRunCount = currentSessions.length - visibleRuns.length;
   const runContent = session
     ? renderRunWorkspace(session)
-    : `<div class="console-empty-state"><span>PULSE / DEBUG</span><p>${currentProject ? "Select a run to open its console." : "Select a workspace and project to open its training runs."}</p></div>`;
+    : `<div class="console-empty-state"><span>PULSE / DEBUG</span><p>${!currentProject ? "Select a workspace and project to open its training runs."
+      : currentSessions.length ? "Select a run to open its console."
+      : "No runs have been logged for this project yet. Start one under Pulse and it shows up here."}</p></div>`;
 
   els.activeConsole.innerHTML = `
       <div class="run-window-shell">
@@ -6074,10 +6256,20 @@ function renderSessions() {
     filterRunMenu(runMenuSearchValue);
   }
 
+  restoreFolds(els.activeConsole);
+
+  // A new dialog: the answer that does nothing has the focus, so a stray Enter or Space cannot
+  // run or apply anything. A redraw of the same question puts the focus back where it was.
   const approvalDialog = els.activeConsole.querySelector(".run-question-backdrop .run-question");
-  if (approvalDialog) {
-    const defaultAnswer = approvalDialog.querySelector('.question-answer[data-answer="n"]:not(:disabled)');
-    (defaultAnswer || approvalDialog.querySelector(".question-answer:not(:disabled)") || approvalDialog).focus();
+  const ask = els.activeConsole.querySelector(".run-question");
+  if (ask && askFocus && ask.dataset.questionId === askFocusId) {
+    const again = askFocusSelector ? ask.querySelector(askFocusSelector) : null;
+    (again && !again.disabled ? again : ask).focus();
+    if (again?.matches("input") && askCaret !== null) again.setSelectionRange(askCaret, askCaret);
+  } else if (approvalDialog && focusedQuestionId !== approvalDialog.dataset.questionId) {
+    focusedQuestionId = approvalDialog.dataset.questionId;
+    const safe = [...approvalDialog.querySelectorAll(".question-answer:not(:disabled)")].find(isSafeAnswer);
+    (safe || approvalDialog).focus();
   }
 
   const transcript = els.activeConsole.querySelector(".run-transcript");

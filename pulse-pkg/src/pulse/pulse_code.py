@@ -71,7 +71,9 @@ from .pulse_cli import (
     _YELLOW,
     _find_fuzzy_snippet_span,
     _reindent_like,
+    _same_text,
     _token_boundary_occurrences,
+    _with_endings_of,
     _flush_stdin,
     _prompt_text,
     cprint,
@@ -561,6 +563,17 @@ def _inside(root, path):
         return False
 
 
+def _protected(root, path):
+    """True for a path in .git or .pulse_history -- reached through a symlink, or spelled
+    .GIT (the same folder on macOS and Windows), too."""
+    try:
+        rel = os.path.relpath(os.path.realpath(path), os.path.realpath(root))
+    except ValueError:
+        return False
+    protected = {p.lower() for p in _PROTECTED_PARTS}
+    return any(part.lower() in protected for part in rel.split(os.sep))
+
+
 # ---------------------------------------------------------------------------------------
 # Context
 # ---------------------------------------------------------------------------------------
@@ -714,7 +727,7 @@ def simulate(cli, fix):
     for spec in fix.get("create") or []:
         target = os.path.abspath(os.path.join(cli._project_root, spec["path"]))
         shown = spec["path"]
-        if not _inside(cli._project_root, target) or any(p in _PROTECTED_PARTS for p in os.path.relpath(target, cli._project_root).split(os.sep)):
+        if not _inside(cli._project_root, target) or _protected(cli._project_root, target):
             problems.append((f"create {shown}", shown, "outside the project or in a protected directory -- refused"))
         elif os.path.exists(target):
             problems.append((f"create {shown}", shown, "already exists -- edit it with old/new snippets instead"))
@@ -1227,22 +1240,26 @@ def _confirm_and_apply(cli, request, plan, fix, changes):
               for path in changes]
     _ui.show_change([f"{'CREATE' if changes[path][2] else 'EDIT'}: {label}" for path, label in zip(changes, labels)], diff)
     n_files = len(changes)
+    # "Always apply" (below or in pulse_code_agent._confirm) skips only this question; unlike
+    # /review off it leaves flagged shell commands confirmed.
+    asking = cli.review and not getattr(cli, "_always_apply_changes", False)
     reviewed = cli._review_change_with_approver(request, str(fix.get("explanation") or plan or ""), diff) \
-        if cli.review else None
+        if asking else None
     if reviewed is False:
         _ui.change_status("not applied", color=_YELLOW, final=True, terminal_text="[Pulse Code] Not applied.")
         return "declined", f"{plan}\n\n(Not applied: {getattr(cli, '_last_change_denial', '') or 'declined'}.)"
-    if cli.review and reviewed is None:
+    if asking and reviewed is None:
         try:
             answer = _prompt_text(
-                f"Apply these changes to {n_files} file{'s' if n_files != 1 else ''}? (Y/n/a=apply all from now on) > ",
-                label=f"Apply these changes to {n_files} file{'s' if n_files != 1 else ''}?  (Y/n/a=always)").strip().lower()
+                f"Apply these changes to {n_files} file{'s' if n_files != 1 else ''}? (Y/n, or type 'always' for this session) > ",
+                label=f"Apply these changes to {n_files} file{'s' if n_files != 1 else ''}?  (Y/n/always)").strip().lower()
         except EOFError:
             answer = "n"
             cprint("[Pulse Code] No terminal to confirm on -- not applied (use -y to apply without asking).", color=_YELLOW)
-        if answer in ("a", "all", "always"):
-            cli.review = False
-            cprint("[Pulse Code] Review is now OFF for this session (/review on to re-enable).", color=_YELLOW)
+        if answer == "always":
+            cli._always_apply_changes = True
+            cprint("[Pulse Code] Code changes are now applied without asking for this session "
+                   "(/review on to ask again).", color=_YELLOW)
         elif answer not in ("", "y", "yes"):
             _ui.change_status("not applied", color=_YELLOW, final=True, terminal_text="[Pulse Code] Not applied.")
             return "declined", f"{plan}\n\n(The user declined the proposed change.)"
@@ -1316,24 +1333,26 @@ def undo(cli, arg="", quiet=False):
     for entry in target.get("files", []):
         path = entry["path"]
         try:
-            with open(path, "r", encoding="utf-8") as handle:
+            # Raw text (newline=""), compared with line endings normalised: the log may hold LF
+            # for a CRLF file, and that alone is not an edit.
+            with open(path, "r", encoding="utf-8", newline="") as handle:
                 current = handle.read()
         except OSError:
             current = None
         if entry.get("created"):
             if current is None:
                 continue
-            if current != entry["after"] and not force:
+            if not _same_text(current, entry["after"]) and not force:
                 conflicts.append(path)
                 continue
             plan.append((path, current, None))
         else:
-            if current == entry["before"]:
+            if _same_text(current, entry["before"]):
                 continue
-            if current != entry["after"] and not force:
+            if not _same_text(current, entry["after"]) and not force:
                 conflicts.append(path)
                 continue
-            plan.append((path, current, entry["before"]))
+            plan.append((path, current, _with_endings_of(entry["before"], current)))
     if conflicts:
         cprint(f"[Pulse Code] Not undone -- changed since the agent edited them, so undoing would overwrite your work:", color=_YELLOW)
         for path in conflicts:
@@ -1348,7 +1367,7 @@ def undo(cli, arg="", quiet=False):
             if restored is None:
                 os.remove(path)
             else:
-                with open(path, "w", encoding="utf-8") as handle:
+                with open(path, "w", encoding="utf-8", newline="") as handle:
                     handle.write(restored)
         except OSError as exc:
             cprint(f"[Pulse Code] ⚠ Could not restore {os.path.basename(path)}: {exc}", color=_RED)
@@ -1380,6 +1399,7 @@ _HELP = [
         ("<request>", "just type it: 'add a --resume flag to train.py', 'why does loader.py drop the last batch?'"),
         ("/review on|off", "show a diff and ask before applying (default on)"),
         ("/undo [id]", "undo the latest change (or a given one); leaves files you've edited since alone"),
+        ("/experiment <spec.json>", "isolated proxy baselines, then candidate fixes (status [id], cancel <id>)"),
     ]),
     ("Context", [
         ("/context", "how much conversation the agent is carrying, and whether PULSE.md is loaded"),
@@ -1463,11 +1483,15 @@ def _handle_command(cli, line):
     elif word == "/review":
         arg = rest.strip().lower()
         cli.review = True if arg in ("on", "true", "1") else False if arg in ("off", "false", "0") else not cli.review
+        cli._always_apply_changes = False
         from . import pulse_settings as _settings
         _settings.set("review", "on" if cli.review else "off")
         cprint(f"[Pulse Code] Review before applying is {'ON' if cli.review else 'OFF'} (remembered).")
     elif word in ("/undo", "/revert"):
         undo(cli, rest)
+    elif word == "/experiment":
+        # The debugger's EXPERIMENT tool; the app sends its unknown commands here too.
+        print(cli._safe_tool("EXPERIMENT", rest.strip(), cli._run_experiment, rest.strip()))
     elif word == "/context":
         name, notes = cli.project_notes()
         chars = cli.history_chars()

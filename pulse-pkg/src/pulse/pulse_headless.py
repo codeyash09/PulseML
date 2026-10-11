@@ -311,16 +311,31 @@ class HeadlessApp(pulse_app.App):
         # nobody here it goes on the run's dashboard page and waits there for a while; with no
         # answer the answer is no -- the pipelines read EOF as "no terminal to confirm on"
         posted = self._post_question(question)
-        if posted is not None:
-            minutes = max(1, round(_ANSWER_SECONDS / 60))
-            self.write(f"  (asked {question.label!r}: waiting up to {minutes} min for an answer on the dashboard)")
-            if question.done.wait(_ANSWER_SECONDS):
-                self.write(f"  (answered on the dashboard: {question.answer!r})")
-                return question.answer
-            posted.close("failed", f"Nobody answered within {minutes} min, so the answer was no.")
-            self.write(f"  (no answer in {minutes} min: no)")
+        if posted is None:
+            self.write(f"  (asked {question.label!r} with nobody to answer: no)")
             raise EOFError
-        self.write(f"  (asked {question.label!r} with nobody to answer: no)")
+        minutes = max(1, round(_ANSWER_SECONDS / 60))
+        self.write(f"  (asked {question.label!r}: waiting up to {minutes} min for an answer on the dashboard)")
+        with self.lock:
+            self._question = question                # the live feed says a question waits
+        try:
+            question.done.wait(_ANSWER_SECONDS)
+        finally:
+            with self.lock:
+                self._question = None
+                # time is up: an answer arriving now is not used (answered() sees it is done)
+                question.done.set()
+        if getattr(question, "from_dashboard", False):
+            self.write(f"  (answered on the dashboard: {question.answer!r})")
+            return question.answer
+        if question.cancelled:                       # the supervisor is stopping
+            closer = posted.close("failed", "No longer asked: Pulse stopped.")
+            self.write("  (no longer asked: stopping)")
+        else:
+            closer = posted.close("failed", f"Nobody answered within {minutes} min, so the answer was no.")
+            self.write(f"  (no answer in {minutes} min: no)")
+        if closer is not None:
+            self._closers.append(closer)
         raise EOFError
 
     def _agent_stop_run(self) -> str:
@@ -436,12 +451,21 @@ def supervise(argv: List[str]) -> int:
             app._open_run(session)
         else:
             app._launch(" ".join(shlex.quote(a) for a in script_argv))
-        if app.console is None:
+        if app.console is None and not app._still_starting():
             app.write("The run did not start; see above.")
             return 1
         return _watch(app, stopping)
     finally:
         app.done = True                              # a dashboard prompt still waiting is failed, not left hanging
+        with app.lock:                               # and so is a question waiting for an answer
+            question = app._question
+            if question is not None:
+                question.cancelled = True
+                question.done.set()
+        job = app._job
+        if job is not None and job.is_alive():
+            job.join(2.0)
+        app._wait_for_rows()
         try:
             app._close_all()
         except Exception:
@@ -462,10 +486,20 @@ def supervise(argv: List[str]) -> int:
 def _watch(app: HeadlessApp, stopping: threading.Event) -> int:
     idle_since: Optional[float] = None
     closing_audit_done: Optional[str] = None
+    starting = app.console is None
     while not stopping.is_set():
         with app.lock:
             app._refresh_side(force=True)
         app._start_pending_remote_command()          # prompts sent from the dashboard
+        if starting:                                 # a run slow to report: opened once it does
+            app._open_slow_starts()
+            starting = app.console is None
+            if starting and not app._slow_starts:
+                app.write("The run did not start; see above.")
+                return 1
+            if starting:
+                stopping.wait(1.0)
+                continue
         busy = app._job is not None or app.view.busy or bool(app._crash_pending or app._problem_pending
                                                              or app._remote_pending)
         live = app._status in ("live", "stalled")

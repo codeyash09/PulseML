@@ -4453,10 +4453,13 @@ def _chat_panel_class():
             def work():
                 try:
                     key = pulse_openrouter.sign_in(ask=None, say=say, browser=True)
-                except pulse_openrouter.SignInError as exc:
-                    tell(f"OpenRouter sign-in did not finish: {exc}. Send your message again to "
-                         "retry, or paste an API key instead.")
+                except Exception as exc:
+                    # Any failure, not only a SignInError, must clear the flag: otherwise
+                    # every later sign-in is silently refused.
                     self._openrouter_signing_in = False
+                    detail = exc if isinstance(exc, pulse_openrouter.SignInError) else f"{type(exc).__name__}: {exc}"
+                    tell(f"OpenRouter sign-in did not finish: {detail}. Send your message again to "
+                         "retry, or paste an API key instead.")
                     return
                 self.after(0, lambda: finish(key))
 

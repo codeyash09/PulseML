@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import sys
 import threading
@@ -217,7 +218,226 @@ def test_cli_experiment_job_can_be_inspected_and_cancelled(tmp_path, monkeypatch
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         status = cli._run_experiment(f"status {job_id}")
-        if "cancelled" in status:
+        if status.startswith(f"EXPERIMENT {job_id}: cancelled"):
             break
         time.sleep(0.05)
-    assert "cancelled" in status
+    # Every report mentions "cancelled" (each run has a cancelled flag): check the state.
+    assert status.splitlines()[0] == f"EXPERIMENT {job_id}: cancelled"
+
+
+def bare_cli(project, monkeypatch):
+    from pulse import pulse_cli
+
+    cli = PulseCLI.__new__(PulseCLI)
+    cli._project_root = str(project)
+    cli.scalar_histories = {}
+    cli._log_incident = lambda *args, **kwargs: None
+    monkeypatch.setattr(pulse_cli._ui, "message", lambda _message: None)
+    return cli
+
+
+def wait_for_state(cli, job_id, timeout=30):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = cli._run_experiment(f"status {job_id}").splitlines()[0]
+        if not state.endswith(": running"):
+            return state
+        time.sleep(0.05)
+    raise AssertionError("experiment did not finish")
+
+
+def test_cli_flagged_experiment_command_is_confirmed_and_a_decline_starts_nothing(tmp_path, monkeypatch):
+    spec = spec_for(tmp_path, scales=(0.75,))
+    spec["command"] = ["rm", "-rf", "{project}/scratch"]
+    (tmp_path / "experiment.json").write_text(json.dumps(spec))
+    cli = bare_cli(tmp_path, monkeypatch)
+    asked = []
+
+    def decline(command, flags, purpose=None):
+        asked.append(command)
+        return False
+
+    cli._confirm_terminal_command = decline
+    result = cli._run_experiment("experiment.json")
+
+    assert asked == ["rm -rf ./scratch"]
+    assert "not started" in result and "declined" in result
+    assert cli._experiment_jobs == {}
+
+
+def test_cli_confirms_each_distinct_experiment_command_once(tmp_path, monkeypatch):
+    spec = spec_for(tmp_path, scales=(0.75,))
+    spec["command"] = [sys.executable, "-c", "pass", "{seed}", "{config}"]
+    (tmp_path / "experiment.json").write_text(json.dumps(spec))
+    cli = bare_cli(tmp_path, monkeypatch)
+    cli._terminal_needs_confirmation = lambda command: {"deletes_files": True}
+    asked = []
+    cli._confirm_terminal_command = lambda command, flags, purpose=None: asked.append(command) or True
+
+    result = cli._run_experiment("experiment.json")
+    job_id = result.split()[1]
+    wait_for_state(cli, job_id)
+
+    assert "started" in result
+    assert len(asked) == len(set(asked)) == 2          # seeds 0 and 1; {branch} is not used
+    assert all(command.endswith(" config.json") for command in asked)
+
+
+def test_cli_invalid_spec_is_reported_before_any_job_starts(tmp_path, monkeypatch):
+    spec = spec_for(tmp_path)
+    spec["repetitions"] = 0
+    (tmp_path / "experiment.json").write_text(json.dumps(spec))
+    cli = bare_cli(tmp_path, monkeypatch)
+
+    result = cli._run_experiment("experiment.json")
+
+    assert "not started -- invalid spec" in result and "repetitions" in result
+    assert cli._experiment_jobs == {}
+    assert "not started" in cli._run_experiment("missing.json")
+
+
+def test_cli_status_is_a_compact_summary(tmp_path, monkeypatch):
+    (tmp_path / "experiment.json").write_text(json.dumps(spec_for(tmp_path, scales=(0.75,))))
+    cli = bare_cli(tmp_path, monkeypatch)
+
+    job_id = cli._run_experiment("experiment.json").split()[1]
+    assert wait_for_state(cli, job_id) == f"EXPERIMENT {job_id}: completed"
+    status = cli._run_experiment(f"status {job_id}")
+
+    assert "conclusion:" in status and "branch stabilize-loss" in status
+    assert "metric_summary" not in status and len(status) < 2000
+
+
+def test_candidate_must_pass_every_validation_scale(tmp_path):
+    spec = spec_for(tmp_path, scales=(0.75,))
+    spec["validation_scales"] = [0.5, 1.0]
+    # The fix holds at the proxy and at full scale but breaks at scale 0.5 (hidden_size 8).
+    spec["command"] = [
+        sys.executable, "-c",
+        "import json,pathlib,sys; c=json.loads(pathlib.Path(sys.argv[1]).read_text()); "
+        "s=pathlib.Path('intervention.txt').read_text().strip(); "
+        "bad=(s=='unchanged' and c['hidden_size']>=12) or (s=='fixed' and c['hidden_size']==8); "
+        "print('PULSE_METRICS: '+json.dumps({'loss':100.0 if bad else 1.0}))",
+        "{config}",
+    ]
+
+    report = experiments.run_experiment(tmp_path, spec)
+
+    assert [(item["scale"], item["passed"]) for item in report["validation"]] == [(0.5, False), (1.0, True)]
+    candidate = next(branch for branch in report["branches"] if branch["name"] == "stabilize-loss")
+    assert candidate["validated"] is False
+
+
+def test_secret_like_metric_names_do_not_break_the_report(tmp_path):
+    spec = spec_for(tmp_path, scales=(0.75,))
+    spec["command"] = [
+        sys.executable, "-c",
+        "import json; print('PULSE_METRICS: '+json.dumps({'loss':100.0,'password':0.123456789,"
+        "'token':12345678.5,'note':'api_key=abcdefgh12345678'}))",
+    ]
+
+    report = experiments.run_experiment(tmp_path, spec)
+
+    metrics = report["runs"][0]["metrics"]
+    assert metrics["password"] == 0.123456789 and metrics["token"] == 12345678.5
+    assert "abcdefgh12345678" not in json.dumps(report)
+
+
+def test_gpu_devices_are_never_shared_by_concurrent_runs(tmp_path):
+    locks = tmp_path.parent / (tmp_path.name + "-locks")
+    locks.mkdir()
+    spec = spec_for(tmp_path, scales=(0.75,))
+    # Equal seeds: a seed-hash assignment would put every run on the same device.
+    spec.update({"resource_class": "gpu", "devices": ["a", "b"], "max_parallel": 2, "repetitions": 6,
+                 "seeds": [0] * 6,
+                 "failure_signature": {"kind": "stderr_regex", "pattern": "DEVICE CLASH"}})
+    spec["command"] = [
+        sys.executable, "-c",
+        "import os,sys,time; p=os.path.join(sys.argv[1], os.environ['CUDA_VISIBLE_DEVICES'])\n"
+        "try: fd=os.open(p, os.O_CREAT|os.O_EXCL)\n"
+        "except FileExistsError: sys.stderr.write('DEVICE CLASH'); raise SystemExit(1)\n"
+        "time.sleep(0.3); os.close(fd); os.remove(p)",
+        str(locks),
+    ]
+
+    report = experiments.run_experiment(tmp_path, spec)
+
+    assert report["proxy_attempts"][0]["reproduced"] == 0
+    assert {run["device"] for run in report["runs"]} == {"a", "b"}
+    assert all(run["returncode"] == 0 for run in report["runs"])
+
+
+def test_timed_out_run_is_not_a_reproduced_nonzero_exit():
+    outcome = experiments._run_command(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        Path.cwd(), dict(os.environ), 0.3, threading.Event(), {"kind": "exit_code_nonzero"},
+    )
+
+    assert outcome["timed_out"]
+    assert not outcome["failure_observed"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="process groups")
+def test_runner_grandchildren_are_killed_with_the_group(tmp_path):
+    pid_file = tmp_path / "grandchild.pid"
+    experiments._run_command(
+        [sys.executable, "-c",
+         "import subprocess,sys; p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+         f"open({str(pid_file)!r},'w').write(str(p.pid))"],
+        tmp_path, dict(os.environ), 10, threading.Event(), {"kind": "exit_code_nonzero"},
+    )
+    pid = int(pid_file.read_text())
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().split(")")[-1].split()[0]
+        except OSError:
+            break                   # gone
+        if state == "Z":
+            break                   # killed, waiting for its new parent to reap it
+        time.sleep(0.05)
+    else:
+        os.kill(pid, 9)
+        raise AssertionError("the runner's grandchild survived")
+
+
+def test_cancel_all_stops_running_and_queued_runs(tmp_path):
+    spec = spec_for(tmp_path, scales=(0.75,))
+    spec.update({"resource_class": "cpu", "max_parallel": 1, "repetitions": 4})
+    spec["command"] = [sys.executable, "-c", "import time; time.sleep(60)"]
+    reports = []
+    thread = threading.Thread(target=lambda: reports.append(experiments.run_experiment(tmp_path, spec)))
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not experiments._LIVE_PROCESSES and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    started = time.monotonic()
+    experiments.cancel_all()
+    thread.join(10)
+
+    assert not thread.is_alive() and time.monotonic() - started < 10
+    assert reports[0]["status"] == "cancelled"
+    assert reports[0]["run_count"] == 4
+    assert not experiments._LIVE_PROCESSES and not experiments._LIVE_CANCELS
+
+
+def test_branch_copy_keeps_symlinks_and_is_removed_when_preparation_fails(tmp_path):
+    project, outside, scratch = tmp_path / "project", tmp_path / "data", tmp_path / "scratch"
+    project.mkdir(); outside.mkdir(); scratch.mkdir()
+    (outside / "train.bin").write_text("shared")
+    (project / "config.json").write_text(json.dumps({"hidden_size": 16}))
+    (project / "data").symlink_to(outside)
+    (project / "latest.json").symlink_to("config.json")
+
+    copy = scratch / "copy"
+    experiments._safe_copy(project, copy, [])
+    assert (copy / "data").is_symlink() and (copy / "data" / "train.bin").read_text() == "shared"
+    assert (copy / "latest.json").resolve() == (copy / "config.json").resolve()
+
+    bad = {"name": "c", "replacements": [{"file": "config.json", "find": "absent", "replace": "x"}]}
+    with pytest.raises(experiments.ExperimentError):
+        experiments._prepare_branch(project, scratch, {"hidden_size": 16}, "config.json", 0.5,
+                                    {"hidden_size"}, ["true"], bad, [])
+    assert [path.name for path in scratch.iterdir()] == ["copy"]

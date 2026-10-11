@@ -745,6 +745,35 @@ def _agent_log_write(text: str) -> None:
                 pass
 
 
+def _json_finite(value: Any) -> Any:
+    """`value` with every NaN/inf float (numpy's too) replaced by its name ("nan", "inf",
+    "-inf"), so it encodes as valid JSON. Containers are copied, never changed in place."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(float(value))
+    if isinstance(value, dict):
+        return {k: _json_finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_finite(v) for v in value]
+    return value
+
+
+def _same_text(a: Optional[str], b: Optional[str]) -> bool:
+    """Equal file contents, CRLF and LF counted the same (None = no file). The change log
+    can hold either form of a file whose disk copy is the other."""
+    if a is None or b is None:
+        return a is b
+    return a.replace("\r\n", "\n") == b.replace("\r\n", "\n")
+
+
+def _with_endings_of(content: str, current: Optional[str]) -> str:
+    """`content` with the line endings of the file it replaces (`current`, its raw text):
+    restoring a version must not turn a CRLF file into LF."""
+    if current is None:
+        return content
+    lf = content.replace("\r\n", "\n")
+    return lf.replace("\n", "\r\n") if "\r\n" in current else lf
+
+
 def _agent_log_event(title: str, body: str = "") -> None:
     """One thing Pulse did: a verdict, an escalation, a fix, a restart."""
     stamp = time.strftime("%H:%M:%S")
@@ -1370,9 +1399,14 @@ def _ui_key_screen(chosen: str, openrouter: bool = False) -> None:
     _ui.header("API key", "Connect your agent model")
     _ui.kv("Model", chosen, indent=0)
     if openrouter:
+        remembering = _settings.on("remember_keys")
         _ui.note("No key yet? Press Enter to sign in to OpenRouter -- or create an account -- in "
-                 "your browser. Pulse asks whether to save that key for future sign-ins.")
-        _ui.note("A key you paste is used only to call the model and is never written to disk.")
+                 "your browser."
+                 + (" Pulse asks whether to save that key for future sign-ins." if remembering else ""))
+        _ui.note("A key you paste is used only to call the model. "
+                 + ("Saved in ~/.pulse/keys.json only if you consent (/config remember_keys off: never "
+                    "kept)." if remembering
+                    else "Pulse does not keep it (/config remember_keys on to keep it)."))
     else:
         _ui.note("Used only to call the model you selected. "
                  + ("Saved in ~/.pulse/keys.json only if you consent, so you are not asked again "
@@ -6498,7 +6532,9 @@ class PulseCLI:
         if not self.debug_session_id:
             return
         entry: Dict[str, Any] = {"t": time.time(), "kind": kind, "summary": summary}
-        entry.update(extra)
+        # Detail can carry NaN/inf (an experiment's diverged metrics): json.dumps writes
+        # them as bare NaN/Infinity, which is not JSON, and the whole sync is rejected.
+        entry.update(_json_finite(extra))
         self._incidents.append(entry)
         self._cloud_dirty_fields.add("incidents")
         self._maybe_flush_cloud(force=True)
@@ -7105,6 +7141,9 @@ class PulseCLI:
         the agent is simply left disabled for the run rather than
         blocking on a prompt that will never be answered.
         """
+        # Set again below only when the person says to save this key: a value left over
+        # from an earlier pick must not save (say) a custom or local agent's key unasked.
+        self._remember_agent_key = False
         names = list(PROVIDERS.keys())
 
         if self.non_interactive:
@@ -7492,7 +7531,9 @@ class PulseCLI:
                 except (ValueError, TypeError):
                     pass
         _say(f"✓ Signed in to OpenRouter (key {_openrouter.tail(key)})."
-             " Pulse will ask whether to save it in the private device config.",
+             + (" Pulse will ask whether to save it in the private device config."
+                if _settings.on("remember_keys") else
+                " Saving keys is off, so it is used for this session only."),
              "OpenRouter", f"signed in  (key {_openrouter.tail(key)})")
         info = _openrouter.key_info(key)
         if info and info.get("is_free_tier"):
@@ -9515,10 +9556,12 @@ class PulseCLI:
         """y/N for a flagged command: the auto-mode approver when there is one, else the
         person. Why a command was declined is kept per thread (a check-in worker and the
         training thread can both be here) -- see _terminal_denial_reason."""
-        if getattr(self, "_always_allow_terminal_commands", False):
-            return True
         why = _terminal.describe_classification(flags)
         cprint(f"[Pulse] ⚠ This command {why}: {command}", color=_YELLOW)
+        if getattr(self, "_always_allow_terminal_commands", False):
+            # Still shown and logged: the person turned the question off, not the record.
+            _agent_log_event("allowed: always-allow this session", f"{command}\nflagged because it {why}")
+            return True
         _terminal_denial.reason = None
         settings = self._approver_settings()
         if settings:
@@ -9567,15 +9610,14 @@ class PulseCLI:
                     # repeat which command the question is about.
                     cprint(f"[Pulse] (background check-in) {command}", color=_YELLOW)
                 _flush_stdin()
+                # "Always" has no single-key shortcut: a stray keystroke must not turn every
+                # later question off. It takes arrows + Enter.
                 options = [
                     _ui.Option("Do not run this command", key="n"),
                     _ui.Option("Run this command once", key="y"),
-                    _ui.Option("Always allow flagged commands this session", key="a"),
+                    _ui.Option("Always allow flagged commands this session"),
                 ]
-                choice = _ui.choose(
-                    options, initial=0, title=f"Run flagged command? {command[:180]}",
-                    hotkeys={"a": "always"},
-                )
+                choice = _ui.choose(options, initial=0, title=f"Run flagged command? {command[:180]}")
         except (EOFError, KeyboardInterrupt) as exc:
             if isinstance(exc, EOFError):
                 _terminal_denial.reason = "not run -- it needs the user's OK and there is no user to ask (no input)"
@@ -9583,19 +9625,19 @@ class PulseCLI:
         except _ui.Unavailable:
             try:
                 resp = _prompt_text(
-                    "Run it anyway? (y/N/a=always this session) > ",
-                    label="Run it anyway?  (y/N/a=always this session)",
+                    "Run it anyway? (y/N, or type 'always' for this session) > ",
+                    label="Run it anyway?  (y/N, or type 'always' for this session)",
                 ).strip().lower()
             except (EOFError, KeyboardInterrupt) as exc:
                 if isinstance(exc, EOFError):
                     _terminal_denial.reason = "not run -- it needs the user's OK and there is no user to ask (no input)"
                 return False
-            if resp in ("a", "all", "always"):
+            if resp == "always":
                 self._always_allow_terminal_commands = True
                 cprint("[Pulse] Flagged command approvals are off for this session.", color=_YELLOW)
                 return True
             return resp in ("y", "yes")
-        if choice == "always" or choice == 2:
+        if choice == 2:
             self._always_allow_terminal_commands = True
             cprint("[Pulse] Flagged command approvals are off for this session.", color=_YELLOW)
             return True
@@ -9929,15 +9971,33 @@ class PulseCLI:
         if not entries:
             return "ROLLBACK: no recorded Pulse code changes to revert."
         arg = arg.strip()
+        paths = None
         if not arg or arg.lower() == "last":
             target_idx = len(entries) - 2
             target_label = f"before commit {entries[-1].get('id', '?')} (most recent)"
+            # Only that commit's files, and only while they are as it left them: anything
+            # edited since (by the person, or a later tool) is not overwritten.
+            last_files = entries[-1].get("files", [])
+            paths = [fc["path"] for fc in last_files]
+            changed = []
+            for fc in last_files:
+                try:
+                    with open(fc["path"], "r", encoding="utf-8", newline="") as f:
+                        current = f.read()
+                except OSError:
+                    current = None
+                if not _same_text(current, None if fc.get("deleted") else fc.get("after", "")):
+                    changed.append(fc["path"])
+            if changed:
+                return ("ROLLBACK: not done -- these files changed after that commit, and rolling back would "
+                        "overwrite the newer edits: " + ", ".join(os.path.basename(p) for p in changed)
+                        + ". Edit them back by hand (EDIT/edit_file), or ROLLBACK to a commit id on purpose.")
         else:
             target_idx, problem = self._match_commit_id(entries, arg)
             if target_idx is None:
                 return f"ROLLBACK '{arg}': {problem}. Recorded commits (oldest first):\n" + self._describe_commits(entries)
             target_label = f"commit {entries[target_idx].get('id', '')}"
-        restored, failed, new_commit = self._perform_revert(entries, target_idx, target_label)
+        restored, failed, new_commit = self._perform_revert(entries, target_idx, target_label, paths=paths)
         if not restored and not failed:
             return f"ROLLBACK '{arg}': workspace already matches that state -- nothing to revert."
         parts = []
@@ -9949,6 +10009,7 @@ class PulseCLI:
 
     def _run_experiment(self, arg: str) -> str:
         """Start, inspect, or cancel an isolated experiment without touching the live project."""
+        import shlex
         from pulse import pulse_experiments
 
         text = arg.strip()
@@ -9962,9 +10023,11 @@ class PulseCLI:
                 selected = [jobs[identifier]] if identifier in jobs else list(jobs.values()) if not identifier else []
                 if not selected:
                     return f"EXPERIMENT: no job found for {job_id!r}."
+                # A summary, not the report: up to 120 runs with metric histories would flood
+                # the agent's context. The full report is in the experiment incident.
                 return "\n".join(
                     f"EXPERIMENT {job['id']}: {job['state']}"
-                    + (f"\n{json.dumps(job['report'], ensure_ascii=True, sort_keys=True)}" if job.get("report") else "")
+                    + (f"\n{pulse_experiments.summarize_report(job['report'])}" if job.get("report") else "")
                     + (f"\nError: {job['error']}" if job.get("error") else "")
                     for job in selected
                 )
@@ -9980,18 +10043,35 @@ class PulseCLI:
             return f"EXPERIMENT {job['id']}: cancellation requested; running subprocesses are stopping."
         if not text:
             return "EXPERIMENT: usage: /experiment <spec.json>, /experiment status [id], or /experiment cancel <id>."
-        project_root = Path(getattr(self, "_project_root", os.getcwd())).resolve()
-        spec_path = pulse_experiments._relative_file(project_root, text, "experiment spec")
-        spec = pulse_experiments._read_json_object(spec_path, "experiment spec")
-        signature = spec.get("failure_signature", {})
-        metric = signature.get("metric") if isinstance(signature, dict) else None
-        if metric and not spec.get("original_metrics"):
-            history = getattr(self, "scalar_histories", {}).get(metric)
-            if history:
-                spec["original_metrics"] = [value for value in history if value is not None]
+        busy = "EXPERIMENT: one experiment is already running; use /experiment status or /experiment cancel <id>."
         with lock:
             if any(job["state"] == "running" for job in jobs.values()):
-                return "EXPERIMENT: one experiment is already running; use /experiment status or /experiment cancel <id>."
+                return busy
+        project_root = Path(getattr(self, "_project_root", os.getcwd())).resolve()
+        try:
+            spec_path = pulse_experiments._relative_file(project_root, text, "experiment spec")
+            spec = pulse_experiments._read_json_object(spec_path, "experiment spec")
+            signature = spec.get("failure_signature", {})
+            metric = signature.get("metric") if isinstance(signature, dict) else None
+            if metric and not spec.get("original_metrics"):
+                history = getattr(self, "scalar_histories", {}).get(metric)
+                if history:
+                    spec["original_metrics"] = [value for value in history if value is not None]
+            # Here, not in the job thread: a malformed spec must not be reported as started.
+            settings = pulse_experiments.validate_spec(project_root, spec)
+        except pulse_experiments.ExperimentError as exc:
+            return f"EXPERIMENT '{text}': not started -- invalid spec: {exc}"
+        # Every runner command goes through the same confirm model as TERMINAL, once per
+        # distinct command and before anything starts.
+        for argv in pulse_experiments.planned_commands(settings):
+            command = shlex.join(argv)
+            flags = self._terminal_needs_confirmation(command)
+            if flags and not self._confirm_terminal_command(command, flags):
+                return (f"EXPERIMENT '{text}': not started -- {self._terminal_denial_reason()} "
+                        f"(command: {command}).")
+        with lock:
+            if any(job["state"] == "running" for job in jobs.values()):
+                return busy
             job_id = uuid.uuid4().hex[:10]
             job = {"id": job_id, "state": "running", "cancel": threading.Event(),
                    "report": None, "error": None}
@@ -12382,14 +12462,16 @@ class PulseCLI:
             "or /revert with no id to undo the most recent one."
         )
 
-    def _perform_revert(self, entries: List[Dict[str, Any]], target_idx: int, target_label: str):
+    def _perform_revert(self, entries: List[Dict[str, Any]], target_idx: int, target_label: str,
+                        paths: Optional[List[str]] = None):
         """Core of /revert, factored out so it can also be invoked
         by the ROLLBACK: tool without going through interactive arg-parsing. Restores every file the
-        changelog has ever touched to its state as of `target_idx`
+        changelog has ever touched (or only `paths`) to its state as of `target_idx`
         (`-1` meaning "before the very first recorded commit"), logs the
         revert itself as a new commit, and returns (restored_paths,
         failed_paths, new_commit_id)."""
-        all_paths = sorted({fc["path"] for e in entries for fc in e.get("files", [])})
+        all_paths = sorted({fc["path"] for e in entries for fc in e.get("files", [])}
+                           if paths is None else set(paths))
         asof = self._fix_log_state_asof(entries, target_idx)
 
         restored, failed = [], []
@@ -12407,8 +12489,10 @@ class PulseCLI:
             # or a commit deleted it): remove it rather than leave an empty module
             # behind, which still shadows or breaks an import.
             content = asof[fpath] if fpath in asof else self._fix_log_original(entries, fpath)
-            if content == current:
-                continue  # already in that state
+            if _same_text(content, current):
+                continue  # already in that state (a CRLF/LF difference alone is not a change)
+            if content is not None:
+                content = _with_endings_of(content, current)
 
             try:
                 if content is None:

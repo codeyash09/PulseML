@@ -78,6 +78,11 @@ def yellow(text: str) -> str:
     return orange(text)
 
 
+def amber(text: str) -> str:
+    # Its own hue for a stalled run: orange (yellow) already means live.
+    return _paint(text, "38;5;178")
+
+
 def green(text: str) -> str:
     return _paint(text, "2")
 
@@ -1294,7 +1299,7 @@ def confirm(question: str) -> bool:
 
 
 def render_session_list(sessions: List[Dict[str, Any]], attached: Optional[str] = None) -> None:
-    status_paint = {"live": orange, "stalled": yellow, "crashed": red}
+    status_paint = {"live": orange, "stalled": amber, "crashed": red}
     for index, session in enumerate(sessions, 1):
         marker = "*" if session["session_id"] == attached else " "
         paint = status_paint.get(session["status"], dim)

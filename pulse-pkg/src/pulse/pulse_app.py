@@ -122,6 +122,7 @@ _WATCH_FIELDS = ("console", "session", "_monitor", "runlog", "_status", "_rate",
                  "_stall_said", "_paused_here")
 _STATUS_PATIENCE_SECONDS = 10.0   # run_status asked again sooner than this waits for progress
 _AUTO_CRASH_TURNS = 3       # crashes in a row the agent starts on by itself, before the person is asked
+_LEAVING_WAIT = 3.0         # leaving Pulse: seconds a dashboard command in hand gets to say how it ended
 _RUN_LOG_DIR = "app-runs"
 
 # How a run is launched: `python -m pulse` puts the working directory first on sys.path, so
@@ -176,6 +177,7 @@ class CommandQueue:
         self._poller: Optional[threading.Thread] = None
         self._active: Optional[threading.Thread] = None
         self._backlog: "collections.deque[Dict[str, Any]]" = collections.deque()
+        self._unsent: List[Tuple[str, str, str]] = []     # results the dashboard has not got yet
         self._lock = threading.Lock()
         self._error_said = False
 
@@ -184,9 +186,10 @@ class CommandQueue:
             self._poller = threading.Thread(target=self._listen, daemon=True, name="pulse-commands")
             self._poller.start()
 
-    def close(self) -> None:
+    def close(self, wait: float = 0.0) -> None:
         """Stop listening. Commands claimed but not started are failed with the reason, so the
-        dashboard does not show them as running for ever."""
+        dashboard does not show them as running for ever. `wait`: leaving Pulse, the command in
+        hand gets that long to send how it ended."""
         self._stop.set()
         with self._lock:
             left, self._backlog = list(self._backlog), collections.deque()
@@ -195,9 +198,14 @@ class CommandQueue:
         poller = self._poller
         if poller is not None and poller is not threading.current_thread():
             poller.join(timeout=1.0)
+        active = self._active
+        if wait and active is not None and active is not threading.current_thread():
+            active.join(wait)
+        self._resend()
 
     def _listen(self) -> None:
         while not self._stop.wait(self.POLL_EVERY):
+            self._resend()
             row = self._row_id()
             if not row:
                 continue
@@ -248,10 +256,26 @@ class CommandQueue:
             self._next()
 
     def _finish(self, command: Dict[str, Any], status: str, result: str) -> None:
+        item = (str(command.get("id") or ""), status, result)
         try:
-            self._cloud.finish_command(str(command.get("id") or ""), status, result)
+            self._cloud.finish_command(*item)
         except Exception as exc:
+            # tried again at every poll: otherwise the row says "processing" for ever and the
+            # person sends the command again
+            with self._lock:
+                self._unsent = (self._unsent + [item])[-50:]
             self._report(f"Could not send a command's result to the dashboard: {exc}")
+
+    def _resend(self) -> None:
+        with self._lock:
+            unsent, self._unsent = self._unsent, []
+        for index, item in enumerate(unsent):
+            try:
+                self._cloud.finish_command(*item)
+            except Exception:
+                with self._lock:
+                    self._unsent = (unsent[index:] + self._unsent)[-50:]
+                return
 
     def _report(self, message: str) -> None:
         if self._error_said or self._on_error is None:
@@ -264,10 +288,16 @@ class CommandQueue:
 
 
 
+# Answers typed at the machine that the dashboard is told word for word (a yes/no); any other
+# free text is not sent.
+_SHOWN_ANSWERS = {"(enter)", "y", "n", "yes", "no"}
+
+
 class DashboardQuestion:
     """A question asked here, put on the run's dashboard page too: whoever answers first --
     at the machine or on the dashboard -- answers it. `on_answer` gets the dashboard's answer
-    (the option's "#index", or the text typed); `close` says how it ended, if it was here."""
+    (the option's "#index", or the text typed) and returns whether it was used; `close` says
+    how it ended, if it was here."""
 
     POLL_EVERY = 1.5
 
@@ -299,28 +329,32 @@ class DashboardQuestion:
                 continue
             status = (row or {}).get("status")
             if status == "completed" and not self._stop.is_set():
-                self.answered_there = True
-                self._on_answer(str((row or {}).get("result") or ""))
+                # answered at the machine in the meantime: close() puts that answer on the row
+                self.answered_there = bool(self._on_answer(str((row or {}).get("result") or "")))
                 return
             if status in ("completed", "failed", None):
                 return
 
-    def close(self, status: str, result: str) -> None:
+    def close(self, status: str, result: str) -> Optional[threading.Thread]:
         """The question is over here: its row says how (unless the dashboard answered it).
-        In the background -- the row may still be being opened."""
+        In the background -- the row may still be being opened; the thread doing it."""
         self._stop.set()
         if self.answered_there:
-            return
+            return None
 
         def finish() -> None:
             self._thread.join(15.0)
             if self.id and not self.answered_there:
                 try:
-                    self._cloud.finish_command(self.id, status, result)
+                    if not self._cloud.finish_command(self.id, status, result):
+                        # the dashboard answered too, too late to be used: the row says which was
+                        self._cloud.finish_command(self.id, status, result, overwrite=True)
                 except Exception:
                     pass
 
-        threading.Thread(target=finish, daemon=True, name="pulse-dashboard-question-close").start()
+        thread = threading.Thread(target=finish, daemon=True, name="pulse-dashboard-question-close")
+        thread.start()
+        return thread
 
 
 class LiveFeed:
@@ -343,7 +377,9 @@ class LiveFeed:
         self._last = ""
         self._sent_at = 0.0
         self._retry_at = 0.0
-        self._turns: "collections.deque[Dict[str, Any]]" = collections.deque()
+        # finished turns still to be kept: [record, the row it is filed on, the row opened for it]
+        self._turns: "collections.deque[List[Any]]" = collections.deque()
+        self._lock = threading.Lock()            # one of tick / close at a time: a row is never sent twice
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="pulse-live-feed")
 
@@ -351,40 +387,45 @@ class LiveFeed:
         self._thread.start()
         return self
 
-    def turn_ended(self, record: Dict[str, Any]) -> None:
+    def turn_ended(self, record: Dict[str, Any], target: Optional[Tuple[str, str, str]] = None) -> None:
         """A job finished: its row is completed with the whole turn (the page keeps it), and
-        the feed goes on in a new row."""
-        self._turns.append(record)
+        the feed goes on in a new row. `target`: the dashboard row the job started on, where
+        the turn is kept even if the run in hand has changed since."""
+        self._turns.append([record, target, None])
 
     def close(self) -> None:
         self._stop.set()
         if self._thread.is_alive():
             self._thread.join(timeout=2.0)
-        try:
-            self._flush_turns()
-        except Exception:
-            pass
-        self._end()
+        with self._lock:                         # a tick still sending finishes first
+            try:
+                self._flush_turns()
+            except Exception:
+                pass
+            self._end()
 
     def _loop(self) -> None:
         while not self._stop.wait(self.EVERY):
-            try:
-                self.tick()
-            except Exception:
-                self._retry_at = time.monotonic() + self.RETRY
+            with self._lock:
+                if self._stop.is_set():
+                    return
+                try:
+                    self.tick()
+                except Exception:
+                    self._retry_at = time.monotonic() + self.RETRY
 
     def tick(self) -> None:
         now = time.monotonic()
         if now < self._retry_at:
             return
         target = self.app._live_target()
+        if self._turns:
+            self._flush_turns()                  # into the rows they streamed in, before a switch
         if target != self._target:
             self._end()
             self._target = target
         if target is None:
             return
-        if self._turns:
-            self._flush_turns()
         if self.id is None:
             self.id = self._cloud.open_runner_row(*target, self._cloud.LIVE_PREFIX)
             self._last = ""
@@ -400,16 +441,23 @@ class LiveFeed:
 
     def _flush_turns(self) -> None:
         """Each finished turn completes the row that streamed it (one is opened if the job
-        was too quick for one)."""
-        target = self._target or self.app._live_target()
-        while self._turns and target is not None:
-            record = self._turns[0]
-            row = self.id or self._cloud.open_runner_row(*target, self._cloud.LIVE_PREFIX)
-            if not row:
+        was too quick for one, or the feed has moved to another run's row since)."""
+        while self._turns:
+            item = self._turns[0]
+            record, target, row = item
+            target = target or self._target or self.app._live_target()
+            if target is None:
                 return
+            if row is None:
+                row = self.id if self.id and target == self._target else \
+                    self._cloud.open_runner_row(*target, self._cloud.LIVE_PREFIX)
+                if not row:
+                    return
+                item[2] = row                    # a send that fails is retried in this row, not a new one
             self._cloud.finish_command(row, "completed", json.dumps(dict(record, t=time.time()), default=str))
             self._turns.popleft()
-            self.id, self._last = None, ""
+            if row == self.id:
+                self.id, self._last = None, ""
 
     def _end(self) -> None:
         """The row is done with: the page stops showing it as live."""
@@ -431,6 +479,10 @@ class RunLog:
 
     TELEMETRY_EVERY = 60.0
     FLUSH_EVERY = 60.0
+    # The newest entries kept per array: a PATCH sends the whole array, and a run of days would
+    # outgrow the request limit, after which nothing syncs. telemetry's first entry (the
+    # environment) always stays.
+    KEEP = {"telemetry": 1500, "agent_logs": 200, "incidents": 500, "error_tracebacks": 50}
 
     def __init__(self, cli: Any, session: Dict[str, Any], workdir: str,
                  on_command: Optional[Callable[[str], str]] = None,
@@ -454,6 +506,8 @@ class RunLog:
         self._last_telemetry = 0.0
         self._last_flush = time.monotonic()
         self._worker: Optional[threading.Thread] = None
+        self._send_lock = threading.Lock()         # one send at a time: an older one never lands last
+        self._wants_row = False                    # started: the row is created, retried until it is
         self._closed = False
         # prompts sent to this run from the web dashboard
         self.commands: Optional[CommandQueue] = (
@@ -475,6 +529,7 @@ class RunLog:
         with self._lock:
             self._fields["telemetry"].append(first)
             self._dirty.add("telemetry")
+        self._wants_row = True
         self._spawn(create=True)
         if self.commands is not None:
             self.commands.start()
@@ -504,8 +559,7 @@ class RunLog:
             for event in events[self._seen_events:]:
                 if event.get("event") == "crash":
                     trace = event.get("traceback") or event.get("exception") or "crash"
-                    self._fields["error_tracebacks"].append(str(trace)[-8000:])
-                    self._dirty.add("error_tracebacks")
+                    self._append("error_tracebacks", str(trace)[-8000:])
                     self._incident("crash", str(event.get("exception") or "the run crashed"))
                     force = True
                 elif event.get("event") in ("stop_requested", "stopped"):
@@ -530,8 +584,7 @@ class RunLog:
                 for name, history in (state.get("histories") or {}).items():
                     if history:
                         snapshot[name] = history[-1]
-                self._fields["telemetry"].append(snapshot)
-                self._dirty.add("telemetry")
+                self._append("telemetry", snapshot)
             started = session.get("started")
             if started:
                 try:
@@ -559,8 +612,7 @@ class RunLog:
                 entry["fix_applied"] = fix_applied
                 self._incident("fix_applied", str(fix_applied.get("explanation") or "code edited"),
                                files=fix_applied.get("files"))
-            self._fields["agent_logs"].append(entry)
-            self._dirty.add("agent_logs")
+            self._append("agent_logs", entry)
         self._spawn()
 
     def incident(self, kind: str, summary: str, **extra: Any) -> None:
@@ -573,22 +625,37 @@ class RunLog:
     def _incident(self, kind: str, summary: str, **extra: Any) -> None:
         entry: Dict[str, Any] = {"t": time.time(), "kind": kind, "summary": summary}
         entry.update({k: v for k, v in extra.items() if v is not None})
-        self._fields["incidents"].append(entry)
-        self._dirty.add("incidents")
+        self._append("incidents", entry)
 
-    def close(self) -> None:
+    def _append(self, name: str, entry: Any) -> None:
+        """With the lock held."""
+        items = self._fields[name]
+        items.append(entry)
+        extra = len(items) - self.KEEP[name]
+        if extra > 0:
+            first = 1 if name == "telemetry" else 0
+            del items[first:first + extra]
+        self._dirty.add(name)
+
+    def close(self, wait: float = 0.0) -> None:
+        """`wait`: leaving Pulse, a dashboard command in hand gets that long to say how it ended."""
         if not self.enabled or self._closed:
             return
         self._closed = True
         if self.commands is not None:
-            self.commands.close()
-        self._spawn(wait=5.0)
+            self.commands.close(wait=wait)
+        # whatever a send already under way did not take goes in a last one
+        deadline = time.monotonic() + 5.0
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            worker.join(5.0)
+        self._spawn(wait=max(0.1, deadline - time.monotonic()), last=True)
 
     # ------------------------------------------------------------------ sending
 
-    def _spawn(self, create: bool = False, wait: float = 0.0) -> None:
+    def _spawn(self, create: bool = False, wait: float = 0.0, last: bool = False) -> None:
         worker = self._worker
-        if worker is not None and worker.is_alive():
+        if worker is not None and worker.is_alive() and not last:
             if wait:
                 worker.join(wait)
             return
@@ -598,10 +665,14 @@ class RunLog:
             self._worker.join(wait)
 
     def _send(self, create: bool) -> None:
+        with self._send_lock:
+            self._send_once(create)
+
+    def _send_once(self, create: bool) -> None:
         cloud = self._cloud
         dirty: set = set()
         try:
-            if create and self.id is None:
+            if (create or self._wants_row) and self.id is None:     # a first try that failed: again
                 sha = None
                 try:
                     sha = cloud.current_git_commit_sha(self.workdir)
@@ -692,6 +763,7 @@ class App:
         self._height = 30
         self._question: Optional[_Question] = None
         self._question_lock = threading.Lock()
+        self._closers: List[threading.Thread] = []   # questions being ended on the dashboard
         self._draft = ""
         self._hushed: Dict[int, List[str]] = {}      # thread id -> what it printed while hushed
         self._live_thinking: Optional[tui.Entry] = None
@@ -705,6 +777,7 @@ class App:
         self._live: Optional[LiveFeed] = None                # what the app is doing, streamed to the dashboard
         self._job_from = 0
         self._job_started = 0.0
+        self._job_target: Optional[Tuple[str, str, str]] = None   # the dashboard row the job is about
         self._last_ctrl_c = 0.0
         self._ui_thread = threading.current_thread()
         # the run that is open (DEBUG), if any
@@ -719,6 +792,7 @@ class App:
         self._monitor: Any = None                    # a py-spy sampler this app started
         self.audits = _settings.on("audits")
         self.launched: Dict[str, Dict[str, Any]] = {}    # session id -> what /run started
+        self._slow_starts: List[Dict[str, Any]] = []     # started by /run, not reporting to Pulse yet
         self._rate: Optional[float] = None
         self._rate_at: Optional[Tuple[float, int]] = None
         self._side_at = 0.0
@@ -834,34 +908,42 @@ class App:
             with self.lock:
                 self._edit_pending.open = True
                 self._edit_pending.touch()
-        with self.lock:
-            held = self._hushed.get(threading.get_ident())
-            if held:
-                text, held[:] = "".join(held), []
-                self._hushed.pop(threading.get_ident())
-                try:
-                    self.feed(text)
-                finally:
-                    self._hushed[threading.get_ident()] = held
-            self._flush_partial()
-            self._question = question
-            view = self.view
-            self._draft = view.editor.take(remember=False)
-            view.question, view.secret, view.scroll = question.label, question.secret, 0
-            if question.options is not None:
-                view.options = [(str(o.label), str(o.detail or ""), str(o.tag or "")) for o in question.options]
-                view.option_ids = list(range(len(view.options)))
-            self.dirty = True
-        posted = self._post_question(question)       # on the dashboard too: the first answer wins
-        question.done.wait()
-        with self.lock:
-            view = self.view
-            view.question, view.secret, view.options, view.option_ids = "", False, None, []
-            view.editor.take(remember=False)
-            view.editor.set(self._draft)
-            self._question = None
-            self.dirty = True
-        self._settle_question(question, posted)
+        posted: Optional[DashboardQuestion] = None
+        try:
+            with self.lock:
+                held = self._hushed.get(threading.get_ident())
+                if held:
+                    text, held[:] = "".join(held), []
+                    self._hushed.pop(threading.get_ident())
+                    try:
+                        self.feed(text)
+                    finally:
+                        self._hushed[threading.get_ident()] = held
+                self._flush_partial()
+                self._question = question
+                view = self.view
+                self._draft = view.editor.take(remember=False)
+                view.question, view.secret, view.scroll = question.label, question.secret, 0
+                if question.options is not None:
+                    view.options = [(str(o.label), str(o.detail or ""), str(o.tag or "")) for o in question.options]
+                    view.option_ids = list(range(len(view.options)))
+                self.dirty = True
+            posted = self._post_question(question)   # on the dashboard too: the first answer wins
+            question.done.wait()
+        finally:
+            # also when the wait is interrupted (the job cancelled, Pulse leaving): otherwise the
+            # question stays up, the dashboard's prompts wait behind it and its row stays open
+            with self.lock:
+                if not question.done.is_set():
+                    question.cancelled = True
+                    question.done.set()
+                view = self.view
+                view.question, view.secret, view.options, view.option_ids = "", False, None, []
+                view.editor.take(remember=False)
+                view.editor.set(self._draft)
+                self._question = None
+                self.dirty = True
+            self._settle_question(question, posted)
         if question.cancelled:
             raise KeyboardInterrupt
         return question.answer
@@ -998,20 +1080,21 @@ class App:
         row, project, user = target
         options = getattr(question, "options", None)
 
-        def answered(text: str) -> None:
+        def answered(text: str) -> bool:
             with self.lock:
                 if question.done.is_set():
-                    return
+                    return False
                 if options is not None:
                     match = re.match(r"#(\d+)", text.strip())
                     index = int(match.group(1)) if match else -1
                     if not 0 <= index < len(options):
-                        return
+                        return False
                     question.answer = index
                 else:
                     question.answer = text
                 question.from_dashboard = True     # type: ignore[attr-defined]
                 question.done.set()
+                return True
 
         label = tui._SGR_RE.sub("", str(question.label or "")).strip()
         payload: Dict[str, Any] = {
@@ -1039,15 +1122,29 @@ class App:
         if posted is None:
             return
         if question.cancelled:
-            posted.close("failed", "No longer asked: cancelled at the machine.")
-            return
-        answer = question.answer
-        if question.options is not None:
-            shown = str(question.options[answer].label) if isinstance(answer, int) and 0 <= answer < len(
-                question.options) else "nothing chosen"
+            closer = posted.close("failed", "No longer asked: " + (
+                "Pulse closed." if self.done else "cancelled at the machine."))
         else:
-            shown = str(answer or "") or "(Enter)"
-        posted.close("completed", f"Answered at the machine: {tui._SGR_RE.sub('', shown)}")
+            answer = question.answer
+            if question.options is not None:
+                shown = str(question.options[answer].label) if isinstance(answer, int) and 0 <= answer < len(
+                    question.options) else "nothing chosen"
+            else:
+                shown = str(answer or "").strip() or "(Enter)"
+            if question.options is None and shown.lower() not in _SHOWN_ANSWERS:
+                # free text typed here (a script's input("API key:")) is not for the dashboard
+                closer = posted.close("completed", "Answered at the machine.")
+            else:
+                closer = posted.close("completed", f"Answered at the machine: {tui._SGR_RE.sub('', shown)}")
+        if closer is not None:
+            self._closers = [t for t in self._closers if t.is_alive()] + [closer]
+
+    def _wait_for_rows(self, seconds: float = 5.0) -> None:
+        """Leaving Pulse: the questions just ended get a few seconds to say so on the dashboard
+        (their threads would die with the process, leaving the rows open)."""
+        deadline = time.monotonic() + seconds
+        for thread in list(self._closers):
+            thread.join(max(0.0, deadline - time.monotonic()))
 
     def ask(self, label: str, secret: bool = False, placeholder: Optional[str] = None, **_ignored: Any) -> str:
         question = _Question(label + (f"  [{placeholder}]" if placeholder else ""), secret=secret)
@@ -1092,9 +1189,21 @@ class App:
         script = str(script or "").strip()
         if not script:
             return "start_run needs the script to run, e.g. train.py (and its arguments, if any)."
+        if self.console is not None and self._status in ("live", "stalled"):
+            # a second training run beside the first (the same GPU, the same files): never by itself
+            name = os.path.basename((self.session or {}).get("script") or "a run")
+            return (f"{name} is already running (session {(self.session or {}).get('session_id')}); nothing "
+                    "was started. restart_run starts it again with the current code; stop_run stops it.")
+        starting = self._still_starting()
+        if starting:
+            return (f"{os.path.basename(starting[0]['argv'][0])} was started and is still starting (pid "
+                    f"{starting[0]['process'].pid}); nothing else was started. run_status shows it once it reports.")
         before = (self.session or {}).get("session_id")
         self._launch(f"{script} {str(args or '').strip()}".strip())
         session = self.session or {}
+        if self._still_starting():
+            return (f"{os.path.basename(script)} is still starting: Pulse has seen no training step from it yet. "
+                    "It keeps running; it opens beside you once it reports (run_status then shows it).")
         if self.console is None or session.get("session_id") in (None, before):
             return (f"The run did not start, or Pulse saw no training step from it; the lines above "
                     f"say what happened. (Run it with run_command only to see an error quickly: a "
@@ -1249,12 +1358,14 @@ class App:
     # ================================================================== jobs
 
     def _start(self, work: Callable[..., None], *args: Any) -> None:
-        with self.lock:
+        with self.lock:                              # with _job set: no other job slips in between
             self.view.busy, self.view.status, self.dirty = True, "", True
             self._job_from = len(self.view.entries)  # what this job shows starts here (the live feed)
             self._job_started = time.time()
-        self._job = threading.Thread(target=self._run_job, args=(work, args), daemon=True, name="pulse-app-job")
-        self._job.start()
+            self._job_target = self._live_target()
+            self._job = threading.Thread(target=self._run_job, args=(work, args), daemon=True,
+                                         name="pulse-app-job")
+            self._job.start()
 
     def _run_job(self, work: Callable[..., None], args: Tuple[Any, ...]) -> None:
         try:
@@ -1274,7 +1385,7 @@ class App:
                     try:
                         record = self._turn_record()
                         if record["activity"]:
-                            self._live.turn_ended(record)    # kept on the dashboard page
+                            self._live.turn_ended(record, self._job_target)    # kept on the dashboard page
                     except Exception:
                         pass
                 self.view.busy, self.view.live, self.view.status = False, "", ""
@@ -1298,17 +1409,24 @@ class App:
     _REMOTE_REFUSED = {
         ("/exit", "/quit", "/q"): "Only the person at the machine can close Pulse.",
         ("/mouse", "/copy"): "That is about the terminal Pulse runs in; from the dashboard it does nothing.",
-        ("/config", "/settings", "/agent"): "Settings and the agent's model are changed at the machine.",
+        ("/config", "/settings", "/agent", "/review", "/telemetry"):
+            "Settings and the agent's model are changed at the machine.",
         ("/monitor", "/runs", "/watch", "/sessions", "/attach", "/change"):
             "On the dashboard, open the run you want and send the prompt there.",
+        ("/logout", "/password", "/recover", "/deleteaccount"): "The account is managed at the machine.",
+        ("/admin", "/webhook", "/project", "/repo"): "The workspace and project are managed at the machine.",
     }
+    # pulse_cli takes these by their start ("/repository" is /repo): refused the same way
+    _REMOTE_REFUSED_PREFIXES = ("/telemetry", "/repo", "/admin", "/webhook", "/password", "/recover",
+                                "/deleteaccount")
 
     def _remote_refusal(self, line: str) -> Optional[str]:
         """Why a prompt from the dashboard cannot be done from afar (None: it can)."""
         word, _, rest = line.strip().partition(" ")
         word = word.lower()
         for words, why in self._REMOTE_REFUSED.items():
-            if word in words:
+            if word in words or (word.startswith(self._REMOTE_REFUSED_PREFIXES)
+                                 and any(word.startswith(w) for w in words)):
                 return f"{word}: {why}"
         if word == "/run" and not rest.strip():
             return "/run needs the script from the dashboard: /run train.py --epochs 3"
@@ -1347,12 +1465,12 @@ class App:
         return str(remote.get("result") or "Done.")
 
     def _start_pending_remote_command(self) -> None:
-        with self.lock:
+        with self.lock:                              # one job: a crash or problem turn cannot start in between
             if self._job is not None or self._question is not None or not self._remote_pending or self.done:
                 return
             remote = self._remote_pending.popleft()
             self._remote_active = remote
-        self._start(self._remote_job, remote)
+            self._start(self._remote_job, remote)
 
     def _remote_job(self, remote: Dict[str, Any]) -> None:
         target = remote.get("session")
@@ -1368,6 +1486,10 @@ class App:
             self.view.entries.append(mark)
             self.view.scroll = 0
             self.dirty = True
+            # the turn is what follows the prompt (which is the turn's prompt), on the page of
+            # the run it was sent to
+            self._job_from = len(self.view.entries)
+            self._job_target = self._live_target()
         remote["mark"] = mark
         self._handle(remote["line"], about_run=target is not None)
 
@@ -1733,6 +1855,7 @@ class App:
             return
         if name == "review":
             cli.review = value == "on"
+            cli._always_apply_changes = False      # setting review again ends "always apply this session"
         if name == "remember_keys" and value == "off":
             _settings.forget_keys()
             self.note("Saved keys deleted; pasted keys are not kept from now on.")
@@ -1966,7 +2089,7 @@ class App:
             self.cli._sync_agent_turn = self._orig_sync
             self._orig_sync = None
         if log is not None:
-            log.close()
+            log.close(wait=_LEAVING_WAIT if self.done else 0.0)
 
     def _close_all(self) -> None:
         """Stop watching every run (they keep running): leaving the app, /close all."""
@@ -2446,26 +2569,62 @@ class App:
             deadline = time.monotonic() + 45.0
             while session is None:
                 over = process.poll() is not None      # then this look is the last one
-                for candidate in con.discover():
-                    same = candidate.get("script") and os.path.realpath(candidate["script"]) == os.path.realpath(script)
-                    if same and (candidate.get("pid") == process.pid
-                                 or float(candidate.get("started") or 0) >= started - 1.0):
-                        session = candidate
-                        break
+                session = _launched_session(con.discover(), process, script, started)
                 if session is not None or over or time.monotonic() >= deadline:
                     break
                 time.sleep(0.25)
         if session is None:
             code = process.poll()
-            self.error(f"{os.path.basename(script)} "
-                       + (f"exited with code {code} before Pulse saw a training step." if code is not None
-                          else "has not reported to Pulse yet (no session after 45 s)."))
+            if code is None:
+                # still going, only slow to report: kept, and opened when it does (_tick_parked)
+                self._slow_starts.append({"process": process, "argv": argv, "cwd": cwd, "log": log_path,
+                                          "started": started, "replace": replace is not None})
+                self.note(f"{os.path.basename(script)} has not reported to Pulse yet (no training step after "
+                          f"45 s). It keeps running (pid {process.pid}) and opens here once it does; its output "
+                          f"goes to {log_path}.")
+                return
+            self.error(f"{os.path.basename(script)} exited with code {code} before Pulse saw a training step.")
             self._print_tail(log_path, 25)
             return
         self.launched[session["session_id"]] = {"process": process, "argv": argv, "cwd": cwd, "log": log_path}
         self._open_run(session, replace=replace is not None)
         self.note(f"Started under Pulse. Its output goes to {log_path} (/output shows the end of it). "
                   "It keeps running if you leave Pulse.")
+
+    def _still_starting(self) -> List[Dict[str, Any]]:
+        """Runs /run started that are still alive but have not reported to Pulse yet."""
+        return [pending for pending in self._slow_starts if pending["process"].poll() is None]
+
+    def _open_slow_starts(self) -> None:
+        """A run that was slow to report (see _launch) is opened once it does, as /run would have;
+        one that ended before it did is said. Between jobs only: opening a run re-aims the agent."""
+        now = time.monotonic()
+        if not self._slow_starts or now - self._slow_at < 2.0 or self.done:
+            return
+        with self.lock:
+            if self._job is not None or self._question is not None:
+                return
+        self._slow_at = now
+        from . import pulse_console as con
+        for pending in list(self._slow_starts):
+            process, script = pending["process"], pending["argv"][0]
+            code = process.poll()
+            session = _launched_session(con.discover(), process, script, pending["started"])
+            if session is None and code is None:
+                continue
+            self._slow_starts.remove(pending)
+            if session is None:
+                self.error(f"{os.path.basename(script)} exited with code {code} before Pulse saw a training step.")
+                self._print_tail(pending["log"], 25)
+                continue
+            self.launched[session["session_id"]] = {key: pending[key] for key in ("process", "argv", "cwd", "log")}
+            try:
+                self._open_run(session, replace=pending["replace"])
+            except Exception as exc:                 # from the screen loop: never the end of the app
+                self.error(f"Could not open {os.path.basename(script)}: {type(exc).__name__}: {exc}")
+            return
+
+    _slow_at = 0.0
 
     def _restart(self) -> Optional[str]:
         """Stop the open run if it is still going, and start it again under Pulse with the
@@ -2698,15 +2857,23 @@ class App:
                     if key:
                         self.on_key(key)
                     self._start_pending_remote_command()
+                    self._open_slow_starts()
             finally:
+                self.done = True                     # a dashboard prompt still waiting is failed, not left hanging
                 job = self._job
                 if job is not None and job.is_alive():
-                    question = self._question
-                    if question is not None:
-                        question.cancelled = True
-                        question.done.set()
-                    self._cancel_job()
+                    with self.lock:
+                        question = self._question
+                        if question is not None:
+                            question.cancelled = True
+                            question.done.set()
+                    if question is None:             # (a question cancelled ends the job by itself,
+                        self._cancel_job()           # and an interrupt could cut its row's ending short)
                     job.join(timeout=2.0)
+                    if question is not None and job.is_alive():
+                        self._cancel_job()           # it went on past the question
+                        job.join(timeout=1.0)
+                self._wait_for_rows()
                 console = self.console
                 if console is not None:
                     try:
@@ -2715,7 +2882,7 @@ class App:
                     except Exception:
                         pass
                 for state in list(self.parked.values()):     # the runs watched off screen
-                    for stop in (lambda: state["runlog"] and state["runlog"].close(),
+                    for stop in (lambda: state["runlog"] and state["runlog"].close(wait=_LEAVING_WAIT),
                                  lambda: state["console"].stop(),
                                  lambda: state["_monitor"] and state["_monitor"].stop()):
                         try:
@@ -2724,7 +2891,7 @@ class App:
                             pass
                 self.parked.clear()
                 if self._home_commands is not None:
-                    self._home_commands.close()
+                    self._home_commands.close(wait=_LEAVING_WAIT)
                 if self._live is not None:
                     self._live.close()
                 if self._monitor is not None:
@@ -2735,6 +2902,16 @@ class App:
                 self.uninstall()
                 self._screen = None
         return self.exit_code
+
+
+def _launched_session(sessions: List[Dict[str, Any]], process: Any, script: str,
+                      started: float) -> Optional[Dict[str, Any]]:
+    """The session among `sessions` that the process /run started (at `started`) is."""
+    for candidate in sessions:
+        same = candidate.get("script") and os.path.realpath(candidate["script"]) == os.path.realpath(script)
+        if same and (candidate.get("pid") == process.pid or float(candidate.get("started") or 0) >= started - 1.0):
+            return candidate
+    return None
 
 
 def _make_console(app: App, session: Dict[str, Any], agent: Optional[Callable[[str], str]]) -> Any:

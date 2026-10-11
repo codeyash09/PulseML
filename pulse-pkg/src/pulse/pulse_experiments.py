@@ -6,12 +6,14 @@ fresh project copy and can emit metrics by printing ``PULSE_METRICS: {json}``.
 """
 from __future__ import annotations
 
+import atexit
 import concurrent.futures
+import concurrent.futures.thread  # noqa: F401 -- registers its exit-time join before cancel_all
 import fnmatch
-import hashlib
 import json
 import math
 import os
+import queue
 import re
 import shutil
 import signal
@@ -40,6 +42,13 @@ _RELIABILITY = {
 }
 _MAX_REPORT_RUNS = 120
 _OUTPUT_TAIL_BYTES = 64 * 1024
+
+# Every experiment's cancel event and every live runner, so interpreter exit can stop them
+# (see cancel_all) instead of waiting on the thread pools or leaving runners -- each in its
+# own session -- holding a GPU.
+_LIVE_LOCK = threading.Lock()
+_LIVE_CANCELS: set = set()
+_LIVE_PROCESSES: set = set()
 
 
 class ExperimentError(ValueError):
@@ -175,20 +184,39 @@ def _set_scaled_dimensions(config: Any, factor: float,
 
 
 def _safe_copy(root: Path, destination: Path, excludes: Sequence[str]) -> None:
+    """Copy the project, keeping symlinks as symlinks: a link into the project points at the
+    copy (isolation), anything else (a symlinked data/ dir) at its real target."""
     excluded_names = _DEFAULT_EXCLUDES | set(excludes)
     root_resolved = root.resolve()
+    links: List[Tuple[Path, Path]] = []
 
     def ignore(directory: str, names: List[str]) -> set[str]:
         ignored = set()
         for name in names:
             source = Path(directory) / name
-            if name in excluded_names or source.is_symlink():
+            relative = os.path.relpath(source, root)
+            if name in excluded_names or any(fnmatch.fnmatch(relative, pattern) for pattern in excludes):
                 ignored.add(name)
-            elif any(fnmatch.fnmatch(str(source.resolve().relative_to(root_resolved)), pattern) for pattern in excludes):
+            elif source.is_symlink():
+                # Recreated below, once every target inside the copy exists.
                 ignored.add(name)
+                links.append((source, destination / relative))
         return ignored
 
     shutil.copytree(root, destination, ignore=ignore, symlinks=False)
+    for source, target in links:
+        resolved = source.resolve()
+        try:
+            inside = destination / resolved.relative_to(root_resolved)
+        except ValueError:
+            inside = None
+        try:
+            if inside is not None and (inside.exists() or inside.is_symlink()):
+                os.symlink(os.path.relpath(inside, target.parent), target)
+            else:
+                os.symlink(str(resolved), target)
+        except OSError:
+            pass    # e.g. Windows without symlink privilege: the link is left out, as before
 
 
 def _apply_interventions(root: Path, candidate: Mapping[str, Any]) -> List[str]:
@@ -341,22 +369,33 @@ def _run_command(command: Sequence[str], cwd: Path, env: Mapping[str, str],
         except OSError as exc:
             result["launch_error"] = f"{type(exc).__name__}: {exc}"
             return result
-        while process.poll() is None:
-            if cancel.is_set():
-                result["cancelled"] = True
-                _terminate_process(process)
-                break
-            elif time.monotonic() - started >= timeout:
-                result["timed_out"] = True
-                _terminate_process(process)
-                break
-            time.sleep(0.05)
+        with _LIVE_LOCK:
+            _LIVE_PROCESSES.add(process)
+        try:
+            while process.poll() is None:
+                if cancel.is_set():
+                    result["cancelled"] = True
+                    _terminate_process(process)
+                    break
+                elif time.monotonic() - started >= timeout:
+                    result["timed_out"] = True
+                    _terminate_process(process)
+                    break
+                time.sleep(0.05)
+            # Whatever the runner left behind (data-loader workers, a background trainer)
+            # would outlive the copy it runs in.
+            _signal_group(process, hard=True)
+        finally:
+            with _LIVE_LOCK:
+                _LIVE_PROCESSES.discard(process)
         result["returncode"] = process.returncode
         stderr = _tail(err)
         result.update(_scan_metrics(out, signature))
         result["failure_observed"] |= _stderr_matches(err, signature)
         if signature["kind"] == "exit_code_nonzero":
-            result["failure_observed"] = process.returncode not in (None, 0)
+            # Pulse's own kill (timeout, cancel) is not the failure being reproduced.
+            result["failure_observed"] = (process.returncode not in (None, 0)
+                                          and not result["timed_out"] and not result["cancelled"])
             result["evidence_complete"] = True
         result["duration_seconds"] = round(time.monotonic() - started, 4)
         if result["launch_error"] is None and process.returncode and not stderr:
@@ -367,26 +406,54 @@ def _run_command(command: Sequence[str], cwd: Path, env: Mapping[str, str],
     return result
 
 
-def _terminate_process(process: subprocess.Popen) -> None:
+def _signal_group(process: subprocess.Popen, hard: bool) -> None:
+    """SIGTERM/SIGKILL the runner's whole process group (it is a session leader), whether
+    or not the leader itself is still alive."""
     if os.name != "nt":
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except (OSError, ProcessLookupError):
-            if process.poll() is None:
-                process.terminate()
-    elif process.poll() is None:
-        process.terminate()
+            os.killpg(process.pid, signal.SIGKILL if hard else signal.SIGTERM)
+            return
+        except OSError:
+            pass
+    if process.poll() is None:
+        try:
+            process.kill() if hard else process.terminate()
+        except OSError:
+            pass
+
+
+def _terminate_process(process: subprocess.Popen) -> None:
+    _signal_group(process, hard=False)
     try:
         process.wait(timeout=3)
     except subprocess.TimeoutExpired:
-        if os.name != "nt":
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                process.kill()
-        else:
-            process.kill()
-        process.wait()
+        pass
+    _signal_group(process, hard=True)
+    process.wait()
+
+
+def cancel_all() -> None:
+    """Interpreter exit: cancel every experiment (queued runs never start) and stop every
+    live runner's process group."""
+    with _LIVE_LOCK:
+        cancels, processes = list(_LIVE_CANCELS), list(_LIVE_PROCESSES)
+    for event in cancels:
+        event.set()
+    for process in processes:
+        _signal_group(process, hard=False)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and any(process.poll() is None for process in processes):
+        time.sleep(0.05)
+    for process in processes:
+        _signal_group(process, hard=True)
+
+
+# threading's exit hooks run last-registered first, so this runs before concurrent.futures
+# joins its workers (registered on import, above); atexit would run after that join.
+try:
+    threading._register_atexit(cancel_all)
+except Exception:
+    atexit.register(cancel_all)
 
 
 def _sanitize_text(text: Optional[str]) -> Optional[str]:
@@ -536,6 +603,11 @@ def _validate_spec(spec: Mapping[str, Any], root: Path) -> Dict[str, Any]:
     validate_top = spec.get("validate_top", 1)
     if isinstance(validate_top, bool) or not isinstance(validate_top, int) or validate_top < 0:
         raise ExperimentError("validate_top must be a non-negative integer")
+    seeds = spec.get("seeds")
+    if seeds is None:
+        seeds = list(range(repetitions + adaptive_repetitions))
+    if not isinstance(seeds, list) or not seeds or len(seeds) < repetitions + adaptive_repetitions:
+        raise ExperimentError("seeds must provide one value per repetition, including adaptive extra repetitions")
     return {
         "command": command, "signature": signature, "evidence": evidence.strip(),
         "original_metrics": original_metrics,
@@ -543,7 +615,7 @@ def _validate_spec(spec: Mapping[str, Any], root: Path) -> Dict[str, Any]:
         "dimension_keys": set(dimensions), "repetitions": repetitions,
         "workers": workers, "timeout": float(timeout), "candidates": candidates,
         "objective": objective, "minimum_confidence": float(minimum_confidence),
-        "seeds": spec.get("seeds"),
+        "seeds": seeds,
         "adaptive_repetitions": adaptive_repetitions,
         "adaptive_top": adaptive_top,
         "excludes": excludes,
@@ -551,6 +623,14 @@ def _validate_spec(spec: Mapping[str, Any], root: Path) -> Dict[str, Any]:
         "validation_scales": validation_scales,
         "validate_top": validate_top,
     }
+
+
+def validate_spec(project_root: str | os.PathLike[str], spec: Mapping[str, Any]) -> Dict[str, Any]:
+    """Check a spec without running anything (raises ExperimentError)."""
+    root = Path(project_root).resolve()
+    if not root.is_dir():
+        raise ExperimentError(f"project directory does not exist: {root}")
+    return _validate_spec(spec, root)
 
 
 def _walk_dicts(value: Any) -> Iterable[Dict[str, Any]]:
@@ -568,17 +648,42 @@ def _prepare_branch(root: Path, temp_root: Path, config: Mapping[str, Any],
                     command: Sequence[str], candidate: Optional[Mapping[str, Any]],
                     excludes: Sequence[str]) -> Tuple[Path, List[str], Dict[str, Any]]:
     branch = temp_root / uuid.uuid4().hex
-    _safe_copy(root, branch, excludes)
-    proxy_config = json.loads(json.dumps(config))
-    changed = _set_scaled_dimensions(proxy_config, factor, dimensions)
-    destination = _relative_file(branch, config_file, "proxy config")
-    destination.write_text(json.dumps(proxy_config, indent=2) + "\n", encoding="utf-8")
-    edits = _apply_interventions(branch, candidate) if candidate else []
+    try:
+        _safe_copy(root, branch, excludes)
+        proxy_config = json.loads(json.dumps(config))
+        changed = _set_scaled_dimensions(proxy_config, factor, dimensions)
+        destination = _relative_file(branch, config_file, "proxy config")
+        destination.write_text(json.dumps(proxy_config, indent=2) + "\n", encoding="utf-8")
+        edits = _apply_interventions(branch, candidate) if candidate else []
+    except BaseException:
+        # The caller never sees this branch, so it would stay on disk until the experiment ends.
+        shutil.rmtree(branch, ignore_errors=True)
+        raise
     expanded = [part.replace("{project}", str(branch)).replace("{config}", str(destination))
                 for part in command]
     return branch, edits, {
         "dimension_changes": changed, "config": proxy_config, "command": expanded,
     }
+
+
+def _substitute(command: Sequence[str], seed: Any, label: str) -> List[str]:
+    return [part.replace("{seed}", str(seed)).replace("{branch}", label) for part in command]
+
+
+def planned_commands(settings: Mapping[str, Any]) -> List[List[str]]:
+    """Every distinct argv this experiment can launch (`{project}` shown as `.`, the run's
+    working directory, and `{config}` as its project-relative path), so each can be
+    confirmed before anything starts."""
+    labels = ["baseline", "control"] + [item["name"] for item in settings["candidates"]]
+    template = [part.replace("{project}", ".").replace("{config}", settings["config_file"])
+                for part in settings["command"]]
+    seen: List[List[str]] = []
+    for label in labels:
+        for seed in settings["seeds"]:
+            argv = _substitute(template, seed, label)
+            if argv not in seen:
+                seen.append(argv)
+    return seen
 
 
 def run_experiment(project_root: str | os.PathLike[str], spec: Mapping[str, Any],
@@ -589,9 +694,7 @@ def run_experiment(project_root: str | os.PathLike[str], spec: Mapping[str, Any]
     snapshots as ``PULSE_METRICS: {"loss": 0.2, "grad_norm": 1.4}`` lines.
     """
     root = Path(project_root).resolve()
-    if not root.is_dir():
-        raise ExperimentError(f"project directory does not exist: {root}")
-    settings = _validate_spec(spec, root)
+    settings = validate_spec(root, spec)
     cancel = cancel_event or threading.Event()
     run_records: List[Dict[str, Any]] = []
     report: Dict[str, Any] = {
@@ -619,10 +722,13 @@ def run_experiment(project_root: str | os.PathLike[str], spec: Mapping[str, Any]
         workers = 1
     workers = max(1, workers)
     seeds = settings["seeds"]
-    if seeds is None:
-        seeds = list(range(settings["repetitions"] + settings["adaptive_repetitions"]))
-    if not isinstance(seeds, list) or not seeds or len(seeds) < settings["repetitions"] + settings["adaptive_repetitions"]:
-        raise ExperimentError("seeds must provide one value per repetition, including adaptive extra repetitions")
+    # One run per device at a time: workers never exceed the device count, so a free one
+    # is always there, but it is never one another run is already using.
+    free_devices: "queue.Queue[str]" = queue.Queue()
+    for item in devices:
+        free_devices.put(str(item))
+    with _LIVE_LOCK:
+        _LIVE_CANCELS.add(cancel)
     try:
         with tempfile.TemporaryDirectory(prefix="pulse-experiment-") as scratch:
             temp_root = Path(scratch)
@@ -632,7 +738,16 @@ def run_experiment(project_root: str | os.PathLike[str], spec: Mapping[str, Any]
                 if cancel.is_set():
                     return {"branch": label, "seed": seed, "factor": factor, "cancelled": True}
                 branch = None
+                device = None
                 try:
+                    if devices and resource != "cpu":
+                        while device is None:
+                            if cancel.is_set():
+                                return {"branch": label, "seed": seed, "factor": factor, "cancelled": True}
+                            try:
+                                device = free_devices.get(timeout=0.1)
+                            except queue.Empty:
+                                pass
                     branch, edited, prepared = _prepare_branch(
                         root, temp_root, settings["config"], settings["config_file"],
                         factor, settings["dimension_keys"], settings["command"], candidate,
@@ -642,16 +757,9 @@ def run_experiment(project_root: str | os.PathLike[str], spec: Mapping[str, Any]
                     env["PULSE_EXPERIMENT_SEED"] = str(seed)
                     env["PULSE_EXPERIMENT_ID"] = report["id"]
                     env["PULSE_EXPERIMENT_BRANCH"] = label
-                    if devices and resource != "cpu":
-                        seed_key = int.from_bytes(
-                            hashlib.sha256(str(seed).encode("utf-8")).digest()[:8], "big",
-                        ) % len(devices)
-                        device = str(devices[seed_key])
+                    if device is not None:
                         env["CUDA_VISIBLE_DEVICES"] = device
-                    else:
-                        device = None
-                    command = [part.replace("{seed}", str(seed)).replace("{branch}", label)
-                               for part in prepared["command"]]
+                    command = _substitute(prepared["command"], seed, label)
                     outcome = _run_command(
                         command, branch, env, settings["timeout"], cancel,
                         settings["signature"],
@@ -685,18 +793,32 @@ def run_experiment(project_root: str | os.PathLike[str], spec: Mapping[str, Any]
                 finally:
                     if branch is not None:
                         shutil.rmtree(branch, ignore_errors=True)
+                    if device is not None:
+                        free_devices.put(device)
+
+            def run_all(calls: List[Tuple[Any, ...]]) -> List[Dict[str, Any]]:
+                """one_run for each call, `workers` at a time; on cancel, queued calls never start."""
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = [pool.submit(one_run, *call) for call in calls]
+                    pending = set(futures)
+                    while pending:
+                        _done, pending = concurrent.futures.wait(pending, timeout=0.2)
+                        if cancel.is_set():
+                            for future in pending:
+                                future.cancel()
+                return [
+                    {"branch": call[0], "seed": call[2], "factor": call[1], "cancelled": True}
+                    if future.cancelled() else future.result()
+                    for future, call in zip(futures, calls)
+                ]
 
             reproduction: Optional[Dict[str, Any]] = None
             for factor in settings["scales"]:
                 if cancel.is_set():
                     report["status"] = "cancelled"
                     break
-                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = [
-                        pool.submit(one_run, "baseline", factor, seeds[i], None, i)
-                        for i in range(settings["repetitions"])
-                    ]
-                    trials = [future.result() for future in futures]
+                trials = run_all([("baseline", factor, seeds[i], None, i)
+                                  for i in range(settings["repetitions"])])
                 run_records.extend(trials)
                 hits = sum(record.get("failure_observed", False) for record in trials)
                 consistency = hits / max(1, len(trials))
@@ -739,15 +861,12 @@ def run_experiment(project_root: str | os.PathLike[str], spec: Mapping[str, Any]
                     {"name": item["name"], "hypothesis": item.get("hypothesis", ""),
                      "candidate": item} for item in settings["candidates"]
                 ]
-                tasks = []
-                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-                    for branch_index, branch in enumerate(branches):
-                        for i in range(settings["repetitions"]):
-                            tasks.append(pool.submit(
-                                one_run, branch["name"], factor, seeds[i],
-                                branch["candidate"], branch_index * settings["repetitions"] + i,
-                            ))
-                    results = [future.result() for future in tasks]
+                results = run_all([
+                    (branch["name"], factor, seeds[i], branch["candidate"],
+                     branch_index * settings["repetitions"] + i)
+                    for branch_index, branch in enumerate(branches)
+                    for i in range(settings["repetitions"])
+                ])
                 run_records.extend(results)
                 if cancel.is_set():
                     report["status"] = "cancelled"
@@ -755,7 +874,7 @@ def run_experiment(project_root: str | os.PathLike[str], spec: Mapping[str, Any]
                     report["conclusion"] = "Experiment cancelled during candidate evaluation; partial results are not ranked."
                     report["run_count"] = len(run_records)
                     report["runs"] = run_records[-_MAX_REPORT_RUNS:]
-                    return report
+                    return _scrub_report(report)
                 objective = settings["objective"]
                 adaptive_allocations = []
                 if settings["adaptive_repetitions"] and settings["adaptive_top"]:
@@ -799,17 +918,12 @@ def run_experiment(project_root: str | os.PathLike[str], spec: Mapping[str, Any]
                         {"name": candidate["name"], "candidate": candidate}
                         for _score, _gain, candidate in ranked_early[:settings["adaptive_top"]]
                     ]
-                    adaptive_results = []
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-                        futures = []
-                        for target_index, target in enumerate(extra_targets):
-                            for offset in range(settings["adaptive_repetitions"]):
-                                seed_index = settings["repetitions"] + offset
-                                futures.append(pool.submit(
-                                    one_run, target["name"], factor, seeds[seed_index],
-                                    target["candidate"], target_index * settings["adaptive_repetitions"] + offset,
-                                ))
-                        adaptive_results = [future.result() for future in futures]
+                    adaptive_results = run_all([
+                        (target["name"], factor, seeds[settings["repetitions"] + offset],
+                         target["candidate"], target_index * settings["adaptive_repetitions"] + offset)
+                        for target_index, target in enumerate(extra_targets)
+                        for offset in range(settings["adaptive_repetitions"])
+                    ])
                     results.extend(adaptive_results)
                     run_records.extend(adaptive_results)
                     adaptive_allocations = [
@@ -880,11 +994,8 @@ def run_experiment(project_root: str | os.PathLike[str], spec: Mapping[str, Any]
                         validation_scale = float(validation_scale)
                         if not math.isfinite(validation_scale) or validation_scale <= 0 or validation_scale > 1:
                             raise ExperimentError("validation scales must be in (0, 1]")
-                        validation_trials = []
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-                            futures = [pool.submit(one_run, candidate_name, validation_scale, seeds[i],
-                                                   candidate, i) for i in range(settings["repetitions"])]
-                            validation_trials = [future.result() for future in futures]
+                        validation_trials = run_all([(candidate_name, validation_scale, seeds[i], candidate, i)
+                                                     for i in range(settings["repetitions"])])
                         run_records.extend(validation_trials)
                         hits = sum(r.get("failure_observed", False) for r in validation_trials)
                         result = {
@@ -902,7 +1013,12 @@ def run_experiment(project_root: str | os.PathLike[str], spec: Mapping[str, Any]
                             break
                     if cancel.is_set():
                         break
-                validated = {item["candidate"] for item in report["validation"] if item["passed"]}
+                # Validated means passed at every validation scale, not at any one of them.
+                validated = {
+                    name for name in {item["candidate"] for item in report["validation"]}
+                    if [item["scale"] for item in report["validation"]
+                        if item["candidate"] == name and item["passed"]] == [float(scale) for scale in validation_scales]
+                }
                 for branch in report["branches"]:
                     if branch["name"] != "control":
                         branch["validated"] = branch["name"] in validated
@@ -936,12 +1052,48 @@ def run_experiment(project_root: str | os.PathLike[str], spec: Mapping[str, Any]
             if len(run_records) > _MAX_REPORT_RUNS:
                 report["runs_truncated"] = True
             report["runs"] = run_records[-_MAX_REPORT_RUNS:]
-            try:
-                from pulse.pulse_supabase import scrub_secrets
-                report = json.loads(scrub_secrets(json.dumps(report, ensure_ascii=True)))
-            except ImportError:
-                pass
-            return report
+            return _scrub_report(report)
     except BaseException:
         cancel.set()
         raise
+    finally:
+        with _LIVE_LOCK:
+            _LIVE_CANCELS.discard(cancel)
+
+
+def _scrub_report(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Redact secrets in every string value. Never as one regex pass over the JSON text: a
+    metric named token/secret/password would be redacted along with its quotes and commas."""
+    try:
+        from pulse.pulse_supabase import scrub_secrets_deep
+    except ImportError:
+        return report
+    return scrub_secrets_deep(report)
+
+
+def summarize_report(report: Mapping[str, Any]) -> str:
+    """A few lines for the agent's context: the full report (every run, metric summaries)
+    stays in the experiment incident."""
+    lines = [f"status {report.get('status')}, stage {report.get('stage')}, "
+             f"{report.get('run_count', 0)} run(s), {report.get('resource_seconds', 0)} s total"]
+    if report.get("conclusion"):
+        lines.append(f"conclusion: {report['conclusion']}")
+    reproduction = report.get("reproduction") or {}
+    lines.append("reproduction: " + (
+        f"passed at scale {reproduction.get('scale')} (confidence {reproduction.get('confidence')})"
+        if reproduction.get("passed") else "not reproduced"))
+    for attempt in report.get("proxy_attempts", []):
+        lines.append(f"  proxy scale {attempt['scale']}: {attempt['reproduced']}/{attempt['trials']} "
+                     f"reproduced, confidence {attempt['confidence']}")
+    for branch in report.get("branches", []):
+        line = (f"  branch {branch['name']}: {branch['successful_trials']}/{branch['trials']} succeeded, "
+                f"mean {branch.get('mean_metric')}, improvement {branch.get('objective_improvement')}")
+        if "validated" in branch:
+            line += f", validated {branch['validated']}"
+        if branch.get("failures"):
+            line += f", e.g. failure: {str(branch['failures'][0])[-200:]!r}"
+        lines.append(line)
+    for item in report.get("validation", []):
+        lines.append(f"  validation {item['candidate']} at scale {item['scale']}: "
+                     f"{'passed' if item['passed'] else 'failed'} ({item['failures_observed']}/{item['trials']} failures)")
+    return "\n".join(lines)

@@ -593,9 +593,9 @@ class Option:
 
 
 def choose(options, *, initial=0, searchable=False, max_rows=None, footer=None,
-           search_label="Search", allow_cancel=True, empty_text="No matches", hotkeys=None):
+           search_label="Search", allow_cancel=True, empty_text="No matches", hotkeys=None, title=None):
     """Pick one option. Returns its index in `options`, or None if cancelled (Esc, or Enter
-    on a filtered-empty list).
+    on a filtered-empty list). `title`, when given, is the question shown above the list.
 
     Arrow keys move; Enter selects; a row's `key` shortcut selects it directly (unless
     `searchable`, where letters go to the search box). `hotkeys` maps extra letters that are
@@ -603,7 +603,7 @@ def choose(options, *, initial=0, searchable=False, max_rows=None, footer=None,
     Ctrl+C raises KeyboardInterrupt.
     """
     if _HOST is not None:
-        return _HOST.choose(options, initial=initial, hotkeys=hotkeys) if options else None
+        return _HOST.choose(options, initial=initial, hotkeys=hotkeys, title=title or "") if options else None
     if not enabled():
         raise Unavailable("not an interactive terminal")
     if not options:
@@ -630,7 +630,7 @@ def choose(options, *, initial=0, searchable=False, max_rows=None, footer=None,
     per_item = 2 if any(o.detail for o in options) else 1
 
     def rows_available():
-        chrome = 7 + (2 if searchable else 0)
+        chrome = 7 + (2 if searchable else 0) + (1 if title else 0)
         budget = max(per_item, _height() - chrome - 4)
         rows = max(3, budget // per_item)
         return min(rows, max_rows or rows, len(options))
@@ -638,7 +638,7 @@ def choose(options, *, initial=0, searchable=False, max_rows=None, footer=None,
     def render(final_index=None):
         _erase_lines(lines_drawn[0])
         vis = visible()
-        out = []
+        out = [_s(title, "bold")] if title else []
         if searchable:
             typed = "".join(query)
             out.append(_s(search_label, "dim"))

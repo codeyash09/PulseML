@@ -245,8 +245,12 @@ def test_code_change_approval_offers_always_for_the_current_session(cli, monkeyp
     state = types.SimpleNamespace(cli=cli, request="make a change", root=str(tmp_path))
 
     assert native._confirm(state, "train.py", "old", "new", False)
-    assert not cli.review
+    # Edits only: review stays on, so flagged shell commands are still confirmed.
+    assert cli.review and cli._always_apply_changes
+    assert cli._terminal_needs_confirmation("rm -rf build") is not None
     assert any("Always apply" in label and "this session" in label for label in seen)
+    monkeypatch.setattr(ui, "choose", lambda *a, **k: pytest.fail("asked again"))
+    assert native._confirm(state, "train.py", "old", "newer", False)
 
 
 @pytest.mark.parametrize(

@@ -55,7 +55,7 @@ class PresentationTest(unittest.TestCase):
 
         lines = output.getvalue().splitlines()
         self.assertIn("\033[38;5;208mlive", lines[0])
-        self.assertIn("\033[38;5;208mstalled", lines[1])
+        self.assertIn("\033[38;5;178mstalled", lines[1])      # its own hue: orange is live
         self.assertIn("\033[91mcrashed", lines[2])
         self.assertIn("\033[2mfinished", lines[3])
 

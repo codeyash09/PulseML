@@ -11,8 +11,24 @@ only imported when auto_track() actually starts a session.
 """
 import sys
 
-__version__ = "0.1.2"
 __all__ = ["auto_track", "shutdown", "check_shape", "check_shapes"]
+
+
+def __getattr__(name):
+    # __version__ comes from the installed package's metadata (pyproject's version), read
+    # only when asked for: importlib.metadata is not free, and every worker imports this.
+    if name == "__version__":
+        try:
+            from importlib.metadata import PackageNotFoundError, version
+            try:
+                value = version("pulseml")
+            except PackageNotFoundError:          # running from a source tree, not installed
+                value = "unknown"
+        except ImportError:
+            value = "unknown"
+        globals()["__version__"] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _in_multiprocessing_bootstrap(caller=None):

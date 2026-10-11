@@ -81,7 +81,8 @@ prints a link to open on any device and asks you to paste the code OpenRouter sh
 - Unattended runs use the saved sign-in when you ask for an OpenRouter model
   (`PULSE_PROVIDER=openrouter/<model>`); a saved sign-in alone never switches the agent on.
 - You can still paste an API key instead, or set `OPENROUTER_API_KEY`. A pasted key is
-  never written to disk.
+  saved (in `~/.pulse/keys.json`, owner-only) only if you say yes when Pulse asks, and
+  never while `remember_keys` is off.
 
 #### Bring your own key
 

@@ -534,6 +534,20 @@ def _reads_code_from_stdin(base: str, args: List[str]) -> bool:
     return not positional or positional[0] == "-"
 
 
+def _shell_reads_stdin(base: str, args: List[str]) -> bool:
+    """`sh`, `bash -s`, `bash -` (no -c script, no script file): the commands come from stdin."""
+    if base not in _SHELL_PROGRAMS:
+        return False
+    for j, a in enumerate(args):
+        if a == "-" or a == "-s" or (len(a) > 1 and a[0] == "-" and a[1] != "-" and "s" in a[1:]):
+            return True
+        if len(a) > 1 and a[0] == "-" and a[1] != "-" and "c" in a[1:]:
+            return False
+        if not a.startswith("-") and not a.startswith("+"):
+            return False                # a script file
+    return True
+
+
 def _string_literals(code: str, start: int) -> "tuple[List[str], int]":
     """The quoted string literals inside the call whose `(` is at code[start], and where
     the call ends. A small scanner, not a parser: good enough for a one-liner."""
@@ -785,6 +799,7 @@ def classify_command(command: str) -> Dict[str, bool]:
         return len(tokens)
 
     simple: List[List[str]] = [[]]
+    piped = set()                           # indexes in `simple` of commands fed by a pipe
     computed_close: Dict[int, str] = {}     # token index closing a computed program -> argv[0]
     backticks = 0
     idx = 0
@@ -822,6 +837,8 @@ def classify_command(command: str) -> Dict[str, bool]:
             simple.append([])
         elif tok in _SEPARATOR_OPERATORS:
             simple.append([])
+            if tok in ("|", "|&"):
+                piped.add(len(simple) - 1)
         elif tok in _REDIRECT_OUT_OPERATORS or tok == "<>":
             target = tokens[idx + 1][0] if idx + 1 < len(tokens) and not tokens[idx + 1][1] else None
             if tok == ">&" and target is not None and (target.isdigit() or target == "-"):
@@ -837,7 +854,7 @@ def classify_command(command: str) -> Dict[str, bool]:
         idx += 1
 
     stdin_interpreter = False
-    for argv in simple:
+    for position, argv in enumerate(simple):
         argv = _strip_wrappers(argv, flags)
         if not argv:
             continue
@@ -847,7 +864,12 @@ def classify_command(command: str) -> Dict[str, bool]:
             continue
         base = os.path.basename(argv[0]).lower()
         _judge_program(base, argv[1:], flags)
-        stdin_interpreter = stdin_interpreter or _reads_code_from_stdin(base, argv[1:])
+        reads_stdin = _reads_code_from_stdin(base, argv[1:]) or _shell_reads_stdin(base, argv[1:])
+        if reads_stdin and position in piped:
+            # `... | sh`, `cat x | python`: the program is whatever comes down the pipe, which
+            # can't be judged from here (the same as a computed program): ask.
+            flags["reaches_outside_workspace"] = True
+        stdin_interpreter = stdin_interpreter or reads_stdin
     if stdin_interpreter and (_PYTHON_DELETE_RE.search(text) or _SCRIPT_DELETE_RE.search(text)):
         # `echo "import os; os.remove('x')" | python`: the code is somewhere in this line.
         flags["deletes_files"] = True

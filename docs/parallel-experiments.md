@@ -4,8 +4,15 @@ Pulse can compare candidate training interventions in isolated subprocesses. Sta
 the run's observed failure and source code, then create a JSON spec in the project and
 run `/experiment experiments/overflow.json` (or have the debugging agent issue
 `EXPERIMENT: experiments/overflow.json`).
-The agent and CLI start a background job, so use `/experiment status [id]` to inspect it
-or `/experiment cancel <id>` to stop it.
+The spec is checked before anything starts, and a malformed one is reported back instead of
+being started. Every distinct command the experiment will launch (after `{seed}` and
+`{branch}` substitution) goes through the same confirmation as `TERMINAL:`: a command that
+deletes files, reaches outside the project, and so on, is put to the auto-mode approver or
+the user first, and the experiment is not started if any one is declined.
+The agent and CLI then start a background job, so use `/experiment status [id]` to inspect
+it (a short summary; the full report is recorded as the experiment incident) or
+`/experiment cancel <id>` to stop it. Quitting Pulse cancels a running experiment and
+stops its runners.
 
 ## Reproduction gate
 
@@ -20,6 +27,10 @@ the result is `inconclusive`; candidate fixes are not ranked.
 Signals currently include a named metric becoming non-finite, a named metric crossing a
 numeric threshold, a regular-expression match in stderr, or a non-zero process exit.
 Metric signals should be preferred: process exits and text matches are weaker evidence.
+A run Pulse stopped itself (timeout or cancel) never counts as a non-zero exit. Note that
+`exit_code_nonzero` has a reliability of 0.65, below the default
+`minimum_reproduction_confidence` of 0.8, so it can only pass the gate if you lower that
+threshold to 0.65 or less, deliberately.
 The configured signal identifies what Pulse can measure; it does not establish that every
 causal aspect of the original failure has been preserved. Review the evidence and proxy
 differences before drawing conclusions.
@@ -83,14 +94,16 @@ at each scale; attention-head counts are adjusted to divide the resulting hidden
 Architecture-specific exporters, custom modules and non-JSON configs should be handled
 by the user's runner, which can translate the generated config to the framework/model it
 uses. Keep data and checkpoint files in the project tree or use `copy_excludes` only for
-paths that are safe to omit.
+paths that are safe to omit. Symlinks stay symlinks in the copy: one pointing into the
+project points into the copy, any other (a symlinked `data/` directory) at its real target,
+which is shared with the live run, not copied.
 
 `candidates[].replacements` are exact text replacements applied only to each candidate's
 temporary copy. A missing or unexpectedly repeated target fails that candidate run; no
 replacement is written to the watched project. The unchanged `control` branch uses the
 same proxy, seeds, and runner. `max_parallel` bounds concurrent subprocesses (default 2);
-`resource_class: "gpu"` requires explicit `devices`; Pulse assigns same-seed comparisons
-to the same device and bounds concurrency to the number of listed devices. Without an
+`resource_class: "gpu"` requires explicit `devices`; Pulse bounds concurrency to the number
+of listed devices and hands each run a device no other run is using at the time. Without an
 explicit device list, `auto` runs one worker conservatively; use `resource_class: "cpu"`
 to opt into CPU parallelism. Pulse sets `CUDA_VISIBLE_DEVICES` for assigned devices;
 distributed launch details remain the runner's responsibility.
@@ -112,7 +125,8 @@ state.
 Candidate ranking requires every candidate repetition to finish successfully without the
 reproduced failure. Optional objective metrics break ties using their mean against the
 unchanged control. The top candidates can then be run at progressively larger scales,
-including scale `1.0` (the configured source architecture), still in isolation. Passing
+including scale `1.0` (the configured source architecture), still in isolation. A candidate
+is validated only if it passes at every validation scale. Passing
 that stage is not proof against the live process's precise training state or data stream.
 Pulse reports it as isolated source-scale validation, not as an applied fix.
 

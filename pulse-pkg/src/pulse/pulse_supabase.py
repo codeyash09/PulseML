@@ -1795,20 +1795,29 @@ def claim_commands(run_id: str, runner_id: str, limit: int = 5) -> List[Dict[str
         return []
     rows = _request(
         "GET", "Commands",
-        params={"run_id": f"eq.{run_id}", "status": "eq.pending",
+        # the runner's own rows (questions, the live feed) are pending for a moment while
+        # they are opened: never taken as commands
+        params={"run_id": f"eq.{run_id}", "status": "eq.pending", "command": "not.like.pulse:*",
                 "select": "id,run_id,project_id,user_id,command", "order": "created_at.asc",
                 "limit": str(max(1, min(int(limit), 20)))},
         timeout=_TIMEOUT_BACKGROUND,
     ) or []
     claimed: List[Dict[str, Any]] = []
     for row in rows:
-        updated = _request(
-            "PATCH", "Commands",
-            params={"id": f"eq.{row['id']}", "status": "eq.pending"},
-            body={"status": "processing", "claimed_by": runner_id,
-                  "started_at": datetime.now(timezone.utc).isoformat()},
-            prefer="return=representation", timeout=_TIMEOUT_BACKGROUND,
-        ) or []
+        try:
+            updated = _request(
+                "PATCH", "Commands",
+                params={"id": f"eq.{row['id']}", "status": "eq.pending"},
+                body={"status": "processing", "claimed_by": runner_id,
+                      "started_at": datetime.now(timezone.utc).isoformat()},
+                prefer="return=representation", timeout=_TIMEOUT_BACKGROUND,
+            ) or []
+        except Exception:
+            # the rows already set to processing are this runner's now: hand them over (or
+            # nobody ever finishes them); the rest stay pending for the next poll
+            if claimed:
+                break
+            raise
         if updated:
             claimed.append(row)
     return claimed
@@ -1828,7 +1837,7 @@ LIVE_PREFIX = "pulse:live"
 def open_question(run_id: str, project_id: str, user_id: str, question: Dict[str, Any]) -> Optional[str]:
     """Put `question` ({"label", "options", "detail", "context"}) on run `run_id`'s dashboard
     page; its row id."""
-    return open_runner_row(run_id, project_id, user_id, QUESTION_PREFIX + json.dumps(question))
+    return open_runner_row(run_id, project_id, user_id, QUESTION_PREFIX + json.dumps(scrub_secrets_deep(question)))
 
 
 def open_runner_row(run_id: str, project_id: str, user_id: str, command: str) -> Optional[str]:
@@ -1845,13 +1854,27 @@ def open_runner_row(run_id: str, project_id: str, user_id: str, command: str) ->
     command_id = str((rows[0] if rows else {}).get("id") or "")
     if not command_id:
         return None
-    _request(
-        "PATCH", "Commands",
-        params={"id": f"eq.{command_id}", "status": "eq.pending"},
-        body={"status": "processing", "claimed_by": user_id,
-              "started_at": datetime.now(timezone.utc).isoformat()},
-        prefer="return=minimal", timeout=_TIMEOUT_BACKGROUND,
-    )
+    try:
+        _request(
+            "PATCH", "Commands",
+            params={"id": f"eq.{command_id}", "status": "eq.pending"},
+            body={"status": "processing", "claimed_by": user_id,
+                  "started_at": datetime.now(timezone.utc).isoformat()},
+            prefer="return=minimal", timeout=_TIMEOUT_BACKGROUND,
+        )
+    except Exception:
+        # half opened: nobody will ever end it, so it is ended now (if the cloud lets us)
+        try:
+            _request(
+                "PATCH", "Commands",
+                params={"id": f"eq.{command_id}", "status": "eq.pending"},
+                body={"status": "failed", "result": "Pulse could not open this row.",
+                      "completed_at": datetime.now(timezone.utc).isoformat()},
+                prefer="return=minimal", timeout=_TIMEOUT_BACKGROUND,
+            )
+        except Exception:
+            pass
+        raise
     return command_id
 
 
@@ -1874,17 +1897,23 @@ def read_command(command_id: str) -> Optional[Dict[str, Any]]:
     return rows[0] if rows else None
 
 
-def finish_command(command_id: str, status: str, result: str) -> None:
-    """Save a command's terminal state and scrubbed result for the dashboard."""
+def finish_command(command_id: str, status: str, result: str, overwrite: bool = False) -> bool:
+    """Save a command's terminal state and scrubbed result for the dashboard. Only a row still
+    processing is changed, unless `overwrite` (a question the dashboard answered too late: the
+    row must say which answer was used). Whether a row was changed."""
     if status not in ("completed", "failed"):
         raise ValueError("command status must be completed or failed")
-    _request(
+    params = {"id": f"eq.{command_id}", "select": "id"}
+    if not overwrite:
+        params["status"] = "eq.processing"
+    rows = _request(
         "PATCH", "Commands",
-        params={"id": f"eq.{command_id}", "status": "eq.processing"},
+        params=params,
         body={"status": status, "result": scrub_secrets(result),
               "completed_at": datetime.now(timezone.utc).isoformat()},
-        prefer="return=minimal", timeout=_TIMEOUT_BACKGROUND,
+        prefer="return=representation", timeout=_TIMEOUT_BACKGROUND,
     )
+    return bool(rows)
 
 
 # ----------------------------------------------------------------------------

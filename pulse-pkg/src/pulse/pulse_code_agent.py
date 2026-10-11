@@ -71,14 +71,13 @@ _RESULT_MAX_CHARS = 24_000       # one tool result sent back to the model
 _LIST_MAX = 300
 _REPEAT_LIMIT = 3                # identical consecutive tool calls before the model is told it is looping
 _MAX_NUDGES = 2                  # retries for non-outline completion nudges
+_MAX_OUTLINE_NUDGES = 8          # "your outline has open items" nudges, counted on their own
 
 _COMPACT_AT_CHARS = 360_000      # conversation size (chars, ~90k tokens) that triggers compaction
 _KEEP_RECENT = 14                # messages kept verbatim by compaction
 _ELIDE_AFTER = 16                # tool results older than this many messages are shortened
 _ELIDED_CHARS = 700
 _SUMMARY_INPUT_CHARS = 140_000
-
-_PROTECTED_PARTS = (".git", ".pulse_history")
 
 # ---------------------------------------------------------------------------------------
 # Prompt
@@ -252,14 +251,15 @@ TOOLS = [
         {"message": _S}, ["message"]),
     _fn("todo_write",
         "Required for requests with more than about two steps: create and maintain the task outline before coding. "
-        "Replace the full outline each time. Each item is {id, parent_id, content, status}; parent_id is null "
-        "for a top-level phase or the id of any parent task. The hierarchy is recursive: phases contain subtasks, "
+        "Replace the full outline each time. Each item is {id, parent_id, content, status}; parent_id is left out "
+        "(or empty) for a top-level phase, else the id of any parent task. The hierarchy is recursive: phases contain subtasks, "
         "and subtasks may contain their own subtasks at any depth. Break broad work into concrete leaf actions, "
         "including verification. Statuses are pending | in_progress | completed. Parent statuses are derived from "
         "their children. Keep exactly one unfinished leaf in_progress. After completing a leaf, update the outline "
         "before moving on; do not finish while any leaf is unfinished.",
         {"todos": {"type": "array", "items": {"type": "object", "properties": {
-            "id": _S, "parent_id": {"type": ["string", "null"]}, "content": _S,
+            # A plain string: some providers reject a ["string", "null"] type union.
+            "id": _S, "parent_id": _S, "content": _S,
             "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}},
             "required": ["id", "content", "status"]}}}, ["todos"]),
 ]
@@ -307,6 +307,7 @@ class _State:
         self.smoke_ok = None         # result of the last smoke_test (None: never run)
         self.said = ""               # what the model said beside its tool calls, until shown
         self.nudges = 0
+        self.outline_nudges = 0
         self.last_call = None
         self.repeats = 0
         self.edits_declined = 0
@@ -325,8 +326,7 @@ class _State:
         from . import pulse_code as _pc
         if not _pc._inside(self.root, absolute):
             return None, f"'{path}' is outside the project root {self.root}"
-        parts = os.path.relpath(absolute, self.root).split(os.sep)
-        if any(p in _PROTECTED_PARTS for p in parts):
+        if _pc._protected(self.root, absolute):
             return None, f"'{path}' is in a protected directory"
         return absolute, None
 
@@ -490,47 +490,77 @@ def _confirm(state, path, before, after, created):
     cli = state.cli
     diff = _pc.render_diff(cli, {path: (before, after, created)})
     _ui.show_change([f"{'CREATE' if created else 'EDIT'}: {_rel(state.root, path)}"], diff)
-    if not cli.review:
+    if not cli.review or getattr(cli, "_always_apply_changes", False):
         return True
     reviewed = cli._review_change_with_approver(state.request, f"{'create' if created else 'edit'} {_rel(state.root, path)}",
                                                 diff)
     if reviewed is not None:
         return reviewed
     try:
+        # "Always" has no single-key shortcut (a stray keystroke must not switch review off),
+        # and it covers code changes only: flagged shell commands are still asked about.
         options = [
             _ui.Option("Apply this change", key="y"),
-            _ui.Option("Always apply code changes this session", key="a"),
+            _ui.Option("Always apply code changes this session"),
             _ui.Option("Reject this change", key="n"),
         ]
-        choice = _ui.choose(options, title="Apply this change?", hotkeys={"a": "always"})
-        if choice == "always" or choice == 1:
-            cli.review = False
-            cprint("[Pulse Code] Review is now OFF for this session (/review on to re-enable).", color=_YELLOW)
+        choice = _ui.choose(options, title="Apply this change?")
+        if choice == 1:
+            cli._always_apply_changes = True
+            cprint("[Pulse Code] Code changes are now applied without asking for this session "
+                   "(/review on to ask again).", color=_YELLOW)
             return True
         if isinstance(choice, int):
             return choice == 0
         return False
-    except _ui.Unavailable:
-        pass
-    try:
-        answer = _prompt_text("Apply this change? (Y/n/a=always this session) > ",
-                              label="Apply this change?  (Y/n/a=always this session)").strip().lower()
     except (EOFError, KeyboardInterrupt):
         cprint("[Pulse Code] No approval received -- change not applied.", color=_YELLOW)
         return False
-    if answer in ("a", "all", "always"):
-        cli.review = False
-        cprint("[Pulse Code] Review is now OFF for this session (/review on to re-enable).", color=_YELLOW)
+    except _ui.Unavailable:
+        pass
+    try:
+        answer = _prompt_text("Apply this change? (Y/n, or type 'always' for this session) > ",
+                              label="Apply this change?  (Y/n, or type 'always' for this session)").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        cprint("[Pulse Code] No approval received -- change not applied.", color=_YELLOW)
+        return False
+    if answer == "always":
+        cli._always_apply_changes = True
+        cprint("[Pulse Code] Code changes are now applied without asking for this session "
+               "(/review on to ask again).", color=_YELLOW)
         return True
     return answer in ("", "y", "yes")
+
+
+def _write_atomic(path, text):
+    """Replace a file's text by writing a temp file beside it and renaming it over: a crash or
+    a full disk mid-write leaves the old file whole instead of truncated. The real file behind
+    a symlink is the one replaced (the link stays), and it keeps its permission bits."""
+    target = os.path.realpath(path)
+    if not os.path.exists(target):            # nothing to lose: an ordinary create
+        with open(target, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        return
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(target) + ".", suffix=".pulse-tmp",
+                               dir=os.path.dirname(target))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        shutil.copymode(target, tmp)
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _commit(state, path, new_text, label, before=None, created=False):
     """Write `new_text` to `path` and record it for this turn's /undo commit."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     on_disk = new_text.replace("\n", "\r\n") if state.crlf.get(path) else new_text
-    with open(path, "w", encoding="utf-8", newline="") as handle:
-        handle.write(on_disk)
+    _write_atomic(path, on_disk)
     prior = state.changes.get(path)
     if prior is None:
         state.changes[path] = [before if before is not None else "", new_text, created]
@@ -677,10 +707,16 @@ def _t_edit_file(state, a):
             where = ", ".join(str(content.count("\n", 0, h) + 1) for h in hits[:8])
             return (f"old_string matches {len(hits)} places (lines {where}). Add surrounding lines to make it "
                     "unique, or pass replace_all=true to change every one.")
+        # Matches can overlap ("aa" in "aaa" at 0 and 1): replacing both would splice one
+        # replacement into the other. Take them left to right, each after the last one ends.
+        spans = []
+        for h in hits:
+            if not spans or h >= spans[-1] + len(old):
+                spans.append(h)
         after = content
-        for h in reversed(hits):
+        for h in reversed(spans):
             after = after[:h] + new + after[h + len(old):]
-        label = f"edited {_rel(state.root, path)} ({len(hits)} replacements)"
+        label = f"edited {_rel(state.root, path)} ({len(spans)} replacements)"
     else:
         span = _find_fuzzy_snippet_span(content, old)
         if span is None:
@@ -785,7 +821,10 @@ def _run_probe(state, code, exprs, expect, timeout, purpose):
     (None, why it produced none). The snippet is judged like a `python -c` command: one that deletes
     files or reaches outside the project pauses for the user exactly as run_command does."""
     cli = state.cli
-    pseudo = f"python -c {_quote(code)}" if code.strip() else ""
+    # `exprs` and the keys of `expect` are eval()'d in the same process as `code`, so they
+    # are judged with it: `expect={"__import__('shutil').rmtree('/x')": "()"}` is code too.
+    source = "\n".join([code] + [str(e) for e in exprs or []] + [str(k) for k in (expect or {})])
+    pseudo = f"python -c {_quote(source)}" if source.strip() else ""
     flags = cli._terminal_needs_confirmation(pseudo) if pseudo else None
     if flags and not cli._confirm_terminal_command(pseudo, flags, purpose):
         return None, f"NOT RUN -- {cli._terminal_denial_reason()}. Try a probe that does not do that."
@@ -1003,6 +1042,8 @@ def _t_todo_write(state, a):
         content = item.get("content")
         status = item.get("status")
         parent_id = item.get("parent_id")
+        if isinstance(parent_id, str) and not parent_id.strip():
+            parent_id = None                     # "" is how a string-only schema says "top level"
         if not isinstance(task_id, str) or not task_id.strip():
             return f"todo item {index} needs a non-empty id."
         task_id = task_id.strip()
@@ -1013,7 +1054,7 @@ def _t_todo_write(state, a):
         if not isinstance(status, str) or status not in _STATUS_MARK:
             return f"todo {task_id!r} status must be pending, in_progress, or completed."
         if parent_id is not None and (not isinstance(parent_id, str) or not parent_id.strip()):
-            return f"todo {task_id!r} parent_id must be null or a non-empty todo id."
+            return f"todo {task_id!r} parent_id must be empty or a todo id."
         task = {
             "id": task_id, "parent_id": parent_id.strip() if isinstance(parent_id, str) else None,
             "content": content.strip(), "status": status,
@@ -1234,7 +1275,8 @@ def _execute(state, call):
     signature = (name, raw)
     state.repeats = state.repeats + 1 if signature == state.last_call else 1
     state.last_call = signature
-    state.calls_made += 1
+    if name != "message_user":          # saying "I'll do X" through the tool is not doing it
+        state.calls_made += 1
     host = _ui.host()
     try:
         if host is not None and hasattr(host, "hush") and name not in _WRITERS and name not in _LOUD:
@@ -1437,8 +1479,8 @@ _INTENT_RE = re.compile(
     r"i'?m going to|now i|i will now|i(?:'ll| will) (?:start|begin|now))\b(?! know)")
 
 
-def _nudge(state, reply_text=""):
-    """A reason the agent should not stop yet, or None."""
+def _outline_nudge(state):
+    """Why the agent should not stop while its task outline has open items, or None."""
     open_items = [t for t in state.todos if t["status"] != "completed"]
     if open_items:
         depth = {}
@@ -1465,6 +1507,16 @@ def _nudge(state, reply_text=""):
                     f"{'  ' * depth[t['id']]}- {t['content']} ({t['status']})"
                     for t in open_items
                 ))
+    return None
+
+
+def _nudge(state, reply_text="", outline=True):
+    """A reason the agent should not stop yet, or None. `outline=False` leaves out the open
+    outline (the turn loop asks about it separately, under its own cap)."""
+    if outline:
+        reason = _outline_nudge(state)
+        if reason:
+            return reason
     if (reply_text and not state.calls_made and not state.changes
             and _INTENT_RE.search(reply_text.strip()[-300:]) and len(reply_text) < 1500):
         # It ended by announcing what it would do and stopped (no tool was called). Doing is
@@ -1535,11 +1587,16 @@ def run_native_turn(cli, request, evidence=None):
                 if reply.finish == "length":
                     messages.append({"role": "user", "content": "Your reply was cut off. Continue where you left off."})
                     continue
-                has_unfinished_tasks = any(todo["status"] != "completed" for todo in state.todos)
-                reason = (_nudge(state, reply.text)
-                          if has_unfinished_tasks or state.nudges < _MAX_NUDGES else None)
+                # Two budgets: an open outline may be nudged more often than the rest, but not
+                # without end, and using it up must not starve the verify/smoke-test nudges.
+                reason = _outline_nudge(state) if state.outline_nudges < _MAX_OUTLINE_NUDGES else None
                 if reason:
-                    state.nudges += 1
+                    state.outline_nudges += 1
+                elif state.nudges < _MAX_NUDGES:
+                    reason = _nudge(state, reply.text, outline=False)
+                    if reason:
+                        state.nudges += 1
+                if reason:
                     cprint("[Pulse Code] Not finished yet -- continuing.", color=_YELLOW)
                     messages.append({"role": "user", "content": reason})
                     continue

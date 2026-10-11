@@ -4322,11 +4322,11 @@ body {
   -webkit-backdrop-filter: blur(12px);
 }
 
-.run-question-readonly {
+.run-question-inline {
   padding: 12px 14px;
 }
 
-.run-question-readonly .run-question {
+.run-question-inline .run-question {
   width: 100%;
   margin: 0;
   padding: 18px;
@@ -5047,7 +5047,7 @@ body {
 }
 
 .run-question,
-.run-question-readonly .run-question {
+.run-question-inline .run-question {
   border: 1px solid rgba(255, 255, 255, .12);
   border-radius: 18px;
   background: var(--surface);
@@ -5108,7 +5108,7 @@ body {
   color: var(--secondary);
 }
 
-.run-question-readonly .run-question {
+.run-question-inline .run-question {
   box-shadow: none;
 }
 
@@ -8139,4 +8139,36 @@ body.dashboard-active .run-window-shell .cli-action-name {
   color: var(--fg);
 }
 
-.run-question-readonly .run-question { background: #111; }
+.run-question-inline .run-question { background: #111; }
+
+/* "Later": put the dialog off; it becomes a card above the composer */
+.ask-head .question-later {
+  margin-left: auto;
+  padding: 4px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--secondary);
+  font: 500 11px var(--sans);
+  cursor: pointer;
+}
+
+.ask-head .question-later:hover { color: var(--fg); }
+.ask-head .question-later:focus-visible { outline: 2px solid #f4f3ef; outline-offset: 2px; }
+
+.run-question-inline .run-question { max-height: none; }
+
+/* the page is white now: the project title and the findings' labels need dark ink */
+body.dashboard-active .project-console-identity h1 { color: #202124; }
+.run-window-shell .run-side-finding.is-warning { border-color: #b8701a; }
+.run-window-shell .run-side-finding.is-warning span { color: #8a5310; }
+
+/* the dialog is dark: its answer field too (the page's light field left the typed text invisible) */
+.run-question .question-text input {
+  border-color: var(--line-strong);
+  background: var(--raised);
+  color: var(--fg);
+}
+
+/* tool output keeps its dark block on the light page: give it light text to match */
+.run-window-shell .t-out pre:not(.ask-diff) { color: #cfd0cc; }
