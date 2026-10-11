@@ -14,7 +14,6 @@ verified to work. Scenarios run one at a time (each 10-60 s); run this file on i
 import json
 import os
 import re
-import resource
 import signal
 import subprocess
 import sys
@@ -23,6 +22,9 @@ import threading
 import time
 
 import pytest
+
+pytest.importorskip("resource", reason="the subprocess resource probe requires POSIX")
+pytest.importorskip("pty", reason="the subprocess terminal probes require POSIX PTYs")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SWEEP1 = os.path.join(os.path.dirname(HERE), "sweep")

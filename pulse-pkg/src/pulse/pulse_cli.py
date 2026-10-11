@@ -1043,9 +1043,10 @@ _enable_windows_ansi()
 _COLOR_ENABLED = (sys.stdout.isatty() and not os.environ.get("NO_COLOR")
                   and os.environ.get("TERM", "").lower() != "dumb")
 _ORANGE = "\033[38;5;208m"
+_OFFWHITE = "\033[97m"
+_BLUE = _OFFWHITE
 _RED = "\033[91m"
 _GREEN = "\033[2m"
-_BLUE = "\033[97m"
 _RESET = "\033[0m"
 _YELLOW = "\033[38;5;208m"
 _PULSE_RE = re.compile(r"Pulse(?:\s(?:CLI|AI))?")
@@ -1119,7 +1120,7 @@ def _highlight_pulse(text: str, base_color: Optional[str] = None) -> str:
     if not _COLOR_ENABLED:
         return text
     resume = base_color or ""
-    return _PULSE_RE.sub(lambda m: f"{_OFFWHITE}{m.group(0)}{_RESET}{resume}", text)
+    return _PULSE_RE.sub(lambda m: f"{_ORANGE}{m.group(0)}{_RESET}{resume}", text)
 
 
 def cprint(text: str = "", color: Optional[str] = None) -> None:
@@ -12477,7 +12478,7 @@ class PulseCLI:
         restored, failed, new_commit = self._perform_revert(entries, target_idx, target_label)
 
         if restored:
-            cprint(f"[Pulse CLI] ✓ Reverted to state {target_label} -- {len(restored)} file(s) restored:", color=_BLUE)
+            cprint(f"[Pulse CLI] ✓ Reverted to state {target_label} -- {len(restored)} file(s) restored:", color=_OFFWHITE)
             for p in restored:
                 print(f"    - {os.path.basename(p)}")
             if new_commit:
@@ -12724,7 +12725,7 @@ class PulseCLI:
                 commit_id=commit_id, files=[os.path.basename(p) for p in applied_by_path],
             )
 
-        cprint("\n".join(lines), color=_BLUE)
+        cprint("\n".join(lines), color=_OFFWHITE)
 
         self._pending_revert_backups = dict(originals)  # path -> original content
         self._fix_applied_this_turn = True  # tells ask_agent's top-level call to restart afterward
