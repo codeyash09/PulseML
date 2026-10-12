@@ -388,6 +388,37 @@ def test_the_live_feed_streams_what_the_agent_is_doing(tmp_path, monkeypatch):
     assert rows.finished == [("live1", "completed")]
 
 
+def test_the_live_feed_keeps_the_colour_the_tui_gives_each_entry(tmp_path, monkeypatch):
+    """The dashboard paints what the TUI paints: a finding by its severity, a red line of
+    captured output red, and the agent's words as it streams them as "say" (plain), not as a
+    dim Pulse note."""
+    rows = LiveRows(monkeypatch)
+    app = appmod.App(SignedInCli(), str(tmp_path))
+    feed = appmod.LiveFeed(app)
+    feed.tick()
+    with app.lock:
+        app.view.busy = True
+        app._job_from = len(app.view.entries)
+        app.view.entries.append(appmod.tui.Entry("finding", "NaN in gradients", severity="critical"))
+        app.view.entries.append(appmod.tui.Entry("finding", "loss plateau", severity="warning"))
+        app.view.entries.append(appmod.tui.Entry("text", "start\n\033[1;31mValueError: nan\033[0m\nend"))
+        app.view.entries.append(appmod.tui.Entry("text", "all quiet"))
+        app.view.partial = "The scheduler steps every batch"
+    feed.tick()
+    activity = rows.updates[-1][1]["activity"]
+    assert [a.get("severity") for a in activity[:2]] == ["critical", "warning"]
+    assert activity[2]["ansi"] == "start\n\033[31mValueError: nan\033[0m\nend"
+    assert "ansi" not in activity[3]                         # nothing coloured, nothing sent
+    assert (activity[-1]["kind"], activity[-1]["live"]) == ("say", "1")
+    feed.close()
+
+
+def test_red_lines_never_end_in_half_an_escape_sequence():
+    out = appmod.App._red_lines("\033[31m" + "x" * 1496 + "\033[0m", limit=1500)
+    assert not out.endswith("\033") and not out.rstrip("m").endswith("\033[")
+    assert appmod.App._red_lines("plain\nlines") == ""
+
+
 def test_the_live_feed_follows_the_row_in_hand(tmp_path, monkeypatch):
     rows = LiveRows(monkeypatch)
     app = appmod.App(SignedInCli(), str(tmp_path))

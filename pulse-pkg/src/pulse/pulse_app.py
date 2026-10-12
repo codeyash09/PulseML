@@ -859,6 +859,23 @@ class App:
         return ("…" + text[-limit:] if len(text) > limit else text) if entry.kind == "thinking" else \
             (text[:limit] + "…" if len(text) > limit else text)
 
+    @staticmethod
+    def _red_lines(text: str, limit: int = 1500) -> str:
+        """`text` with only its red lines kept coloured (what the TUI keeps of a captured
+        program's colours), or "" when no line is red."""
+        lines, any_red = [], False
+        for part in str(text or "").strip("\n").split("\n"):
+            bare = tui._SGR_RE.sub("", part)
+            if tui._RED_SGR_RE.search(part):
+                any_red = True
+                lines.append("\033[31m" + bare + tui.RESET)
+            else:
+                lines.append(bare)
+        if not any_red:
+            return ""
+        out = "\n".join(lines)[:limit]
+        return re.sub(r"\033\[[0-9;]*$", "", out)       # never leave half an escape sequence behind
+
     def _live_state(self) -> Dict[str, Any]:
         """What the dashboard's live view shows: what the job in hand has shown so far (its
         reasoning streaming in), what is running, and the run's step and latest values."""
@@ -873,12 +890,21 @@ class App:
                         item = {"kind": entry.kind, "text": words}
                         if entry.kind == "trace":
                             item["ansi"] = tui.clean(entry.text)[:1500]
+                        elif entry.kind == "finding":
+                            # the TUI colours a finding by its severity (red / orange / dim)
+                            item["severity"] = str(entry.severity or "").lower()
+                        elif entry.kind not in ("thinking", "tool", "edit", "user"):
+                            red = self._red_lines(entry.text)
+                            if red:
+                                item["ansi"] = red       # a line that came out red stays red, as in the TUI
                         if getattr(entry, "live", False):
                             item["live"] = "1"
                         activity.append(item)
                 partial = tui._SGR_RE.sub("", view.partial or "").strip()
                 if partial:
-                    activity.append({"kind": "text", "text": partial[-800:], "live": "1"})
+                    # the agent's words, still arriving: "say" (plain in the TUI), not a Pulse
+                    # note ("text", dim) -- the dashboard colours the two differently
+                    activity.append({"kind": "say", "text": partial[-800:], "live": "1"})
             state: Dict[str, Any] = {
                 "busy": busy, "activity": activity[-30:],
                 "doing": tui._SGR_RE.sub("", str(view.live or "")).strip() if busy else "",
