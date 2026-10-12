@@ -55,6 +55,7 @@ dependencies = [
     "litellm",
     "fpdf2",
     "py-spy",
+    "pyflakes",   # the undefined-name gate on model-proposed edits (pulse_cli._lint_check); without it that gate silently passes everything
 ]
 
 [project.scripts]

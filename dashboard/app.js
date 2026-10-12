@@ -69,6 +69,9 @@ let observedLiveRunIds = new Set();
 let pinnedRunsProjectId = null;
 let commandDrafts = new Map();
 let commandSuggestionIndex = 0;
+// The RUN STATE panel folds away on phones (it would otherwise sit above the chat); kept here
+// so a re-render doesn't fold it again.
+let runStatsOpen = false;
 
 let emailCache = new Map();
 
@@ -1092,6 +1095,30 @@ const CLI_ACTION_NAMES = new Set([
   "VIEW", "WRITE_FILE"
 ]);
 
+// The TUI's palette, as the dashboard draws it (colours themselves live in styles.css as
+// --pulse-*). Orange marks what is active or worth a look, grey is a command, red is wrong,
+// off-white is emphasis. What the TUI paints in the 16-colour codes it also paints orange --
+// pulse_tui._TRACE_ANSI_COLORS sends yellow (33) and cyan (36) to orange -- so they are orange
+// here too; the genuinely blue codes stay blue.
+const CLI_COLOR_CLASSES = ["cli-ansi-orange", "cli-ansi-red", "cli-ansi-blue", "cli-ansi-grey", "cli-ansi-strong"];
+const CLI_COLOR_16 = {
+  31: "cli-ansi-red", 91: "cli-ansi-red",
+  33: "cli-ansi-orange", 93: "cli-ansi-orange", 36: "cli-ansi-orange", 96: "cli-ansi-orange",
+  34: "cli-ansi-blue", 94: "cli-ansi-blue",
+  97: "cli-ansi-strong"
+};
+const CLI_COLOR_256 = {
+  208: "cli-ansi-orange", 214: "cli-ansi-orange",      // accent, and accent under the mouse
+  248: "cli-ansi-grey",                                  // a command in the transcript
+  255: "cli-ansi-strong",                                // the same, lit up
+  27: "cli-ansi-blue", 33: "cli-ansi-blue", 39: "cli-ansi-blue", 69: "cli-ansi-blue", 75: "cli-ansi-blue"
+};
+
+function setCliColor(active, className) {
+  CLI_COLOR_CLASSES.forEach(name => active.delete(name));
+  if (className) active.add(className);
+}
+
 function renderCliText(value) {
   const text = String(value ?? "");
   const ansi = /\u001b\[([0-9;]*)m/g;
@@ -1129,12 +1156,19 @@ function renderCliText(value) {
 
     const codes = (match[1] || "0").split(";").map(code => Number(code || 0));
     for (let index = 0; index < codes.length; index += 1) {
-      let code = codes[index];
-      let extendedColor = false;
-      if (code === 38 && codes[index + 1] === 5 && codes[index + 2] !== undefined) {
-        code = codes[index + 2];
-        extendedColor = true;
-        index += 2;
+      const code = codes[index];
+      if (code === 38 || code === 48) {
+        // 38;5;N / 48;5;N (256-colour) and 38;2;r;g;b / 48;2;r;g;b: consume their arguments so
+        // they are never mistaken for codes of their own; only a foreground colour is drawn
+        const mode = codes[index + 1];
+        const foreground = code === 38;
+        if (mode === 5) {
+          if (foreground) setCliColor(active, CLI_COLOR_256[codes[index + 2]] || null);
+          index += 2;
+        } else if (mode === 2) {
+          index += 4;
+        }
+        continue;
       }
       if (code === 0) active = new Set();
       else if (code === 1) active.add("cli-ansi-bold");
@@ -1144,25 +1178,8 @@ function renderCliText(value) {
         active.delete("cli-ansi-bold");
         active.delete("cli-ansi-dim");
       } else if (code === 23) active.delete("cli-ansi-italic");
-      else if ([31, 91].includes(code)) {
-        active.delete("cli-ansi-orange");
-        active.delete("cli-ansi-blue");
-        active.add("cli-ansi-red");
-      } else if ((!extendedColor && [33, 93].includes(code)) ||
-                 (extendedColor && [208, 214].includes(code))) {
-        active.delete("cli-ansi-red");
-        active.delete("cli-ansi-blue");
-        active.add("cli-ansi-orange");
-      } else if ((!extendedColor && [36, 96].includes(code)) ||
-                 (extendedColor && [33, 39].includes(code))) {
-        active.delete("cli-ansi-red");
-        active.delete("cli-ansi-orange");
-        active.add("cli-ansi-blue");
-      } else if (code === 39) {
-        active.delete("cli-ansi-red");
-        active.delete("cli-ansi-orange");
-        active.delete("cli-ansi-blue");
-      }
+      else if (code === 39) setCliColor(active, null);
+      else if (CLI_COLOR_16[code]) setCliColor(active, CLI_COLOR_16[code]);
     }
     position = ansi.lastIndex;
   }
@@ -4028,8 +4045,12 @@ function renderRunWorkspace(session) {
     </div>
   `).join("");
   const statsPane = hasRunStats ? `
-    <aside class="run-side-panel" aria-label="Run telemetry">
-      <div class="run-side-heading">RUN STATE</div>
+    <aside class="run-side-panel ${runStatsOpen ? "is-open" : ""}" aria-label="Run telemetry">
+      <button class="run-side-heading run-side-toggle" type="button" aria-expanded="${runStatsOpen}">
+        <span>RUN STATE</span>
+        <span class="run-side-summary">step <b data-live-step>${escapeHtml(metricValue(step))}</b> · ${escapeHtml(stepRate || "—")}</span>
+        <svg class="run-side-chevron" viewBox="0 0 20 20" aria-hidden="true"><path d="m5 8 5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
       <div class="run-side-stat"><span>STEP</span><strong data-live-step>${escapeHtml(metricValue(step))}</strong></div>
       <div class="run-side-stat"><span>RATE</span><strong>${escapeHtml(stepRate || "—")}</strong></div>
       <div class="run-side-stat"><span>ELAPSED</span><strong>${escapeHtml(elapsed)}</strong></div>
@@ -4234,6 +4255,7 @@ function renderOpenQuestion(command, canSend, modal = true) {
         </div>
         ${body}
         <div class="ask-question" id="${promptId}">${escapeHtml(label || "Pulse is asking you to choose:")}</div>
+        ${asked.context && subject.kind !== "other" ? `<details class="approval-context"><summary>Recent context</summary><pre>${escapeHtml(asked.context)}</pre></details>` : ""}
         <div class="question-choices">${choices}</div>
         <p class="question-status" role="status">${!canSend ? "Only the run owner or workspace admins can answer."
           : sending ? "Sending…"
@@ -4365,11 +4387,17 @@ function renderTurn(turn, { live = false, asking = false, doing = "" } = {}) {
           </div>`;
       }
       case "note":
-        return `<div class="t-note">${escapeHtml(String(item.text || "").replace(/^\[Pulse\]\s*/gm, ""))}</div>`;
+        return `<div class="t-note">${renderCliText(String(item.ansi || item.text || "").replace(/^\[Pulse\]\s*/gm, ""))}</div>`;
       case "error":
         return `<div class="t-note is-error">${text}</div>`;
-      case "finding":
-        return `<div class="t-note is-finding">${text}</div>`;
+      case "finding": {
+        // coloured by severity, as in the TUI: red / orange / dim
+        const severity = ["critical", "error", "warning"].includes(item.severity) ? item.severity : "info";
+        return `<div class="t-note is-finding is-${severity}"><b class="t-mark">${severity.toUpperCase()}</b> ${text}</div>`;
+      }
+      case "text":
+        // Pulse's own output and the agent's printed answer: quieter, as the TUI draws it; red stays red
+        return `<div class="t-text is-output">${renderCliText(item.ansi || item.text || "")}${caret}</div>`;
       case "trace":
         return `<pre class="t-trace">${renderCliText(item.ansi || item.text || "")}</pre>`;
       case "user":
@@ -5319,6 +5347,36 @@ els.workspaceList.addEventListener("contextmenu", event => {
   menu.querySelector("[role=menuitem]")?.focus();
 });
 
+// A long-press on a workspace is its context menu on touch screens: Android fires `contextmenu`
+// itself, iOS Safari never does, so without this a phone can't rename a workspace there.
+{
+  let pressTimer = null;
+  let pressed = null;
+  let fired = false;
+  const cancelPress = () => { clearTimeout(pressTimer); pressTimer = null; };
+  els.workspaceList.addEventListener("touchstart", event => {
+    const row = event.target.closest(".sidebar-workspace-item");
+    if (!row || event.touches.length !== 1) return;
+    pressed = { x: event.touches[0].clientX, y: event.touches[0].clientY };
+    fired = false;
+    pressTimer = setTimeout(() => {
+      fired = true;
+      row.dispatchEvent(new MouseEvent("contextmenu", {
+        bubbles: true, cancelable: true, clientX: pressed.x, clientY: pressed.y
+      }));
+    }, 550);
+  }, { passive: true });
+  els.workspaceList.addEventListener("touchmove", event => {
+    const touch = event.touches[0];
+    if (pressed && touch && Math.hypot(touch.clientX - pressed.x, touch.clientY - pressed.y) > 10) cancelPress();
+  }, { passive: true });
+  els.workspaceList.addEventListener("touchend", event => {
+    cancelPress();
+    if (fired) { event.preventDefault(); fired = false; }   // the release is not a tap that opens it
+  });
+  els.workspaceList.addEventListener("touchcancel", cancelPress);
+}
+
 els.workspaceList.addEventListener("keydown", event => {
   if (!["ContextMenu", "F10"].includes(event.key) || (event.key === "F10" && !event.shiftKey)) return;
   const row = event.target.closest(".sidebar-workspace-item");
@@ -5435,13 +5493,22 @@ els.activeConsole.addEventListener("click", event => {
     return;
   }
 
+  const statsToggle = event.target.closest(".run-side-toggle");
+  if (statsToggle) {
+    runStatsOpen = !runStatsOpen;
+    statsToggle.setAttribute("aria-expanded", String(runStatsOpen));
+    statsToggle.closest(".run-side-panel").classList.toggle("is-open", runStatsOpen);
+    return;
+  }
+
   const menuToggle = event.target.closest(".run-menu-toggle");
   if (menuToggle) {
-    const menu = els.activeConsole.querySelector(".run-menu");
     const isOpen = menuToggle.getAttribute("aria-expanded") === "true";
-    menuToggle.setAttribute("aria-expanded", String(!isOpen));
-    menu.hidden = isOpen;
-    if (!isOpen) menu.querySelector(".run-menu-search")?.focus();
+    setRunMenuOpen(!isOpen, { focusSearch: true });
+    return;
+  }
+  if (event.target.closest(".run-menu-backdrop, .run-menu-close")) {
+    setRunMenuOpen(false, { returnFocus: true });
     return;
   }
   const pinToggle = event.target.closest(".run-pin-toggle");
@@ -5451,9 +5518,7 @@ els.activeConsole.addEventListener("click", event => {
   }
   const runTab = event.target.closest(".run-tab-pill, .run-picker-item");
   if (runTab) {
-    const menu = els.activeConsole.querySelector(".run-menu");
-    if (menu) menu.hidden = true;
-    els.activeConsole.querySelector(".run-menu-toggle")?.setAttribute("aria-expanded", "false");
+    setRunMenuOpen(false);
     if (runTab.dataset.sessionId !== activeSessionId) {
       activeSessionId = runTab.dataset.sessionId;
       lastRenderedSignature = "";
@@ -5494,10 +5559,8 @@ els.activeConsole.addEventListener("input", event => {
 
 document.addEventListener("click", event => {
   const menu = els.activeConsole.querySelector(".run-menu");
-  const toggle = els.activeConsole.querySelector(".run-menu-toggle");
   if (!menu || menu.hidden || event.target.closest(".run-tab-bar")) return;
-  menu.hidden = true;
-  toggle?.setAttribute("aria-expanded", "false");
+  setRunMenuOpen(false);
 });
 
 
@@ -5505,9 +5568,7 @@ els.activeConsole.addEventListener("keydown", event => {
   if (event.key === "Escape") {
     const menu = els.activeConsole.querySelector(".run-menu");
     if (menu && !menu.hidden) {
-      menu.hidden = true;
-      els.activeConsole.querySelector(".run-menu-toggle")?.setAttribute("aria-expanded", "false");
-      els.activeConsole.querySelector(".run-menu-toggle")?.focus();
+      setRunMenuOpen(false, { returnFocus: true });
       event.preventDefault();
       return;
     }
@@ -5874,8 +5935,9 @@ function renderLive() {
 
   const run = state?.run;
   if (run) {
-    const stepEl = els.activeConsole.querySelector("[data-live-step]");
-    if (stepEl && run.step !== undefined) stepEl.textContent = metricValue(run.step);
+    if (run.step !== undefined) {
+      els.activeConsole.querySelectorAll("[data-live-step]").forEach(node => { node.textContent = metricValue(run.step); });
+    }
     const picker = [...els.activeConsole.querySelectorAll("[data-live-picker]")].find(node => node.dataset.livePicker === session.id);
     const loss = ["loss", "train_loss", "loss_value", "current_loss"].map(name => run.values?.[name]).find(value => value !== undefined);
     if (picker && run.step !== undefined) {
@@ -6059,6 +6121,7 @@ function togglePinnedRun(sessionId) {
   const existingMenu = els.activeConsole.querySelector(".run-menu");
   const wasMenuOpen = Boolean(existingMenu && !existingMenu.hidden);
   const searchQuery = els.activeConsole.querySelector(".run-menu-search")?.value || "";
+  const listScroll = els.activeConsole.querySelector(".run-menu-list")?.scrollTop || 0;
   const session = currentSessions.find(item => item.id === sessionId);
   if (pinnedRunIds.has(sessionId)) {
     pinnedRunIds.delete(sessionId);
@@ -6078,17 +6141,35 @@ function togglePinnedRun(sessionId) {
   lastRenderedSignature = "";
   renderSessions();
   if (wasMenuOpen) {
-    const menu = els.activeConsole.querySelector(".run-menu");
-    const toggle = els.activeConsole.querySelector(".run-menu-toggle");
     const search = els.activeConsole.querySelector(".run-menu-search");
-    if (menu && toggle && search) {
-      menu.hidden = false;
-      toggle.setAttribute("aria-expanded", "true");
+    if (search) {
+      setRunMenuOpen(true);
       search.value = searchQuery;
       search.dispatchEvent(new Event("input", { bubbles: true }));
-      search.focus();
+      if (!window.matchMedia("(pointer: coarse)").matches) search.focus();
+      if (listScroll) els.activeConsole.querySelector(".run-menu-list").scrollTop = listScroll;
     }
   }
+}
+
+
+// One place that opens and closes the "all runs" menu, so the toggle, a tap on a run, a tap
+// outside, Escape and a re-render can't disagree about what state it is in. On phones the menu
+// is a bottom sheet with a backdrop (see styles.css), and focusing its search box would raise
+// the on-screen keyboard over the list the person just opened to choose from -- so a touch
+// device only gets the search box focused when they tap it themselves.
+function setRunMenuOpen(open, { focusSearch = false, returnFocus = false } = {}) {
+  const menu = els.activeConsole.querySelector(".run-menu");
+  const toggle = els.activeConsole.querySelector(".run-menu-toggle");
+  if (!menu || !toggle) return;
+  const backdrop = els.activeConsole.querySelector(".run-menu-backdrop");
+  menu.hidden = !open;
+  if (backdrop) backdrop.hidden = !open;
+  toggle.setAttribute("aria-expanded", String(open));
+  if (open && focusSearch && !window.matchMedia("(pointer: coarse)").matches) {
+    menu.querySelector(".run-menu-search")?.focus();
+  }
+  if (!open && returnFocus) toggle.focus();
 }
 
 
@@ -6211,6 +6292,7 @@ function renderSessions() {
     : askFocus.dataset.answer !== undefined ? `.question-answer[data-answer="${CSS.escape(askFocus.dataset.answer)}"]`
     : askFocus.matches(".question-later") ? ".question-later" : "";
   const askCaret = askFocus?.matches("input") ? askFocus.selectionStart : null;
+  const runMenuListScroll = els.activeConsole.querySelector(".run-menu-list")?.scrollTop || 0;
   const visibleRuns = currentSessions.filter(item =>
     item.id === activeSessionId || pinnedRunIds.has(item.id)
   );
@@ -6228,11 +6310,17 @@ function renderSessions() {
           <div class="run-tab-pills">${visibleRuns.map(renderRunTab).join("")}</div>
           ${currentSessions.length ? `
             <button class="run-menu-toggle" type="button" aria-haspopup="dialog" aria-expanded="false"
-              aria-label="Browse all ${currentSessions.length} runs, ${hiddenRunCount} hidden">+${hiddenRunCount}
+              aria-label="Browse all ${currentSessions.length} runs, ${hiddenRunCount} hidden">
+              <span class="run-menu-count is-wide">${hiddenRunCount > 0 ? `+${hiddenRunCount}` : "All"}</span>
+              <span class="run-menu-count is-narrow">${currentSessions.length} ${currentSessions.length === 1 ? "run" : "runs"}</span>
             </button>
+            <div class="run-menu-backdrop" hidden></div>
             <section class="run-menu" role="dialog" aria-label="All runs" hidden>
               <header class="run-menu-header">
-                <div><strong>All runs</strong><span>${currentSessions.length} runs</span></div>
+                <div>
+                  <strong>All runs</strong><span>${currentSessions.length} runs</span>
+                  <button class="run-menu-close" type="button" aria-label="Close run list">×</button>
+                </div>
                 <input class="run-menu-search" type="search" placeholder="Find a run..." aria-label="Find a run">
               </header>
               <div class="run-menu-list" role="list">${currentSessions.map(item => renderRunPickerItem(item)).join("")}</div>
@@ -6246,14 +6334,13 @@ function renderSessions() {
 
   mountWorkspaceNavigation(els.activeConsole.querySelector(".run-window-shell"));
 
-  const runMenu = els.activeConsole.querySelector(".run-menu");
-  const runMenuToggle = els.activeConsole.querySelector(".run-menu-toggle");
   const runMenuSearch = els.activeConsole.querySelector(".run-menu-search");
-  if (runMenuWasOpen && runMenu && runMenuToggle && runMenuSearch) {
-    runMenu.hidden = false;
-    runMenuToggle.setAttribute("aria-expanded", "true");
+  if (runMenuWasOpen && runMenuSearch) {
+    setRunMenuOpen(true);
     runMenuSearch.value = runMenuSearchValue;
     filterRunMenu(runMenuSearchValue);
+    const list = els.activeConsole.querySelector(".run-menu-list");
+    if (list) list.scrollTop = runMenuListScroll;
   }
 
   restoreFolds(els.activeConsole);

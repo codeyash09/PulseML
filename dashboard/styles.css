@@ -1,4 +1,3 @@
-
 /* ============================================================
    PULSE TEAMS
    Dashboard — styled to match the residual / pulse site
@@ -2587,7 +2586,9 @@ body.dashboard-active #footer-sign-out:hover {
     flex-wrap: nowrap;
     gap: 6px;
     padding: 8px;
-    overflow: hidden;
+    /* Not `overflow: hidden`: the "all runs" menu is a child of this bar and hangs below it,
+       so clipping the bar clipped the menu to its 52px strip and taps fell through to the
+       page underneath. The pills scroll on their own (.run-tab-pills). */
   }
 
   .run-window-shell .run-tab-pills {
@@ -8172,3 +8173,213 @@ body.dashboard-active .project-console-identity h1 { color: #202124; }
 
 /* tool output keeps its dark block on the light page: give it light text to match */
 .run-window-shell .t-out pre:not(.ask-diff) { color: #cfd0cc; }
+
+/* ============================================================
+   MOBILE + TOUCH (kept last so it wins the cascade above)
+============================================================ */
+
+/* The project title was the dark theme's near-white on the light page (about 1.1:1). */
+body.dashboard-active .project-console-identity h1 { color: #202124; }
+body.dashboard-active .project-console-crumb { color: #6b6c70; }
+
+/* "All runs" menu pieces: the narrow label, close button and backdrop are phone-only. */
+.run-menu-count.is-narrow,
+.run-menu-close,
+.run-menu-backdrop { display: none; }
+.run-menu-backdrop[hidden] { display: none !important; }
+
+.run-menu-close {
+  width: 36px;
+  height: 36px;
+  margin: -6px -6px -6px auto;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: #505155;
+  font: 400 24px/1 var(--sans);
+  cursor: pointer;
+}
+
+/* RUN STATE heading is a button so it can fold; on desktop it looks like the old heading. */
+.run-side-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  border: 0;
+  background: none;
+  text-align: left;
+  cursor: default;
+}
+.run-side-summary,
+.run-side-chevron { display: none; }
+
+@media (max-width: 760px) {
+  /* Pills scroll sideways on their own instead of being clipped. */
+  body.dashboard-active .run-window-shell .run-tab-pills {
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  body.dashboard-active .run-window-shell .run-tab-pills::-webkit-scrollbar { display: none; }
+
+  /* The menu becomes a bottom sheet fixed to the viewport, so no ancestor can clip it or
+     paint over it, and it sits above the workspace drawer (z-index 200). */
+  body.dashboard-active .run-window-shell .run-menu {
+    position: fixed;
+    z-index: 410;
+    top: auto;
+    right: 8px;
+    left: 8px;
+    bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+    width: auto;
+    max-height: min(72dvh, 560px);
+    border-radius: 18px;
+  }
+  .run-menu-backdrop:not([hidden]) {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 400;
+    background: rgba(20, 21, 23, .42);
+  }
+  .run-menu-close { display: inline-flex; }
+  .run-menu-search { min-height: 44px; font-size: 16px; }   /* 16px: iOS zooms in on anything smaller */
+  .run-menu-list { padding-bottom: 14px; }
+  .run-menu-item .run-picker-item { min-height: 52px; }
+  .run-menu .run-pin-toggle { min-width: 44px; min-height: 44px; }
+
+  /* The stats stop being a 132px scroller above the chat: one row that opens on tap. */
+  body.dashboard-active .run-window-body.has-run-stats {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  body.dashboard-active .run-side-panel {
+    display: block;
+    max-height: none;
+    padding: 0 12px;
+    overflow: visible;
+  }
+  body.dashboard-active .run-side-panel > :not(.run-side-toggle) { display: none; }
+  body.dashboard-active .run-side-panel.is-open {
+    max-height: 42dvh;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding-bottom: 10px;
+  }
+  body.dashboard-active .run-side-panel.is-open > .run-side-stat,
+  body.dashboard-active .run-side-panel.is-open > .run-metric-row,
+  body.dashboard-active .run-side-panel.is-open > .run-side-finding,
+  body.dashboard-active .run-side-panel.is-open > .run-side-tensor,
+  body.dashboard-active .run-side-panel.is-open > .run-side-incident { display: grid; }
+  body.dashboard-active .run-side-panel.is-open > :not(.run-side-toggle) { display: revert; }
+  body.dashboard-active .run-side-panel.is-open > .run-side-rule { display: block; }
+  .run-side-toggle { min-height: 44px; cursor: pointer; }
+  .run-side-summary {
+    display: inline;
+    margin-left: auto;
+    color: #6b6c70;
+    font-weight: 500;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .run-side-chevron { display: block; width: 16px; height: 16px; flex: 0 0 auto; transition: transform .15s ease; }
+  .run-side-panel.is-open .run-side-chevron { transform: rotate(180deg); }
+}
+
+@media (max-width: 600px) {
+  .run-menu-count.is-wide { display: none; }
+  .run-menu-count.is-narrow { display: inline; }
+  body.dashboard-active .run-window-shell .run-menu-toggle { min-width: 64px; min-height: 40px; }
+  body.dashboard-active .run-tab-pill.is-selected { min-height: 40px; }
+  body.dashboard-active .console-control-btn { width: 40px; height: 40px; }
+  /* 16px in text fields so iOS doesn't zoom the page when one is focused. */
+  .command-field, .sidebar-join-form input, .question-text input, #login-form input { font-size: 16px; }
+  .command-composer-foot button, .question-answer { min-height: 44px; }
+}
+
+@media (max-width: 600px) {
+  /* Stacked, the modal buttons' `flex: 1` (0% basis) beat their `height` and squashed them
+     to ~17px; let them be their own height. */
+  .modal-actions .modal-btn-primary,
+  .modal-actions .modal-btn-secondary { flex: 0 0 auto; min-height: 46px; font-size: 11px; }
+  .modal-close { width: 40px; height: 40px; }
+  .modal-field label { min-height: 40px; display: flex; align-items: center; gap: 10px; }
+  .modal-field input[type="checkbox"] { width: 20px; height: 20px; }
+  .sidebar-toggle, .workspace-sidebar-toggle { width: 40px; height: 40px; }
+  .sidebar-join-form button { min-width: 44px; min-height: 44px; }
+  .sidebar-join-form input { min-height: 44px; }
+  .footer-account button { min-height: 40px; padding: 0 14px; }
+}
+
+/* The approval dialog is a dark card, but the light theme's dark text colours were applied
+   inside it (about 1.3:1 contrast on the screen where someone decides whether to apply a change). */
+body.dashboard-active .run-window-shell .run-question h2 { color: #f2f1ed; }
+body.dashboard-active .run-window-shell .run-question .question-prompt { color: #e4e4e7; }
+body.dashboard-active .run-window-shell .run-question summary { color: #c7c7cc; }
+body.dashboard-active .run-window-shell .run-question pre { color: #d4d4d8; }
+body.dashboard-active .run-window-shell .run-question .question-status { color: #a1a1aa; }
+
+
+/* ============================================================
+   TUI PALETTE
+   The same roles the terminal UI paints (pulse_tui.entry_lines), so a run reads the same in
+   both places: orange = what is active or worth a look (thinking, the person's own prompt,
+   warnings, added lines), bold grey = a command or tool call, dim = secondary output,
+   red = something wrong, strong = emphasis. Change a colour here and it changes everywhere.
+============================================================ */
+:root {
+  --pulse-orange: #b66318;
+  --pulse-orange-on-dark: #f2994a;     /* the same orange, for the dark approval card */
+  --pulse-grey: #56575b;               /* commands / tool calls (the TUI's bold grey) */
+  --pulse-dim: #85868a;                /* secondary text */
+  --pulse-red: #c43e36;
+  --pulse-red-on-dark: #ff6b60;
+  --pulse-blue: #2878bd;               /* only for output that is itself blue (SGR 34/94) */
+  --pulse-strong: #202124;             /* the TUI's off-white emphasis, inverted for a light page */
+}
+
+/* ANSI classes, wherever renderCliText() puts them */
+body.dashboard-active .run-window-shell .cli-ansi-orange { color: var(--pulse-orange); }
+body.dashboard-active .run-window-shell .cli-ansi-red    { color: var(--pulse-red); }
+body.dashboard-active .run-window-shell .cli-ansi-blue   { color: var(--pulse-blue); }
+body.dashboard-active .run-window-shell .cli-ansi-grey   { color: var(--pulse-grey); font-weight: 600; }
+body.dashboard-active .run-window-shell .cli-ansi-strong { color: var(--pulse-strong); font-weight: 600; }
+body.dashboard-active .run-window-shell .cli-ansi-dim    { opacity: .62; }
+body.dashboard-active .run-window-shell .cli-action-name { color: var(--pulse-grey); font-weight: 700; }
+
+/* One rule per kind of entry */
+body.dashboard-active .run-window-shell .live-line.is-say      { color: #3a3b3f; }                       /* the agent's words: plain */
+body.dashboard-active .run-window-shell .live-line.is-text     { color: var(--pulse-dim); font-family: var(--mono); font-size: 12px; }
+body.dashboard-active .run-window-shell .live-line.is-note     { color: var(--pulse-dim); }
+body.dashboard-active .run-window-shell .live-line.is-error    { color: var(--pulse-red); }
+body.dashboard-active .run-window-shell .live-line.is-error::before { content: "✕ "; font-weight: 700; }
+body.dashboard-active .run-window-shell .live-line.is-user     { color: var(--pulse-strong); font-weight: 600; }
+body.dashboard-active .run-window-shell .live-line.is-user::before { color: var(--pulse-orange); }
+body.dashboard-active .run-window-shell .live-line.is-tool     { color: var(--pulse-grey); font-weight: 700; }
+body.dashboard-active .run-window-shell .live-line.is-trace    { color: var(--pulse-dim); font-family: var(--mono); font-size: 12px; white-space: pre-wrap; }
+body.dashboard-active .run-window-shell .live-line.is-thinking { color: var(--pulse-dim); font-style: italic; }
+body.dashboard-active .run-window-shell .live-think-head       { color: var(--pulse-orange); font-weight: 600; }
+
+/* A finding is coloured by severity, as in the TUI: red / orange / dim */
+body.dashboard-active .run-window-shell .live-line.is-finding .live-mark { font-family: var(--mono); font-size: 11px; letter-spacing: .06em; }
+body.dashboard-active .run-window-shell .live-line.is-finding.is-critical .live-mark,
+body.dashboard-active .run-window-shell .live-line.is-finding.is-error .live-mark    { color: var(--pulse-red); }
+body.dashboard-active .run-window-shell .live-line.is-finding.is-warning .live-mark  { color: var(--pulse-orange); }
+body.dashboard-active .run-window-shell .live-line.is-finding.is-info .live-mark     { color: var(--pulse-dim); }
+
+/* Changes: added lines orange, headers bold, the rest dim (light on the dark approval card) */
+
+/* The same palette in a turn (kept or live): the agent's words plain, Pulse's output dim,
+   findings by severity */
+body.dashboard-active .run-window-shell .t-text.is-output { color: #5f6064; font-family: var(--mono); font-size: 12px; }
+body.dashboard-active .run-window-shell .t-note.is-finding { color: #3a3b3f; }
+body.dashboard-active .run-window-shell .t-note.is-finding .t-mark { font-family: var(--mono); font-size: 10px; letter-spacing: .06em; }
+body.dashboard-active .run-window-shell .t-note.is-finding.is-critical .t-mark,
+body.dashboard-active .run-window-shell .t-note.is-finding.is-error .t-mark   { color: var(--pulse-red); }
+body.dashboard-active .run-window-shell .t-note.is-finding.is-warning .t-mark { color: var(--pulse-orange); }
+body.dashboard-active .run-window-shell .t-note.is-finding.is-info .t-mark    { color: var(--pulse-dim); }

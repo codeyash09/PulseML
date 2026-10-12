@@ -997,12 +997,20 @@ class App:
                 words = self._clip(entry.text, text)
                 if not words:
                     continue
-                if kind == "text" and items and items[-1]["kind"] == "text" and not items[-1].get("live"):
+                if (kind == "text" and items and items[-1]["kind"] == "text" and not items[-1].get("live")
+                        and "ansi" not in items[-1] and not self._red_lines(entry.text)):    # red keeps its own block
                     items[-1]["text"] = self._clip(items[-1]["text"] + "\n" + words, text)
                     continue
                 item = {"kind": kind, "text": words}
                 if kind == "trace":     # the dependency trace keeps its colours for the page
                     item["ansi"] = tui.clean(entry.text)[:1500]
+                elif kind == "finding":
+                    # the TUI colours a finding by its severity (red / orange / dim)
+                    item["severity"] = str(getattr(entry, "severity", "") or "").lower()
+                elif kind != "user":
+                    red = self._red_lines(entry.text)
+                    if red:
+                        item["ansi"] = red       # a line that came out red stays red, as in the TUI
             else:
                 continue
             if live:
@@ -1010,7 +1018,9 @@ class App:
             items.append(item)
         partial = self._clip(self.view.partial, 800, tail=True)
         if partial:
-            items.append({"kind": "text", "text": partial, "live": True})
+            # the agent's words, still arriving: "say" (plain in the TUI), not a Pulse
+            # note ("text", dim) -- the dashboard colours the two differently
+            items.append({"kind": "say", "text": partial, "live": True})
         return items[-150:] if final else items[-40:]
 
     def _turn_prompt(self) -> str:
@@ -1033,6 +1043,23 @@ class App:
                         item[key] = self._clip(item[key], 1500, tail=item["kind"] == "thinking")
         return {"turn": True, "who": who, "prompt": self._turn_prompt(), "activity": activity,
                 "started": self._job_started, "ended": time.time()}
+
+    @staticmethod
+    def _red_lines(text: str, limit: int = 1500) -> str:
+        """`text` with only its red lines kept coloured (what the TUI keeps of a captured
+        program's colours), or "" when no line is red."""
+        lines, any_red = [], False
+        for part in str(text or "").strip("\n").split("\n"):
+            bare = tui._SGR_RE.sub("", part)
+            if tui._RED_SGR_RE.search(part):
+                any_red = True
+                lines.append("\033[31m" + bare + tui.RESET)
+            else:
+                lines.append(bare)
+        if not any_red:
+            return ""
+        out = "\n".join(lines)[:limit]
+        return re.sub(r"\033\[[0-9;]*$", "", out)       # never leave half an escape sequence behind
 
     def _live_state(self) -> Dict[str, Any]:
         """What the dashboard's live view shows: what the job in hand has shown so far (its
