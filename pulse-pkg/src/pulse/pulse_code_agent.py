@@ -40,6 +40,7 @@ import time
 from . import pulse_ui as _ui
 from . import pulse_ratelimit as _ratelimit
 from . import pulse_shapes as _shapes
+from . import pulse_code_rules as _rules
 from .pulse_cli import (
     AgentRequestFailed,
     PROVIDERS,
@@ -71,6 +72,7 @@ _RESULT_MAX_CHARS = 24_000       # one tool result sent back to the model
 _LIST_MAX = 300
 _REPEAT_LIMIT = 3                # identical consecutive tool calls before the model is told it is looping
 _MAX_NUDGES = 2                  # retries for non-outline completion nudges
+_MAX_STUB_NUDGES = 3             # "your change still has placeholder code" nudges, counted on their own
 _MAX_OUTLINE_NUDGES = 8          # "your outline has open items" nudges, counted on their own
 
 _COMPACT_AT_CHARS = 360_000      # conversation size (chars, ~90k tokens) that triggers compaction
@@ -98,6 +100,35 @@ SYSTEM_PROMPT = """You are Pulse Code, an autonomous coding agent working in the
 - If the request is a question, answer it from the code; make no edits.
 - Do what the request says, not the nearest thing you know how to do: "run it" means start_run, "why is X" means an answer with the real numbers, "add Y" means edits. A reply that describes what you are going to do, without doing it, is not an answer: do it, in that same reply, with the tools.
 
+# Planning: decompose until the whole job is written down
+Plan before you touch code, and plan in detail. Read enough to name real files and symbols, then call todo_write before your first edit (edits are refused on a multi-part request until an outline exists).
+1. First phase "Requirements": one leaf per thing the request names -- every library, technique, feature, file and behaviour, in the user's words. Nothing the user listed may be missing from the outline, and nothing may be dropped later without telling them.
+2. Then one phase per component. Break each down until every leaf is a single edit or a single command that names the file and the function or class ("Add the merge-count loop to train_bpe in tokenizer/bpe.py"), never an area ("implement the tokenizer"). If a leaf would take more than ~3 edits it is not a leaf yet: split it. Edits pile up against the outline and are refused once it goes stale, so update it as you finish leaves.
+3. Give each component, in order: design (signatures and shapes), implement, wire into its callers, verify (smoke_test with a probe, tests, a gradient check).
+4. Re-plan as you learn: when you find a missing piece add leaves for it; never silently skip work.
+Scale the detail to the work: a one-line fix is one or two leaves; a model, tokenizer or training pipeline is dozens.
+
+# Follow the request exactly, including how
+The stack, libraries, language, algorithms and structure the user names are requirements, not suggestions. If they say numpy/cupy, the code uses numpy/cupy. If they say add flash attention and BPE, you write flash attention and BPE.
+- Never swap in a different framework, library, algorithm or architecture because it is easier, quicker to write, or already has the feature built in. In particular do not introduce torch, tensorflow, jax or keras into a project that does not use them. The edit tool refuses a new framework the user did not ask for.
+- Harder is not impossible. If the requested approach needs a piece that does not exist yet (a kernel, a tokenizer, a backward pass), build that piece. Only if it is truly impossible here: stop, say exactly what blocks it with message_user, and ask. Never substitute another approach and present it as done.
+- Before choosing how to do something, check what the project already uses (imports, requirements, notes) and match it.
+- Do not shrink the scope ("simplified", "minimal", "basic" versions) unless asked, and do not widen it either.
+
+# Production code, not placeholders
+Everything you write must be complete code that would run as-is in production.
+- No stubs: no `pass` or `...` bodies, no `raise NotImplementedError`, no TODO/FIXME, no "placeholder", "dummy", "mock" or "simplified for brevity" implementations, no hard-coded values or random numbers standing in for real logic or real data, no commented-out "real version". If you cannot finish a piece, say so plainly; never fake it. Every change is scanned for stubs, and unresolved ones keep the turn open.
+- A training script is a full loop: real data loading and batching, forward, loss, backward, gradient clipping where appropriate, optimizer step, learning-rate schedule, periodic evaluation, logging, checkpoint save and resume, seeding, and error handling -- not a ten-line sketch.
+- Write complete modules (imports, configuration, the full logic) and wire the new code into the entry point so it is actually used.
+
+# Neural networks: every forward pass has a backward pass
+Before you write the outline for any model, layer, loss or training code:
+1. List the forward-pass components (embedding, attention, norm, MLP, loss, ...).
+2. Check which stack is in use. With an autograd framework (torch, tensorflow, jax) gradients come from loss.backward() or grad; the outline still has a leaf for backward plus the optimizer step, and a leaf that checks every parameter receives a non-None, non-zero gradient.
+3. With numpy, cupy or any hand-rolled code there is NO autograd. For each forward task add its own backward task right after it, at the same level of detail: cache the activations the backward needs during forward, compute dX and every parameter gradient (dW, db, dgamma, ...), including the softmax, layer-norm and attention Jacobians, masks, and the loss gradient. Then add a leaf for the optimizer update and one that checks the gradients numerically (finite differences on a tiny model in float64, relative error under ~1e-4).
+4. Add an end-to-end leaf: overfit one tiny batch; the loss must fall toward zero. A probe runs forward AND backward, never forward alone.
+An outline with forward tasks and no matching backward tasks is rejected.
+
 # Use the code structure, not just text search
 This is Pulse's advantage. For Python code prefer the AST tools over grep:
 - outline: the classes/functions of a file with line ranges. Use it before reading a big file, then read_file just the range you need.
@@ -117,7 +148,7 @@ run_command runs a real command in the project directory and returns the real st
 - Probes run on CPU-sized inputs. Do not load a full dataset or train in a probe. If building the model needs data you cannot fake, construct tensors of the shape the code expects.
 
 # Finishing
-When the work is done and verified, reply with a short summary: what you changed, how you checked it, and anything the user should know. No tool call in a reply means you are finished, so only reply without one when you are.
+When the work is done and verified, reply with a short summary: each requirement from the request and how you verified it, what you changed, and anything not done or the user should know. No tool call in a reply means you are finished, so only reply without one when you are.
 """
 
 # Run control exists only inside the Pulse app, which owns the runs on screen. Outside it the
@@ -256,7 +287,11 @@ TOOLS = [
         "and subtasks may contain their own subtasks at any depth. Break broad work into concrete leaf actions, "
         "including verification. Statuses are pending | in_progress | completed. Parent statuses are derived from "
         "their children. Keep exactly one unfinished leaf in_progress. After completing a leaf, update the outline "
-        "before moving on; do not finish while any leaf is unfinished.",
+        "before moving on; do not finish while any leaf is unfinished. Begin with a Requirements phase (one leaf per thing "
+        "the request names), then one phase per component down to leaves that are one edit or one command naming a file "
+        "and function, with verification. Where there is no autograd, every forward-pass leaf needs its own "
+        "backward-pass leaf plus a gradient check. Vague outlines are rejected, and edits are refused until an outline "
+        "exists on a multi-part request.",
         {"todos": {"type": "array", "items": {"type": "object", "properties": {
             # A plain string: some providers reject a ["string", "null"] type union.
             "id": _S, "parent_id": _S, "content": _S,
@@ -308,6 +343,11 @@ class _State:
         self.said = ""               # what the model said beside its tool calls, until shown
         self.nudges = 0
         self.outline_nudges = 0
+        self.stub_nudges = 0
+        self.writes_total = 0            # edits applied in this request
+        self.writes_since_outline = 0    # ... since the outline was last updated (a leaf is one edit)
+        self.outline_sig = None          # the outline as last accepted
+        self._stack = None               # frameworks the project imports (see _project_stack)
         self.last_call = None
         self.repeats = 0
         self.edits_declined = 0
@@ -576,15 +616,55 @@ def _commit(state, path, new_text, label, before=None, created=False):
     return f"{label}"
 
 
+def _project_stack(state):
+    """The frameworks the project's own files import (numpy, cupy, torch...), scanned once per request."""
+    cached = getattr(state, "_stack", None)
+    if cached is not None:
+        return cached
+    texts = []
+    for path in list(getattr(getattr(state, "cli", None), "known", None) or [])[:200]:
+        if not str(path).endswith(".py"):
+            continue
+        try:
+            if os.path.getsize(path) > 400_000:
+                continue
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                texts.append(handle.read())
+        except OSError:
+            continue
+    stack = _rules.detect_stack(texts)
+    try:
+        state._stack = stack
+    except AttributeError:
+        pass
+    return stack
+
+
+def _request_text(state):
+    """What the user asked for this turn, and in the turns before it in this session."""
+    parts = [str(getattr(state, "request", "") or "")]
+    for message in list(getattr(getattr(state, "cli", None), "native_history", None) or [])[-40:]:
+        if message.get("role") == "user" and isinstance(message.get("content"), str):
+            parts.append(message["content"].rsplit("Request:", 1)[-1])
+    return "\n".join(parts)
+
+
 def _write_checked(state, path, before, after, label, created=False):
-    """Lint gate -> confirm -> write -> impact. Returns the tool result text."""
+    """Plan gate -> lint gate -> stack gate -> confirm -> write -> impact. Returns the tool result text."""
     cli = state.cli
+    blocked = _rules.plan_gate(bool(getattr(state, "todos", None)), getattr(state, "request", ""),
+                               getattr(state, "writes_total", 0), getattr(state, "writes_since_outline", 0))
+    if blocked:
+        return blocked
     ok, messages = cli._lint_check(after, path, original=None if created else before)
     if not ok:
         return ("NOT APPLIED -- the change would break the file:\n  " + "\n  ".join(messages[:12]) +
                 "\nFix the problem in your edit and try again.")
     if after == before:
         return "NOT APPLIED -- the new text is identical to the old text; nothing to change."
+    swapped = _rules.find_stack_swap(path, "" if created else before, after, _project_stack(state), _request_text(state))
+    if swapped:
+        return "NOT APPLIED -- " + swapped
     if not _confirm(state, path, before, after, created):
         state.edits_declined += 1
         denial = getattr(cli, "_last_change_denial", "") or "the user declined this change"
@@ -596,6 +676,13 @@ def _write_checked(state, path, before, after, label, created=False):
     note = f"{label}  (+{n_add} -{n_del} lines)"
     if path.endswith(".py") and not created:
         note += _impact(cli, before, after)
+    state.writes_total = getattr(state, "writes_total", 0) + 1
+    state.writes_since_outline = getattr(state, "writes_since_outline", 0) + 1
+    note += _rules.broad_leaf_warning(state.writes_since_outline)
+    stubs = _rules.find_stubs(_rel(state.root, path), "" if created else before, after)
+    if stubs:
+        note += ("\nPLACEHOLDER CODE in this change. Production code only: replace it with the real "
+                 "implementation now, before moving on:\n  " + "\n  ".join(stubs))
     return note
 
 
@@ -1122,6 +1209,17 @@ def _t_todo_write(state, a):
         return lines
 
     clean = [by_id[task["id"]] for task in clean]
+    signature = _rules.outline_signature(clean)
+    if (signature == getattr(state, "outline_sig", None)
+            and getattr(state, "writes_since_outline", 0) >= _rules.MAX_WRITES_PER_LEAF):
+        return ("Outline unchanged. You have made many edits under it: mark the finished leaves completed and "
+                "split the broad leaf into smaller ones (one edit or command each), then call todo_write again.")
+    request = _request_text(state)
+    rejected = _rules.check_outline(clean, request, _rules.autograd_in_play(_project_stack(state), request))
+    if rejected:
+        return rejected
+    state.outline_sig = signature
+    state.writes_since_outline = 0
     state.todos = clean
     state.cli._todos = clean
     return "Task outline updated:\n" + "\n".join(
@@ -1510,6 +1608,19 @@ def _outline_nudge(state):
     return None
 
 
+def _stub_nudge(state):
+    """Why the agent should not stop while its changes still contain placeholder code, or None."""
+    found = []
+    for path, (before, after, created) in getattr(state, "changes", {}).items():
+        found += _rules.find_stubs(_rel(state.root, path), "" if created else before, after)
+    if not found:
+        return None
+    return ("Your changes still contain placeholder code. Production code only: replace each of these with the "
+            "real, complete implementation (no stubs, dummy data or 'simplified' versions), run smoke_test, "
+            "then finish. If something truly cannot be implemented, stop and tell the user exactly what.\n  "
+            + "\n  ".join(found[:8]))
+
+
 def _nudge(state, reply_text="", outline=True):
     """A reason the agent should not stop yet, or None. `outline=False` leaves out the open
     outline (the turn loop asks about it separately, under its own cap)."""
@@ -1558,7 +1669,8 @@ def run_native_turn(cli, request, evidence=None):
     state = _State(cli, request)
     cli._todos = []
     cli.reload()
-    marker = {"role": "user", "content": f"{_project_context(cli, evidence)}\n\nRequest: {request}"}
+    brief = _rules.planning_brief(_project_stack(state), _request_text(state))
+    marker = {"role": "user", "content": f"{_project_context(cli, evidence)}\n\n{brief}\n\nRequest: {request}"}
     messages.append(marker)
     outcome, final_text, unsupported = "failed", "", False
     try:
@@ -1592,10 +1704,15 @@ def run_native_turn(cli, request, evidence=None):
                 reason = _outline_nudge(state) if state.outline_nudges < _MAX_OUTLINE_NUDGES else None
                 if reason:
                     state.outline_nudges += 1
-                elif state.nudges < _MAX_NUDGES:
-                    reason = _nudge(state, reply.text, outline=False)
-                    if reason:
-                        state.nudges += 1
+                else:
+                    if state.stub_nudges < _MAX_STUB_NUDGES:
+                        reason = _stub_nudge(state)
+                        if reason:
+                            state.stub_nudges += 1
+                    if not reason and state.nudges < _MAX_NUDGES:
+                        reason = _nudge(state, reply.text, outline=False)
+                        if reason:
+                            state.nudges += 1
                 if reason:
                     cprint("[Pulse Code] Not finished yet -- continuing.", color=_YELLOW)
                     messages.append({"role": "user", "content": reason})

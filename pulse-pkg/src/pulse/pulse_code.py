@@ -295,6 +295,25 @@ _AUTONOMY_NOTE = (
 )
 CODE_SYSTEM_PROMPT += _AUTONOMY_NOTE
 
+_QUALITY_NOTE = (
+    "\nHOLD YOURSELF TO THE REQUEST\n"
+    "- The stack, libraries, algorithms and structure the user names are requirements. If the project is "
+    "numpy/cupy, write numpy/cupy: never switch to torch, tensorflow or jax (or any other framework or algorithm) "
+    "because it is easier. If the requested approach needs a piece that does not exist yet (a kernel, a tokenizer, "
+    "a backward pass), build it; if it is truly impossible here, say exactly what blocks it instead of substituting.\n"
+    "- Write complete production code. No stubs, no `pass`/`...`/`raise NotImplementedError` bodies, no TODOs, no "
+    "placeholder, dummy, mock or 'simplified' versions, no hard-coded or random values standing in for real logic or "
+    "data. A training script is a full loop: data and batching, forward, loss, backward, clipping, optimizer step, "
+    "schedule, evaluation, logging, checkpoints.\n"
+    "- Plan in detail, then do every step: list each thing the request names, break each into single edits, and "
+    "verify as you go. Do not shrink the scope.\n"
+    "- Every forward pass has a backward pass. With no autograd (numpy/cupy), each forward component gets its own "
+    "hand-written backward (cache what it needs, compute dX and every parameter gradient) plus a finite-difference "
+    "gradient check and an overfit-one-tiny-batch check. With autograd, the backward and optimizer step must be "
+    "present and every parameter must receive a gradient.\n"
+)
+CODE_SYSTEM_PROMPT += _QUALITY_NOTE
+
 
 
 
