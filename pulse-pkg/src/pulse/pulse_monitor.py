@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import _thread
 import atexit
+import linecache
 import math
 import os
 import sys
@@ -50,6 +51,11 @@ AUTO_PROBE_MAX_ELEMENTS = 4_000_000
 
 # Values that are worth a device sync to read, in elements.
 _SMALL_ELEMENT_LIMIT = 4
+
+# How often the profile of where the training thread spends its time (see note_where) is
+# sent to the brain, in seconds.
+WHERE_SECONDS = 30.0
+WHERE_LINES = 6
 
 # Bounds on the sampling interval the brain may ask for.
 MIN_INTERVAL = 0.01
@@ -262,6 +268,11 @@ class Monitor:
         self._stop_requested = False
         self._samples = 0
         self._observe_seconds = 0.0
+        # (file, line) of the user's code the training thread was at -> [samples, {what it
+        # was inside: samples}]: a sampling profile, sent every WHERE_SECONDS (note_where)
+        self._where: Dict[Tuple[str, int], List[Any]] = {}
+        self._where_samples = 0
+        self._where_since = time.monotonic()
         self._started = time.time()
         # The process's start ticks and pid namespace: what tells a reader this process
         # apart from a later one with the same pid, without trusting the wall clock.
@@ -408,6 +419,43 @@ class Monitor:
                 "value": "nan" if math.isnan(number) else ("inf" if number > 0 else "-inf"),
                 "step": self.step, "urgent": True,
             })
+
+    def note_where(self, frame: Any) -> None:
+        """One sample of where the training thread is: the innermost line of the user's own
+        code on its stack, and the library function it is inside, if any. The sampler looks at
+        an even pace, so the share of samples at a line is the share of the run's time spent
+        there -- a `time.sleep` in the loop, a data loader the step waits on. Sent to the brain
+        every WHERE_SECONDS; nothing is read from the training thread's variables for it."""
+        if self._paused:
+            return
+        user = frame
+        while user is not None and not _is_user_frame(user):
+            user = user.f_back
+        if user is None:
+            return
+        key = (user.f_code.co_filename, user.f_lineno)
+        entry = self._where.get(key)
+        if entry is None:
+            entry = self._where[key] = [0, {}]
+        entry[0] += 1
+        if user is not frame:
+            inside = f"{os.path.basename(frame.f_code.co_filename)}:{frame.f_code.co_name}"
+            entry[1][inside] = entry[1].get(inside, 0) + 1
+        self._where_samples += 1
+        now = time.monotonic()
+        if now - self._where_since >= WHERE_SECONDS:
+            self._send_where(now)
+
+    def _send_where(self, now: float) -> None:
+        top = sorted(self._where.items(), key=lambda item: -item[1][0])[:WHERE_LINES]
+        lines = []
+        for (filename, lineno), (count, inside) in top:
+            lines.append({"file": filename, "line": lineno, "count": count,
+                          "code": linecache.getline(filename, lineno).strip()[:160],
+                          "inside": max(inside, key=inside.get) if inside else ""})
+        self.writer.emit(stream.KIND_EVENT, {"event": "where", "step": self.step, "samples": self._where_samples,
+                                             "seconds": round(now - self._where_since, 1), "lines": lines})
+        self._where, self._where_samples, self._where_since = {}, 0, now
 
     def _is_repeat(self, name: str, value: Any, number: float) -> bool:
         """Is this sample the reading already sent, read again?
@@ -741,6 +789,10 @@ def _sample_loop(monitor: "Monitor", thread_id: int, depth: int, interval: float
         frame = frames.get(thread_id)
         if frame is None:
             continue
+        try:
+            monitor.note_where(frame)
+        except Exception:                        # a profile sample is never worth a run
+            pass
         try:
             monitor.observe_locals(_collect_locals(frame, depth))
         except Exception as exc:                 # sampling must never kill a run

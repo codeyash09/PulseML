@@ -1957,7 +1957,7 @@ def test_a_nan_gets_the_agent_at_once(app):
     app._on_findings([_finding()])
     app._on_findings([_finding()])                                     # announced again: not twice
     assert len(started) == 1 and "loss is NaN" in started[0][0] and "restart" in started[0][0]
-    assert any(e.kind == "user" and "What is wrong with loss" in e.text for e in app.view.entries)
+    assert any(e.kind == "user" and "Pulse flagged loss" in e.text for e in app.view.entries)
 
 
 def test_a_warning_or_a_pause_does_not_start_the_agent(app):

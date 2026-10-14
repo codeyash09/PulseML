@@ -54,17 +54,30 @@ from . import pulse_ui as _ui
 from . import pulse_settings as _settings
 from . import pulse_detect as detect
 
-def _debug_prompt(restart: str, status: str) -> str:
+def _debug_prompt(restart: str, status: str, unattended: bool = False) -> str:
+    if unattended:
+        who = ("Pulse is debugging this run unattended: nobody is watching it or will answer you. Pulse "
+               "starts you on it by itself when the run crashes, or when its checks or its scheduled audit "
+               "flag something. ")
+        when = ("Change code only to fix what you have found to be really wrong. ")
+    else:
+        who = "The person opened a run in the Pulse app and is looking at it with you. "
+        when = ("Change code only when asked to fix something, or when the person agrees to a fix you "
+                "proposed. ")
     return (
         "\n\nYOU ARE ATTACHED TO A LIVE TRAINING RUN\n"
-        "The person opened a run in the Pulse app and is looking at it with you. Each request comes "
+        + who +
+        "Each request comes "
         "with EVIDENCE FROM THE RUN: its step, every tracked value's curve, tensors, the detectors' "
         "findings and recent events. Use it and quote the numbers. Diagnose before you conclude: read "
         "the code with the tools, check what you suspect. A question about the run is a question -- "
-        "answer it in words, with no code change. Change code only when asked to fix something, or "
-        "when the person agrees to a fix you proposed. (A request Pulse makes by itself when the run "
-        "crashes or its checks find something serious asks you to fix it: that is the person's "
-        "standing instruction.) The run keeps executing the code it started with. After an edit, "
+        "answer it in words, with no code change. " + when +
+        # A flag is a claim: a request worded as an order to fix made a healthy run get "fixed"
+        # after a false alarm (the benchmark's premature "not learning").
+        "A request Pulse makes by itself (after a crash, or when its checks or audit flag something) "
+        "asks you to find what is really wrong and fix that; a flag can be wrong, and then the answer "
+        "is to say so, with the numbers, and change nothing. The run keeps executing the code it "
+        "started with. After an edit, "
         f"decide whether to run it again with {restart}: do when the fix only takes effect in a "
         "fresh run or you need to see it work (after a crash, almost always); don't when the run is "
         "healthy and the change can wait for its next start -- and say which you chose. "
@@ -76,6 +89,8 @@ def _debug_prompt(restart: str, status: str) -> str:
 # about the tools it really has)
 DEBUG_PROMPT = _debug_prompt("a RESTART: line", "RUNSTATUS:")
 DEBUG_PROMPT_NATIVE = _debug_prompt("restart_run", "run_status")
+UNATTENDED_DEBUG_PROMPT = _debug_prompt("a RESTART: line", "RUNSTATUS:", unattended=True)
+UNATTENDED_DEBUG_PROMPT_NATIVE = _debug_prompt("restart_run", "run_status", unattended=True)
 
 HOME_COMMANDS: List[Tuple[str, str]] = [
     ("/monitor", "pick a run on this machine and open it beside the agent"),
@@ -793,6 +808,9 @@ class App:
         self.audits = _settings.on("audits")
         self.launched: Dict[str, Dict[str, Any]] = {}    # session id -> what /run started
         self._slow_starts: List[Dict[str, Any]] = []     # started by /run, not reporting to Pulse yet
+        # the last start that ended before Pulse saw a training step: {"script", "code", "log"}
+        self._start_failure: Optional[Dict[str, Any]] = None
+        self._last_outcome: Optional[str] = None         # what the last agent turn came to ("applied", ...)
         self._rate: Optional[float] = None
         self._rate_at: Optional[Tuple[float, int]] = None
         self._side_at = 0.0
@@ -1213,7 +1231,7 @@ class App:
                 "restart_run": self._agent_restart_run, "run_status": self._agent_run_status}
 
     def _agent_start_run(self, script: str = "", args: str = "") -> str:
-        script = str(script or "").strip()
+        script, args = _without_interpreter(str(script or "").strip(), str(args or "").strip())
         if not script:
             return "start_run needs the script to run, e.g. train.py (and its arguments, if any)."
         if self.console is not None and self._status in ("live", "stalled"):
@@ -1226,14 +1244,15 @@ class App:
             return (f"{os.path.basename(starting[0]['argv'][0])} was started and is still starting (pid "
                     f"{starting[0]['process'].pid}); nothing else was started. run_status shows it once it reports.")
         before = (self.session or {}).get("session_id")
+        self._start_failure = None
         self._launch(f"{script} {str(args or '').strip()}".strip())
         session = self.session or {}
         if self._still_starting():
             return (f"{os.path.basename(script)} is still starting: Pulse has seen no training step from it yet. "
                     "It keeps running; it opens beside you once it reports (run_status then shows it).")
         if self.console is None or session.get("session_id") in (None, before):
-            return (f"The run did not start, or Pulse saw no training step from it; the lines above "
-                    f"say what happened. (Run it with run_command only to see an error quickly: a "
+            return (f"The run did not start, or Pulse saw no training step from it.{self._start_failure_text()} "
+                    f"(Run it with run_command only to see an error quickly: a "
                     f"training run started that way is killed at the command timeout.)")
         return (f"Started {os.path.basename(session.get('script') or script)} under Pulse (session "
                 f"{session.get('session_id')}). It is now open beside you: run_status gives its latest "
@@ -1255,6 +1274,7 @@ class App:
         if self.console is None:
             return "No run is open. start_run starts one."
         before = session.get("session_id")
+        self._start_failure = None
         refused = self._restart()
         if refused:
             return refused
@@ -1262,7 +1282,18 @@ class App:
         if after and after != before:
             return (f"Restarted with the current code: the new run (session {after}) is open beside you. "
                     "run_status shows how it is doing -- check it before you call the fix done.")
-        return "The restart did not produce a new run; the lines above say what happened (the log's last lines)."
+        return ("The restart did not produce a new run: the old one is still the open one, and the change is "
+                "in no run." + (self._start_failure_text() or " The lines above say what happened."))
+
+    def _start_failure_text(self) -> str:
+        """The end of what a start that never reached a training step printed (its traceback),
+        for the agent: a tool result is all it sees of a start it asked for."""
+        failure = self._start_failure
+        if not failure:
+            return ""
+        tail = "\n".join(_tail(failure["log"], 30)).strip()
+        return (f" {os.path.basename(failure['script'])} exited with code {failure['code']} before its first "
+                "training step. The end of its output:\n" + (tail or "(it printed nothing)"))
 
     def _agent_run_status(self) -> str:
         if self.console is None:
@@ -1761,6 +1792,7 @@ class App:
         evidence = self._evidence() if self.console is not None and (not self.background or about_run) else None
         before = (self.session or {}).get("session_id")
         outcome = pulse_code.run_turn(cli, line, evidence=evidence)
+        self._last_outcome = outcome
         restarted = (self.session or {}).get("session_id") != before     # the agent ran it again itself
         if outcome == "applied" and self.console is not None and not restarted:
             try:
@@ -1771,13 +1803,18 @@ class App:
             over = self._status not in ("live", "stalled")
             hosted = self.hosting is not None and (self.session or {}).get("session_id") == getattr(
                 self.hosting, "session_id", None)
-            if over:
-                self.note("/restart runs it again with the change." if launched or hosted
-                          else "Start it again to try the change.")
-            else:
-                self.note("The run is still executing the code it started with. "
-                          + ("/restart stops it and starts it again with the change."
-                             if launched else "Stop it (/stop) and start it again to apply the change."))
+            self._fix_not_run(over, launched, hosted)
+
+    def _fix_not_run(self, over: bool, launched: bool, hosted: bool) -> None:
+        """A turn changed the code and no run uses the change yet. Here the person is told how
+        to try it; headless, where nobody is there to, it restarts the run itself."""
+        if over:
+            self.note("/restart runs it again with the change." if launched or hosted
+                      else "Start it again to try the change.")
+        else:
+            self.note("The run is still executing the code it started with. "
+                      + ("/restart stops it and starts it again with the change."
+                         if launched else "Stop it (/stop) and start it again to apply the change."))
 
     def _command(self, line: str) -> None:
         from . import pulse_code
@@ -2046,11 +2083,24 @@ class App:
         if session.get("session_id") in self.parked:
             self._switch_to(session)
             return
+        # A restart: what the run before it went through -- the fixes, what the audits said --
+        # goes to the new run's brain, so its audits know the code changed and why. Without it
+        # the first audit of a fixed run saw a fresh run with no history at all.
+        carried = None
+        if replace and self.console is not None:
+            old = self.console.brain
+            carried = (list(getattr(old, "fixes", [])), list(getattr(old, "audits", [])))
         if replace:
             self._close_run(quiet=True)
         else:
             self._park()
         console = _make_console(self, session, self._brain_agent())
+        console.brain.hold_audits = lambda: self._job is not None      # not while the agent is at work
+        if carried is not None:
+            fixes, audits = carried
+            console.brain.fixes = [dict(f, before_restart=True) for f in fixes][-5:] + console.brain.fixes
+            console.brain.audits = [dict(a, status=f"{a.get('status')}, on the run before the restart")
+                                    for a in audits][-3:] + console.brain.audits
         console.brain.poll_once()
         console.start()
         with self.lock:
@@ -2063,8 +2113,9 @@ class App:
         if os.path.isdir(workdir):
             self._point(workdir, [script] if script and os.path.isfile(script) else [])
         from . import pulse_code
-        self.cli._system_prompt_override = pulse_code.CODE_SYSTEM_PROMPT + DEBUG_PROMPT
-        self.cli._native_prompt_suffix = DEBUG_PROMPT_NATIVE
+        debug, native = self._debug_prompts
+        self.cli._system_prompt_override = pulse_code.CODE_SYSTEM_PROMPT + debug
+        self.cli._native_prompt_suffix = native
         self._start_runlog(session, workdir)
         self._refresh_header()
         name = os.path.basename(script) or session.get("session_id") or "the run"
@@ -2197,8 +2248,10 @@ class App:
         self.error(f"{script} crashed" + (f": {what}" if what else "") + ".")
         request = (f"{script} just crashed" + (f" with {what}" if what else "") + ". The traceback is in the "
                    "evidence. Find the cause in the code, explain it in a sentence or two, and fix it. Then "
-                   "decide: run it again with the fix (restart_run, or a RESTART: line) to check it works, or "
-                   "leave it stopped if a run now would not tell anything (say why) -- and say which you did.")
+                   "decide: run it again with the fix (a RESTART: line, or restart_run -- whichever you have) "
+                   "to check it works, or "
+                   "leave it stopped if a run now would not tell anything (say why) -- and say which you did."
+                   + self._unattended_note)
         self.view.entries.append(tui.Entry("user", f"Why did {script} crash? Fix it."))
         self._last_blank = False
         self.dirty = True
@@ -2277,19 +2330,40 @@ class App:
 
     def _start_problem_turn(self, findings: List[Any]) -> None:
         script = os.path.basename((self.session or {}).get("script") or "the run")
-        found = "; ".join(str(getattr(f, "message", f)) for f in findings[:3])
         variable = getattr(findings[0], "variable", "") or "it"
-        request = (f"{script} is still running, and Pulse's checks found something serious: {found}. The "
-                   "evidence has the run's values. Find the cause in the code, explain it in a sentence or two, "
-                   "and fix it. Then decide what to do with the run: restart it with the fix (restart_run, or "
-                   "a RESTART: line) when the run as it is cannot recover (a NaN in the weights never goes "
-                   "away), stop it (stop_run) if it is only burning compute, or leave it running if the "
-                   "problem is harmless -- and say which you did.")
-        self.view.entries.append(tui.Entry("user", f"What is wrong with {variable} in {script}? Fix it."))
+        # Where each claim comes from, said as it is: a fixed-rule check over the numbers, or
+        # the scheduled audit (a model's reading of the run and the code). Both were once
+        # handed over as "Pulse's checks found something serious ... fix it", and a false
+        # alarm worded as a fact got a healthy run "fixed".
+        claims = []
+        for f in findings[:3]:
+            message = str(getattr(f, "message", f))
+            if getattr(f, "check", "") == "audit":
+                claims.append(f"Pulse's scheduled audit (a model that read the run's numbers and the code) "
+                              f"concluded: {message}")
+            else:
+                claims.append(f"Pulse's checks (fixed rules over the run's numbers) flagged: {message}")
+        request = (f"{script} is still running. " + " ".join(claims) + " Treat that as a claim to check, not "
+                   "a fact: test it against the evidence (the run's values) and the code. If it holds, find the "
+                   "cause, explain it in a sentence or two with the numbers that show it, and fix it. If it does "
+                   "not hold -- a false alarm, or nothing that hurts this run -- say so, with the numbers; and "
+                   "unless you found something else that is really wrong with this run (then fix that, and say "
+                   "the flag itself was false), change nothing. If you changed the code, decide what to do with "
+                   "the run: restart it with the fix (a RESTART: line, or restart_run -- whichever you have) when "
+                   "the run as it is cannot finish well, stop it (STOP: / stop_run) if it is only burning "
+                   "compute, or leave it running if what you fixed does not affect it -- and say which you did."
+                   + self._unattended_note)
+        self.view.entries.append(tui.Entry("user", f"Pulse flagged {variable} in {script}: is it real? Fix it if so."))
         self._last_blank = False
         self.dirty = True
         self._auto_turn_session = (self.session or {}).get("session_id")
         self._start(self._crash_turn, request)
+
+    # Added to the requests Pulse makes by itself (a crash, a serious finding); headless says
+    # there that nobody else will restart the run.
+    _unattended_note = ""
+    # what the agent is told about the open run (pipeline directives, native tool names)
+    _debug_prompts = (DEBUG_PROMPT, DEBUG_PROMPT_NATIVE)
 
     def _crash_turn(self, request: str) -> None:
         """A crash is about the run even from home: the agent works on the run's project for
@@ -2343,8 +2417,9 @@ class App:
         script = session.get("script") or ""
         if os.path.isdir(console.workdir):
             self._point(console.workdir, [script] if script and os.path.isfile(script) else [])
-        self.cli._system_prompt_override = pulse_code.CODE_SYSTEM_PROMPT + DEBUG_PROMPT
-        self.cli._native_prompt_suffix = DEBUG_PROMPT_NATIVE
+        debug, native = self._debug_prompts
+        self.cli._system_prompt_override = pulse_code.CODE_SYSTEM_PROMPT + debug
+        self.cli._native_prompt_suffix = native
 
     def _park(self) -> None:
         """Keep watching the open run, off screen: its console goes on reading the run (its
@@ -2565,6 +2640,7 @@ class App:
             cwd = self.home_root
             argv[0] = os.path.abspath(os.path.join(cwd, os.path.expanduser(argv[0])))
         script = argv[0]
+        self._start_failure = None
         if not os.path.isfile(script):
             self.error(f"No such script: {script}")
             return
@@ -2612,7 +2688,9 @@ class App:
                 return
             self.error(f"{os.path.basename(script)} exited with code {code} before Pulse saw a training step.")
             self._print_tail(log_path, 25)
+            self._start_failure = {"script": script, "code": code, "log": log_path, "argv": argv, "cwd": cwd}
             return
+        self._start_failure = None
         self.launched[session["session_id"]] = {"process": process, "argv": argv, "cwd": cwd, "log": log_path}
         self._open_run(session, replace=replace is not None)
         self.note(f"Started under Pulse. Its output goes to {log_path} (/output shows the end of it). "
@@ -2643,7 +2721,10 @@ class App:
             if session is None:
                 self.error(f"{os.path.basename(script)} exited with code {code} before Pulse saw a training step.")
                 self._print_tail(pending["log"], 25)
+                self._start_failure = {"script": script, "code": code, "log": pending["log"],
+                                       "argv": pending["argv"], "cwd": pending["cwd"]}
                 continue
+            self._start_failure = None
             self.launched[session["session_id"]] = {key: pending[key] for key in ("process", "argv", "cwd", "log")}
             try:
                 self._open_run(session, replace=pending["replace"])
@@ -3017,6 +3098,27 @@ def audit_words(text: str) -> str:
     text = _DECISION_RE.sub("", str(text))
     text = re.sub(r"```(?:json)?\s*```", "", text)
     return " ".join(text.split()).strip()
+
+
+_INTERPRETER_RE = re.compile(r"^python[0-9.]*(\.exe)?$", re.IGNORECASE)
+
+
+def _without_interpreter(script: str, args: str) -> Tuple[str, str]:
+    """start_run("python train.py") -> ("train.py", ""): Pulse starts the script with its own
+    interpreter, and models write the command as they would type it. Taken as the script,
+    "python" was looked for in the project ("No such script: .../python") and nothing ran."""
+    try:
+        words = shlex.split(f"{script} {args}".strip())
+    except ValueError:
+        return script, args
+    if len(words) < 2 or not _INTERPRETER_RE.match(os.path.basename(words[0])):
+        return script, args
+    words = words[1:]
+    while len(words) > 1 and words[0].startswith("-") and words[0] not in ("-m", "-c"):
+        words = words[2:] if words[0] in ("-X", "-W") else words[1:]    # interpreter flags: -u, -X dev
+    if not words or words[0] in ("-m", "-c"):
+        return script, args                          # a module or code, not a script: as it was
+    return words[0], " ".join(shlex.quote(w) for w in words[1:])
 
 
 def _tail(path: str, count: int) -> List[str]:

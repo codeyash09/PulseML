@@ -42,6 +42,10 @@ DASHBOARD_URL = "https://pulsedashb.netlify.app/"
 # Seconds a finished run is kept after the last thing happened (a fix being written, the
 # closing audit), before the supervisor stops.
 _GRACE_SECONDS = float(os.environ.get("PULSE_HEADLESS_GRACE", "20"))
+# A script that dies before its first training step leaves no run to watch: the agent gets
+# what it printed, fixes it, and Pulse starts it again -- this many times in a row at most
+# (each one is a paid turn, and a script that never starts has nothing else to show).
+_STARTUP_FIXES = int(os.environ.get("PULSE_HEADLESS_STARTUP_FIXES", "5"))
 # How long a question waits for an answer on the dashboard before it is declined.
 _ANSWER_SECONDS = float(os.environ.get("PULSE_HEADLESS_ANSWER_SECONDS", "900"))
 # terminal control sequences (colours, "clear to end of line"): not for a log file
@@ -272,6 +276,29 @@ class HeadlessApp(pulse_app.App):
         self.mouse = False
         self.auto_fix_limit = None          # it fixes and restarts as often as the run needs
 
+    # Facts the agent cannot see from where it is, not a rule for what to do: the decision is
+    # the request's own (restart when the run cannot finish well...). An earlier wording told it
+    # to restart "unless it can still finish well" in tool names only the native loop has.
+    _unattended_note = (
+        " Nobody is at the machine: Pulse is debugging this run unattended, and nobody else will start "
+        "it again. A code change does nothing to a run already going -- it takes effect only when the "
+        "run is started again (a RESTART: line, or restart_run -- whichever you have). A new run shows "
+        "little in its first seconds: WAIT: <seconds> before RUNSTATUS: (or run_status) lets it get to "
+        "where the fix shows.")
+
+    _debug_prompts = (pulse_app.UNATTENDED_DEBUG_PROMPT, pulse_app.UNATTENDED_DEBUG_PROMPT_NATIVE)
+
+    def _fix_not_run(self, over: bool, launched: bool, hosted: bool) -> None:
+        # The run is over and the turn left its fix in no run: with nobody here to /restart,
+        # the supervisor would see nothing left to do and stop, the fix never tried. A run
+        # still going is left to the agent's call (it may have meant to let it finish).
+        if over and launched:
+            name = os.path.basename((self.session or {}).get("script") or "the run")
+            self.write(f"== the change is in no run yet and {name} is over: Pulse starts it again with the change")
+            if self._restart() is None:
+                return
+        super()._fix_not_run(over, launched, hosted)
+
     # -------------------------------------------------------------- the log
 
     def write(self, text: str) -> None:
@@ -451,7 +478,7 @@ def supervise(argv: List[str]) -> int:
             app._open_run(session)
         else:
             app._launch(" ".join(shlex.quote(a) for a in script_argv))
-        if app.console is None and not app._still_starting():
+        if app.console is None and not app._still_starting() and not _fix_startup(app, stopping):
             app.write("The run did not start; see above.")
             return 1
         return _watch(app, stopping)
@@ -483,6 +510,66 @@ def supervise(argv: List[str]) -> int:
         app.write("Pulse headless debugger stopped.")
 
 
+def _fix_startup(app: HeadlessApp, stopping: threading.Event) -> bool:
+    """The last start of the script exited before Pulse saw a training step -- the first one,
+    or a restart after a fix -- so there is no new run to debug, only what it printed. With
+    nobody to read that, the agent does: it gets the output, fixes the code, and the script is
+    started again; at most _STARTUP_FIXES times in a row. True once a start got going (a new
+    run open, or one still starting); False when there is nothing to fix, no agent, the agent
+    changed nothing, or the tries ran out -- and then the failure is let go, so it is not
+    taken up again."""
+    cli = app.cli
+    if app._start_failure is None:
+        return False
+    failure = app._start_failure
+    got_going = False
+
+    def going(before: Optional[str]) -> bool:
+        # a new run open (not the old one a failed restart left in place), or one on its way
+        return bool(app._still_starting()) or (
+            app.console is not None and (app.session or {}).get("session_id") != before)
+
+    try:
+        for attempt in range(1, _STARTUP_FIXES + 1):
+            if not (cli.agent_provider and cli.agent_key) or stopping.is_set():
+                return False
+            failure = app._start_failure or failure
+            script = os.path.basename(failure["script"])
+            printed = "\n".join(pulse_app._tail(failure["log"], 40)).strip() or "(it printed nothing)"
+            request = (f"{script} exited with code {failure['code']} before its first training step, so Pulse "
+                       "has no run of it to show you -- only what it printed, which ends:\n\n" + printed + "\n\n"
+                       "Find the cause in the code, explain it in a sentence or two, and fix it. Nobody is at the "
+                       "machine: when your turn ends Pulse starts the script again with your change and watches it -- no RESTART: "
+                       "or RUN: from you is needed.")
+            app.write(f"== the agent is looking at why {script} exited before its first training step"
+                      + (f" (try {attempt} of {_STARTUP_FIXES})" if attempt > 1 else ""))
+            before = (app.session or {}).get("session_id")
+            app._last_outcome = None
+            app._start(app._handle, request)
+            job = app._job
+            while job is not None and job.is_alive() and not stopping.is_set():
+                job.join(1.0)
+            if stopping.is_set():
+                return False
+            if going(before):
+                got_going = True
+                return True                          # the agent started it again itself, and it got going
+            if app._last_outcome != "applied":
+                app.write(f"The agent changed nothing, so {script} is not started again.")
+                return False
+            app.write(f"== starting {script} again with the change")
+            app._launch("", replace={"argv": failure["argv"], "cwd": failure["cwd"]})
+            if going(before):
+                got_going = True
+                return True
+        app.write(f"{os.path.basename(failure['script'])} still exits before its first training step after "
+                  f"{_STARTUP_FIXES} fixes; leaving it.")
+        return False
+    finally:
+        if not got_going:
+            app._start_failure = None                # given up on: not taken up again
+
+
 def _watch(app: HeadlessApp, stopping: threading.Event) -> int:
     idle_since: Optional[float] = None
     closing_audit_done: Optional[str] = None
@@ -495,8 +582,10 @@ def _watch(app: HeadlessApp, stopping: threading.Event) -> int:
             app._open_slow_starts()
             starting = app.console is None
             if starting and not app._slow_starts:
-                app.write("The run did not start; see above.")
-                return 1
+                if not _fix_startup(app, stopping):
+                    app.write("The run did not start; see above.")
+                    return 1
+                starting = app.console is None
             if starting:
                 stopping.wait(1.0)
                 continue
@@ -506,6 +595,10 @@ def _watch(app: HeadlessApp, stopping: threading.Event) -> int:
         now = time.monotonic()
         if live or busy:
             idle_since = None
+        elif app._start_failure is not None and _fix_startup(app, stopping):
+            # a restart after a fix died before its first step, and the agent got it going
+            idle_since = None
+            continue
         else:
             session_id = (app.session or {}).get("session_id")
             if closing_audit_done != session_id and app.console is not None:
@@ -515,6 +608,9 @@ def _watch(app: HeadlessApp, stopping: threading.Event) -> int:
                 if brain.agent is not None:
                     app.write(f"{os.path.basename((app.session or {}).get('script') or 'The run')} is over "
                               f"({app._status}); a closing audit.")
+                    # the run is over whether or not its stream said goodbye: the audit is told so
+                    # (it read "still running" and chose when to look again at a finished run)
+                    brain.finished = True
                     app.console._report_audit(brain.audit())
                 idle_since = time.monotonic()
                 continue

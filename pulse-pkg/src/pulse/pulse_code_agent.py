@@ -54,6 +54,7 @@ from .pulse_cli import (
     _clamp_output_tokens,
     _complete,
     _find_fuzzy_snippet_span,
+    _reasoning_cap,
     _prompt_text,
     _reindent_like,
     _token_boundary_occurrences,
@@ -1514,13 +1515,15 @@ def _chat(cli, messages):
     last_exc = None
     waiter = _ratelimit.RateLimitWaiter()      # a rate limit is waited out, not counted as an attempt
     attempt = 0
+    thought_out = False                   # the last attempt came back empty: think less (see _reasoning_cap)
     while attempt < 4:
         attempt += 1
         try:
             response = _complete(
                 model=model, messages=payload, tools=_tools(), tool_choice="auto", max_tokens=max_tokens,
                 timeout=_AGENT_TIMEOUT_SECONDS, api_base=cli.agent_api_base,
-                api_key=(cli.agent_key if cli.agent_key and cli.agent_key != "local" else None))
+                api_key=(cli.agent_key if cli.agent_key and cli.agent_key != "local" else None),
+                **_reasoning_cap(model, max_tokens, thought_out))
             cli._record_usage(response)
             choice = response.choices[0]
             msg = choice.message
@@ -1530,6 +1533,7 @@ def _chat(cli, messages):
                               "arguments": tc.function.arguments or ""})
             text = (msg.content or "").strip()
             if not text and not calls:
+                thought_out = True
                 raise RuntimeError("the provider returned an empty response")
             return _Reply(text, calls, getattr(choice, "finish_reason", None), msg)
         except AgentRequestFailed:

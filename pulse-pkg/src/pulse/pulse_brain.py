@@ -46,6 +46,13 @@ MIN_INTERVAL_SECONDS = 60.0
 MAX_INTERVAL_SECONDS = 3600.0
 DEFAULT_INTERVAL_SECONDS = 900.0
 
+# The first look at a new run. Waiting the full default meant a run that was wrong from
+# its first epoch got its first audit 15 minutes in -- most of a short run, all of a broken one.
+FIRST_LOOK_SECONDS = 300.0
+# A warning (a loss that stopped improving, a metric that never moved) is not acted on by
+# itself, but it is a reason to look properly soon -- once per kind of warning.
+WARNING_LOOK_SECONDS = 180.0
+
 # How closely to watch immediately after the code changed under the run.
 POST_FIX_INTERVAL_SECONDS = 120.0
 
@@ -67,6 +74,72 @@ TENSOR_PROBE_BATCH = 8
 _TENSOR_META_KEYS = ("shape", "dtype", "device", "elements", "step", "requires_grad")
 
 
+# Where the training thread spends its time (the monitor's sampling profile, "where"
+# events): the profiles of about the last two minutes are what the time-sink check reads.
+WHERE_WINDOWS = 4
+# One line of the user's code holding at least this share of that time, and the time spent
+# there waiting (a sleep, a lock, a queue, a socket) rather than computing: a warning.
+TIME_SINK_SHARE = 0.5
+TIME_SINK_MIN_SECONDS = 60.0
+# What a stack sampled while waiting is inside: the library function at the top of the
+# stack, or a sleep called from the user's line (a C call leaves no Python frame).
+_WAIT_FUNCTIONS = frozenset({
+    "wait", "get", "select", "poll", "recv", "recv_bytes", "_recv", "_recv_bytes", "_poll", "acquire",
+    "sleep", "readinto", "read", "accept", "join", "_wait_for_tstate_lock", "_try_get_data", "_get_data",
+})
+_SLEEP_CALL_RE = re.compile(r"\bsleep\s*\(")
+
+
+def _bookkeeping(history: List[float]) -> Optional[str]:
+    """What a tracked value is when it is the loop's own bookkeeping rather than something the
+    run measures, or None. Sampled from the loop's locals, a batch counter, a running sum that
+    starts over each epoch and a time.time() stamp were drawn as curves beside the loss -- a
+    third of an audit's evidence, saying nothing (seen from the model's seat)."""
+    if not history:
+        return None
+    lo, hi = min(history), max(history)
+    if 1.0e9 <= lo and hi <= 2.2e9:
+        return "a timestamp"
+    if len(history) == 1 or lo == hi:
+        return f"constant {history[-1]:g}"
+    if len(history) < 10 or lo < 0:
+        return None
+    integral = all(float(v).is_integer() for v in history)
+    if integral and all(b >= a for a, b in zip(history, history[1:])):
+        return f"counting {history[0]:g} -> {history[-1]:g}"
+    # a running total or counter: never decreasing, except where it starts over -- each drop
+    # landing near its bottom (the sampler may first see it a batch in, not at 0). Twice at
+    # least: a metric that collapsed once and climbed back is news, not bookkeeping.
+    # And between restarts it really accumulates, over several readings. Without that, a
+    # per-epoch train_loss sitting on its plateau (small wobbles, each dip "near the
+    # bottom") was taken for a running total and dropped from the evidence (seen from the
+    # model's seat, on 4 of 10 jobs). Not "climbs most of its range": a running sum of a
+    # falling loss climbs less each epoch, and was then drawn as a curve again.
+    bottom = lo + 0.2 * (hi - lo)
+    restarts, lengths, seg_len = 0, [], 1
+    for a, b in zip(history, history[1:]):
+        if b < a:
+            if b > bottom:
+                return None
+            restarts += 1
+            lengths.append(seg_len)
+            seg_len = 1
+        else:
+            seg_len += 1
+    if lengths and sum(lengths) / len(lengths) < 4:
+        return None
+    if restarts >= 2 and len(history) >= 20:
+        return f"a running {'count' if integral else 'total'} that starts over each pass ({restarts + 1} passes)"
+    return None
+
+
+def _is_wait(line: Dict[str, Any]) -> bool:
+    inside = str(line.get("inside") or "")
+    if inside and inside.rsplit(":", 1)[-1] in _WAIT_FUNCTIONS:
+        return True
+    return not inside and bool(_SLEEP_CALL_RE.search(str(line.get("code") or "")))
+
+
 class Schedule:
     """When the brain next looks properly, and why.
 
@@ -80,7 +153,7 @@ class Schedule:
         self.interval = self._clamp(interval)
         self.reason = "first look"
         self.risk = "unknown"
-        self.next_at = time.time() + self.interval
+        self.next_at = time.time() + min(self.interval, FIRST_LOOK_SECONDS)
         self.history: List[Dict[str, Any]] = []
         self.loaded = False             # True when a persisted schedule was picked up
         self._load()
@@ -207,12 +280,15 @@ is the part they cannot do.
 Look at the actual numbers and read the code. Do not assume the checks would have \
 caught anything worth catching: they compare each curve against fixed thresholds, one \
 variable at a time. They cannot read the code, tell that two metrics are inconsistent \
-with each other, that a value is plausible but wrong for this model, or that the run is \
-healthy in every way except the one that matters.
+with each other, that a value is plausible but wrong for this model, or that a run looks \
+healthy on every curve and is still wrong.
 
 What counts as a problem: something you can point at -- a line of code that is wrong, a \
 value that cannot be right, two numbers that contradict each other -- or harm that is \
-already certain (NaN or exploding weights, a loss that is diverging). A curve that has \
+already certain (NaN or exploding weights, a loss that is diverging). Time is harm too: a run \
+spending most of its time on something you can point at in the code and remove without changing \
+what is trained on (a sleep, a wait whose result is not used) is a problem -- say it is a speed \
+one. A wait you cannot see into (a library, a data loader) is not that. A curve that has \
 flattened, is noisier than you expected, or sits higher than you would guess is not a \
 problem by itself: how low a loss can go depends on the data (its noise, how much the \
 classes overlap) and the model's capacity, which you mostly cannot see, and a per-batch \
@@ -231,7 +307,8 @@ invent a concern to look useful.
 2. A JSON object on its own line, and nothing after it:
 {{"status": "ok" | "watch" | "problem",
   "risk": "low" | "medium" | "high",
-  "findings": ["short description", ...],
+  "findings": ["each thing that is wrong, one short line each -- only those", ...],
+  "notes": ["anything you looked at and found fine, or only worth knowing", ...],
   "next_check_minutes": <number between {min_minutes:g} and {max_minutes:g}>,
   "reason": "why that interval"}}
 
@@ -287,6 +364,12 @@ class Brain:
         self._probe_cursor = 0
         self._probe_now = False
         self.events: List[Dict[str, Any]] = []
+        # the monitor's time profiles: the recent ones, and the whole run's (file, line) -> line
+        self._where_recent: List[Dict[str, Any]] = []
+        self._where_total: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        self._where_samples = 0
+        self._where_seconds = 0.0
+        self._own_findings: Dict[Tuple[str, str], detect.Finding] = {}   # the brain's own checks
         self.step = 0
         self.session: Dict[str, Any] = self.reader.session()
         self.finished = False
@@ -305,6 +388,16 @@ class Brain:
         # Set once the run is over and it has had its closing audit: after that, a due
         # schedule is not a reason to pay for another look at numbers that stopped moving.
         self._final_audit_done = False
+        # what the checks raised since the last audit, cleared or not: a hypothesis that fired
+        # and cleared ("can mean the input order...") never reached the audit that could
+        # settle it from the code
+        self._raised_since_audit: List[str] = []
+        # (check, variable) of warnings that already brought an audit forward
+        self._warnings_looked_at: set = set()
+        # Set by whoever runs an agent on this run: while it says so, a due audit waits. One
+        # sent in the middle of a fix showed the dead run beside the half-fixed code, and its
+        # "problem" would have started a second agent on the same thing.
+        self.hold_audits: Optional[Callable[[], bool]] = None
 
     # ------------------------------------------------------------------ ingest
 
@@ -317,8 +410,21 @@ class Brain:
             self.schedule.bring_forward(MIN_INTERVAL_SECONDS,
                                         f"monitor reported {urgent[0].get('event')}")
         if raised:
-            if any(f.severity == detect.CRITICAL for f in raised):
+            self._raised_since_audit.extend(f"[{f.severity}] {f.check} on {f.variable}: {f.message}" for f in raised)
+            del self._raised_since_audit[:-12]
+            # once per (check, variable): a critical that clears and comes back (a false
+            # "not learning" did, all run long) pulled an audit every minute, whatever
+            # interval the last audit had chosen
+            fresh_critical = [f for f in raised if f.severity == detect.CRITICAL
+                              and ("critical", f.check, f.variable) not in self._warnings_looked_at]
+            if fresh_critical:
+                self._warnings_looked_at.update(("critical", f.check, f.variable) for f in fresh_critical)
                 self.schedule.bring_forward(MIN_INTERVAL_SECONDS, "a critical check fired")
+            fresh = [f for f in raised if f.severity == detect.WARNING
+                     and (f.check, f.variable) not in self._warnings_looked_at]
+            if fresh:
+                self._warnings_looked_at.update((f.check, f.variable) for f in fresh)
+                self.schedule.bring_forward(WARNING_LOOK_SECONDS, f"a warning: {fresh[0].message}"[:200])
             if self.on_finding is not None:
                 self.on_finding(raised)
             if self.escalate is not None:
@@ -369,6 +475,8 @@ class Brain:
                     self.tensor_stats[name] = dict(frame["stats"], taken_at_step=frame.get("step"))
                 self.tensor_counts[name] = self.tensor_counts.get(name, 0) + 1
                 dirty = True
+            elif kind == stream.KIND_EVENT and frame.get("event") == "where":
+                raised.extend(self._fold_where(frame))
             elif kind == stream.KIND_EVENT:
                 self.events.append(frame)
                 del self.events[:-200]
@@ -388,6 +496,83 @@ class Brain:
         if any(f.check in ("nonfinite", "tensor_nonfinite") for f in raised):
             self._probe_now = True
         return urgent, raised
+
+    def _fold_where(self, frame: Dict[str, Any]) -> List[detect.Finding]:
+        """A time profile from the monitor: kept for the evidence, and checked for one line
+        that holds most of the run's time waiting."""
+        lines = [dict(line) for line in (frame.get("lines") or []) if isinstance(line, dict)]
+        samples = int(frame.get("samples") or 0)
+        seconds = float(frame.get("seconds") or 0.0)
+        if samples <= 0:
+            return []
+        self._where_recent.append({"samples": samples, "seconds": seconds, "lines": lines, "step": frame.get("step")})
+        del self._where_recent[:-WHERE_WINDOWS]
+        self._where_samples += samples
+        self._where_seconds += seconds
+        for line in lines:
+            key = (str(line.get("file")), int(line.get("line") or 0))
+            total = self._where_total.setdefault(key, dict(line, count=0))
+            total["count"] += int(line.get("count") or 0)
+            total["code"], total["inside"] = line.get("code") or total.get("code"), line.get("inside") or ""
+        recent_seconds = sum(w["seconds"] for w in self._where_recent)
+        recent_samples = sum(w["samples"] for w in self._where_recent)
+        if recent_seconds < TIME_SINK_MIN_SECONDS or recent_samples < 40:
+            return []
+        merged: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        for window in self._where_recent:
+            for line in window["lines"]:
+                key = (str(line.get("file")), int(line.get("line") or 0))
+                entry = merged.setdefault(key, dict(line, count=0))
+                entry["count"] += int(line.get("count") or 0)
+        top = max(merged.values(), key=lambda line: line["count"], default=None)
+        sink = top is not None and _is_wait(top) and top["count"] >= TIME_SINK_SHARE * recent_samples
+        where = f"{os.path.basename(top['file'])}:{top['line']}" if sink else ""
+        # a wait that no longer holds the run (a loader that warmed up, a fixed sleep) is
+        # no longer reported
+        for stale in [k for k in self._own_findings if k[0] == "time_sink" and k[1] != where]:
+            del self._own_findings[stale]
+        if not sink:
+            return []
+        share = top["count"] / recent_samples
+        key = ("time_sink", where)
+        if key in self._own_findings:
+            finding = self._own_findings[key]
+            finding.count += 1
+            finding.last_seen = time.time()
+            finding.message = self._sink_message(top, share, recent_seconds)
+            return []
+        # A sleep in the user's own loop is a line to look at. A wait inside a library -- a data
+        # loader's queue, a socket, a store's client -- is the run being input-bound: worth
+        # knowing, not a bug, and the data it brings is needed. Said as a warning, it had the
+        # agent deleting data-loading calls to "fix" the wait (a benchmark, 4 runs in 6).
+        severity = detect.INFO if top.get("inside") else detect.WARNING
+        finding = detect.Finding("time_sink", where, severity, self._sink_message(top, share, recent_seconds),
+                                 step=self.step, values={"share": round(share, 3), "code": top.get("code"),
+                                                         "inside": top.get("inside")},
+                                 confidence=round(min(0.95, share), 2))
+        self._own_findings[key] = finding
+        return [finding]
+
+    @staticmethod
+    def _sink_message(top: Dict[str, Any], share: float, seconds: float) -> str:
+        where = f"{os.path.basename(top['file'])}:{top['line']}"
+        code = f"`{top.get('code') or '?'}`"
+        # what was seen, not a verdict: whether the wait is needed is for whoever reads the code
+        if top.get("inside"):
+            return (f"the training thread spent {share:.0%} of the last {seconds / 60:.0f} min waiting at {where} "
+                    f"{code}, inside {top['inside']} (I/O or a queue, not computation): that line sets the "
+                    f"run's pace")
+        return (f"the training thread spent {share:.0%} of the last {seconds / 60:.0f} min sleeping at {where} "
+                f"{code}: that line sets the run's pace")
+
+    def time_profile(self, limit: int = 6) -> List[Dict[str, Any]]:
+        """Where the training thread has spent its time over the whole run, the biggest first."""
+        if not self._where_samples:
+            return []
+        lines = sorted(self._where_total.values(), key=lambda line: -line["count"])[:limit]
+        return [{"where": f"{os.path.basename(str(line['file']))}:{line['line']}", "code": line.get("code"),
+                 "inside": line.get("inside") or "", "share": round(line["count"] / self._where_samples, 3),
+                 "wait": _is_wait(line)} for line in lines]
 
     def _detect(self) -> List[detect.Finding]:
         counts = dict(self.reading_counts)
@@ -453,12 +638,17 @@ class Brain:
             return self._evidence(include_code)
 
     def _evidence(self, include_code: bool) -> Dict[str, Any]:
-        findings = [f.to_dict() for f in self.engine.current()]
+        findings = [f.to_dict() for f in self.engine.current()] + [f.to_dict() for f in self._own_findings.values()]
         curves = {}
         for name, history in self.histories.items():
             # One reading is still a reading: the first val_loss after an epoch, a final
             # test score. Leaving it out hid it from the audit while /vars showed it.
             if not history:
+                continue
+            kind = _bookkeeping(history)
+            if kind is not None:
+                curves[name] = {"points": len(history), "last": history[-1], "first": history[0],
+                                "min": min(history), "max": max(history), "bookkeeping": kind}
                 continue
             curves[name] = {
                 "points": len(history),
@@ -484,7 +674,10 @@ class Brain:
             "fixes_applied": self.fixes[-5:],
             "previous_audits": [{"t": a.get("t"), "status": a.get("status"), "risk": a.get("risk"),
                                  "findings": a.get("findings")} for a in self.audits[-3:]],
+            "raised_since_audit": list(self._raised_since_audit),
             "stream_gaps": self.reader.gaps,
+            "time_profile": self.time_profile(),
+            "time_profile_seconds": round(self._where_seconds, 1),
         }
         if include_code:
             pack["code"] = self._read_script()
@@ -496,32 +689,62 @@ class Brain:
             return None
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as handle:
-                lines = handle.read().splitlines()
+                text = handle.read()
         except OSError:
             return None
-        return "\n".join(f"{i + 1:>4} | {line}" for i, line in enumerate(lines))
+        out = "\n".join(f"{i + 1:>4} | {line}" for i, line in enumerate(text.splitlines()))
+        folder = os.path.dirname(path)
+        # The project's own modules the script imports (data.py, model.py beside it): the bug can
+        # live there, and the audit has no tool to open them. Small ones, a few.
+        for module in sorted(set(re.findall(r"^\s*(?:from|import)\s+([A-Za-z_]\w*)", text, re.M)))[:4]:
+            candidate = os.path.join(folder, f"{module}.py")
+            try:
+                if os.path.isfile(candidate) and os.path.getsize(candidate) <= 12000:
+                    with open(candidate, "r", encoding="utf-8", errors="replace") as handle:
+                        body = handle.read().splitlines()
+                    out += f"\n\n{module}.py (imported by the script):\n" + "\n".join(
+                        f"{i + 1:>4} | {line}" for i, line in enumerate(body))
+            except OSError:
+                continue
+        # The small config files the script names (config.json, params.yaml): CONFIG["epochs"]
+        # read in the code says nothing without them, and the audit had no tool to look.
+        for name in sorted(set(re.findall(r"[\w.-]+\.(?:json|ya?ml|toml|ini|cfg)\b", text)))[:4]:
+            candidate = os.path.join(folder, name)
+            try:
+                if os.path.isfile(candidate) and os.path.getsize(candidate) <= 4000:
+                    with open(candidate, "r", encoding="utf-8", errors="replace") as handle:
+                        out += f"\n\n{name} (read by the script):\n" + handle.read().rstrip()
+            except OSError:
+                continue
+        return out
 
     @staticmethod
     def render_evidence(pack: Dict[str, Any]) -> str:
         """The evidence as text for a prompt: compact, but nothing silently dropped."""
         out: List[str] = []
-        out.append(f"Run: step {pack.get('step')}, {pack.get('elapsed_seconds')}s "
+        # "step" is whatever counter the script keeps (step, epoch, i...): said, because a reader
+        # took "step 5287" (a data-generation loop's i) for 5,287 training steps
+        out.append(f"Run: at step {pack.get('step')} by the script's own counter, {pack.get('elapsed_seconds')}s "
                    + ("long, finished" if pack.get("finished") else "elapsed, still running")
                    + f", script {(pack.get('session') or {}).get('script')}")
         if pack.get("stream_gaps"):
             out.append(f"NOTE: {pack['stream_gaps']} sample(s) were dropped under load; "
                        f"the curves below have holes.")
         findings = pack.get("findings") or []
-        out.append("\nWhat Pulse's deterministic checks currently report:")
+        out.append("\nWhat Pulse's deterministic checks currently report (still active):")
         if findings:
             for f in findings:
-                out.append(f"  [{f['severity']}] {f['check']} on {f['variable']}: {f['message']}"
-                           f"  (seen {f['count']}x, confidence {f['confidence']})")
+                # "seen 3063x" counted re-checks, not events: noise to a reader
+                out.append(f"  [{f['severity']}] {f['check']} on {f['variable']}: {f['message']}")
         else:
             out.append("  nothing")
         out.append("\nTracked values (each curve downsampled to buckets of min/mean/max, "
                    "so brief spikes survive the compression):")
-        for name, info in (pack.get("scalars") or {}).items():
+        scalars = pack.get("scalars") or {}
+        kept = [f"{name} ({info['bookkeeping']})" for name, info in scalars.items() if info.get("bookkeeping")]
+        for name, info in scalars.items():
+            if info.get("bookkeeping"):
+                continue
             out.append(f"  {name}: {info['points']} readings, first {info['first']:.6g}, "
                        f"last {info['last']:.6g}, min {info['min']:.6g}, max {info['max']:.6g}")
             curve = info.get("curve") or []
@@ -530,6 +753,8 @@ class Brain:
                  else f"{b['mean']:.4g}[{b['min']:.4g}..{b['max']:.4g}]")
                 for b in curve)
             out.append(f"    {rendered}")
+        if kept:
+            out.append("  Not drawn -- the loop's own bookkeeping: " + "; ".join(kept))
         tensors = pack.get("tensors") or {}
         if tensors:
             out.append("\nTensors seen:")
@@ -548,20 +773,46 @@ class Brain:
                         line += f"  (values at step {taken}" + (
                             f", the run is now at {pack.get('step')})" if taken != pack.get("step") else ")")
                 out.append(line)
-        events = pack.get("recent_events") or []
+        profile = pack.get("time_profile") or []
+        if profile:
+            out.append(f"\nWhere the training thread spent its time (sampled a few times a second over "
+                       f"{(pack.get('time_profile_seconds') or 0) / 60:.0f} min; the share of samples is the share "
+                       "of wall time):")
+            for line in profile:
+                if line["share"] < 0.01:
+                    continue                         # a stray sample, not where the time goes
+                inside = f"  [inside {line['inside']}]" if line.get("inside") else ""
+                kind = "  (waiting)" if line.get("wait") else ""
+                out.append(f"  {line['share']:>5.0%}  {line['where']}  {line.get('code') or ''}{inside}{kind}")
+        # Pulse's own probe bookkeeping (a name it looked for and did not find) is not the run's
+        events = [e for e in (pack.get("recent_events") or []) if e.get("event") != "probe_missing"]
         if events:
             out.append("\nRecent events:")
             for e in events[-10:]:
                 out.extend(_describe_event(e))
-        fixes = pack.get("fixes_applied") or []
+        every_fix = pack.get("fixes_applied") or []
+        earlier = [f for f in every_fix if f.get("before_restart")]
+        fixes = [f for f in every_fix if not f.get("before_restart")]
+        if earlier:
+            out.append("\nThis run was started again after these changes (it runs the code with them in):")
+            for fix in earlier:
+                out.append(f"  {fix.get('summary')}")
         if fixes:
             out.append("\nFixes already applied this run:")
             for fix in fixes:
                 out.append(f"  step {fix.get('step')}: {fix.get('summary')}")
+        active = {f"[{f['severity']}] {f['check']} on {f['variable']}: {f['message']}" for f in findings}
+        since = [m for m in dict.fromkeys(pack.get("raised_since_audit") or []) if m not in active]
+        if since:
+            out.append("\nAlso raised by the checks since the last look, and no longer active:")
+            out.extend(f"  {m}" for m in since)
         audits = pack.get("previous_audits") or []
         if audits:
+            # what they found, not only the verdict: each look re-derived the same observation
             out.append("\nWhat previous audits concluded: " + "; ".join(
-                f"{a.get('status')} (risk {a.get('risk')})" for a in audits))
+                f"{a.get('status')} (risk {a.get('risk')})"
+                + (f" -- {'; '.join(str(x) for x in (a.get('findings') or [])[:3])}" if a.get("findings") else "")
+                for a in audits))
         if pack.get("code"):
             heading = "\nTraining code:"
             if fixes:
@@ -589,9 +840,14 @@ class Brain:
 
     def _audit(self, include_code: bool) -> Dict[str, Any]:
         pack = self.evidence(include_code=include_code)
+        self._raised_since_audit = []                  # the next look is told what comes after this one
         prompt = AUDIT_PROMPT.format(evidence=self.render_evidence(pack),
                                      min_minutes=MIN_INTERVAL_SECONDS / 60.0,
                                      max_minutes=MAX_INTERVAL_SECONDS / 60.0)
+        if pack.get("finished"):
+            # read as a live run, a closing look chose when to look again at a run that had ended
+            prompt += ("\nThis run has ended: this is the closing look, and nothing will check it again. "
+                       "next_check_minutes is not used -- put 60.\n")
         if self.agent is None:
             # No model available: keep the loop honest rather than pretending to audit.
             self.schedule.set(self.schedule.interval, "no agent configured", "unknown")
@@ -647,7 +903,8 @@ class Brain:
         raised = self.ingest(frames) if frames else []
         self._maybe_probe_tensors()
         audited = None
-        if self.schedule.due() and not self._final_audit_done:
+        holding = self.hold_audits is not None and self.hold_audits()
+        if self.schedule.due() and not self._final_audit_done and not holding:
             if not self.finished and not frames:
                 self._check_process_gone()
             was_finished = self.finished
@@ -789,6 +1046,22 @@ class EmptyAnswer(RuntimeError):
 AGENT_TIMEOUT_SECONDS = 900.0
 
 
+# Even 32,000 was not room enough: in a benchmark of 277 runs, DeepSeek V4 Flash thought
+# through the whole budget on 264 of 415 scheduled audits and answered nothing -- each one
+# billed, 22% of all the spending, and the run left unaudited. OpenRouter takes a cap on the
+# reasoning itself; the model treats it loosely (a cap of 1,500 thought ~3,000), so this one
+# leaves the answer plenty of room. A model reached another way has no such setting.
+AUDIT_REASONING_TOKENS = 8000
+# The one retry after an answer lost to thinking anyway: a much tighter cap.
+AUDIT_RETRY_REASONING_TOKENS = 2000
+
+
+def _reasoning_cap(model: str, tokens: int) -> Dict[str, Any]:
+    if str(model or "").startswith("openrouter/"):
+        return {"extra_body": {"reasoning": {"max_tokens": int(tokens)}}}
+    return {}
+
+
 def build_litellm_agent(model: str, api_key: Optional[str] = None, api_base: Optional[str] = None,
                         max_tokens: int = AGENT_MAX_TOKENS,
                         timeout: float = AGENT_TIMEOUT_SECONDS) -> Callable[[str], str]:
@@ -801,19 +1074,28 @@ def build_litellm_agent(model: str, api_key: Optional[str] = None, api_base: Opt
         from . import pulse_openrouter
         api_key = pulse_openrouter.key_for(model)
 
-    def ask(prompt: str) -> str:
+    def call(prompt: str, reasoning_tokens: int) -> Any:
         import litellm
-        response = litellm.completion(
+        return litellm.completion(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
             timeout=timeout,
             **({"api_key": api_key} if api_key else {}),
             **({"api_base": api_base} if api_base else {}),
+            **_reasoning_cap(model, reasoning_tokens),
         )
+
+    def ask(prompt: str) -> str:
+        response = call(prompt, AUDIT_REASONING_TOKENS)
         text = (response.choices[0].message.content or "").strip()
-        if not text:
+        finish = getattr(response.choices[0], "finish_reason", None)
+        if not text and finish == "length" and _reasoning_cap(model, 1):
+            # it thought past the cap and the budget: once more, told to think less
+            response = call(prompt, AUDIT_RETRY_REASONING_TOKENS)
+            text = (response.choices[0].message.content or "").strip()
             finish = getattr(response.choices[0], "finish_reason", None)
+        if not text:
             raise EmptyAnswer("the model gave no answer" + (
                 f" (it used its whole {max_tokens:,}-token budget, most likely thinking)" if finish == "length"
                 else f" (finish reason: {finish})" if finish else ""))

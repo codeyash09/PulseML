@@ -1987,6 +1987,19 @@ def _streaming_wanted() -> bool:
     return os.environ.get("PULSE_STREAMING", "1").strip().lower() not in ("0", "off", "false", "no")
 
 
+def _reasoning_cap(model: str, max_tokens: int, tight: bool = False) -> Dict[str, Any]:
+    """OpenRouter's cap on a reasoning model's hidden thinking, which counts against
+    max_tokens. Uncapped, DeepSeek V4 Flash thought through all 32,000 tokens on about a
+    hundred agent calls of a 277-run benchmark and answered nothing (each billed, then retried
+    the same way). The model treats the cap loosely -- it can think about twice it -- so it
+    is set well inside the budget; after an empty answer, much tighter. Other providers have
+    no such setting and get nothing."""
+    if not str(model or "").startswith("openrouter/"):
+        return {}
+    cap = max(1024, int(max_tokens) // (8 if tight else 3))
+    return {"extra_body": {"reasoning": {"max_tokens": cap}}}
+
+
 def _complete(**kwargs):
     """litellm.completion, streamed: the model's reasoning and answer are handed to the
     agent observer as they arrive (the Pulse app shows them live), and the full response
@@ -8663,6 +8676,7 @@ class PulseCLI:
             budget = min(_ratelimit.max_wait_seconds(), _STALLED_RATE_LIMIT_WAIT_SECONDS)
         waiter = _ratelimit.RateLimitWaiter(budget=budget)
         attempt = 0
+        thought_out = False                  # the last attempt came back empty: think less
         while True:
             attempt += 1
             started = time.monotonic()
@@ -8674,9 +8688,11 @@ class PulseCLI:
                     timeout=timeout or _AGENT_TIMEOUT_SECONDS,
                     api_base=self.agent_api_base,  # only set for local/self-hosted providers
                     api_key=(self.agent_key if self.agent_key and self.agent_key != "local" else None),
+                    **_reasoning_cap(model, max_tokens, thought_out),
                 )
                 content = (response.choices[0].message.content or "").strip()
                 if not content:
+                    thought_out = True
                     # Seen with reasoning models: the whole answer went into reasoning and none
                     # came back. It is billed like any other call, and the same request usually
                     # succeeds on a second try, so it is retried like a transient error.
@@ -8737,6 +8753,7 @@ class PulseCLI:
         sensitivity_args/normal_start_args/grep_patterns/view_requests are
         lists of raw argument strings -- applied via _apply_directives.
         """
+        text = cls.normalize_directives(text)
         calc_exprs = [m.strip() for m in cls._CALC_RE.findall(text) if m.strip()]
         promote_names = []
         for m in cls._PROMOTE_RE.findall(text):
@@ -8912,6 +8929,101 @@ class PulseCLI:
     }
     _FLAG_STYLE_DIRECTIVES = {"depgraph", "changelog", "shapetrace", "gpustatus", "mllint", "layerstats", "hardexamples", "ampstatus", "seedcheck", "runcompare", "cost"}
 
+    # Every directive name, for normalize_directives: the ones above, the extended toolset's,
+    # and run control (pulse_code's RUN:/RUNSTATUS:/RESTART:/STOP:).
+    _ARGLESS_DIRECTIVES = {"RUNSTATUS", "RESTART", "STOP", "DEPGRAPH", "CHANGELOG", "SHAPETRACE", "GPUSTATUS",
+                           "MLLINT", "LAYERSTATS", "HARDEXAMPLES", "AMPSTATUS", "SEEDCHECK", "RUNCOMPARE", "COST"}
+
+    @classmethod
+    def _directive_names(cls) -> set:
+        names = {key.upper() for key in cls._NEW_DIRECTIVE_RES}
+        names.update({"CALC", "PROMOTE", "GPUTRACK", "GPUUNTRACK", "SENSITIVITY", "NORMAL_START", "GREP", "VIEW",
+                      "RUN", "RUNSTATUS", "RESTART", "STOP", "WAIT"})
+        return names
+
+    _DSML_INVOKE_RE = re.compile(
+        r"<\s*[｜|]\s*DSML\s*[｜|]\s*invoke\s+name\s*=\s*\"([^\"]+)\"\s*>(.*?)<\s*/\s*[｜|]\s*DSML\s*[｜|]\s*invoke\s*>",
+        re.DOTALL | re.IGNORECASE)
+    _DSML_PARAM_RE = re.compile(
+        r"<\s*[｜|]\s*DSML\s*[｜|]\s*parameter\s+name\s*=\s*\"([^\"]+)\"(.*?)<\s*/\s*[｜|]\s*DSML\s*[｜|]\s*parameter\s*>",
+        re.DOTALL | re.IGNORECASE)
+    _DSML_WRAPPER_RE = re.compile(r"^[ \t]*<\s*/?\s*[｜|]\s*DSML\s*[｜|]\s*(?:tool_calls|function_calls)\s*>[ \t]*$",
+                                  re.MULTILINE | re.IGNORECASE)
+    _DSML_SHORT_RE = re.compile(r"^[ \t]*<\s*[｜|]\s*DSML\s*[｜|]\s*([A-Za-z_]+)\s*:\s*(.*?)\s*>[ \t]*$",
+                                re.MULTILINE)
+
+    @classmethod
+    def normalize_directives(cls, text: str) -> str:
+        """Tool directives as models actually write them, rewritten to the one form the parsers
+        read (`NAME: argument` alone on a line). DeepSeek wraps them -- `<VIEW: config.json:1-15>`,
+        `<RUNSTATUS>`, `<VIEW>train.py</VIEW>` -- or lets its native tool-call markup through
+        as text (`<｜DSML｜invoke name="VIEW">` with parameter tags). Read as prose, those asked
+        for nothing: the model was told it had sent neither a tool request nor an edit, asked
+        again the same way, and a benchmark turn spent its retries on it (79 of 277 runs).
+        Only Pulse's own directive names are rewritten; anything else is left alone."""
+        if not text or ("<" not in text and not any(f"\n{n}\n" in f"\n{text}\n" for n in cls._ARGLESS_DIRECTIVES)):
+            return text
+        names = cls._directive_names()
+
+        def directive(name: str, arg: str) -> Optional[str]:
+            name = name.strip().upper()
+            if name not in names:
+                return None
+            arg = str(arg or "").strip()
+            if "\n" in arg and name in ("TERMINAL", "REPL", "CALC"):
+                return None          # a multi-line command cannot be one directive line; joining it would change it
+            arg = " ".join(arg.split())
+            return f"{name}: {arg}".rstrip() if arg else f"{name}:"
+
+        def invoke(match: "re.Match") -> str:
+            params: List[Tuple[str, str]] = []
+            for pname, rest in cls._DSML_PARAM_RE.findall(match.group(2)):
+                value_at = re.search(r'value\s*=\s*"', rest)
+                if value_at:
+                    value = rest[value_at.end():].split('"', 1)[0]
+                else:
+                    value = rest.split(">", 1)[1] if ">" in rest else rest
+                params.append((pname.strip().lower(), value.strip()))
+            name = match.group(1).strip().upper()
+            values = dict(params)
+            if name == "VIEW" and values:
+                where = values.get("file") or values.get("path") or values.get("filename") or ""
+                span = values.get("range") or values.get("lines") or ""
+                if not span and values.get("start") and values.get("end"):
+                    span = f"{values['start']}-{values['end']}"
+                arg = f"{where}:{span}" if where and span else where or span
+            else:
+                arg = " ".join(v for _k, v in params)
+            line = directive(name, arg)
+            return f"\n{line}\n" if line else match.group(0)
+
+        text = cls._DSML_INVOKE_RE.sub(invoke, text)
+        text = cls._DSML_WRAPPER_RE.sub("", text)
+        text = cls._DSML_SHORT_RE.sub(lambda m: directive(m.group(1), m.group(2)) or m.group(0), text)
+
+        out = []
+        for raw in text.split("\n"):
+            line = raw.strip()
+            fixed = None
+            # <NAME>arg</NAME>
+            m = re.fullmatch(r"<\s*([A-Za-z_]+)\s*>\s*(.*?)\s*<\s*/\s*\1\s*>", line)
+            if m:
+                fixed = directive(m.group(1), m.group(2))
+            if fixed is None:
+                # <NAME: arg>, <NAME:>, <NAME>, <NAME/>
+                m = re.fullmatch(r"<\s*([A-Za-z_]+)\s*(?::\s*(.*?))?\s*/?\s*>", line)
+                if m:
+                    fixed = directive(m.group(1), m.group(2) or "")
+            if fixed is None and line.upper() in cls._ARGLESS_DIRECTIVES and line.isupper():
+                fixed = f"{line}:"                   # RUNSTATUS alone on its line, no colon
+            if fixed is None:
+                # "<RUNSTATUS:" left open, the model writing on as if it had the result
+                m = re.fullmatch(r"<\s*([A-Z_]+)\s*:?", line)
+                if m and m.group(1) in cls._ARGLESS_DIRECTIVES - {"STOP", "RESTART"}:   # read-only ones only
+                    fixed = f"{m.group(1)}:"
+            out.append(fixed if fixed is not None else raw)
+        return "\n".join(out)
+
     @classmethod
     def _extract_new_directives(cls, text: str):
         """Pull the extended toolset's directive lines out of an agent
@@ -8920,6 +9032,7 @@ class PulseCLI:
         a flag-style directive with no argument (DEPGRAPH/CHANGELOG/bare
         SHAPETRACE) still shows up as [''] so callers can just check
         truthiness/`in`."""
+        text = cls.normalize_directives(text)
         requests: Dict[str, List[str]] = {}
         cleaned = text
         for key, rx in cls._NEW_DIRECTIVE_RES.items():
@@ -11269,6 +11382,7 @@ class PulseCLI:
         training objects, since this runs on a worker thread while training continues."""
         results: List[str] = []
         summary: List[str] = []
+        answer = self.normalize_directives(answer)
         for expr in (m.strip() for m in self._CALC_RE.findall(answer)):
             if expr:
                 results.append(f"CALC {expr} = {_safe_eval_math(expr)}")

@@ -451,6 +451,22 @@ class Finding:
         return f"<Finding {self.severity} {self.check}:{self.variable} {self.message!r}>"
 
 
+def _excursions(values: List[float], line: float) -> Tuple[int, float]:
+    """How often `values` went over `line` and came back under it, counted from where they
+    first settled under it (a loss starts high: its opening descent is not a bump), and the
+    highest point of those bumps."""
+    count, highest, settled, above, peak = 0, 0.0, False, False, 0.0
+    for value in values:
+        if value <= line:
+            if above:
+                count += 1
+                highest = max(highest, peak)
+            settled, above, peak = True, False, 0.0
+        elif settled:
+            above, peak = True, max(peak, value)
+    return count, highest
+
+
 def _as_float(value: Any) -> Optional[float]:
     """The number this reading stands for, or None if it is not a number.
 
@@ -675,6 +691,9 @@ def _grid(values: Sequence[float]) -> float:
     steps = [_resolution(v) for v in values if v != 0.0]
     return min(steps) if steps else 0.0
 
+
+# "Never learned" is a warning before this many readings and critical from there (see the check).
+_NEVER_LEARNED_CRITICAL_READINGS = 30
 
 # NORMAL_START (an agent's estimate of where a loss should start) stands in for the
 # run's own floor this long, and no longer.
@@ -932,6 +951,13 @@ class DetectionEngine:
             self._streak[key] = streak
             if key in self.active:
                 existing = self.active[key]
+                if _SEVERITY_ORDER.get(finding.severity, 9) < _SEVERITY_ORDER.get(existing.severity, 9):
+                    # the same finding, now worse (a warning the evidence has made critical):
+                    # raised again, as what it is now
+                    finding.first_seen, finding.count = existing.first_seen, existing.count + 1
+                    self.active[key] = finding
+                    raised.append(finding)
+                    continue
                 existing.last_seen = time.time()
                 existing.count += 1
                 existing.message = finding.message
@@ -1531,11 +1557,14 @@ class DetectionEngine:
         anti = correlation(best_lag // 2) if best_lag >= 6 else -1.0
         repeat = correlation(best_lag * 2) if best_lag * 2 <= n - 8 else best_score
         if best_lag and best_score > 0.55 and anti < -0.15 and repeat > 0.25:
-            return Finding("periodic", name, WARNING,
+            # A hypothesis, said as one, and only info: in a benchmark it fired on 5 of 10
+            # runs that reshuffle every epoch (sampling a per-batch loss a few times a
+            # second makes cycles of its own), stated as "the batches are not being shuffled".
+            return Finding("periodic", name, INFO,
                            f"{name} repeats on a cycle of {best_lag} readings "
-                           f"(autocorrelation {best_score:.2f} after removing the trend): "
-                           f"something in the input order is coming round again, so the "
-                           f"batches are not being shuffled",
+                           f"(autocorrelation {best_score:.2f} after removing the trend): this can "
+                           f"mean the input order comes round again unshuffled -- or only the "
+                           f"sampling's rhythm; whether the loop reshuffles each epoch settles it",
                            step, {"lag": best_lag, "correlation": best_score}, 0.7)
         return None
 
@@ -1577,10 +1606,29 @@ class DetectionEngine:
                 # multiple to be measured in, so measure the jump against the loss's own
                 # spread, or its size, whichever is bigger.
                 ratio = 1.0 + (latest - baseline) / max(noise, abs(baseline), 1e-12)
-            if ratio > t["explosion_multiplier"] and big_for_this_run and real_jump:
+            # A per-batch loss with a heavy tail -- a few hard batches near a floor of
+            # almost zero -- jumps "100x its floor" every minute or so and comes straight
+            # back each time (a benchmark run had 40 CRITICAL spikes in ten minutes, and the
+            # agent chased them instead of the real bug the audit had found). If the loss
+            # has already gone over the same line and come back down, twice or more since
+            # it first settled under it, this is that tail, not a divergence -- unless it
+            # goes far past every earlier bump (a learning rate that jumped 200x). A loss
+            # that really blows up crosses the line for the first time, or goes far beyond.
+            heavy_tail = False
+            line = baseline * t["explosion_multiplier"] if baseline > 0 else None
+            if line is not None:
+                bumps, highest = _excursions(values[:-1], line)
+                heavy_tail = bumps >= 2 and latest <= 1.5 * highest
+            if ratio > t["explosion_multiplier"] and big_for_this_run and real_jump and not heavy_tail:
                 size = (f"{ratio:.1f}x its recent floor of {baseline:g}" if baseline > 0
                         else f"up {latest - baseline:g} from its recent floor of {baseline:g}")
-                out.append(Finding("loss_spike", name, CRITICAL,
+                # One reading over the line is one hard batch as often as a blow-up: a warning
+                # (an audit soon). Still over it at the next reading, the run has left its
+                # floor: critical (the finding is raised again, escalated). A single batch at
+                # "77x its floor" started the agent on a healthy run, and again on its restart.
+                held = len(values) >= 2 and line is not None and values[-2] > line
+                severity = CRITICAL if held or line is None else WARNING
+                out.append(Finding("loss_spike", name, severity,
                                    f"{name} spiked to {latest:g}, {size}",
                                    step, {"latest": latest, "baseline": baseline},
                                    _confidence(ratio, t["explosion_multiplier"], len(values))))
@@ -1647,8 +1695,8 @@ class DetectionEngine:
             if stalled and progress < 0.9 and not getattr(self, "_already_good", False):
                 out.append(Finding("stagnation", name, WARNING,
                                    f"{name} stopped improving at {late:.4g} and has barely moved for "
-                                   f"{len(recent)} readings, after coming down only {progress * 100:.0f}% "
-                                   f"from {opening:.4g}",
+                                   f"{len(recent)} readings, after coming down {progress * 100:.0f}% "
+                                   f"from an opening average of {opening:.4g}",
                                    step, {"early": early, "late": late, "spread": spread,
                                           "progress": progress}, 0.65))
 
@@ -1679,7 +1727,11 @@ class DetectionEngine:
         # looks for training going wrong; this one is for training that never started.
         if len(values) >= 10 and not directionless:
             span = max(2, len(values) // 5)
-            start, end = _mean(values[:span]), _mean(values[-span:])
+            # "When it started" is the first few readings, not the first fifth: a loss that
+            # converged in its first 30 readings of 1,500 had a "start" of 0.33 (already
+            # converged) against a true opening of 0.67, and was called "not learning".
+            head = max(2, min(span, 5))
+            start, end = _mean(values[:head]), _mean(values[-span:])
             # The best the run ever *held*, not the single luckiest reading: one noisy
             # epoch dipping below the opening is not the run having learned something,
             # and taking it for one made this check a coin flip on any noisy curve.
@@ -1707,7 +1759,13 @@ class DetectionEngine:
                                                          3.0 * se))
             if (abs(start) > 0 and precise_enough and not improved_measurably
                     and (start - end) < worth_noticing and never_improved and not learned_earlier):
-                out.append(Finding("never_learned", name, CRITICAL,
+                # Ten readings of a per-batch loss are ten steps, seconds into a run: a model
+                # can sit at chance that long and then learn. Said as CRITICAL then, it started
+                # the agent on a healthy run, which went looking for a cause and "fixed" one
+                # (a benchmark run: 17 readings in). Early, it is a warning -- which brings an
+                # audit within minutes -- and it becomes critical once the evidence is long.
+                severity = CRITICAL if len(values) >= _NEVER_LEARNED_CRITICAL_READINGS else WARNING
+                out.append(Finding("never_learned", name, severity,
                                    f"{name} is no better than when it started ({start:.4g} -> {end:.4g} "
                                    f"over {len(values)} readings): this run is not learning",
                                    step, {"start": start, "end": end, "points": len(values)}, 0.9))
@@ -1751,7 +1809,8 @@ class DetectionEngine:
                 and min(values[-2:]) >= t["perfect_metric"]):
             out.append(Finding("suspiciously_perfect", name, WARNING,
                                f"{name} reached {max(values):.4g} within {len(values)} readings, "
-                               f"which usually means the labels are reachable from the inputs",
+                               f"which can mean the labels are reachable from the inputs -- or that the "
+                               f"task is that easy; the code says which",
                                step, {"value": max(values), "points": len(values)}, 0.7))
         # A leak does not have to be obvious in the first two epochs: one that takes ten
         # to saturate looks like fast learning on the way up and is only visible once
@@ -1760,16 +1819,19 @@ class DetectionEngine:
         elif (unit_scale and is_validation(name) and len(values) >= 8
                 and min(values[-8:]) >= t["perfect_metric"]):
             out.append(Finding("suspiciously_perfect", name, WARNING,
-                               f"{name} has been a perfect {values[-1]:.4g} for its last 8 readings: "
-                               f"a validation score that stops at the ceiling usually means the "
-                               f"labels are reachable from the inputs",
+                               f"{name} has been at {values[-1]:.4g} for its last 8 readings: a "
+                               f"validation score that stays at the ceiling can mean the labels are "
+                               f"reachable from the inputs, or a task that easy; the code says which",
                                step, {"value": values[-1], "points": len(values)}, 0.7))
         if len(values) >= 10:
             quarter = max(2, len(values) // 4)
             early, late = _mean(values[:quarter]), _mean(values[-quarter:])
-            if abs(early) > 1e-12 and abs(late - early) / abs(early) < t["stagnation_frac"]:
+            at_ceiling = unit_scale and late >= 0.99           # nowhere left to move
+            if abs(early) > 1e-12 and abs(late - early) / abs(early) < t["stagnation_frac"] and not at_ceiling:
                 out.append(Finding("metric_stagnation", name, INFO,
-                                   f"{name} has not moved ({early:.4g} -> {late:.4g} over {len(values)} readings)",
+                                   f"{name} has barely moved: it averaged {early:.4g} over its first "
+                                   f"{quarter} readings and {late:.4g} over its last {quarter} "
+                                   f"({len(values)} in all)",
                                    step, {"early": early, "late": late}, 0.6))
         return out
 
@@ -2317,8 +2379,9 @@ class DetectionEngine:
             out.append(Finding("widening_gap", val, WARNING,
                                f"{train} improved {100 * train_gain:.0f}% while {val} moved "
                                f"{100 * val_gain:.0f}%: the gap between them went from "
-                               f"{early_gap:.4g} to {late_gap:.4g}, which is memorising without "
-                               f"{val} ever having to get worse",
+                               f"{early_gap:.4g} to {late_gap:.4g}: that can be memorising without "
+                               f"{val} ever having to get worse -- or both sitting at the data's noise "
+                               f"floor, where a gap that size means nothing",
                                step, {"train": train, "early_gap": early_gap,
                                       "late_gap": late_gap, "train_gain": train_gain}, 0.75))
         return out

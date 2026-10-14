@@ -168,6 +168,8 @@ CODE_SYSTEM_PROMPT = (
     "start, train, launch, or try a completed change, use this directive -- do not just tell them a command "
     "to run. A training run started with TERMINAL is killed at the command timeout.\n"
     "  RUNSTATUS:                 the watched run's numbers and findings right now\n"
+    "  WAIT: <seconds>            let the run go on for that long (up to 600) before what follows -- e.g.\n"
+    "                             WAIT: 120 then RUNSTATUS: to see a restarted run past its first epoch\n"
     "  RESTART:                   run the watched script again with the current code (after a fix; a run\n"
     "                             still going is stopped first, a crashed one is just started again)\n"
     "  STOP:                      stop the watched run (the user is asked first)\n"
@@ -175,7 +177,7 @@ CODE_SYSTEM_PROMPT = (
     "you found, what you are about to do. Not a tool: nothing comes back and it does not end your turn, "
     "so put it beside the directives you issue in the same reply. Text around directives is not shown "
     "to the user; MESSAGE: always is.\n"
-    "  TERMINAL: <shell command>  run a REAL command in the project directory; get back the actual "
+    "  TERMINAL: <shell command>  (one line) run a REAL command in the project directory; get back the actual "
     "stdout, stderr, exit code and duration -- e.g. 'TERMINAL: pytest tests/test_model.py', "
     "'TERMINAL: python -m py_compile src/model.py', 'TERMINAL: git status', 'TERMINAL: python "
     "repro.py'. This is a general terminal, not a fixed set of commands -- compose whatever command "
@@ -250,6 +252,8 @@ _REVISE_APPLIED = (
     "file that now exists. No prose, no fences."
 )
 
+_TERMINAL_CODES_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
 _VERIFY_TERMINAL = (
     "STEP 4 -- VERIFY FOR REAL. This change was just applied:\n{explanation}\n\n{diff}\n\n"
     "Use TERMINAL: (and GREP:/VIEW: if useful) to actually check it -- don't just reason about "
@@ -272,6 +276,11 @@ _CONTINUE = (
     "implemented, wired together, and verified? If it is, reply with a one or two sentence summary "
     "of what was done and end with a line containing only TASK_COMPLETE. If something remains, reply "
     "with ONLY the next step, as a concrete instruction for yourself (which file, what to do). "
+    "A step the request asked for that is not an edit counts too -- starting the script again "
+    "(RESTART: or RUN:), looking at the new run (RUNSTATUS:): if one is still to do, put its directive "
+    "on its own line now; it is carried out before your answer is read. A fix that only shows later in "
+    "the run (an epoch the bug struck at) is checked once the run is past that point: WAIT: <seconds> "
+    "first. "
     "Do not repeat work that is already in place. Do not start unrelated work."
 )
 
@@ -297,6 +306,11 @@ CODE_SYSTEM_PROMPT += _AUTONOMY_NOTE
 
 _QUALITY_NOTE = (
     "\nHOLD YOURSELF TO THE REQUEST\n"
+    # Read from the model's seat on a one-line fix, the build rules below ("a full loop: ...
+    # clipping ... checkpoints", "do not shrink the scope") read as a list of things to add.
+    "- A request to find or fix a problem in existing code is not a request to build: the fix is the "
+    "smallest change that removes the cause, and when nothing is wrong it is no change at all. The rules "
+    "below are for writing or extending code.\n"
     "- The stack, libraries, algorithms and structure the user names are requirements. If the project is "
     "numpy/cupy, write numpy/cupy: never switch to torch, tensorflow or jax (or any other framework or algorithm) "
     "because it is easier. If the requested approach needs a piece that does not exist yet (a kernel, a tokenizer, "
@@ -835,20 +849,34 @@ def _show_tools(answer, notes, label="tool results"):
     print(f"\n[{label}]\n{notes}\n")
 
 
-_RUN_DIRECTIVE_RE = re.compile(r"(?m)^[ \t]*(RUN|RUNSTATUS|RESTART|STOP):[ \t]*(.*)$")
-_RUN_ACTIONS = {"RUN": "start_run", "RUNSTATUS": "run_status", "RESTART": "restart_run", "STOP": "stop_run"}
+_RUN_DIRECTIVE_RE = re.compile(r"(?m)^[ \t]*(RUN|RUNSTATUS|RESTART|STOP|WAIT):[ \t]*(.*)$")
+# WAIT: <seconds> -- let a run get somewhere before looking at it: a fix that only shows at
+# epoch 14 cannot be seen by a RUNSTATUS: four seconds after the restart, and the agent was
+# left to `sleep` in its terminal (which ran after the RUNSTATUS it was meant to precede).
+_WAIT_MAX_SECONDS = 600.0
+_RUN_ACTIONS = {"RUN": "start_run", "RUNSTATUS": "run_status", "RESTART": "restart_run", "STOP": "stop_run",
+                "WAIT": "wait"}             # WAIT: is served here, not by the app (see _service_run_directives)
 
 
 def _service_run_directives(answer):
     """RUN: <script> [args] / RUNSTATUS: / RESTART: / STOP: -- run control, which the Pulse
     app provides (it owns the runs on screen). Returns the notes for the model."""
-    found = _RUN_DIRECTIVE_RE.findall(answer or "")
+    found = _RUN_DIRECTIVE_RE.findall(PulseCLI.normalize_directives(answer or ""))
     if not found:
         return []
     host = _ui.host()
     actions = host.run_actions() if host is not None and hasattr(host, "run_actions") else {}
     notes = []
     for name, arg in found:
+        if name == "WAIT":
+            try:
+                seconds = max(0.0, min(_WAIT_MAX_SECONDS, float(str(arg).split()[0])))
+            except (ValueError, IndexError):
+                notes.append("WAIT: needs a number of seconds, e.g. WAIT: 120")
+                continue
+            time.sleep(seconds)
+            notes.append(f"Waited {seconds:.0f} s.")
+            continue
         action = actions.get(_RUN_ACTIONS[name])
         if action is None:
             notes.append(f"{name}: only available inside the Pulse app (`pulse`), which watches runs. Here, "
@@ -868,13 +896,27 @@ def _service_run_directives(answer):
 def _service(cli, answer):
     """Run the tools `answer` asked for. Inside the Pulse app their own progress lines are
     held back -- the transcript shows the calls as one entry (see _show_tools)."""
-    notes = _service_run_directives(answer)
-    host = _ui.host()
-    if host is not None and hasattr(host, "hush"):
-        with host.hush():
-            notes.append(cli._service_tool_requests(answer))
+    # In the order written, as far as two groups go: "TERMINAL: ... then RUNSTATUS:" ran the
+    # status first, and the agent read a run 19 s old where it expected 30 s more.
+    text = PulseCLI.normalize_directives(answer or "")
+    run_at = [m.start() for m in _RUN_DIRECTIVE_RE.finditer(text)]
+    tool_at = [m.start() for m in re.finditer(r"(?m)^[ \t]*([A-Z_]+):", text)
+               if m.group(1) in PulseCLI._directive_names() - set(_RUN_ACTIONS) - {"WAIT"}]
+    tools_first = bool(run_at and tool_at and min(tool_at) < min(run_at))
+
+    def tools():
+        host = _ui.host()
+        if host is not None and hasattr(host, "hush"):
+            with host.hush():
+                return cli._service_tool_requests(answer)
+        return cli._service_tool_requests(answer)
+
+    if tools_first:
+        tool_notes = tools()
+        notes = [tool_notes] + _service_run_directives(answer)
     else:
-        notes.append(cli._service_tool_requests(answer))
+        notes = _service_run_directives(answer)
+        notes.append(tools())
     return "\n\n".join(n for n in notes if n)
 
 
@@ -902,8 +944,8 @@ def _tool_rounds(cli, answer, instruction):
 
 def _plain_text(answer):
     """The model's answer with tool directive lines removed, for showing to a person."""
-    cleaned, _ = PulseCLI._extract_new_directives(answer)
-    cleaned = re.sub(r"(?m)^\s*(GREP|VIEW|DEFOF|CALLERS|DEPGRAPH|DOCLOOKUP|CHANGELOG|MESSAGE|RUN|RUNSTATUS|RESTART|STOP):.*$",
+    cleaned, _ = PulseCLI._extract_new_directives(PulseCLI.normalize_directives(answer))
+    cleaned = re.sub(r"(?m)^\s*(GREP|VIEW|DEFOF|CALLERS|DEPGRAPH|DOCLOOKUP|CHANGELOG|MESSAGE|RUN|RUNSTATUS|RESTART|STOP|WAIT):.*$",
                      "", cleaned)
     return _NO_CHANGES_RE.sub("", cleaned).strip()
 
@@ -1151,7 +1193,8 @@ def _run_verification_pass(cli, fix, changes):
     swallowed)."""
     explanation = fix.get("explanation") or "(no explanation given)"
     diff = render_diff(cli, changes)
-    prompt = _VERIFY_TERMINAL.format(explanation=explanation, diff=diff)
+    # the diff is the one drawn for the terminal: its colour codes are noise to a model
+    prompt = _VERIFY_TERMINAL.format(explanation=explanation, diff=_TERMINAL_CODES_RE.sub("", diff))
     cli._in_verification_pass = True   # tags any TERMINAL: run in this pass -- see PulseCLI._run_terminal
     try:
         with _Spinner("Verifying"):
