@@ -815,6 +815,15 @@ def describe_changes(cli, fix, changes):
 # ---------------------------------------------------------------------------------------
 
 _NO_CHANGES_RE = re.compile(r"(?m)^\s*NO_CHANGES\s*$")
+_NO_CHANGES_TAIL = 400       # text allowed after the marker: a closing remark, not a plan
+
+
+def _says_no_changes(answer):
+    """The plan step's verdict that nothing needs changing: the NO_CHANGES line it is asked to
+    end with. A marker followed by a plan is a verdict taken back ("NO_CHANGES ... wait, the
+    config does need to change: Plan ...") -- the plan stands."""
+    found = list(_NO_CHANGES_RE.finditer(answer or ""))
+    return bool(found) and len(answer[found[-1].end():].strip()) <= _NO_CHANGES_TAIL
 
 
 _TOOL_CALL_RE = re.compile(r"(?m)^[ \t]*([A-Z][A-Z_]{2,}):[ \t]*(.*)$")
@@ -1068,6 +1077,18 @@ def _run_turn_pipeline(cli, request, evidence=None):
                             "Take a different, smaller, concrete approach -- one edit at a time. Re-read the "
                             "exact code with VIEW/GREP before writing snippets.)")
             continue
+        if outcome == "declined" and getattr(cli, "_reviewer_declined", "") and failures < _MAX_STEP_RETRIES:
+            # The reviewer is a model too, and it can be wrong; nobody may be there to overrule
+            # it. The agent hears its reason and either answers it or makes a better change.
+            failures += 1
+            reason = cli._reviewer_declined
+            cli._reviewer_declined = ""
+            cprint(f"[Pulse Code] Retrying ({failures}/{_MAX_STEP_RETRIES}) -- {reason[:160]}", color=_YELLOW)
+            step_request = (f"{base_request}\n\n(Your change was not applied: {reason[:1500]}. A reviewer can "
+                            "be wrong. Check its objection against the code: if it holds, change your fix; if it "
+                            "does not, propose the change again and say in the explanation why the objection "
+                            "does not apply.)")
+            continue
         if outcome != "applied":
             break
         failures = 0
@@ -1097,11 +1118,11 @@ def _run_turn_passes(cli, request):
         answer = cli._call_model(_PLAN, max_tokens=_AGENT_MAX_TOKENS)
     answer = _tool_rounds(cli, answer, _PLAN)
     plan = _plain_text(answer)
-    if not plan and not _NO_CHANGES_RE.search(answer):
+    if not plan and not _says_no_changes(answer):
         cli._last_failure = "the planning reply was empty"
         cprint("[Pulse Code] ⚠ Empty plan.", color=_YELLOW)
         return "failed", ""
-    if _NO_CHANGES_RE.search(answer):
+    if _says_no_changes(answer):
         if plan:
             _ui.answer(plan)
         else:
@@ -1297,6 +1318,10 @@ def _confirm_and_apply(cli, request, plan, fix, changes):
     if not changes:
         cprint("[Pulse Code] The change turned out to be empty; nothing was edited.", color=_YELLOW)
         return "answered", plan
+    if all(before == after and not is_new for before, after, is_new in changes.values()):
+        # e.g. the agent already made the edit with a command: there is nothing to review
+        cprint("[Pulse Code] The files already read that way; nothing was edited.", color=_YELLOW)
+        return "answered", f"{plan}\n\n(The files already have this content: nothing was changed.)"
     diff = render_diff(cli, changes)
     labels = [cli._label_for_path.get(path) or os.path.relpath(path, cli._project_root).replace(os.sep, "/")
               for path in changes]
@@ -1307,7 +1332,9 @@ def _confirm_and_apply(cli, request, plan, fix, changes):
     asking = cli.review and not getattr(cli, "_always_apply_changes", False)
     reviewed = cli._review_change_with_approver(request, str(fix.get("explanation") or plan or ""), diff) \
         if asking else None
+    cli._reviewer_declined = ""
     if reviewed is False:
+        cli._reviewer_declined = getattr(cli, '_last_change_denial', '') or "declined"
         _ui.change_status("not applied", color=_YELLOW, final=True, terminal_text="[Pulse Code] Not applied.")
         return "declined", f"{plan}\n\n(Not applied: {getattr(cli, '_last_change_denial', '') or 'declined'}.)"
     if asking and reviewed is None:

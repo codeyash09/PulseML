@@ -2328,7 +2328,9 @@ class App:
                 self.error(f"{name} (watched off screen) needs a look: {serious[0].message}. "
                            f"/change {name} opens it.")
 
-    def _start_problem_turn(self, findings: List[Any]) -> None:
+    def _start_problem_turn(self, findings: List[Any], over: bool = False) -> None:
+        """`over`: the run has ended (a closing audit's finding) -- the request says so, and
+        that a fix only shows in a new run."""
         script = os.path.basename((self.session or {}).get("script") or "the run")
         variable = getattr(findings[0], "variable", "") or "it"
         # Where each claim comes from, said as it is: a fixed-rule check over the numbers, or
@@ -2343,15 +2345,19 @@ class App:
                               f"concluded: {message}")
             else:
                 claims.append(f"Pulse's checks (fixed rules over the run's numbers) flagged: {message}")
-        request = (f"{script} is still running. " + " ".join(claims) + " Treat that as a claim to check, not "
+        state = (f"{script} has ended ({self._status}). " if over else f"{script} is still running. ")
+        request = (state + " ".join(claims) + " Treat that as a claim to check, not "
                    "a fact: test it against the evidence (the run's values) and the code. If it holds, find the "
                    "cause, explain it in a sentence or two with the numbers that show it, and fix it. If it does "
                    "not hold -- a false alarm, or nothing that hurts this run -- say so, with the numbers; and "
                    "unless you found something else that is really wrong with this run (then fix that, and say "
-                   "the flag itself was false), change nothing. If you changed the code, decide what to do with "
-                   "the run: restart it with the fix (a RESTART: line, or restart_run -- whichever you have) when "
-                   "the run as it is cannot finish well, stop it (STOP: / stop_run) if it is only burning "
-                   "compute, or leave it running if what you fixed does not affect it -- and say which you did."
+                   "the flag itself was false), change nothing. "
+                   + ("If you changed the code, the fix only shows in a new run: start it again with the fix (a "
+                      "RESTART: line, or restart_run -- whichever you have)." if over else
+                      "If you changed the code, decide what to do with "
+                      "the run: restart it with the fix (a RESTART: line, or restart_run -- whichever you have) when "
+                      "the run as it is cannot finish well, stop it (STOP: / stop_run) if it is only burning "
+                      "compute, or leave it running if what you fixed does not affect it -- and say which you did.")
                    + self._unattended_note)
         self.view.entries.append(tui.Entry("user", f"Pulse flagged {variable} in {script}: is it real? Fix it if so."))
         self._last_blank = False

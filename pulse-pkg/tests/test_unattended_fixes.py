@@ -333,7 +333,11 @@ def _startup(tmp_path, outcomes, monkeypatch, starts_after=None):
     app, log = _headless(tmp_path, AgentCli())
     out = tmp_path / "run.log"
     out.write_text("Traceback (most recent call last):\nKeyError: 'lr'\n")
-    failure = {"script": str(tmp_path / "train.py"), "code": 1, "log": str(out), "argv": ["train.py"], "cwd": "."}
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "config.json").write_text('{"lr": 0.1,}')
+    failure = {"script": str(project / "train.py"), "code": 1, "log": str(out), "argv": ["train.py"],
+               "cwd": str(project)}
     app._start_failure = dict(failure)
     seen = {"turns": [], "launches": 0}
     turns = iter(outcomes)
@@ -341,6 +345,9 @@ def _startup(tmp_path, outcomes, monkeypatch, starts_after=None):
     def start(work, request):
         seen["turns"].append(request)
         app._last_outcome = next(turns)
+        if app._last_outcome == "edited with a command":
+            (project / "config.json").write_text('{"lr": 0.1}')
+            app._last_outcome = "declined"
         app._job = None
 
     def launch(arg, replace=None):
@@ -415,6 +422,33 @@ def test_no_change_means_no_relaunch(tmp_path, monkeypatch):
     assert headless._fix_startup(app, threading.Event()) is False
     log.close()
     assert seen["launches"] == 0 and "changed nothing" in (tmp_path / "log").read_text()
+
+
+def test_a_fix_made_with_a_command_is_started_even_if_the_edit_was_declined(tmp_path, monkeypatch):
+    # the agent fixed config.json with a shell command; its formal edit then came out empty and
+    # the reviewer declined it: the file is fixed all the same, so the script is started again
+    app, log, seen = _startup(tmp_path, ["edited with a command"], monkeypatch, starts_after=1)
+    assert headless._fix_startup(app, threading.Event()) is True
+    log.close()
+    assert seen["launches"] == 1
+
+
+def test_project_files_see_an_edit_and_not_pulse_bookkeeping(tmp_path):
+    (tmp_path / "train.py").write_text("x = 1\n")
+    before = headless._project_files(str(tmp_path))
+    (tmp_path / ".pulse_fixlog.json").write_text("[]")
+    (tmp_path / ".pulse_stream").mkdir()
+    (tmp_path / ".pulse_stream" / "events").write_text("{}")
+    assert headless._project_files(str(tmp_path)) == before
+    (tmp_path / "train.py").write_text("x = 22\n")
+    assert headless._project_files(str(tmp_path)) != before
+
+
+def test_an_edit_the_files_already_have_is_not_sent_for_review():
+    from pulse import pulse_code
+    cli = types.SimpleNamespace(_review_change_with_approver=lambda *a: pytest.fail("reviewed a no-op"))
+    outcome, _ = pulse_code._confirm_and_apply(cli, "fix", "plan", {}, {"/p/config.json": ("{}", "{}", False)})
+    assert outcome == "answered"
 
 
 def test_tries_are_bounded(tmp_path, monkeypatch):
@@ -680,3 +714,82 @@ def test_a_restarted_run_is_told_what_changed_before_it_and_not_that_its_code_is
     assert "started again after these changes" in text and "removed the y_val shuffle" in text
     assert "AS IT IS NOW" not in text                      # it runs this code
     assert "problem, on the run before the restart (risk high) -- train.py:51 shuffles y_val" in text
+
+
+# ---------------------------------------------------------------- a reviewer's denial is answered
+
+def _pipeline(monkeypatch, outcomes):
+    from pulse import pulse_code
+    cli = types.SimpleNamespace(compact_history=lambda: None, _last_applied_fix=None,
+                                _sync_agent_turn=lambda *a, **k: None)
+    asked = []
+
+    def step(cli_, request, evidence=None):
+        asked.append(request)
+        outcome, denial = outcomes.pop(0)
+        cli_._reviewer_declined = denial
+        return outcome, ""
+    monkeypatch.setattr(pulse_code, "_run_step", step)
+    monkeypatch.setattr(pulse_code, "_next_step", lambda *a: None)
+    return pulse_code._run_turn_pipeline(cli, "fix the crash"), asked
+
+
+def test_a_change_the_reviewer_denied_goes_back_to_the_agent_with_the_reason(monkeypatch):
+    outcome, asked = _pipeline(monkeypatch, [("declined", "the reviewer declined it: the model is on GPU"),
+                                             ("applied", "")])
+    assert outcome == "applied" and len(asked) == 2
+    assert "the model is on GPU" in asked[1] and "can be wrong" in asked[1]
+
+
+def test_a_person_declining_ends_the_turn(monkeypatch):
+    outcome, asked = _pipeline(monkeypatch, [("declined", "")])
+    assert outcome == "declined" and len(asked) == 1
+
+
+def test_denials_are_answered_a_bounded_number_of_times(monkeypatch):
+    outcome, asked = _pipeline(monkeypatch, [("declined", "no")] * 10)
+    assert outcome == "declined" and len(asked) == 4
+
+
+# ---------------------------------------------------------------- a verdict taken back; a run that ended wrong
+
+def test_no_changes_taken_back_by_a_plan_is_not_the_verdict():
+    from pulse import pulse_code
+    taken_back = ("The lr is negative.\nNO_CHANGES\nWait -- the request asks for a fix, so I do need to change "
+                  "the config.\n**Plan**\n- config.json line 9: \"lr\": -0.003 -> 0.003.\n" + "Then restart it. " * 30)
+    assert not pulse_code._says_no_changes(taken_back)
+    assert pulse_code._says_no_changes("The run is healthy: val_acc 0.91 at epoch 12.\nNO_CHANGES")
+    assert pulse_code._says_no_changes("Nothing to change.\nNO_CHANGES\nThe curve matches the clean one.")
+    assert not pulse_code._says_no_changes("Plan: change lr.")
+
+
+def test_a_closing_audit_problem_is_a_claim_for_the_agent_unless_low_risk():
+    assert headless._closing_problem({"status": "problem", "risk": "high", "findings": ["lr = -0.003 in config.json"]}) \
+        == "lr = -0.003 in config.json"
+    assert headless._closing_problem({"status": "problem", "risk": "low", "findings": ["x"]}) == ""
+    assert headless._closing_problem({"status": "ok"}) == "" and headless._closing_problem(None) == ""
+
+
+def test_a_problem_with_a_run_that_ended_says_it_ended(tmp_path):
+    app = appmod.App(FakeCli(), str(tmp_path))
+    started = []
+    app._start = lambda work, request: started.append(request)
+    app.session, app._status = {"script": "/p/train.py", "session_id": "s1"}, "crashed"
+    app._start_problem_turn([types.SimpleNamespace(check="audit", variable="audit@0", severity="critical",
+                                                   message="lr = -0.003")], over=True)
+    assert started[0].startswith("train.py has ended (crashed).") and "still running" not in started[0]
+    assert "only shows in a new run" in started[0] and "claim to check" in started[0]
+
+
+def test_headless_hands_over_a_problem_with_a_run_that_ended(tmp_path):
+    # was: HeadlessApp's own _start_problem_turn did not take `over`, and the supervisor died
+    # with a TypeError the moment a closing audit found a problem
+    app, log = _headless(tmp_path, AgentCli())
+    started = []
+    app._start = lambda work, request: started.append(request)
+    app.session, app._status = {"script": "/p/train.py", "session_id": "s1"}, "finished"
+    app._start_problem_turn([types.SimpleNamespace(check="audit", variable="audit@0", severity="critical",
+                                                   message="epochs=0: no training step ran")], over=True)
+    log.close()
+    assert started and started[0].startswith("train.py has ended (finished).")
+    assert "epochs=0" in (tmp_path / "log").read_text()

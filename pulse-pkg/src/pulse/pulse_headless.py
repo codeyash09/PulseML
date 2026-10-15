@@ -31,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -327,9 +328,9 @@ class HeadlessApp(pulse_app.App):
         self.write(f"== the agent is looking at a crash of {script}" + (f": {what}" if what else ""))
         super()._start_crash_turn(script, what)
 
-    def _start_problem_turn(self, findings: List[Any]) -> None:
+    def _start_problem_turn(self, findings: List[Any], over: bool = False) -> None:
         self.write("== the agent is looking at: " + "; ".join(str(getattr(f, "message", f)) for f in findings[:3]))
-        super()._start_problem_turn(findings)
+        super()._start_problem_turn(findings, over=over)
 
     # -------------------------------------------------------------- nobody to ask
 
@@ -510,6 +511,36 @@ def supervise(argv: List[str]) -> int:
         app.write("Pulse headless debugger stopped.")
 
 
+def _closing_problem(record: Optional[Dict[str, Any]]) -> str:
+    """What a closing audit found wrong, said as a claim for the agent; "" when it found nothing
+    to act on (no problem, or one it rated low risk)."""
+    if not record or record.get("status") != "problem" or str(record.get("risk") or "").lower() == "low":
+        return ""
+    found = "; ".join(str(f) for f in (record.get("findings") or [])[:3])
+    return (found or pulse_app.audit_words(record.get("text") or "") or "the closing audit found a problem")[:600]
+
+
+def _project_files(root: Optional[str], limit: int = 5000) -> dict:
+    """Path -> (mtime, size) of the files under root, skipping hidden folders and caches."""
+    out: dict = {}
+    if not root or not os.path.isdir(root):
+        return out
+    for folder, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("__pycache__", "node_modules")]
+        for name in files:
+            if name.startswith("."):             # Pulse's own .pulse_* bookkeeping among them
+                continue
+            path = os.path.join(folder, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            out[path] = (st.st_mtime_ns, st.st_size)
+            if len(out) >= limit:
+                return out
+    return out
+
+
 def _fix_startup(app: HeadlessApp, stopping: threading.Event) -> bool:
     """The last start of the script exited before Pulse saw a training step -- the first one,
     or a restart after a fix -- so there is no new run to debug, only what it printed. With
@@ -544,6 +575,7 @@ def _fix_startup(app: HeadlessApp, stopping: threading.Event) -> bool:
             app.write(f"== the agent is looking at why {script} exited before its first training step"
                       + (f" (try {attempt} of {_STARTUP_FIXES})" if attempt > 1 else ""))
             before = (app.session or {}).get("session_id")
+            files_before = _project_files(failure["cwd"])
             app._last_outcome = None
             app._start(app._handle, request)
             job = app._job
@@ -554,7 +586,8 @@ def _fix_startup(app: HeadlessApp, stopping: threading.Event) -> bool:
             if going(before):
                 got_going = True
                 return True                          # the agent started it again itself, and it got going
-            if app._last_outcome != "applied":
+            if app._last_outcome != "applied" and _project_files(failure["cwd"]) == files_before:
+                # (an edit made with a shell command counts too: the files are what is compared)
                 app.write(f"The agent changed nothing, so {script} is not started again.")
                 return False
             app.write(f"== starting {script} again with the change")
@@ -611,7 +644,16 @@ def _watch(app: HeadlessApp, stopping: threading.Event) -> int:
                     # the run is over whether or not its stream said goodbye: the audit is told so
                     # (it read "still running" and chose when to look again at a finished run)
                     brain.finished = True
-                    app.console._report_audit(brain.audit())
+                    record = brain.audit()
+                    app.console._report_audit(record)
+                    if _closing_problem(record) and (app.cli.agent_provider and app.cli.agent_key):
+                        # a run over is past the checks' reach (they act on live runs), and with
+                        # nobody to read the finding the agent takes it on: a crash it did not fix,
+                        # or a run that ended wrong. A fix it makes is run again (_fix_not_run).
+                        with app.lock:
+                            app._start_problem_turn([types.SimpleNamespace(
+                                check="audit", variable=f"audit@{record.get('step')}", severity="critical",
+                                message=_closing_problem(record))], over=True)
                 idle_since = time.monotonic()
                 continue
             if idle_since is None:
