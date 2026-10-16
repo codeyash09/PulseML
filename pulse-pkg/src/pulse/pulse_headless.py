@@ -47,6 +47,10 @@ _GRACE_SECONDS = float(os.environ.get("PULSE_HEADLESS_GRACE", "20"))
 # what it printed, fixes it, and Pulse starts it again -- this many times in a row at most
 # (each one is a paid turn, and a script that never starts has nothing else to show).
 _STARTUP_FIXES = int(os.environ.get("PULSE_HEADLESS_STARTUP_FIXES", "5"))
+# runs started again on Pulse's own initiative (a fix no run used), and closing audits handed
+# to the agent, per supervisor: each one can be a whole training run
+_FORCED_RESTARTS = int(os.environ.get("PULSE_HEADLESS_FORCED_RESTARTS", "5"))
+_CLOSING_TURNS = int(os.environ.get("PULSE_HEADLESS_CLOSING_TURNS", "3"))
 # How long a question waits for an answer on the dashboard before it is declined.
 _ANSWER_SECONDS = float(os.environ.get("PULSE_HEADLESS_ANSWER_SECONDS", "900"))
 # terminal control sequences (colours, "clear to end of line"): not for a log file
@@ -289,11 +293,23 @@ class HeadlessApp(pulse_app.App):
 
     _debug_prompts = (pulse_app.UNATTENDED_DEBUG_PROMPT, pulse_app.UNATTENDED_DEBUG_PROMPT_NATIVE)
 
+    _hold_audits_when_over = True
+    _in_startup_fix = False
+    _forced_restarts = 0
+
     def _fix_not_run(self, over: bool, launched: bool, hosted: bool) -> None:
         # The run is over and the turn left its fix in no run: with nobody here to /restart,
         # the supervisor would see nothing left to do and stop, the fix never tried. A run
-        # still going is left to the agent's call (it may have meant to let it finish).
-        if over and launched:
+        # still going is left to the agent's call (it may have meant to let it finish); so is
+        # one it stopped itself. Not inside a startup fix, which starts the script itself (it
+        # went twice), and not without end: each one is a whole training run.
+        session_id = (self.session or {}).get("session_id")
+        if over and launched and not self._in_startup_fix and self._stopped_by_agent != session_id:
+            if self._forced_restarts >= _FORCED_RESTARTS:
+                self.write(f"== the change is in no run yet; Pulse has started the run again {_FORCED_RESTARTS} "
+                           "times on its own already, and leaves it there")
+                return
+            self._forced_restarts += 1
             name = os.path.basename((self.session or {}).get("script") or "the run")
             self.write(f"== the change is in no run yet and {name} is over: Pulse starts it again with the change")
             if self._restart() is None:
@@ -577,10 +593,14 @@ def _fix_startup(app: HeadlessApp, stopping: threading.Event) -> bool:
             before = (app.session or {}).get("session_id")
             files_before = _project_files(failure["cwd"])
             app._last_outcome = None
-            app._start(app._handle, request)
-            job = app._job
-            while job is not None and job.is_alive() and not stopping.is_set():
-                job.join(1.0)
+            app._in_startup_fix = True
+            try:
+                app._start(app._handle, request)
+                job = app._job
+                while job is not None and job.is_alive() and not stopping.is_set():
+                    job.join(1.0)
+            finally:
+                app._in_startup_fix = False
             if stopping.is_set():
                 return False
             if going(before):
@@ -606,6 +626,7 @@ def _fix_startup(app: HeadlessApp, stopping: threading.Event) -> bool:
 def _watch(app: HeadlessApp, stopping: threading.Event) -> int:
     idle_since: Optional[float] = None
     closing_audit_done: Optional[str] = None
+    closing_turns = 0
     starting = app.console is None
     while not stopping.is_set():
         with app.lock:
@@ -622,8 +643,12 @@ def _watch(app: HeadlessApp, stopping: threading.Event) -> int:
             if starting:
                 stopping.wait(1.0)
                 continue
+        else:
+            # a restart slow to report (data loading, a compile) lands among the slow starts:
+            # it is opened when it reports, and it is not "nothing left to do" meanwhile
+            app._open_slow_starts()
         busy = app._job is not None or app.view.busy or bool(app._crash_pending or app._problem_pending
-                                                             or app._remote_pending)
+                                                             or app._remote_pending or app._slow_starts)
         live = app._status in ("live", "stalled")
         now = time.monotonic()
         if live or busy:
@@ -634,7 +659,7 @@ def _watch(app: HeadlessApp, stopping: threading.Event) -> int:
             continue
         else:
             session_id = (app.session or {}).get("session_id")
-            if closing_audit_done != session_id and app.console is not None:
+            if closing_audit_done != session_id and app.console is not None and not stopping.is_set():
                 # the run is over and nothing is pending: one closing look, then stop
                 closing_audit_done = session_id
                 brain = app.console.brain
@@ -646,7 +671,9 @@ def _watch(app: HeadlessApp, stopping: threading.Event) -> int:
                     brain.finished = True
                     record = brain.audit()
                     app.console._report_audit(record)
-                    if _closing_problem(record) and (app.cli.agent_provider and app.cli.agent_key):
+                    if (_closing_problem(record) and app.cli.agent_provider and app.cli.agent_key
+                            and closing_turns < _CLOSING_TURNS and not stopping.is_set()):
+                        closing_turns += 1
                         # a run over is past the checks' reach (they act on live runs), and with
                         # nobody to read the finding the agent takes it on: a crash it did not fix,
                         # or a run that ended wrong. A fix it makes is run again (_fix_not_run).

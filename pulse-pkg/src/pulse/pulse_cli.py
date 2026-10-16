@@ -8944,12 +8944,16 @@ class PulseCLI:
     _DSML_INVOKE_RE = re.compile(
         r"<\s*[｜|]\s*DSML\s*[｜|]\s*invoke\s+name\s*=\s*\"([^\"]+)\"\s*>(.*?)<\s*/\s*[｜|]\s*DSML\s*[｜|]\s*invoke\s*>",
         re.DOTALL | re.IGNORECASE)
+    # a parameter is self-closing (`name="path" value="a.py"/>`) or wraps its value; the
+    # self-closing one used to run on to the next parameter's closing tag and swallow it
     _DSML_PARAM_RE = re.compile(
-        r"<\s*[｜|]\s*DSML\s*[｜|]\s*parameter\s+name\s*=\s*\"([^\"]+)\"(.*?)<\s*/\s*[｜|]\s*DSML\s*[｜|]\s*parameter\s*>",
+        r"<\s*[｜|]\s*DSML\s*[｜|]\s*parameter\s+name\s*=\s*\"([^\"]+)\""
+        r"([^<>]*/\s*>|.*?<\s*/\s*[｜|]\s*DSML\s*[｜|]\s*parameter\s*>)",
         re.DOTALL | re.IGNORECASE)
+    _DSML_PARAM_CLOSE_RE = re.compile(r"<\s*/\s*[｜|]\s*DSML\s*[｜|]\s*parameter\s*>\Z", re.IGNORECASE)
     _DSML_WRAPPER_RE = re.compile(r"^[ \t]*<\s*/?\s*[｜|]\s*DSML\s*[｜|]\s*(?:tool_calls|function_calls)\s*>[ \t]*$",
                                   re.MULTILINE | re.IGNORECASE)
-    _DSML_SHORT_RE = re.compile(r"^[ \t]*<\s*[｜|]\s*DSML\s*[｜|]\s*([A-Za-z_]+)\s*:\s*(.*?)\s*>[ \t]*$",
+    _DSML_SHORT_RE = re.compile(r"^[ \t]*<\s*[｜|]\s*DSML\s*[｜|]\s*([A-Za-z_]+)\s*:(.*)>[ \t]*$",
                                 re.MULTILINE)
 
     @classmethod
@@ -8970,15 +8974,18 @@ class PulseCLI:
             if name not in names:
                 return None
             arg = str(arg or "").strip()
-            if "\n" in arg and name in ("TERMINAL", "REPL", "CALC"):
-                return None          # a multi-line command cannot be one directive line; joining it would change it
-            arg = " ".join(arg.split())
+            if name in ("TERMINAL", "REPL", "CALC"):
+                if "\n" in arg:
+                    return None      # a multi-line command cannot be one directive line; joining it would change it
+            else:                    # a command keeps its spaces: echo 'a   b'
+                arg = " ".join(arg.split())
             return f"{name}: {arg}".rstrip() if arg else f"{name}:"
 
         def invoke(match: "re.Match") -> str:
             params: List[Tuple[str, str]] = []
             for pname, rest in cls._DSML_PARAM_RE.findall(match.group(2)):
-                value_at = re.search(r'value\s*=\s*"', rest)
+                rest = cls._DSML_PARAM_CLOSE_RE.sub("", rest)
+                value_at = re.search(r'value\s*=\s*"', rest.split(">", 1)[0])
                 if value_at:
                     value = rest[value_at.end():].split('"', 1)[0]
                 else:
@@ -9001,21 +9008,32 @@ class PulseCLI:
         text = cls._DSML_WRAPPER_RE.sub("", text)
         text = cls._DSML_SHORT_RE.sub(lambda m: directive(m.group(1), m.group(2)) or m.group(0), text)
 
-        out = []
+        out, fenced = [], False
         for raw in text.split("\n"):
             line = raw.strip()
+            if line.startswith("```"):
+                fenced = not fenced
+            if fenced or line.startswith("```"):
+                out.append(raw)                      # quoted code: never a request
+                continue
             fixed = None
-            # <NAME>arg</NAME>
-            m = re.fullmatch(r"<\s*([A-Za-z_]+)\s*>\s*(.*?)\s*<\s*/\s*\1\s*>", line)
-            if m:
-                fixed = directive(m.group(1), m.group(2))
-            if fixed is None:
-                # <NAME: arg>, <NAME:>, <NAME>, <NAME/>
-                m = re.fullmatch(r"<\s*([A-Za-z_]+)\s*(?::\s*(.*?))?\s*/?\s*>", line)
-                if m:
-                    fixed = directive(m.group(1), m.group(2) or "")
-            if fixed is None and line.upper() in cls._ARGLESS_DIRECTIVES and line.isupper():
-                fixed = f"{line}:"                   # RUNSTATUS alone on its line, no colon
+            # matched in steps, not one pattern: `\s*(.*?)\s*` side by side backtracked for
+            # minutes on a line with a long run of spaces
+            head = re.match(r"<\s*([A-Za-z_]+)\s*", line) if line.endswith(">") else None
+            if head:
+                rest = line[head.end():-1]
+                close = re.search(r"<\s*/\s*([A-Za-z_]+)\s*$", rest) if rest.startswith(">") else None
+                if close and close.group(1) == head.group(1):
+                    fixed = directive(head.group(1), rest[1:close.start()])         # <NAME>arg</NAME>
+                elif rest.startswith(":"):
+                    fixed = directive(head.group(1), rest[1:])                       # <NAME: arg>, <NAME:>
+                elif rest.strip() in ("", "/"):
+                    fixed = directive(head.group(1), "")                             # <NAME>, <NAME/>
+            if (fixed is None and raw.rstrip() == line and line.upper() in cls._ARGLESS_DIRECTIVES - {"STOP", "RESTART"}
+                    and line.isupper()):
+                # RUNSTATUS alone on its line, no colon; never STOP or RESTART -- a bare word in an
+                # indented block or a diff is not a request to end or restart the run
+                fixed = f"{line}:"
             if fixed is None:
                 # "<RUNSTATUS:" left open, the model writing on as if it had the result
                 m = re.fullmatch(r"<\s*([A-Z_]+)\s*:?", line)

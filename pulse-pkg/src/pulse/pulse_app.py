@@ -1267,6 +1267,7 @@ class App:
         if not _ui.confirm(f"The agent wants to stop {name}. Stop it?", default=False):
             return "The person did not allow stopping the run."
         self.console.send_control(stream.CONTROL_STOP, reason="asked by the agent")
+        self._stopped_by_agent = (self.session or {}).get("session_id")
         return f"Asked {name} to stop."
 
     def _agent_restart_run(self) -> str:
@@ -1282,6 +1283,11 @@ class App:
         if after and after != before:
             return (f"Restarted with the current code: the new run (session {after}) is open beside you. "
                     "run_status shows how it is doing -- check it before you call the fix done.")
+        pending = self._still_starting()
+        if pending:
+            return (f"Restarted with the current code: the new run (pid {pending[0]['process'].pid}) is starting "
+                    "and has not reported a training step yet; it opens here when it does. Do not restart it "
+                    "again -- wait, then check run_status.")
         return ("The restart did not produce a new run: the old one is still the open one, and the change is "
                 "in no run." + (self._start_failure_text() or " The lines above say what happened."))
 
@@ -2095,7 +2101,11 @@ class App:
         else:
             self._park()
         console = _make_console(self, session, self._brain_agent())
-        console.brain.hold_audits = lambda: self._job is not None      # not while the agent is at work
+        # not while the agent is at work; headless: not once the run is over either -- its
+        # supervisor makes the one closing look (a scheduled audit due then took the look, its
+        # problem dropped as about a run no longer live, and the closing one came back "busy")
+        console.brain.hold_audits = lambda: self._job is not None or (
+            self._hold_audits_when_over and self._status not in ("live", "stalled"))
         if carried is not None:
             fixes, audits = carried
             console.brain.fixes = [dict(f, before_restart=True) for f in fixes][-5:] + console.brain.fixes
@@ -2739,6 +2749,8 @@ class App:
             return
 
     _slow_at = 0.0
+    _hold_audits_when_over = False
+    _stopped_by_agent: Optional[str] = None       # the session the agent itself asked to stop
 
     def _restart(self) -> Optional[str]:
         """Stop the open run if it is still going, and start it again under Pulse with the
@@ -2746,6 +2758,13 @@ class App:
         opened this app (auto_track) with its arguments; a run started elsewhere only once it
         is over (its arguments are not known here). Returns why it refused, or None."""
         from . import pulse_stream as stream
+        pending = self._still_starting()
+        if pending:
+            # a second start beside one that has not reported yet: two runs on one set of files
+            why = (f"A start of {os.path.basename(pending[0]['argv'][0])} is already on its way (pid "
+                   f"{pending[0]['process'].pid}): it opens here once it reports its first training step.")
+            self.note(why)
+            return why
         session = self.session or {}
         info = self.launched.get(session.get("session_id", ""))
         hosted = self.hosting is not None and session.get("session_id") == getattr(self.hosting, "session_id", None)

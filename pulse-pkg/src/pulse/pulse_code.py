@@ -867,24 +867,43 @@ _RUN_ACTIONS = {"RUN": "start_run", "RUNSTATUS": "run_status", "RESTART": "resta
                 "WAIT": "wait"}             # WAIT: is served here, not by the app (see _service_run_directives)
 
 
-def _service_run_directives(answer):
+def _wait(seconds):
+    """Sleep in short slices: a cancel (an exception sent to this thread) lands only between
+    them -- one long sleep held Esc off for up to ten minutes."""
+    deadline = time.monotonic() + seconds
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(0.25, left))
+
+
+def _service_run_directives(answer, budget=None):
     """RUN: <script> [args] / RUNSTATUS: / RESTART: / STOP: -- run control, which the Pulse
-    app provides (it owns the runs on screen). Returns the notes for the model."""
+    app provides (it owns the runs on screen). Returns the notes for the model. `budget`
+    carries the WAIT seconds one answer may still spend (shared across its lines)."""
     found = _RUN_DIRECTIVE_RE.findall(PulseCLI.normalize_directives(answer or ""))
     if not found:
         return []
     host = _ui.host()
     actions = host.run_actions() if host is not None and hasattr(host, "run_actions") else {}
+    budget = budget if budget is not None else {"wait": _WAIT_MAX_SECONDS}
     notes = []
     for name, arg in found:
         if name == "WAIT":
+            if not actions:
+                notes.append("WAIT: only available inside the Pulse app, where there is a run to wait for.")
+                continue
             try:
                 seconds = max(0.0, min(_WAIT_MAX_SECONDS, float(str(arg).split()[0])))
             except (ValueError, IndexError):
                 notes.append("WAIT: needs a number of seconds, e.g. WAIT: 120")
                 continue
-            time.sleep(seconds)
-            notes.append(f"Waited {seconds:.0f} s.")
+            seconds = min(seconds, budget["wait"])  # ten WAIT: 600 lines were 100 minutes
+            budget["wait"] -= seconds
+            _wait(seconds)
+            notes.append(f"Waited {seconds:.0f} s." + ("" if budget["wait"] > 0 else
+                                                       f" (That is the {_WAIT_MAX_SECONDS:.0f} s one answer may wait.)"))
             continue
         action = actions.get(_RUN_ACTIONS[name])
         if action is None:
@@ -908,25 +927,32 @@ def _service(cli, answer):
     # In the order written, as far as two groups go: "TERMINAL: ... then RUNSTATUS:" ran the
     # status first, and the agent read a run 19 s old where it expected 30 s more.
     text = PulseCLI.normalize_directives(answer or "")
-    run_at = [m.start() for m in _RUN_DIRECTIVE_RE.finditer(text)]
-    tool_at = [m.start() for m in re.finditer(r"(?m)^[ \t]*([A-Z_]+):", text)
-               if m.group(1) in PulseCLI._directive_names() - set(_RUN_ACTIONS) - {"WAIT"}]
-    tools_first = bool(run_at and tool_at and min(tool_at) < min(run_at))
-
-    def tools():
-        host = _ui.host()
-        if host is not None and hasattr(host, "hush"):
-            with host.hush():
-                return cli._service_tool_requests(answer)
-        return cli._service_tool_requests(answer)
-
-    if tools_first:
-        tool_notes = tools()
-        notes = [tool_notes] + _service_run_directives(answer)
-    else:
-        notes = _service_run_directives(answer)
-        notes.append(tools())
+    if not _RUN_DIRECTIVE_RE.search(text):
+        return _service_tools(cli, answer)
+    # Line by line in the order written: the text between two run-control lines is served as
+    # one piece. Two groups (all tools, then all run control, or the other way) put a
+    # "TERMINAL: tail train.log" written after RESTART: and WAIT: before them whenever any
+    # tool line -- a MESSAGE: -- came first, and it read the old run's log.
+    notes, piece, budget = [], [], {"wait": _WAIT_MAX_SECONDS}
+    for line in text.splitlines(keepends=True):
+        if _RUN_DIRECTIVE_RE.match(line):
+            if "".join(piece).strip():
+                notes.append(_service_tools(cli, "".join(piece)))
+            piece = []
+            notes += _service_run_directives(line, budget)
+        else:
+            piece.append(line)
+    if "".join(piece).strip():
+        notes.append(_service_tools(cli, "".join(piece)))
     return "\n\n".join(n for n in notes if n)
+
+
+def _service_tools(cli, text):
+    host = _ui.host()
+    if host is not None and hasattr(host, "hush"):
+        with host.hush():
+            return cli._service_tool_requests(text)
+    return cli._service_tool_requests(text)
 
 
 def _tool_rounds(cli, answer, instruction):
@@ -1199,7 +1225,10 @@ def _run_turn_passes(cli, request):
         outcome, apply_summary = _confirm_and_apply(cli, request, plan, new_fix, new_changes)
         summary = f"{summary}\n\n{apply_summary}"
         if outcome != "applied":
-            return outcome, summary
+            # the step's own change is on disk whatever became of this revision (a no-op, a
+            # decline): the turn changed files, and saying "answered" skipped the restart of a
+            # fix no run uses
+            return "applied", summary
         fix, changes = new_fix, new_changes
 
     return outcome, summary
@@ -1334,7 +1363,10 @@ def _confirm_and_apply(cli, request, plan, fix, changes):
         if asking else None
     cli._reviewer_declined = ""
     if reviewed is False:
-        cli._reviewer_declined = getattr(cli, '_last_change_denial', '') or "declined"
+        denial = getattr(cli, '_last_change_denial', '') or "declined"
+        # a reviewer that could not answer has no objection to answer: retrying asks again
+        # into the same outage, three whole rounds of it
+        cli._reviewer_declined = "" if "could not answer" in denial else denial
         _ui.change_status("not applied", color=_YELLOW, final=True, terminal_text="[Pulse Code] Not applied.")
         return "declined", f"{plan}\n\n(Not applied: {getattr(cli, '_last_change_denial', '') or 'declined'}.)"
     if asking and reviewed is None:

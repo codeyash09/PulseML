@@ -427,6 +427,8 @@ class Monitor:
         there -- a `time.sleep` in the loop, a data loader the step waits on. Sent to the brain
         every WHERE_SECONDS; nothing is read from the training thread's variables for it."""
         if self._paused:
+            # a paused run's window starts over on resume: its seconds were counting the pause
+            self._where, self._where_samples, self._where_since = {}, 0, time.monotonic()
             return
         user = frame
         while user is not None and not _is_user_frame(user):

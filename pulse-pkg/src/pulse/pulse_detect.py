@@ -455,13 +455,14 @@ def _excursions(values: List[float], line: float) -> Tuple[int, float]:
     """How often `values` went over `line` and came back under it, counted from where they
     first settled under it (a loss starts high: its opening descent is not a bump), and the
     highest point of those bumps."""
-    count, highest, settled, above, peak = 0, 0.0, False, False, 0.0
+    low = float("-inf")                              # a loss can live below zero
+    count, highest, settled, above, peak = 0, low, False, False, low
     for value in values:
         if value <= line:
             if above:
                 count += 1
                 highest = max(highest, peak)
-            settled, above, peak = True, False, 0.0
+            settled, above, peak = True, False, low
         elif settled:
             above, peak = True, max(peak, value)
     return count, highest
@@ -1614,20 +1615,33 @@ class DetectionEngine:
             # it first settled under it, this is that tail, not a divergence -- unless it
             # goes far past every earlier bump (a learning rate that jumped 200x). A loss
             # that really blows up crosses the line for the first time, or goes far beyond.
-            heavy_tail = False
-            line = baseline * t["explosion_multiplier"] if baseline > 0 else None
-            if line is not None:
-                bumps, highest = _excursions(values[:-1], line)
-                heavy_tail = bumps >= 2 and latest <= 1.5 * highest
-            if ratio > t["explosion_multiplier"] and big_for_this_run and real_jump and not heavy_tail:
+            # The line a reading must cross: the multiple of the floor, or for a floor at or
+            # below zero the same jump the ratio above measures (it once had none there, and
+            # every hard batch on a loss that reaches 0 was CRITICAL).
+            if baseline > 0:
+                line = baseline * t["explosion_multiplier"]
+            else:
+                line = baseline + (t["explosion_multiplier"] - 1.0) * max(noise, abs(baseline), 1e-12)
+            bumps, highest = _excursions(values[:-1], line)
+            # Still over the line three readings running: the run has left its floor. Judged
+            # against the line alone -- the first spike inflates the recent spread, so asking
+            # the second reading to be "big for this run" again let a loss that jumped and
+            # stayed 11x up go on as a cleared WARNING.
+            # Each also well above the spread from before them, or ordinary noise on a floor near
+            # zero (where the line sits inside the noise) is "held".
+            before = values[-53:-3]
+            held = (len(before) >= 5 and all(v > line and v > _mean(before) + 4.0 * _stdev(before)
+                                             for v in values[-3:]))
+            heavy_tail = (bumps >= 2 and latest - baseline <= 1.5 * (highest - baseline)
+                          and not held)                  # a tail is single readings, not a stay
+            if ratio > t["explosion_multiplier"] and (big_for_this_run or held) and real_jump and not heavy_tail:
                 size = (f"{ratio:.1f}x its recent floor of {baseline:g}" if baseline > 0
                         else f"up {latest - baseline:g} from its recent floor of {baseline:g}")
                 # One reading over the line is one hard batch as often as a blow-up: a warning
                 # (an audit soon). Still over it at the next reading, the run has left its
                 # floor: critical (the finding is raised again, escalated). A single batch at
                 # "77x its floor" started the agent on a healthy run, and again on its restart.
-                held = len(values) >= 2 and line is not None and values[-2] > line
-                severity = CRITICAL if held or line is None else WARNING
+                severity = CRITICAL if held else WARNING
                 out.append(Finding("loss_spike", name, severity,
                                    f"{name} spiked to {latest:g}, {size}",
                                    step, {"latest": latest, "baseline": baseline},

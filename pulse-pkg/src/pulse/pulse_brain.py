@@ -90,19 +90,37 @@ _WAIT_FUNCTIONS = frozenset({
 _SLEEP_CALL_RE = re.compile(r"\bsleep\s*\(")
 
 
-def _bookkeeping(history: List[float]) -> Optional[str]:
+_SECRET_NAME_RE = re.compile(r"(?:^|[_.-])(?:secrets?|credentials?|auth|tokens?|keys?|passwords?|env)"
+                             r"(?:[_.-]|$)|service[_-]?account|kaggle", re.I)
+_SECRET_TEXT_RE = re.compile(r"private[_-]?key|api[_-]?key|client[_-]?secret|secret[_-]?key|"
+                             r"passw(?:or)?d[\"']?\s*[:=]|(?:access|auth|refresh|bearer)[_-]?token|"
+                             r"BEGIN [A-Z ]*PRIVATE KEY|\b(?:sk|rk)-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}", re.I)
+
+
+def _measures(name: str) -> bool:
+    """A name that says the value is something the run measures (a loss, a metric, a norm, a
+    learning rate, a score): drawn as a curve whatever its shape -- a loss frozen at 2.30259 or
+    a grad norm stuck at 0 is the finding, not bookkeeping."""
+    return any(check(name) for check in (detect.looks_like_loss, detect.looks_like_metric,
+                                         detect.looks_like_norm, detect.looks_like_lr,
+                                         detect.looks_like_score))
+
+
+def _bookkeeping(history: List[float], name: str = "") -> Optional[str]:
     """What a tracked value is when it is the loop's own bookkeeping rather than something the
     run measures, or None. Sampled from the loop's locals, a batch counter, a running sum that
     starts over each epoch and a time.time() stamp were drawn as curves beside the loss -- a
     third of an audit's evidence, saying nothing (seen from the model's seat)."""
-    if not history:
+    if not history or (name and _measures(name)):
         return None
     lo, hi = min(history), max(history)
-    if 1.0e9 <= lo and hi <= 2.2e9:
-        return "a timestamp"
-    if len(history) == 1 or lo == hi:
+    if 1.0e9 <= lo and hi <= 2.2e9 and all(b >= a for a, b in zip(history, history[1:])):
+        return "a timestamp"                         # never going back, in epoch seconds
+    if len(history) < 10:
+        return None                                # one reading is still a reading
+    if lo == hi:
         return f"constant {history[-1]:g}"
-    if len(history) < 10 or lo < 0:
+    if lo < 0:
         return None
     integral = all(float(v).is_integer() for v in history)
     if integral and all(b >= a for a, b in zip(history, history[1:])):
@@ -410,8 +428,10 @@ class Brain:
             self.schedule.bring_forward(MIN_INTERVAL_SECONDS,
                                         f"monitor reported {urgent[0].get('event')}")
         if raised:
-            self._raised_since_audit.extend(f"[{f.severity}] {f.check} on {f.variable}: {f.message}" for f in raised)
-            del self._raised_since_audit[:-12]
+            with self.state_lock:
+                self._raised_since_audit.extend(f"[{f.severity}] {f.check} on {f.variable}: {f.message}"
+                                                for f in raised)
+                del self._raised_since_audit[:-12]
             # once per (check, variable): a critical that clears and comes back (a false
             # "not learning" did, all run long) pulled an audit every minute, whatever
             # interval the last audit had chosen
@@ -645,7 +665,7 @@ class Brain:
             # test score. Leaving it out hid it from the audit while /vars showed it.
             if not history:
                 continue
-            kind = _bookkeeping(history)
+            kind = _bookkeeping(history, name)
             if kind is not None:
                 curves[name] = {"points": len(history), "last": history[-1], "first": history[0],
                                 "min": min(history), "max": max(history), "bookkeeping": kind}
@@ -696,10 +716,17 @@ class Brain:
         folder = os.path.dirname(path)
         # The project's own modules the script imports (data.py, model.py beside it): the bug can
         # live there, and the audit has no tool to open them. Small ones, a few.
-        for module in sorted(set(re.findall(r"^\s*(?:from|import)\s+([A-Za-z_]\w*)", text, re.M)))[:4]:
+        # Filtered to the project's own before the cut: cut first, `import argparse, json, math,
+        # numpy` took the four places and model.py was never shown.
+        names = set(re.findall(r"^\s*from\s+\.?([A-Za-z_]\w*)", text, re.M))
+        for group in re.findall(r"^\s*import\s+([\w., \t]+)", text, re.M):
+            names.update(part.split()[0].split(".")[0] for part in group.split(",") if part.split())
+        own = [m for m in sorted(names) if os.path.isfile(os.path.join(folder, f"{m}.py"))
+               and os.path.join(folder, f"{m}.py") != path]
+        for module in own[:4]:
             candidate = os.path.join(folder, f"{module}.py")
             try:
-                if os.path.isfile(candidate) and os.path.getsize(candidate) <= 12000:
+                if os.path.getsize(candidate) <= 12000:
                     with open(candidate, "r", encoding="utf-8", errors="replace") as handle:
                         body = handle.read().splitlines()
                     out += f"\n\n{module}.py (imported by the script):\n" + "\n".join(
@@ -708,12 +735,20 @@ class Brain:
                 continue
         # The small config files the script names (config.json, params.yaml): CONFIG["epochs"]
         # read in the code says nothing without them, and the audit had no tool to look.
-        for name in sorted(set(re.findall(r"[\w.-]+\.(?:json|ya?ml|toml|ini|cfg)\b", text)))[:4]:
+        # Never a file that holds credentials: a service-account json or a kaggle.json is named
+        # in a script as plainly as config.json, and would go to the model provider unasked.
+        configs = [n for n in sorted(set(re.findall(r"[\w.-]+\.(?:json|ya?ml|toml|ini|cfg)\b", text)))
+                   if not _SECRET_NAME_RE.search(n) and os.path.isfile(os.path.join(folder, n))]
+        for name in configs[:4]:
             candidate = os.path.join(folder, name)
             try:
-                if os.path.isfile(candidate) and os.path.getsize(candidate) <= 4000:
+                if os.path.getsize(candidate) <= 4000:
                     with open(candidate, "r", encoding="utf-8", errors="replace") as handle:
-                        out += f"\n\n{name} (read by the script):\n" + handle.read().rstrip()
+                        body = handle.read().rstrip()
+                    if _SECRET_TEXT_RE.search(body):
+                        out += f"\n\n{name} (read by the script): not shown -- it looks like it holds credentials."
+                    else:
+                        out += f"\n\n{name} (read by the script):\n" + body
             except OSError:
                 continue
         return out
@@ -801,8 +836,13 @@ class Brain:
             out.append("\nFixes already applied this run:")
             for fix in fixes:
                 out.append(f"  step {fix.get('step')}: {fix.get('summary')}")
-        active = {f"[{f['severity']}] {f['check']} on {f['variable']}: {f['message']}" for f in findings}
-        since = [m for m in dict.fromkeys(pack.get("raised_since_audit") or []) if m not in active]
+        # by check and variable: a finding still active has a message that keeps changing ("over
+        # N readings", "spiked to X"), and was listed again as "no longer active"
+        def which(entry: str) -> str:
+            return entry.split("] ", 1)[-1].split(": ", 1)[0]
+        active = {f"{f['check']} on {f['variable']}" for f in findings}
+        latest = {which(m): m for m in pack.get("raised_since_audit") or []}
+        since = [m for key, m in latest.items() if key not in active]
         if since:
             out.append("\nAlso raised by the checks since the last look, and no longer active:")
             out.extend(f"  {m}" for m in since)
@@ -840,7 +880,7 @@ class Brain:
 
     def _audit(self, include_code: bool) -> Dict[str, Any]:
         pack = self.evidence(include_code=include_code)
-        self._raised_since_audit = []                  # the next look is told what comes after this one
+        shown = set(pack.get("raised_since_audit") or [])
         prompt = AUDIT_PROMPT.format(evidence=self.render_evidence(pack),
                                      min_minutes=MIN_INTERVAL_SECONDS / 60.0,
                                      max_minutes=MAX_INTERVAL_SECONDS / 60.0)
@@ -860,6 +900,8 @@ class Brain:
             return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
         decision = parse_decision(answer)
         with self.state_lock:
+            # the next look is told what comes after this one; a look that failed told nobody
+            self._raised_since_audit = [m for m in self._raised_since_audit if m not in shown]
             record = dict(decision, t=time.time(), step=self.step, text=answer)
             self.audits.append(record)
             del self.audits[:-20]

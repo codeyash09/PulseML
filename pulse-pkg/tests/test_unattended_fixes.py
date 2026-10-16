@@ -655,7 +655,7 @@ def test_directives_run_in_the_order_written_and_wait_waits(monkeypatch):
     monkeypatch.setattr(ui, "host", lambda: host)
     cli = types.SimpleNamespace(_service_tool_requests=lambda answer: order.append("terminal") or "t")
     slept = []
-    monkeypatch.setattr(pulse_code.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(pulse_code, "_wait", lambda s: slept.append(s))
     pulse_code._service(cli, "TERMINAL: sleep 30\nRUNSTATUS:\n")
     assert order == ["terminal", "status"]
     order.clear()
@@ -793,3 +793,284 @@ def test_headless_hands_over_a_problem_with_a_run_that_ended(tmp_path):
     log.close()
     assert started and started[0].startswith("train.py has ended (finished).")
     assert "epochs=0" in (tmp_path / "log").read_text()
+
+
+# ---------------------------------------------------------------- bug hunt (2026-10-15)
+
+def test_a_loss_that_reaches_zero_gets_the_same_one_batch_rule():
+    # a floor of exactly 0 had no line: every hard batch was CRITICAL and started the agent
+    import random
+    rng = random.Random(6)
+    values = [max(0.0, 1.0 - i / 30) for i in range(40)]
+    values += [0.5 * rng.random() if rng.random() < 0.03 else 0.0 for _ in range(560)]
+    assert not [f for f in _spikes(_engine(), values) if f.severity == detect.CRITICAL]
+
+
+@pytest.mark.parametrize("level", [11.0, 25.0])
+def test_a_loss_that_jumps_and_stays_up_becomes_critical(level):
+    # the first spike inflated the spread the second reading was measured against: an 11x
+    # jump that held went on as a WARNING, then cleared
+    values = [1.0 + 0.01 * (i % 5) for i in range(100)] + [40.0] + [level + 0.1 * (i % 3) for i in range(20)]
+    assert any(f.severity == detect.CRITICAL for f in _spikes(_engine(), values))
+
+
+def test_a_divergence_to_the_height_of_earlier_bumps_is_not_taken_for_the_tail():
+    values = [2.0 * 0.9 ** i + 0.01 for i in range(100)]
+    values[60], values[80] = 0.5, 0.6
+    values += [0.55 + 0.01 * (i % 4) for i in range(30)]
+    assert any(f.severity == detect.CRITICAL for f in _spikes(_engine(), values))
+
+
+@pytest.mark.parametrize("name, history", [
+    ("train_loss", [2.302585] * 50),                 # frozen: the finding itself
+    ("grad_norm", [0.0] * 30),
+    ("val_loss", [0.53]),                            # one reading is a reading
+    ("mse", [1.5e9 - 1e6 * i for i in range(30)]),   # an unnormalised MSE is not a timestamp
+    ("val_acc", ([0.1 * i for i in range(10)] + [0.0]) * 3),
+])
+def test_a_measured_value_is_never_folded_away_as_bookkeeping(name, history):
+    assert brain._bookkeeping(history, name) is None
+
+
+def test_loop_counters_are_still_bookkeeping():
+    assert brain._bookkeeping(list(range(30)), "i")
+    assert brain._bookkeeping([1.79e9 + i for i in range(30)], "t0") == "a timestamp"
+    assert brain._bookkeeping([64] * 30, "bs") == "constant 64"
+
+
+def _script_brain(tmp_path, text, files):
+    for name, body in files.items():
+        (tmp_path / name).write_text(body)
+    (tmp_path / "train.py").write_text(text)
+    b = brain.Brain.__new__(brain.Brain)
+    b.session = {"script": str(tmp_path / "train.py")}
+    return b._read_script()
+
+
+def test_a_credentials_file_the_script_names_is_never_sent(tmp_path):
+    out = _script_brain(tmp_path, 'c = Client.from_service_account_json("service_account.json")\n'
+                                  'cfg = json.load(open("config.json"))\nk = json.load(open("kaggle.json"))\n'
+                                  'o = json.load(open("other.json"))\n',
+                        {"service_account.json": '{"private_key": "-----BEGIN PRIVATE KEY-----x"}',
+                         "kaggle.json": '{"username": "u", "key": "abc"}',
+                         "other.json": '{"api_key": "abc"}', "config.json": '{"lr": 0.1, "max_tokens": 5}'})
+    assert "BEGIN PRIVATE" not in out and '"key": "abc"' not in out and '"api_key"' not in out
+    assert '"lr": 0.1' in out and "other.json (read by the script): not shown" in out
+
+
+def test_the_projects_own_modules_are_found_past_the_standard_library(tmp_path):
+    out = _script_brain(tmp_path, "import argparse, json, math\nimport numpy\nimport torch\nimport dataset\n"
+                                  "from model import Net\nfrom .utils import x\n",
+                        {"dataset.py": "D = 1\n", "model.py": "class Net: pass\n", "utils.py": "x = 2\n"})
+    assert "dataset.py (imported" in out and "model.py (imported" in out and "utils.py (imported" in out
+
+
+def test_a_finding_still_active_is_not_listed_as_gone():
+    pack = {"findings": [{"severity": "critical", "check": "never_learned", "variable": "loss",
+                          "message": "no better over 40 readings"}],
+            "raised_since_audit": ["[warning] never_learned on loss: no better over 16 readings",
+                                   "[critical] never_learned on loss: no better over 30 readings",
+                                   "[warning] loss_spike on loss: spiked to 3"]}
+    text = brain.Brain.render_evidence(pack)
+    gone = text.split("no longer active:", 1)[1].split("\n\n")[0]
+    assert "loss_spike" in gone and "never_learned" not in gone
+
+
+def test_a_message_first_does_not_pull_later_tools_ahead_of_a_restart(monkeypatch):
+    from pulse import pulse_code
+    from pulse import pulse_ui as ui
+    order = []
+    host = types.SimpleNamespace(run_actions=lambda: {"restart_run": lambda: order.append("restart") or "r",
+                                                      "run_status": lambda: order.append("status") or "s"})
+    monkeypatch.setattr(ui, "host", lambda: host)
+    monkeypatch.setattr(pulse_code, "_wait", lambda s: order.append(f"wait {s:g}"))
+    cli = types.SimpleNamespace(_service_tool_requests=lambda text: order.append(text.strip().split(":")[0]) or "")
+    pulse_code._service(cli, "MESSAGE: restarting with the fix\nRESTART:\nWAIT: 90\nRUNSTATUS:\n"
+                             "TERMINAL: tail -n 20 train.log\n")
+    assert order == ["MESSAGE", "restart", "wait 90", "status", "TERMINAL"]
+
+
+def test_waits_in_one_answer_share_one_cap(monkeypatch):
+    from pulse import pulse_code
+    from pulse import pulse_ui as ui
+    monkeypatch.setattr(ui, "host", lambda: types.SimpleNamespace(run_actions=lambda: {"run_status": lambda: ""}))
+    slept = []
+    monkeypatch.setattr(pulse_code, "_wait", slept.append)
+    pulse_code._service(types.SimpleNamespace(_service_tool_requests=lambda t: ""), "WAIT: 600\n" * 10)
+    assert sum(slept) == pulse_code._WAIT_MAX_SECONDS
+
+
+def test_wait_outside_the_app_does_not_sleep(monkeypatch):
+    from pulse import pulse_code
+    from pulse import pulse_ui as ui
+    monkeypatch.setattr(ui, "host", lambda: None)
+    monkeypatch.setattr(pulse_code, "_wait", lambda s: pytest.fail("slept with no run to wait for"))
+    assert "only available inside" in pulse_code._service_run_directives("WAIT: 60\n")[0]
+
+
+def test_the_sliced_wait_waits():
+    from pulse import pulse_code
+    started = time.monotonic()
+    pulse_code._wait(0.3)
+    assert 0.29 <= time.monotonic() - started < 1.0
+
+
+@pytest.mark.parametrize("text", ["<VIEW:" + " " * 3000 + "x", "<a>" + " " * 5000 + "x",
+                                  "<VIEW: a" + " " * 3000 + "b"])
+def test_directive_markup_with_long_runs_of_spaces_is_fast(text):
+    started = time.monotonic()
+    pulse_cli.PulseCLI.normalize_directives(text)
+    assert time.monotonic() - started < 0.5
+
+
+def test_restart_or_stop_in_quoted_code_is_not_a_request():
+    text = "Here is the loop:\n```python\nif loss < 0:\n    RESTART\n```\n<VIEW: train.py>\n    STOP\n"
+    out = pulse_cli.PulseCLI.normalize_directives(text)
+    assert "RESTART:" not in out and "STOP:" not in out and "VIEW: train.py" in out
+    assert pulse_cli.PulseCLI.normalize_directives("<x>\nRUNSTATUS\n").splitlines()[1] == "RUNSTATUS:"
+
+
+def test_markup_keeps_a_commands_spaces_and_a_trailing_slash():
+    out = pulse_cli.PulseCLI.normalize_directives("<TERMINAL: echo 'a   b'>\n<TERMINAL: ls build/>")
+    assert "TERMINAL: echo 'a   b'" in out and "TERMINAL: ls build/" in out
+
+
+def test_a_self_closing_dsml_parameter_does_not_swallow_the_next():
+    text = ('<｜DSML｜invoke name="VIEW"><｜DSML｜parameter name="path" value="a.py"/>'
+            '<｜DSML｜parameter name="range">1-5</｜DSML｜parameter></｜DSML｜invoke>')
+    assert "VIEW: a.py:1-5" in pulse_cli.PulseCLI.normalize_directives(text)
+
+
+def test_a_reviewer_that_could_not_answer_is_not_argued_with(monkeypatch):
+    from pulse import pulse_code
+    cli = types.SimpleNamespace(review=True, _always_apply_changes=False, _label_for_path={}, _project_root="/p",
+                                _last_change_denial="the auto-mode reviewer could not answer and there is no user to ask",
+                                _review_change_with_approver=lambda *a: False)
+    monkeypatch.setattr(pulse_code, "render_diff", lambda *a: "diff")
+    outcome, _ = pulse_code._confirm_and_apply(cli, "fix", "plan", {}, {"/p/a.py": ("a", "b", False)})
+    assert outcome == "declined" and cli._reviewer_declined == ""
+
+
+# ---------------------------------------------------------------- headless restarts (bug hunt)
+
+class _Proc:
+    def __init__(self, code=None):
+        self.code, self.pid = code, 999999
+
+    def poll(self):
+        return self.code
+
+
+def _watched(tmp_path, cli=None):
+    app, log = _headless(tmp_path, cli or AgentCli())
+    app._refresh_side = lambda force=False: None
+    app._evidence = lambda: "evidence"
+    return app, log
+
+
+def test_a_restart_slow_to_report_is_waited_for_not_left(tmp_path, monkeypatch):
+    # was: the over run stayed open, the restart sat among the slow starts unlooked-at, and the
+    # supervisor said "nothing is left to do" and left the new process unwatched
+    monkeypatch.setattr(headless, "_GRACE_SECONDS", 0.3)
+    app, log = _watched(tmp_path, FakeCli())
+    app.console = types.SimpleNamespace(brain=types.SimpleNamespace(agent=None))
+    app.session, app._status = {"session_id": "S1", "script": str(tmp_path / "train.py")}, "finished"
+    app._slow_starts.append({"process": _Proc(None), "argv": ["x"], "cwd": str(tmp_path), "log": "l",
+                             "started": time.time(), "replace": True})
+    looked = []
+    app._open_slow_starts = lambda: looked.append(1)
+    stopping = threading.Event()
+    threading.Timer(1.5, stopping.set).start()
+    headless._watch(app, stopping)
+    log.close()
+    assert looked and "nothing is left to do" not in (tmp_path / "log").read_text()
+
+
+def test_no_second_start_while_a_restart_is_on_its_way(tmp_path, monkeypatch):
+    app, log = _watched(tmp_path)
+    app.console = types.SimpleNamespace(brain=types.SimpleNamespace(agent=None, note_fix=lambda s: None),
+                                        workdir=str(tmp_path))
+    app.session, app._status = {"session_id": "S1", "script": str(tmp_path / "train.py")}, "crashed"
+    app.launched["S1"] = {"process": _Proc(1), "argv": [str(tmp_path / "train.py")], "cwd": str(tmp_path), "log": "l"}
+    started, said = [], []
+
+    def slow_launch(arg, replace=None):              # no session within 45 s
+        started.append(_Proc(None))
+        app._slow_starts.append({"process": started[-1], "argv": ["t"], "cwd": str(tmp_path), "log": "l",
+                                 "started": time.time(), "replace": True})
+    app._launch = slow_launch
+    from pulse import pulse_code
+    monkeypatch.setattr(pulse_code, "run_turn",
+                        lambda cli, line, evidence=None: said.append(app._agent_restart_run()) or "applied")
+    app._handle("why did it crash", about_run=True)
+    log.close()
+    assert len(started) == 1 and "is starting" in said[0] and "no run" not in said[0]
+
+
+def test_a_startup_fix_launches_once_per_turn(tmp_path, monkeypatch):
+    app, log = _watched(tmp_path)
+    app.console = types.SimpleNamespace(brain=types.SimpleNamespace(agent=None, note_fix=lambda s: None),
+                                        workdir=str(tmp_path))
+    app.session, app._status = {"session_id": "S1", "script": str(tmp_path / "train.py")}, "finished"
+    app.launched["S1"] = {"process": _Proc(1), "argv": [str(tmp_path / "train.py")], "cwd": str(tmp_path), "log": "l"}
+    fail = {"script": str(tmp_path / "train.py"), "code": 1, "log": str(tmp_path / "nolog"),
+            "argv": [str(tmp_path / "train.py")], "cwd": str(tmp_path)}
+    app._start_failure, launches = dict(fail), []
+
+    def launch(arg, replace=None):
+        launches.append(1)
+        app._start_failure = dict(fail)              # dies before its first step again
+    app._launch = launch
+    from pulse import pulse_code
+    monkeypatch.setattr(pulse_code, "run_turn", lambda cli, line, evidence=None: "applied")
+    monkeypatch.setattr(headless, "_STARTUP_FIXES", 1)
+    assert not headless._fix_startup(app, threading.Event())
+    log.close()
+    assert len(launches) == 1
+
+
+def test_closing_audit_turns_are_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(headless, "_GRACE_SECONDS", 0.3)
+    app, log = _watched(tmp_path)
+    record = {"status": "problem", "risk": "medium", "findings": ["loss plateaued"], "step": 100}
+    n = {"sid": 0, "turns": 0}
+
+    def new_run():
+        n["sid"] += 1
+        brain_ = types.SimpleNamespace(agent=object(), finished=False, audit=lambda: dict(record))
+        app.console = types.SimpleNamespace(brain=brain_, _report_audit=lambda r: None)
+        app.session, app._status = {"session_id": f"S{n['sid']}", "script": "train.py"}, "finished"
+
+    def turn(findings, over=False):
+        n["turns"] += 1
+        new_run()                                    # the fix is run again
+    app._start_problem_turn = turn
+    new_run()
+    stopping = threading.Event()
+    threading.Timer(20, stopping.set).start()
+    headless._watch(app, stopping)
+    log.close()
+    assert n["turns"] == headless._CLOSING_TURNS
+
+
+def test_a_run_the_agent_stopped_is_not_started_again(tmp_path):
+    app, log = _watched(tmp_path)
+    restarted = []
+    app._restart = lambda: restarted.append(1)
+    app.session = {"script": "/p/train.py", "session_id": "s1"}
+    app._stopped_by_agent = "s1"
+    app._fix_not_run(over=True, launched=True, hosted=False)
+    log.close()
+    assert not restarted
+
+
+def test_forced_restarts_are_bounded(tmp_path):
+    app, log = _watched(tmp_path)
+    restarted = []
+    app._restart = lambda: restarted.append(1)
+    for i in range(10):
+        app.session = {"script": "/p/train.py", "session_id": f"s{i}"}
+        app._fix_not_run(over=True, launched=True, hosted=False)
+    log.close()
+    assert len(restarted) == headless._FORCED_RESTARTS
+
