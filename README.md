@@ -10,60 +10,88 @@
 
 ## Installation
 
-Pulse is available on PyPI.
+Pulse is published on [PyPI](https://pypi.org/project/pulseml/). Install it into the same
+Python environment that you use for your training code. A virtual environment keeps its
+dependencies separate from other projects.
 
 ### Requirements
 
-- Python 3.9+
-- A supported backend: NumPy, PyTorch, TensorFlow, CuPy, or JAX
-- A model for the AI debugging agent: sign in to OpenRouter from Pulse (no key to handle, free models available), or bring an API key for any supported provider
+- Python 3.9 or newer.
+- `pip` (included with current Python installations).
+- Your training framework, if you use one. Pulse installs NumPy and its own runtime
+  dependencies; it does not require PyTorch, TensorFlow, CuPy, or JAX. Install the
+  framework and accelerator build that your project needs in this same environment.
+- An AI provider is optional for monitoring. Pulse's AI agent setup can sign you in with
+  OpenRouter or use a provider API key.
 
-### Install
+### 1. Create and activate an environment
 
-```bash
-pip install pulseml
+Run these commands from your project directory.
+
+**Windows — PowerShell:**
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
 ```
 
-### Verify
+If PowerShell activation is blocked by your execution policy, use Command Prompt instead:
 
-```bash
-python -c "import pulse; print('Pulse installed successfully')"
+```bat
+py -3 -m venv .venv
+.venv\Scripts\activate.bat
 ```
 
-### Start Pulse
+Or skip activation and use `.venv\Scripts\python.exe` in place of `python` in the
+remaining commands.
 
-Use 
+**macOS / Linux:**
 
 ```bash
-python3 -m pulse
+python3 -m venv .venv
+source .venv/bin/activate
 ```
 
-or 
+### 2. Install Pulse
 
-Permanently make it so only the pulse command is needed:
-```bash
-export PATH="$PATH:$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))')"
-pulse
+With the environment activated:
+
+```text
+python -m pip install --upgrade pip
+python -m pip install pulseml
 ```
 
-and for future uses after
-```bash
-pulse
+Using `python -m pip` ensures Pulse is installed for the Python interpreter selected by
+the active environment. If you already have a project environment, activate it and run
+the second command there instead of creating a new one.
+
+### 3. Verify and launch
+
+```text
+python -m pulse --version
+python -m pulse --help
 ```
 
+`python -m pulse` works on Windows, macOS, and Linux, including when the environment's
+Scripts directory is not on `PATH`. When the environment is activated, the shorter
+`pulse` command is available too.
 
+To open Pulse, run:
 
-which will take you to the Pulse setup page
+```text
+python -m pulse
+```
 
-Or put Pulse in the script itself -- `from pulse import auto_track; auto_track()` before
-the training loop -- and run the script as you always do. In a terminal, Pulse opens as
-the same full-screen app on that very run (see [The Pulse app](#the-pulse-app)): the
-run's state on the left with your script's own output under it, the agent on the right,
-and the script goes on exactly as it would have. Leaving the app (Ctrl+C
-twice) gives you the terminal back while the training continues; when the script ends,
-the app stays until you leave it. Without a terminal (a notebook, `nohup`, a log file)
-Pulse keeps its line-by-line mode, and `auto_track(mode="cli")` or `PULSE_MODE=cli` asks
-for that mode anywhere.
+To start a training script under Pulse:
+
+```text
+python -m pulse run --stream train.py
+```
+
+Replace `train.py` with your script path and put any script arguments after it. Pulse
+launches the existing script with the active environment's Python; no source-code edits
+are needed. `--stream` lets you watch the run from another terminal. See
+[The `pulse` command](#the-pulse-command) for more run and attach options.
 
 ### AI provider configuration
 
@@ -79,7 +107,7 @@ pulse openrouter            # sign in, or create an account, in your browser
 ```
 
 or just press Enter at any API key question. Pulse asks for a key in `pulse run`,
-`auto_track()`, `pulse code` and when you switch agents, and every one of those offers the
+`pulse code` and when you switch agents, and every one of those offers the
 sign-in: for an OpenRouter model Enter starts it directly, and for any other provider Enter
 offers to sign you in and switch to an OpenRouter model. The dashboard asks the same thing
 in a dialog, and `pulse --model openrouter/<model>` offers it when there is no key.
@@ -172,57 +200,6 @@ Pulse gives the debugging agent access to that evidence instead of requiring it 
 
 ---
 
-## Benchmark
-
-Two different questions get measured separately: whether the agent can *repair* a fault,
-and whether the detectors *notice* one. This section is the first. For the second —
-94 failure families as difficulty ladders, what holds and what does not, and the five
-faults that are still invisible — see
-[docs/detection-benchmark.md](docs/detection-benchmark.md).
-
-Pulse was evaluated against Claude Code on a **28-case ML debugging benchmark** designed to test whether an AI coding agent could identify and repair injected ML faults.
-
-### Results
-
-| Agent | Model | Score |
-|---|---|---:|
-| **Pulse** | Gemini 3.5 Flash Lite | **15 / 28** |
-| **Claude Code** | Opus 5 | **18 / 28** |
-
-Pulse achieved **15/28**, compared with **18/28** for Claude Code.
-
-The benchmark was particularly informative because the task was not simply to generate code that ran. The agent needed to identify the injected mutation, determine whether it was actually responsible for the observed behavior, and apply the necessary correction.
-
-### What the benchmark exposed
-
-Pulse's largest weakness was **diagnostic precision**.
-
-In difficult cases, Pulse could recognize that something was wrong but fail to consistently:
-
-1. identify the exact mutation responsible for the failure;
-2. isolate the smallest relevant code region;
-3. distinguish the root cause from surrounding symptoms; or
-4. apply only the necessary fix instead of proposing a broader change.
-
-This matters because ML debugging is different from generic code generation.
-
-A debugger should not rewrite a training system simply because it can. It should be able to identify the specific value, argument, operation, or line responsible for the failure and make the smallest correct change.
-
-### How the benchmark changed Pulse
-
-The benchmark directly motivated upgrades to the debugging pipeline:
-
-- **Expanded `mllint`** with additional deterministic ML-specific checks.
-- **Minimal-fix-first behavior**, prioritizing single-line or small adjacent-line fixes before refactors.
-- **Whitespace-tolerant patch matching**, preventing valid fixes from being rejected because of formatting differences.
-- **Retry-on-mismatch patching**, allowing the agent to re-quote the exact current code when a proposed patch does not match.
-- **Stronger verification**, checking both logical correctness and whether the scope of the patch is unnecessarily broad.
-- **More agentic debugging workflows**, reducing the amount of manual investigation the underlying model has to perform.
-
-The benchmark is not presented as proof that Pulse is already better than general-purpose coding agents. It provides a measurable baseline, exposes a concrete failure mode, and gives Pulse a data-driven direction for improvement.
-
----
-
 ## Two processes: the monitor and the brain
 
 Pulse used to be one process. The tracker, the detectors and the AI agent all ran on the
@@ -239,18 +216,15 @@ pulse_monitor.Monitor      ---stream--->  pulse_brain.Brain
   never blocks, never thinks                thinks as long as it likes
 ```
 
-Start it from the training side:
+Start the script through Pulse; no source changes are needed:
 
-```python
-from pulse import auto_track
-auto_track(mode="stream")
+```text
+python -m pulse run --stream train.py
 ```
 
-(`auto_track()` with no mode, in a terminal, is this monitor plus the Pulse app opened on
-the run in the same terminal -- the brain then runs beside the app.) Watch a stream from
-anywhere else:
+The run streams metrics to a separate brain process. To open that process explicitly:
 
-```bash
+```text
 python -m pulse.brain                      # newest session
 python -m pulse.brain <session-dir> --model openrouter/deepseek/deepseek-v4.1-flash
 python -m pulse.brain <session-dir> --once # one pass over a finished run
@@ -473,7 +447,7 @@ validation; no experiment automatically changes the watched training process or 
 Configure a runner and its measurable failure signature, then use `/experiment
 experiments/spec.json`. The framework-neutral runner consumes JSON model configs and
 `PULSE_METRICS:` JSON output; details, limitations, and a complete example are in
-[the parallel experiments guide](docs/parallel-experiments.md).
+[the parallel experiments guide](../docs/parallel-experiments.md).
 
 ### Minimal Fixes by Default
 
@@ -498,6 +472,75 @@ With:
 ```
 
 Pulse can pause training when configured detection logic identifies serious numerical or training problems, allowing the debugging agent to investigate before additional compute is wasted.
+
+### Rate limits, and fixes that keep failing
+
+**Rate limits are waited out, not retried three times.** When the provider answers "slow down",
+Pulse waits as long as the provider asked (the `Retry-After` header, or the "retry in 34s" in
+the message), or, if it did not say, 5s, 10s, 20s... with jitter. A request waits up to
+10 minutes in total; `PULSE_RATE_LIMIT_WAIT=<seconds>` changes that, and `0` fails at once. An
+error that waiting cannot fix (no credit left, an exhausted plan) is reported immediately
+instead.
+
+If the limit outlasts the wait, the outcome is the same wherever it happened: the request is
+parked and asked again in the background, nothing is applied half-way, and training carries on.
+While a run is paused on the agent, the wait is capped at 90 seconds so the GPUs are not left
+idle.
+
+**A fix that keeps failing is never rolled back for you.** When a fix's re-run crashes, the
+failure is handed back to the agent to repair, up to 5 times (`PULSE_MAX_RESTART_ATTEMPTS`).
+If it still fails, Pulse stops and says so: the latest fix stays on disk, the report lists the
+changes that attempt made, and `/revert <id>` (or `/log` to look first) undoes them if you want
+that. If the agent cannot be reached during the repair, the re-run is not retried with the same
+broken code and no attempt is used up; the repair request is parked and retried.
+
+### Shapes and smoke tests
+
+`pulse code` checks its own work instead of guessing:
+
+- **`check_shape`** runs a short snippet in your project and reports the real shape, dtype and
+  device of the values you name, and checks them against specs. `(B, 10)` means "10 in the
+  last dimension, any batch size, but the same B everywhere"; `*` is any size and `...` any
+  number of dimensions. Values are described even when the snippet fails part-way, and
+  well-known shape errors come with what they mean ("a Linear built for 256 features received
+  784"). With torch imported, every layer's input and output shapes are traced, so a mismatch
+  names the layer that received the wrong shape.
+- **`smoke_test`** runs after edits, in three stages that stop at the first failure: a compile
+  and undefined-name check of the changed files; a tiny probe (a few lines that build the
+  changed model or pipeline on a batch of 2-4 and run it once); and your project's own pytest
+  or unittest suite. A snippet that deletes files or reaches outside the project asks you first,
+  exactly like `run_command`.
+
+The same check is available in your own training code:
+
+```python
+import pulse
+
+pulse.check_shape(logits, "(B, 10)")
+pulse.check_shapes({"x": (x, "(B, 784)"), "y": (y, "(B,)")})   # one B for both
+pulse.check_shape(x, "(B, 3, 224, 224)", raise_on_mismatch=True)
+```
+
+### Multi-step task outlines
+
+For requests with several steps, Pulse Code creates a recursive task outline before editing:
+phases can contain subtasks, and subtasks can contain further subtasks at any depth. The
+outline tracks concrete leaf actions, including verification; parent status follows its
+children, and only one unfinished leaf can be active at a time. Pulse Code updates the
+outline as it completes each leaf. An unfinished outline keeps the turn open until all leaf
+work is complete or the turn reaches its safety limit.
+
+### Evidence-gated bug fixes
+
+For bug and failure fixes, Pulse Code records outputs from its inspection and execution tools.
+Before any code write, a separate evidence review must cite exact excerpts from at least three
+distinct tool results, include source inspection and a runtime/test observation, compare a
+leading cause with a plausible alternative, and cite both supporting and disconfirming evidence.
+The write tools reject patches until that review passes. If the evidence leaves competing
+causes, the agent must wait for an isolated experiment to complete and validate a candidate;
+starting an experiment alone does not authorize a patch. Verification after a patch invalidates
+the previous review, so any follow-up fix needs fresh evidence. Direct file-writing shell
+commands are blocked for bug-fix requests; use the gated patch tools instead.
 
 ### Auto mode: no stopping to ask
 
@@ -533,25 +576,18 @@ Type `pulse` in a terminal and Pulse opens as one full-screen app:
  ───────────────────────────────────────────────────────────────────────────────────────────────
   train.py                    ● live │ ❯ why did the loss stop moving?
   ~/experiments                      │
-  step 4,120 · 19.8/s · 3m 28s       │ Thought for 6.2s
-                                     │
-  loss      0.5001 █▅▃▂▁▁▁▁▁▁▁▁      │ I need to see how the learning rate is used.
-  grad_norm 2.4e-5 █▆▄▂▁▁▁▁▁▁▁▁      │ Searched for lr · Read train.py:1-12  · 25 lines
-                                     │ Edited train.py  · +1 −1  · approved by deepseek-chat · applied
-  Findings  2                        │
-  ▲ loss stopped improving at 0.5    │ The loss is flat at 0.5 because of the `+ 0.5` on line 12 ...
-                                     │ ────────────────────────────────────────────────────────────
-  Tensors                            │ ❯
-  X  256x8 float32                   │ Enter send · / commands · click or Ctrl+O to expand · ↑↓ scroll
+  step 4,120 · 19.8/s · 3m 28s       │ ✻ Thinking  (47 words · ctrl+o to expand)
+                                     │ ● GREP(lr)
+  loss      0.5001 █▅▃▂▁▁▁▁▁▁▁▁      │ ● VIEW(train.py:1-12)
+  grad_norm 2.4e-5 █▆▄▂▁▁▁▁▁▁▁▁      │   ⎿ 23 lines  (ctrl+o to expand)
+                                     │ The loss is flat at 0.5 because of the `+ 0.5` on line 12 ...
+  Findings  2                        │ ────────────────────────────────────────────────────────────
+  ▲ loss stopped improving at 0.5    │ ❯
+                                     │ Enter send · Tab agent · Ctrl+O details · PgUp/PgDn scroll
 ```
 
-1. **Setup** comes first: account, workspace, project, agent model, key (or the OpenRouter
-   sign-in) -- once. What you pick is remembered in `~/.pulse/settings.json` (a pasted key in
-   `~/.pulse/keys.json`, readable by you only), so the next start goes straight to the agent.
-   `/config` shows the settings and changes them (`/config agent` opens the model picker,
-   `/config mouse off` sets a value, `/config reset` forgets everything); `pulse config` does
-   the same from a shell. `/config remember_keys off` deletes the saved keys and stops saving
-   them; a key in the environment always wins over a saved one.
+1. **Setup** comes first, the same as ever: account, workspace, agent model, key (or the
+   OpenRouter sign-in).
 2. **Home is the agent.** Type what you want built, fixed or explained; it plans, reads the
    project with its tools, shows a diff and asks before applying it. This is `pulse code`
    -- `pulse code [paths]` opens the same app with those files in focus.
@@ -564,29 +600,28 @@ Type `pulse` in a terminal and Pulse opens as one full-screen app:
    evidence. Its reasoning streams in as the model thinks, then folds to `Thought for 4s`;
    every tool call folds to a line that says what was done -- `Ran pytest -q`, `Read
    train.py:40-80`, `Searched for lr` -- and a click on it, or **Ctrl+O**, opens the
-   output in place. A change to your files is one line too, `Edited train.py · +3 −1`,
-   with what became of it (reviewed, applied, declined) on the same line and the diff
-   under it when opened. Three things are told apart at a glance: the agent's thinking is
-   orange, a command it ran (a tool call, an edit) is bold grey, and what Pulse itself says --
-   the run's output, a note from a pipeline -- is dim grey. What the agent says to you is
-   plain text; what it says to itself as it reaches for a tool ("I need to see how lr is
-   used") stays with that tool's line, shown when it is opened. One colour: Pulse's orange marks what is
-   live, selected or worth a look (a finding, an added line), red marks what is wrong,
-   and nothing else is coloured. The agent can also talk to you while it works -- a message beside its
-   tool calls -- so you see what it found and what it is about to check without waiting
-   for the end of its turn. A fix is a diff you confirm; `/restart` then stops the
+   output in place. What the agent says to you is plain text; the run's own output is
+   dim. The agent can also talk to you while it works -- a message beside its tool calls
+   -- so you see what it found and what it is about to check without waiting for the end
+   of its turn. A fix is a diff you confirm; `/restart` then stops the
    run and starts it again with the change (for runs started with `/run`).
 
 | Key | What it does |
 |---|---|
 | Enter | send the request, or answer a question Pulse asked |
 | `/` | commands; typing shows the ones that match, Tab completes |
-| Ctrl+O | fold / unfold the agent's thinking and tool output |
-| mouse | drag over any text to copy it (it is highlighted, then put on the clipboard -- through the terminal and the system's clipboard tool); what can be clicked lights up under the pointer and a click opens or shuts it; the wheel scrolls the conversation, and over the run's figures scrolls them. `/mouse off` leaves the mouse to your terminal (remembered); `/copy` copies the agent's last answer |
-| ↑ / ↓ | what you typed before, like a shell; PgUp/PgDn (or the wheel) scroll the conversation, which otherwise shows the latest exchange |
+| Tab (empty composer) | open agent selection |
+| Ctrl+O | open agent selection while composing; otherwise fold / unfold the agent's thinking and tool output |
+| `/agent` or click the agent chip | open agent selection in any terminal/IDE |
+| mouse | click a subtle `[copy]` button to copy an answer or a folded line to open it; PgUp/PgDn scroll the transcript |
+| PgUp / PgDn | scroll back and forward through the conversation; the screen otherwise shows the latest exchange |
 | Ctrl+C | cancel what is running; twice at an empty prompt leaves |
-| Esc, `/home` | back to the agent for anything else -- it works on your home project, without the run's data -- while the run stays watched (its findings and crashes still show up, and a crash still gets the agent); Esc or `/monitor` brings it back |
-| `/change [run]` | look at another run; the run you leave stays watched. Every run you opened is watched until `/close` (or `/close all`); a finding from one off screen carries its name |
+| Esc | leave the open run in the background and go back to the agent; Esc again brings it back |
+
+Each agent answer has a subtle `[copy]` button beneath it. Pulse uses the platform clipboard
+on Windows, macOS, and Linux, with a Tk desktop fallback where available. Mouse dragging is
+not used for copying; use `/mouse off` if you want the terminal itself to handle text
+selection.
 
 Commands on an open run: `/findings`, `/curve <name>`, `/vars`, `/audit`, `/audits on|off`,
 `/trace <var>`, `/source`, `/pause`, `/resume`, `/stop`, `/restart`, `/output`,
@@ -606,50 +641,14 @@ at a paused `pulse run` is likewise handled as what it is -- a question gets an 
 change you asked for gets made -- instead of being read as a bug report to diagnose.
 
 `pulse watch <run>`, `pulse <script.py>` and `pulse attach --pid N` open the same app
-directly on that run, and so does a script that calls `auto_track()` when it is run in a
-terminal: the app opens beside the training, in the same terminal, with the script's own
-output under the run's figures in the left pane (`mode="app"`, the default there; the agent is the one used last
-time if its key is in the environment, else `/agent`). On Windows it needs a console that
-understands escape sequences (Windows Terminal, or the console of Windows 10 and later).
-Without a real terminal (a pipe, CI), on a very small one, or with `PULSE_CLASSIC=1`,
-Pulse keeps the line-by-line screens described below. `PULSE_STREAMING=0` turns off the
-streaming of the model's replies.
+directly on that run. On Windows it needs a console that understands escape sequences
+(Windows Terminal, or the console of Windows 10 and later). Without a real terminal (a
+pipe, CI), on a very small one, or with `PULSE_CLASSIC=1`, Pulse keeps the line-by-line
+screens described below. `PULSE_STREAMING=0` turns off the streaming of the model's
+replies. `pulse run train.py` -- training with Pulse inside the script's own terminal --
+is unchanged.
 
 ---
-
-## Headless mode: start a run and walk away
-
-```bash
-pulse run --headless train.py --epochs 3     # returns at once; you can close the terminal
-```
-
-Your run starts in the background, and Pulse watches it there instead of on your screen. When
-the run crashes, or Pulse's checks or its periodic AI review find something seriously wrong,
-the agent fixes the code by itself and restarts the run -- as many times as it takes. You are
-never asked anything: a second AI (the reviewer) approves each command and each code change,
-and anything it does not approve is not done. When the run ends, Pulse writes a closing review
-and stops.
-
-**Where it shows up.** The first time, Pulse asks you to sign in to Pulse Cloud (if you are
-not) and to pick a workspace and a project; the run goes on the
-[dashboard](https://pulsedashb.netlify.app/) there, and the choice is remembered. Change it
-with `--to WORKSPACE/PROJECT` -- both together, e.g. `--to "Lab/GPT small"` (also remembered) --
-or with `pulse config workspace`.
-
-**Keeping an eye on it.**
-
-| | |
-|---|---|
-| `pulse headless` | what is being debugged in the background, and the log of each |
-| `~/.pulse/headless/<run>.log` | everything Pulse did: what it found, what it changed, why |
-| `pulse`, then `/monitor` | open the run in the app, live |
-| `pulse headless stop [pid\|script]` | stop the background debugging (the training goes on) |
-
-From the script itself: `auto_track(mode="headless")`, or `PULSE_MODE=headless`
-(`PULSE_TO=WORKSPACE/PROJECT` chooses where it goes).
-
-Quick guide:
-[docs/headless.md](docs/headless.md).
 
 ## The `pulse` command
 
@@ -732,21 +731,21 @@ Pulse can pause training for investigation, allowing you to inspect the current 
 
 ## Quickstart
 
-After installation, import `auto_track` immediately before your training loop:
+Start an existing training script under Pulse without editing it:
 
-```python
-from pulse import auto_track
-
-if __name__ == "__main__":
-    auto_track()
-
-    # Your training loop
-    for epoch in range(num_epochs):
-        # Training logic here
-        pass
+```text
+python -m pulse run train.py
 ```
 
-Pulse discovers numeric variables available to the training process and provides them through the CLI.
+To keep training independent of the viewer and watch the run from another terminal, use:
+
+```text
+python -m pulse run --stream train.py
+```
+
+Pulse launches the script with its existing source code and exposes the run through its
+app and CLI. It instruments the script in memory; your files are not modified. Replace
+`train.py` with your script path and put any script arguments after it.
 
 You can then control tracking while the run is active:
 
@@ -827,9 +826,9 @@ LESS OVERHEAD
 
 Rather than collecting everything continuously, Pulse lets you decide what information is worth monitoring.
 
-Measured, on a 20k-step loop with the loop in the same frame as `auto_track()`:
+Measured on a 20k-step loop started with `pulse run --stream`:
 
-| Work on the training thread | single process | `mode="stream"` |
+| Work on the training thread | single process | stream mode |
 |---|---:|---:|
 | `is_trackable` calls | 67,112 | 0 |
 | `to_numpy` (device sync + copy on GPU) | 264 | 0 |
@@ -837,9 +836,9 @@ Measured, on a 20k-step loop with the loop in the same frame as `auto_track()`:
 | seconds of Pulse on the training thread | 0.059 | 0 |
 | with an agent configured, `update()` on the training thread | 13.39 s of a 15.9 s run | never runs there |
 
-`docs/overhead.md` has the method and the caveats. The short version: in stream mode the
-training process runs no Pulse code at all beyond a background thread reading its
-variables, and it never waits for a model.
+`docs/overhead.md` has the method and the caveats. Stream mode reads run data in the
+training process and handles model calls separately, so the training loop does not wait
+for the agent.
 
 ---
 
