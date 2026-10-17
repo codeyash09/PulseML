@@ -698,7 +698,25 @@ def main(argv=None):
     if argv and argv[0] == "openrouter":
         from .pulse_openrouter import main as openrouter_main
         return openrouter_main(argv[1:])
+    if argv and argv[0] == "stash":
+        from .pulse_supabase import get_allow_fix_stashing, set_allow_fix_stashing
+        sub = argv[1].lower() if len(argv) > 1 else "status"
+        if sub in ("off", "disable", "false", "0"):
+            set_allow_fix_stashing(False)
+            print("[Pulse] Shared fix stashing is now disabled. Your run bug fixes will not be contributed to the shared knowledge base.")
+            return 0
+        elif sub in ("on", "enable", "true", "1"):
+            set_allow_fix_stashing(True)
+            print("[Pulse] Shared fix stashing is now enabled. Anonymized, scrubbed bug fixes will help other runs.")
+            return 0
+        else:
+            current = get_allow_fix_stashing()
+            state_str = "ENABLED" if current else "DISABLED"
+            print(f"[Pulse] Shared fix stashing status: {state_str}")
+            print("[Pulse] Usage: pulse stash on  OR  pulse stash off")
+            return 0
     if argv and argv[0] in ("config", "settings"):
+
         from .pulse_settings import main as settings_main
         return settings_main(argv[1:])
     if argv and argv[0] == "headless":

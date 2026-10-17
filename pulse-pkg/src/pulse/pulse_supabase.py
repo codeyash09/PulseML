@@ -2023,6 +2023,119 @@ def _gpu_info() -> Dict[str, Any]:
     return info
 
 
+# ----------------------------------------------------------------------------
+# Shared Mistake Learning across Runs and Users
+# ----------------------------------------------------------------------------
+
+def share_mistake(error_type: str, error_message: str, file_path: str, fix_applied: str, explanation: str, session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Share a resolved run mistake and its successful fix to the collective
+    knowledge base (Shared_Mistakes table) so other people's runs can learn from it.
+    Checks allowFixStashing consent first (on by default) and notifies user on first use."""
+    if not check_and_notify_fix_stash_consent():
+        return None
+    body = {
+        "error_type": error_type[:255] if error_type else "UnknownError",
+        "error_message": scrub_secrets(error_message[:1000]) if error_message else "",
+        "file_path": file_path or "",
+        "fix_applied": scrub_secrets(fix_applied) if fix_applied else "",
+        "explanation": scrub_secrets(explanation) if explanation else "",
+        "session_id": session_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        rows = _request(
+            "POST", "Shared_Mistakes",
+            body=body,
+            prefer="return=representation",
+        )
+        return rows[0] if rows else None
+    except SupabaseError:
+        return None
+    except Exception:
+        return None
+
+
+def query_shared_mistakes(error_query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """Query other people's shared run mistakes and successful fixes matching
+    an error message, exception type, or keyword. Used by Pulse Brain / agent
+    to suggest fixes learned from other runs.
+    Degrades gracefully (returns empty list) on any network or table error."""
+    if not error_query:
+        return []
+    term = error_query.strip()[:100]
+    try:
+        rows = _request(
+            "GET", "Shared_Mistakes",
+            params={
+                "or": f"(error_type.ilike.%{term}%,error_message.ilike.%{term}%,explanation.ilike.%{term}%)",
+                "select": "id,error_type,error_message,file_path,fix_applied,explanation,created_at",
+                "order": "created_at.desc",
+                "limit": str(limit),
+            }
+        )
+        return rows if isinstance(rows, list) else []
+    except SupabaseError:
+        return []
+    except Exception:
+        return []
+
+
+
+def get_allow_fix_stashing() -> bool:
+    """Check if the user allows fix stashing (allowFixStashing column in Supabase profile / cached settings).
+    Default is True (on by default)."""
+    try:
+        profile = load_cached_profile()
+        if profile and "allowFixStashing" in profile:
+            val = profile["allowFixStashing"]
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                return val.lower() in ("true", "1", "yes")
+    except Exception:
+        pass
+    return True
+
+
+def set_allow_fix_stashing(allowed: bool) -> None:
+    """Enable or disable fix stashing (`allowFixStashing`) in local profile cache and Supabase."""
+    save_cached_profile(allowFixStashing=allowed)
+    try:
+        creds = load_cached_credentials()
+        if creds and creds.get("user_id"):
+            user_id = creds["user_id"]
+            _request("PATCH", f"Profiles?id=eq.{user_id}", body={"allowFixStashing": allowed})
+    except Exception:
+        pass
+
+
+
+def check_and_notify_fix_stash_consent() -> bool:
+    """Check if the user has been notified about the shared fix stash before.
+    If not, notify them that fix stashing is on by default and explain what it does
+    (sharing sanitized, anonymized past bug fixes to help other runs, while scrubbing all secrets).
+    Returns whether fix stashing is allowed."""
+    if not get_allow_fix_stashing():
+        return False
+    
+    # Check local marker to see if user was already notified
+    marker_path = ".pulse_stash_notified"
+    if not os.path.exists(marker_path):
+        try:
+            print("\n[Pulse] Notice: Shared Fix Stash is enabled by default.")
+            print("[Pulse] What it does: Anonymized and fully scrubbed (secrets removed) bug fixes")
+            print("[Pulse] from your runs are contributed to the collective shared knowledge base")
+            print("[Pulse] so other developers' runs can learn from mistakes and fix them faster.")
+            print("[Pulse] You can opt out anytime or check settings. Enjoy collaborative learning!\n")
+            with open(marker_path, "w", encoding="utf-8") as f:
+                f.write("notified=true\n")
+        except Exception:
+            pass
+    return True
+
+
+
+
 def _framework_versions() -> Dict[str, str]:
     """Reports whichever of Pulse's five supported array backends (plus
     numpy) the process has already imported -- never imports one itself

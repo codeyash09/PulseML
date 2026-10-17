@@ -22,20 +22,24 @@ from typing import Dict, Iterable, List, Optional, Set
 # The stack a project is built on
 # --------------------------------------------------------------------------------------
 
-# import name -> the name the user would use for it in a request
+# import name -> the names a user would use for it in a request
 _FRAMEWORKS = {
     "torch": ("torch", "pytorch"),
     "tensorflow": ("tensorflow", "tf"),
     "jax": ("jax", "flax"),
     "keras": ("keras",),
+    "mxnet": ("mxnet",),
+    "paddle": ("paddle", "paddlepaddle"),
+    "tinygrad": ("tinygrad",),
     "cupy": ("cupy",),
     "numpy": ("numpy",),
 }
 # these give gradients for free; numpy / cupy do not
-AUTOGRAD = frozenset({"torch", "tensorflow", "jax", "keras"})
-# importing one of these into a project built on another is what "switched it to torch" looks like.
-# (numpy is left out: a torch project importing numpy is ordinary.)
-_SWAP_TARGETS = frozenset({"torch", "tensorflow", "jax", "keras", "cupy"})
+AUTOGRAD = frozenset({"torch", "tensorflow", "jax", "keras", "mxnet", "paddle", "tinygrad"})
+# The rule is symmetric: whatever the project is built on, a DIFFERENT framework arriving is a swap,
+# whichever way round (torch -> jax, jax -> torch, cupy -> torch, ...). The only exception is numpy as a
+# newcomer: a project on any framework uses numpy for data handling, so importing it is ordinary.
+_SWAP_TARGETS = frozenset(_FRAMEWORKS) - {"numpy"}
 
 
 def imports_of(text: str) -> Set[str]:
@@ -76,7 +80,7 @@ def has_autograd(stack: Iterable[str]) -> bool:
 
 def autograd_in_play(stack: Iterable[str], request_text: str = "") -> bool:
     """Gradients come for free: the project imports an autograd framework, or the request names one."""
-    return has_autograd(stack) or any(_mentioned(request_text, name) for name in AUTOGRAD)
+    return has_autograd(stack) or any(_asked_for(request_text, name) for name in AUTOGRAD)
 
 
 def describe_stack(stack: Iterable[str]) -> str:
@@ -89,32 +93,52 @@ def describe_stack(stack: Iterable[str]) -> str:
     return f"{', '.join(stack)} (NO autograd: every backward pass is hand-written)"
 
 
-def _mentioned(request_text: str, framework: str) -> bool:
+_NEGATION = re.compile(r"(?i)\b(?:don'?t use|do not use|never use|stop using|stay off|instead of|rather than|"
+                       r"don'?t|do not|never|without|avoid|remove|drop|ditch|not|no)\b")
+_AFFIRM = re.compile(r"(?i)\b(?:use|using|switch to|port(?:ed)? to|move to|go with|convert(?:ed)? to|"
+                     r"write (?:it )?in|build with|but)\b")
+
+
+def _asked_for(request_text: str, framework: str) -> bool:
+    """True when the request names `framework` and means it: "port it to jax", "use pytorch".
+
+    A negated mention ("don't use torch", "no torch", "instead of torch") is the opposite of asking
+    for it. Negation covers only what it directly governs: it stops at a comma or full stop, and a
+    later "use X" in the same clause is affirmative ("instead of torch use jax" asks for jax,
+    "don't use jax, use torch" asks for torch)."""
     low = (request_text or "").lower()
-    return any(re.search(rf"(?<![\w]){re.escape(alias)}(?![\w])", low) for alias in _FRAMEWORKS[framework])
+    for alias in _FRAMEWORKS[framework]:
+        for match in re.finditer(rf"(?<![\w]){re.escape(alias)}(?![\w])", low):
+            clause = re.split(r"[,;:.!?\n]", low[max(0, match.start() - 40):match.start()])[-1]
+            negations = list(_NEGATION.finditer(clause))
+            if not negations or _AFFIRM.search(clause[negations[-1].end():]):
+                return True
+    return False
 
 
 def find_stack_swap(path: str, before: str, after: str, project_stack: Set[str], request_text: str) -> str:
     """"" when the edit is fine, else why it is refused.
 
     An edit is a swap when it introduces an import of a framework the project does not use
-    anywhere, into a project that is built on a different one, and nobody asked for it."""
+    anywhere, into a project that is built on a different one, and the user has not explicitly asked
+    for it. Which framework the project is built on is read from its own files: nothing is assumed."""
     if not str(path).endswith(".py"):
         return ""
     new = (imports_of(after) - imports_of(before)) & _SWAP_TARGETS
     new -= project_stack
-    new = {name for name in new if not _mentioned(request_text, name)}
+    new = {name for name in new if not _asked_for(request_text, name)}
     if not new:
         return ""
     built_on = sorted(project_stack & (_SWAP_TARGETS | {"numpy"}))
     if not built_on:
         return ""                    # nothing to swap away from: a fresh project may choose
     chosen = ", ".join(sorted(new))
-    return (f"this edit imports {chosen}, but this project is built on {', '.join(built_on)} and the request "
-            f"does not ask for {chosen}. The stack the user is using is a requirement: do not switch to "
-            f"something easier. Implement it with {', '.join(built_on)} (write the missing piece yourself: "
-            "a kernel, a backward pass, a tokenizer...). If it is truly impossible with the current stack, "
-            "stop and tell the user exactly what blocks it with message_user, and ask.")
+    return (f"this edit imports {chosen}, but this project is built on {', '.join(built_on)} and the user has not "
+            f"asked to change that. The framework the project uses is a requirement, not a default to improve on: "
+            f"do not switch to something easier. Implement it with {', '.join(built_on)} (write the missing piece "
+            "yourself: a kernel, a backward pass, a tokenizer...). If it is truly impossible with the current "
+            f"framework, stop and tell the user exactly what blocks it with message_user, and ask. Only if the user "
+            f"explicitly tells you to use {chosen} may you bring it in.")
 
 
 # --------------------------------------------------------------------------------------
@@ -346,8 +370,9 @@ def planning_brief(stack: Iterable[str], request_text: str = "") -> str:
     stack = set(stack)
     lines = [
         "Planning brief for this request:",
-        f"- Stack in this project: {describe_stack(stack)}. Use it. Do not bring in another framework, "
-        "library or algorithm because it is easier; the edit tool refuses a new framework the user did not ask for.",
+        f"- Stack in this project: {describe_stack(stack)}. Stay on it, whatever it is. Do not bring in another "
+        "framework, library or algorithm because it is easier or already has the feature; change stack only if "
+        "the user explicitly tells you to. The edit tool refuses a new framework the user did not ask for.",
         "- Call todo_write before your first edit. Its first phase is \"Requirements\": one leaf per thing the "
         "request names (every library, technique, feature, file), in the user's words. Then one phase per "
         "component, broken down until each leaf is a single edit or command naming a file and function.",

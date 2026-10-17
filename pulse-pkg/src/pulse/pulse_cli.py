@@ -1199,13 +1199,14 @@ def _flush_stdin() -> None:
 # code runs unchanged.
 
 def _prompt_text(plain_prompt: str, *, label: Optional[str] = None, secret: bool = False,
-                 placeholder: Optional[str] = None, validate=None) -> str:
+                 placeholder: Optional[str] = None, validate=None, title: Optional[str] = None,
+                 note: Optional[str] = None) -> str:
     """input(plain_prompt) / getpass.getpass(plain_prompt), as a styled field on a terminal."""
     if _ui.enabled():
         try:
             _flush_stdin()
             return _ui.ask(label or plain_prompt.strip().rstrip(">").strip(),
-                           secret=secret, placeholder=placeholder, validate=validate)
+                           secret=secret, placeholder=placeholder, validate=validate, title=title, note=note)
         except _ui.Unavailable:
             pass
     return getpass.getpass(plain_prompt) if secret else input(plain_prompt)
@@ -1262,6 +1263,48 @@ def _ui_account_menu() -> Optional[str]:
     except _ui.Unavailable:
         return None
     return "slr"[idx]
+
+
+def _ui_auth_card() -> Optional[Tuple[str, Dict[str, str]]]:
+    """Sign up / log in / recover as ONE card: tabs along the top and the fields on it. Returns
+    ("s" | "l" | "r", the values typed) -- the same letters the plain prompts take, so everything
+    after it (terms, recovery code, errors, retries) is unchanged and merely skips the questions
+    already answered here. None: use the line-by-line prompts (no terminal, or a short one)."""
+    if not _ui.enabled():
+        return None
+
+    def valid_email(text: str, _values: Dict[str, str]) -> Optional[str]:
+        return None if cloud.is_valid_email(text.strip()) else "Enter a valid email address, e.g. name@example.com"
+
+    def long_enough(text: str, _values: Dict[str, str]) -> Optional[str]:
+        return None if len(text) >= 8 else "Password must be at least 8 characters"
+
+    def same(label: str):
+        return lambda text, values: None if text == values.get("password", "") else "Passwords don't match"
+
+    email = {"name": "email", "label": "Email", "placeholder": "name@example.com", "check": valid_email}
+    new_password = {"name": "password", "label": "Password", "secret": True, "placeholder": "min. 8 characters",
+                    "hint": _password_progress, "check": long_enough}
+    confirm = {"name": "confirm", "label": "Confirm password", "secret": True, "check": same("password")}
+    login_email = dict(email, check=None)
+    login_password = {"name": "password", "label": "Password", "secret": True}
+    code = {"name": "code", "label": "Recovery code", "placeholder": "e.g. 7F3K-9QRT-2LXP"}
+    reset = dict(new_password, label="New password")
+    reset_confirm = dict(confirm, label="Confirm new password")
+    try:
+        _flush_stdin()
+        picked = _ui.form(
+            "", "Debug training runs with an AI agent",
+            tabs=["Sign up", "Log in", "Recover"], tab=0,
+            fields=[[email, new_password, confirm], [login_email, login_password],
+                    [email, code, reset, reset_confirm]],
+            button=["Create account", "Log in", "Reset password"])
+    except _ui.Unavailable:
+        return None
+    if picked is None:
+        return None
+    tab, values = picked
+    return "slr"[tab], values
 
 
 def _ui_workspace_menu(existing: List[Dict[str, Any]], cached_team_id: Optional[str], describe) -> Optional[str]:
@@ -1358,6 +1401,30 @@ def _say_plain(label: str, value: str, plain: str) -> None:
         print(plain)
 
 
+def agent_key_state(name: str) -> Tuple[str, str]:
+    """Whether the agent `name` can be used right now, as (state, badge): "ready" (a key is set,
+    from the environment or one Pulse was allowed to keep), "missing" (it needs one), "signin"
+    (an OpenRouter model, which signs in instead), "local" or "custom" (no key to hold). The badge
+    is what the picker shows beside it."""
+    info = PROVIDERS.get(name) or {}
+    if info.get("custom") or name == "custom":
+        return "custom", "custom"
+    if info.get("local"):
+        return "local", "local"
+    env_var = info.get("env_key") or ""
+    try:
+        have = bool(env_var and (os.environ.get(env_var) or _settings.saved_key(env_var)))
+        if not have and (info.get("openrouter") or env_var == _openrouter.ENV_KEY):
+            have = bool(os.environ.get(_openrouter.ENV_KEY) or _openrouter.saved_key())
+    except Exception:
+        have = bool(env_var and os.environ.get(env_var))
+    if have:
+        return "ready", f"{_ui._g('now')} key set"
+    if info.get("openrouter") or env_var == _openrouter.ENV_KEY:
+        return "signin", f"{_ui._g('todo')} sign in"
+    return "missing", f"{_ui._g('todo')} add key"
+
+
 def _ui_pick_agent(names: List[str], cached_provider: Optional[str], current: Optional[str]) -> Optional[str]:
     """A searchable list of the registered providers. Returns the chosen provider's exact
     name, "" if the person skipped (Esc -- what pressing Enter on a blank line meant), or
@@ -1368,7 +1435,9 @@ def _ui_pick_agent(names: List[str], cached_provider: Optional[str], current: Op
         return None
     try:
         _flush_stdin()
-        _ui.header("Agent model", "Select the model that powers Pulse's analysis.")
+        hosted = _ui._HOST is not None            # inside the app the dropdown needs no banner above it
+        if not hosted:
+            _ui.header("Agent model", "Select the model that powers Pulse's analysis.")
         options: List[Any] = []
         initial = 0
         for i, name in enumerate(names):
@@ -1376,18 +1445,21 @@ def _ui_pick_agent(names: List[str], cached_provider: Optional[str], current: Op
             if info.get("custom"):
                 detail = "type any provider/model string"
             elif info.get("openrouter"):
-                detail = "type any OpenRouter model  ·  no key needed: sign in"
+                detail = "any OpenRouter model"
             elif info.get("env_key") == _openrouter.ENV_KEY:
-                detail = f"{info.get('model') or ''}  ·  no key needed: sign in".strip()
+                detail = info.get("model") or None
             elif info.get("local"):
-                detail = "local -- no data leaves this machine"
+                detail = "runs here, nothing leaves this machine"
             else:
                 detail = info.get("model") or None
+            state, badge = agent_key_state(name)
             tag = "current" if name == current else ("last used" if name == cached_provider else None)
             if tag and (name == current or initial == 0):
                 initial = i
-            options.append(_ui.Option(name, detail, tag=tag))
-        picked = _ui.choose(options, initial=initial, searchable=True, max_rows=7)
+            options.append(_ui.Option(name, detail, tag=tag, badge=badge,
+                                      tone="attn" if state in ("missing", "signin") else None))
+        picked = _ui.choose(options, initial=initial, searchable=True, max_rows=7, compact=True,
+                            title="Select an agent" if hosted else None)
     except _ui.Unavailable:
         return None
     return "" if picked is None else names[picked]
@@ -1421,6 +1493,7 @@ def _ui_key_screen(chosen: str, openrouter: bool = False) -> None:
 _KEY_PROMPT = ("API key (paste one -- or press Enter if you have none: Pulse can sign you in to "
                "OpenRouter instead) > ")
 _KEY_LABEL = "API key  (none? Enter = sign in with OpenRouter instead)"
+_KEY_NOTE = "Used only to call the model. Never shown again; kept on this machine only if you allow it."
 
 
 def _ui_code_version(sha: Optional[str], cwd: Optional[str]) -> None:
@@ -5339,7 +5412,9 @@ class PulseCLI:
 
         while attempts < max_attempts:
             _flush_stdin()
-            resp = _ui_account_menu()
+            card = _ui_auth_card()
+            prefill = dict(card[1]) if card else {}
+            resp = card[0] if card else _ui_account_menu()
             if resp is None:
                 cprint("\n--- Pulse Cloud Authentication ---")
                 resp = input(
@@ -5355,7 +5430,7 @@ class PulseCLI:
                 # used to mean a single password mismatch cost you a full
                 # re-type of the email address too.
                 while True:
-                    email = _prompt_text("email (e.g. name@example.com, min. 8 characters) > ", label="Email", placeholder="name@example.com").strip()
+                    email = (prefill.pop("email", "") or _prompt_text("email (e.g. name@example.com, min. 8 characters) > ", label="Email", placeholder="name@example.com")).strip()
                     if not email:
                         cprint("[Pulse] email cannot be blank.", color=_RED)
                         continue
@@ -5365,11 +5440,11 @@ class PulseCLI:
                     _ui_done("Email", email)
                     break
                 while True:
-                    password = _prompt_text("Password (min. 8 characters) > ", label="Password", secret=True, placeholder="min. 8 characters", validate=_password_progress)
+                    password = prefill.pop("password", "") or _prompt_text("Password (min. 8 characters) > ", label="Password", secret=True, placeholder="min. 8 characters", validate=_password_progress)
                     if len(password) < 8:
                         cprint("[Pulse] Password must be at least 8 characters.", color=_RED)
                         continue
-                    confirm_password = _prompt_text("Confirm password > ", label="Confirm password", secret=True)
+                    confirm_password = prefill.pop("confirm", "") or _prompt_text("Confirm password > ", label="Confirm password", secret=True)
                     if password != confirm_password:
                         # A typo here with no confirmation step means signing up
                         # with a password the user doesn't actually know -- and
@@ -5432,12 +5507,12 @@ class PulseCLI:
             elif resp in ("l", "login", "log in"):
                 _flush_stdin()
                 _ui_step("Log in")
-                email = _prompt_text("email > ", label="Email", placeholder="name@example.com").strip()
+                email = (prefill.pop("email", "") or _prompt_text("email > ", label="Email", placeholder="name@example.com")).strip()
                 if not email:
                     cprint("[Pulse] email cannot be blank.", color=_RED)
                     continue
                 _ui_done("Email", email)
-                password = _prompt_text("Password > ", label="Password", secret=True)
+                password = prefill.pop("password", "") or _prompt_text("Password > ", label="Password", secret=True)
                 if not password:
                     cprint("[Pulse] Password cannot be blank.", color=_RED)
                     continue
@@ -5461,16 +5536,16 @@ class PulseCLI:
                     "(or the last time you recovered/changed your password)."
                 )
                 _ui_step("Recover your account")
-                email = _prompt_text("email > ", label="Email", placeholder="name@example.com").strip()
-                recovery_code = _prompt_text("Recovery code (e.g. 7F3K-9QRT-2LXP) > ", label="Recovery code", placeholder="e.g. 7F3K-9QRT-2LXP").strip()
+                email = (prefill.pop("email", "") or _prompt_text("email > ", label="Email", placeholder="name@example.com")).strip()
+                recovery_code = (prefill.pop("code", "") or _prompt_text("Recovery code (e.g. 7F3K-9QRT-2LXP) > ", label="Recovery code", placeholder="e.g. 7F3K-9QRT-2LXP")).strip()
                 if not email or not recovery_code:
                     cprint("[Pulse] Both email and recovery code are required.", color=_RED)
                     continue
-                new_password = _prompt_text("New password (min. 8 characters) > ", label="New password", secret=True, placeholder="min. 8 characters", validate=_password_progress)
+                new_password = prefill.pop("password", "") or _prompt_text("New password (min. 8 characters) > ", label="New password", secret=True, placeholder="min. 8 characters", validate=_password_progress)
                 if len(new_password) < 8:
                     cprint("[Pulse] Password must be at least 8 characters.", color=_RED)
                     continue
-                confirm_new_password = _prompt_text("Confirm new password > ", label="Confirm new password", secret=True)
+                confirm_new_password = prefill.pop("confirm", "") or _prompt_text("Confirm new password > ", label="Confirm new password", secret=True)
                 if new_password != confirm_new_password:
                     cprint("[Pulse] Passwords didn't match. Let's try again.", color=_RED)
                     continue
@@ -7389,9 +7464,11 @@ class PulseCLI:
             if use_existing in ("", "y", "yes"):
                 key = existing
             else:
-                key = _prompt_text(_KEY_PROMPT, label=_KEY_LABEL, secret=True, validate=lambda t: _ui.key_hint_for(t, env_var)).strip()
+                key = _prompt_text(_KEY_PROMPT, label=_KEY_LABEL, secret=True, title=f"{chosen} API key",
+                                   note=_KEY_NOTE, validate=lambda t: _ui.key_hint_for(t, env_var)).strip()
         else:
-            key = _prompt_text(_KEY_PROMPT, label=_KEY_LABEL, secret=True, validate=lambda t: _ui.key_hint_for(t, env_var)).strip()
+            key = _prompt_text(_KEY_PROMPT, label=_KEY_LABEL, secret=True, title=f"{chosen} API key",
+                               note=_KEY_NOTE, validate=lambda t: _ui.key_hint_for(t, env_var)).strip()
 
         if not key and env_var != _openrouter.ENV_KEY:
             # No key for this provider: an OpenRouter sign-in gets one for its models.
@@ -8944,16 +9021,12 @@ class PulseCLI:
     _DSML_INVOKE_RE = re.compile(
         r"<\s*[｜|]\s*DSML\s*[｜|]\s*invoke\s+name\s*=\s*\"([^\"]+)\"\s*>(.*?)<\s*/\s*[｜|]\s*DSML\s*[｜|]\s*invoke\s*>",
         re.DOTALL | re.IGNORECASE)
-    # a parameter is self-closing (`name="path" value="a.py"/>`) or wraps its value; the
-    # self-closing one used to run on to the next parameter's closing tag and swallow it
     _DSML_PARAM_RE = re.compile(
-        r"<\s*[｜|]\s*DSML\s*[｜|]\s*parameter\s+name\s*=\s*\"([^\"]+)\""
-        r"([^<>]*/\s*>|.*?<\s*/\s*[｜|]\s*DSML\s*[｜|]\s*parameter\s*>)",
+        r"<\s*[｜|]\s*DSML\s*[｜|]\s*parameter\s+name\s*=\s*\"([^\"]+)\"(.*?)<\s*/\s*[｜|]\s*DSML\s*[｜|]\s*parameter\s*>",
         re.DOTALL | re.IGNORECASE)
-    _DSML_PARAM_CLOSE_RE = re.compile(r"<\s*/\s*[｜|]\s*DSML\s*[｜|]\s*parameter\s*>\Z", re.IGNORECASE)
     _DSML_WRAPPER_RE = re.compile(r"^[ \t]*<\s*/?\s*[｜|]\s*DSML\s*[｜|]\s*(?:tool_calls|function_calls)\s*>[ \t]*$",
                                   re.MULTILINE | re.IGNORECASE)
-    _DSML_SHORT_RE = re.compile(r"^[ \t]*<\s*[｜|]\s*DSML\s*[｜|]\s*([A-Za-z_]+)\s*:(.*)>[ \t]*$",
+    _DSML_SHORT_RE = re.compile(r"^[ \t]*<\s*[｜|]\s*DSML\s*[｜|]\s*([A-Za-z_]+)\s*:\s*(.*?)\s*>[ \t]*$",
                                 re.MULTILINE)
 
     @classmethod
@@ -8974,18 +9047,15 @@ class PulseCLI:
             if name not in names:
                 return None
             arg = str(arg or "").strip()
-            if name in ("TERMINAL", "REPL", "CALC"):
-                if "\n" in arg:
-                    return None      # a multi-line command cannot be one directive line; joining it would change it
-            else:                    # a command keeps its spaces: echo 'a   b'
-                arg = " ".join(arg.split())
+            if "\n" in arg and name in ("TERMINAL", "REPL", "CALC"):
+                return None          # a multi-line command cannot be one directive line; joining it would change it
+            arg = " ".join(arg.split())
             return f"{name}: {arg}".rstrip() if arg else f"{name}:"
 
         def invoke(match: "re.Match") -> str:
             params: List[Tuple[str, str]] = []
             for pname, rest in cls._DSML_PARAM_RE.findall(match.group(2)):
-                rest = cls._DSML_PARAM_CLOSE_RE.sub("", rest)
-                value_at = re.search(r'value\s*=\s*"', rest.split(">", 1)[0])
+                value_at = re.search(r'value\s*=\s*"', rest)
                 if value_at:
                     value = rest[value_at.end():].split('"', 1)[0]
                 else:
@@ -9008,32 +9078,21 @@ class PulseCLI:
         text = cls._DSML_WRAPPER_RE.sub("", text)
         text = cls._DSML_SHORT_RE.sub(lambda m: directive(m.group(1), m.group(2)) or m.group(0), text)
 
-        out, fenced = [], False
+        out = []
         for raw in text.split("\n"):
             line = raw.strip()
-            if line.startswith("```"):
-                fenced = not fenced
-            if fenced or line.startswith("```"):
-                out.append(raw)                      # quoted code: never a request
-                continue
             fixed = None
-            # matched in steps, not one pattern: `\s*(.*?)\s*` side by side backtracked for
-            # minutes on a line with a long run of spaces
-            head = re.match(r"<\s*([A-Za-z_]+)\s*", line) if line.endswith(">") else None
-            if head:
-                rest = line[head.end():-1]
-                close = re.search(r"<\s*/\s*([A-Za-z_]+)\s*$", rest) if rest.startswith(">") else None
-                if close and close.group(1) == head.group(1):
-                    fixed = directive(head.group(1), rest[1:close.start()])         # <NAME>arg</NAME>
-                elif rest.startswith(":"):
-                    fixed = directive(head.group(1), rest[1:])                       # <NAME: arg>, <NAME:>
-                elif rest.strip() in ("", "/"):
-                    fixed = directive(head.group(1), "")                             # <NAME>, <NAME/>
-            if (fixed is None and raw.rstrip() == line and line.upper() in cls._ARGLESS_DIRECTIVES - {"STOP", "RESTART"}
-                    and line.isupper()):
-                # RUNSTATUS alone on its line, no colon; never STOP or RESTART -- a bare word in an
-                # indented block or a diff is not a request to end or restart the run
-                fixed = f"{line}:"
+            # <NAME>arg</NAME>
+            m = re.fullmatch(r"<\s*([A-Za-z_]+)\s*>\s*(.*?)\s*<\s*/\s*\1\s*>", line)
+            if m:
+                fixed = directive(m.group(1), m.group(2))
+            if fixed is None:
+                # <NAME: arg>, <NAME:>, <NAME>, <NAME/>
+                m = re.fullmatch(r"<\s*([A-Za-z_]+)\s*(?::\s*(.*?))?\s*/?\s*>", line)
+                if m:
+                    fixed = directive(m.group(1), m.group(2) or "")
+            if fixed is None and line.upper() in cls._ARGLESS_DIRECTIVES and line.isupper():
+                fixed = f"{line}:"                   # RUNSTATUS alone on its line, no colon
             if fixed is None:
                 # "<RUNSTATUS:" left open, the model writing on as if it had the result
                 m = re.fullmatch(r"<\s*([A-Z_]+)\s*:?", line)

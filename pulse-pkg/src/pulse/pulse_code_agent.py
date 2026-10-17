@@ -81,6 +81,38 @@ _KEEP_RECENT = 14                # messages kept verbatim by compaction
 _ELIDE_AFTER = 16                # tool results older than this many messages are shortened
 _ELIDED_CHARS = 700
 _SUMMARY_INPUT_CHARS = 140_000
+_EVIDENCE_TOOLS = {
+    "read_file", "list_files", "grep", "outline", "find_definition", "find_references",
+    "dep_graph", "trace_variable", "run_command", "experiment", "check_shape", "smoke_test",
+    "run_status",
+}
+_EVIDENCE_SOURCE_TOOLS = {
+    "read_file", "list_files", "grep", "outline", "find_definition", "find_references",
+    "dep_graph", "trace_variable", "VIEW", "GREP", "DEFOF", "CALLERS", "DEPGRAPH", "TRACE",
+    "DOCLOOKUP",
+}
+_EVIDENCE_EXECUTION_TOOLS = {
+    "run_command", "experiment", "check_shape", "smoke_test", "run_status", "TERMINAL", "EXPERIMENT",
+    "RUNSTATUS",
+}
+_VERIFICATION_TOOLS = {"run_command", "experiment", "check_shape", "smoke_test", "run_status"}
+_BUGFIX_REQUEST_RE = re.compile(
+    r"\b(?:bug|bugs|fix|fixes|fixed|fixing|repair|broken|wrong|incorrect|failure|failures|"
+    r"failing|regression|regressions|crash|crashes|exception|debug|diagnos(?:e|is|ing)|"
+    r"issue|issues|problem|problems|defect|defects|symptom|symptoms|unexpected|"
+    r"not working|does(?:n't| not) work)\b",
+    re.I,
+)
+_CODE_WRITE_COMMAND_RE = re.compile(
+    r"(?:^\s*(?:apply_patch|patch)\b|"
+    r"\b(?:sed|perl)\s+-i\b|\bgit\s+(?:apply|checkout|restore|reset)\b|"
+    r"\b(?:write_text|write_bytes|writeFile(?:Sync)?|appendFile(?:Sync)?|createWriteStream|"
+    r"unlink|rename)\s*\(|"
+    r"\bopen\s*\([^)]*,\s*['\"](?:w|a|x)|"
+    r"\b(?:tee|Set-Content|Add-Content|Out-File|Remove-Item|New-Item)\b)",
+    re.I,
+)
+_SHELL_REDIRECTION_RE = re.compile(r"(?<![<>=])(?:>>?|2>)(?!=)\s*(?!&)[^\s;|&]+")
 
 # ---------------------------------------------------------------------------------------
 # Prompt
@@ -101,6 +133,14 @@ SYSTEM_PROMPT = """You are Pulse Code, an autonomous coding agent working in the
 - If the request is a question, answer it from the code; make no edits.
 - Do what the request says, not the nearest thing you know how to do: "run it" means start_run, "why is X" means an answer with the real numbers, "add Y" means edits. A reply that describes what you are going to do, without doing it, is not an answer: do it, in that same reply, with the tools.
 
+# Evidence before patches
+- For a reported bug/failure, writer tools are mechanically blocked until `review_evidence` accepts a review of actual tool outputs. Direct file-writing shell commands are also blocked; use the gated patch tools. First reproduce the symptom with a focused test or command when possible, inspect implementation and data/control flow, and verify callers/configuration/runtime values.
+- Gather at least three independent observations from at least three distinct tools, including source inspection and an execution/runtime check. Repeated copies of one claim are not independent. `review_evidence` requires exact quotes from the evidence receipts returned by tools, a leading hypothesis, a plausible alternative, supporting and disconfirming observations, and a confidence decision.
+- Keep observations separate from interpretation. Treat prior model conclusions, heuristic warnings, and a test that merely agrees with your guess as hypotheses, not proof. Follow contradictory results rather than discarding them to preserve the first conclusion.
+- If evidence leaves competing causal fixes, mark the review uncertain and use `experiment`. A started experiment is not evidence: wait for a completed report with a validated candidate, then cite that report in a new evidence review. Do not edit until the gate confirms it.
+- For requested features, ground changes in requirements, existing call paths, and focused tests. Once a cause is established, make the smallest surgical change and verify it; failed verification invalidates the previous review and requires fresh evidence.
+- Once the cause is established, make the smallest targeted fix and verify it removes the observed failure without breaking adjacent behavior. If the exact cause or fix remains uncertain and the failure can be measured, use the `experiment` tool: provide an evidence-based failure signature and original measurements, require the isolated control to reproduce it, compare candidate changes against that control, and apply only a candidate the report validates. Pass a new spec as the tool's `spec` object so no temporary project file is needed. Inspect experiment status/report before editing. If the failure cannot be safely reproduced or no candidate is validated, explain what remains uncertain and do not guess.
+
 # Planning: decompose until the whole job is written down
 Plan before you touch code, and plan in detail. Read enough to name real files and symbols, then call todo_write before your first edit (edits are refused on a multi-part request until an outline exists).
 1. First phase "Requirements": one leaf per thing the request names -- every library, technique, feature, file and behaviour, in the user's words. Nothing the user listed may be missing from the outline, and nothing may be dropped later without telling them.
@@ -110,10 +150,11 @@ Plan before you touch code, and plan in detail. Read enough to name real files a
 Scale the detail to the work: a one-line fix is one or two leaves; a model, tokenizer or training pipeline is dozens.
 
 # Follow the request exactly, including how
-The stack, libraries, language, algorithms and structure the user names are requirements, not suggestions. If they say numpy/cupy, the code uses numpy/cupy. If they say add flash attention and BPE, you write flash attention and BPE.
-- Never swap in a different framework, library, algorithm or architecture because it is easier, quicker to write, or already has the feature built in. In particular do not introduce torch, tensorflow, jax or keras into a project that does not use them. The edit tool refuses a new framework the user did not ask for.
+The framework, libraries, language, algorithms and structure the project already uses -- or the user names -- are requirements, not suggestions. Find out what the project is built on (its imports, requirements, notes, existing files) and stay on it, whatever it is: a PyTorch project stays PyTorch, a JAX project stays JAX, a NumPy project stays NumPy, and a framework you have never heard of stays that framework. Change framework, library or language only when the user explicitly tells you to ("port this to X", "use Y instead").
+- Never swap in a different framework, library, algorithm or architecture because it is easier, quicker to write, or already has the feature built in, and never route around the framework in use. The edit tool refuses a new compute framework the user did not ask for.
+- A request is carried out in the framework in use. If the user asks for a feature (flash attention, a tokenizer, a new layer), you write that feature there, even if another framework ships it ready-made.
 - Harder is not impossible. If the requested approach needs a piece that does not exist yet (a kernel, a tokenizer, a backward pass), build that piece. Only if it is truly impossible here: stop, say exactly what blocks it with message_user, and ask. Never substitute another approach and present it as done.
-- Before choosing how to do something, check what the project already uses (imports, requirements, notes) and match it.
+- Before choosing how to do something, check what the project already uses and match it.
 - Do not shrink the scope ("simplified", "minimal", "basic" versions) unless asked, and do not widen it either.
 
 # Production code, not placeholders
@@ -125,8 +166,8 @@ Everything you write must be complete code that would run as-is in production.
 # Neural networks: every forward pass has a backward pass
 Before you write the outline for any model, layer, loss or training code:
 1. List the forward-pass components (embedding, attention, norm, MLP, loss, ...).
-2. Check which stack is in use. With an autograd framework (torch, tensorflow, jax) gradients come from loss.backward() or grad; the outline still has a leaf for backward plus the optimizer step, and a leaf that checks every parameter receives a non-None, non-zero gradient.
-3. With numpy, cupy or any hand-rolled code there is NO autograd. For each forward task add its own backward task right after it, at the same level of detail: cache the activations the backward needs during forward, compute dX and every parameter gradient (dW, db, dgamma, ...), including the softmax, layer-norm and attention Jacobians, masks, and the loss gradient. Then add a leaf for the optimizer update and one that checks the gradients numerically (finite differences on a tiny model in float64, relative error under ~1e-4).
+2. Check which stack is in use. If it has autograd (PyTorch, TensorFlow, JAX, ...) gradients come from the framework (loss.backward(), grad); the outline still has a leaf for backward plus the optimizer step, and a leaf that checks every parameter receives a non-None, non-zero gradient.
+3. If it has no autograd (NumPy, CuPy, hand-written kernels, ...) every gradient is yours to write. For each forward task add its own backward task right after it, at the same level of detail: cache the activations the backward needs during forward, compute dX and every parameter gradient (dW, db, dgamma, ...), including the softmax, layer-norm and attention Jacobians, masks, and the loss gradient. Then add a leaf for the optimizer update and one that checks the gradients numerically (finite differences on a tiny model in float64, relative error under ~1e-4).
 4. Add an end-to-end leaf: overfit one tiny batch; the loss must fall toward zero. A probe runs forward AND backward, never forward alone.
 An outline with forward tasks and no matching backward tasks is rejected.
 
@@ -241,6 +282,29 @@ TOOLS = [
         "Run a shell command in the project directory and get back real stdout, stderr, exit code and duration. "
         "Optional timeout in seconds.",
         {"command": _S, "timeout": _I}, ["command"]),
+    _fn("experiment",
+        "Start, inspect, or cancel a Pulse isolated proxy experiment via `<project-relative-spec.json>`, "
+        "`status [id]`, or `cancel <id>`. For a new experiment you may pass its JSON object as `spec` instead "
+        "of creating a project file. Use it when evidence leaves competing causal fixes: provide a valid spec "
+        "with the observed failure signature and original run metrics, require its isolated control to reproduce "
+        "the failure, compare candidates with control, and apply only a validated result. Specs are validated before "
+        "commands run and potentially risky commands still require user confirmation.",
+        {"argument": _S, "spec": {"type": "object", "additionalProperties": True}}),
+    _fn("review_evidence",
+        "Mandatory authorization gate before any code write for bug/failure fixes. Cite at least three distinct "
+        "evidence receipts returned by inspection and execution tools. Every quote must be copied exactly from "
+        "that receipt's output. Include one supporting and one disconfirming observation, a leading hypothesis, "
+        "a plausible alternative, and confidence ('supported' only when the alternative is ruled out; otherwise "
+        "'uncertain', which requires a completed experiment with a validated candidate). Fabricated or stale "
+        "receipts are rejected.",
+        {"hypothesis": _S, "alternative": _S,
+         "confidence": {"type": "string", "enum": ["supported", "uncertain"]},
+         "evidence": {"type": "array", "items": {
+             "type": "object",
+             "properties": {"id": _S, "quote": _S, "supports": {"type": "boolean"}},
+             "required": ["id", "quote", "supports"],
+         }}},
+        ["hypothesis", "alternative", "confidence", "evidence"]),
     _fn("check_shape",
         "Run a short Python snippet in the project and report the real shape, dtype and device of values -- so you "
         "know a shape instead of guessing it. `code` runs first (imports, build a model, make a tiny batch); "
@@ -353,6 +417,14 @@ class _State:
         self.repeats = 0
         self.edits_declined = 0
         self.calls_made = 0          # tool calls executed in this request
+        self.requires_evidence = _requires_evidence_review(request)
+        self.evidence_observations = []
+        self.evidence_sequence = 0
+        self.evidence_reviewed = not self.requires_evidence
+        self.evidence_requires_experiment = False
+        self.experiment_validated = False
+        self.experiment_job_ids = set()
+        self.writes_since_review = 0
 
     @property
     def root(self):
@@ -650,9 +722,149 @@ def _request_text(state):
     return "\n".join(parts)
 
 
+def _requires_evidence_review(request):
+    return bool(_BUGFIX_REQUEST_RE.search(str(request or "")))
+
+
+def _command_may_write_code(command):
+    command = str(command or "")
+    shell, quote, escaped = [], None, False
+    for char in command:
+        if quote:
+            shell.append(" " if char in "<>" else char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in ("'", '"'):
+            quote = char
+            shell.append(char)
+        else:
+            shell.append(char)
+    shell = "".join(shell)
+    return bool("<<" in shell or _SHELL_REDIRECTION_RE.search(shell)
+                or _CODE_WRITE_COMMAND_RE.search(command))
+
+
+def _completed_validated_experiment(cli, job_ids=None):
+    jobs = getattr(cli, "__dict__", {}).get("_experiment_jobs", {})
+    for job_id, job in jobs.items():
+        if job_ids is not None and job_id not in job_ids:
+            continue
+        report = job.get("report") if isinstance(job, dict) else None
+        if job.get("state") != "completed" or not isinstance(report, dict):
+            continue
+        if any(branch.get("name") != "control" and branch.get("validated") is True
+               for branch in report.get("branches", []) if isinstance(branch, dict)):
+            return True
+    return False
+
+
+def _evidence_review_error(observations, review, experiment_validated=False):
+    if not isinstance(review, dict):
+        return "review must be a JSON object."
+    hypothesis = str(review.get("hypothesis") or "").strip()
+    alternative = str(review.get("alternative") or "").strip()
+    confidence = review.get("confidence")
+    if len(hypothesis) < 12 or len(alternative) < 12 or hypothesis.casefold() == alternative.casefold():
+        return "provide a specific leading hypothesis and a distinct plausible alternative."
+    if confidence not in ("supported", "uncertain"):
+        return "confidence must be 'supported' or 'uncertain'."
+    citations = review.get("evidence")
+    if not isinstance(citations, list) or len(citations) < 3:
+        return "cite at least three independent observations."
+    by_id = {item.get("id"): item for item in observations if isinstance(item, dict)}
+    cited_ids, cited_tools, cited_items, has_support, has_counter = set(), set(), [], False, False
+    for citation in citations:
+        if not isinstance(citation, dict):
+            return "each evidence citation must be an object."
+        identifier = citation.get("id")
+        quote = citation.get("quote")
+        item = by_id.get(identifier)
+        if not item or not isinstance(quote, str) or len(quote.strip()) < 12:
+            return "each citation must use a current evidence receipt and a meaningful exact quote."
+        if quote not in item.get("result", ""):
+            return f"quote for {identifier} does not exactly occur in that tool's output."
+        cited_ids.add(identifier)
+        cited_items.append(item)
+        tools = item.get("tools") or [item.get("tool")]
+        cited_tools.update(tool for tool in tools if isinstance(tool, str))
+        if citation.get("supports") is True:
+            has_support = True
+        elif citation.get("supports") is False:
+            has_counter = True
+        else:
+            return "each citation must state whether it supports the hypothesis."
+    if len(cited_ids) < 3 or len(cited_tools) < 3:
+        return "the review must cite three distinct observations from three distinct tools."
+    if not (cited_tools & _EVIDENCE_SOURCE_TOOLS):
+        return "the review needs source/code inspection evidence."
+    if not (cited_tools & _EVIDENCE_EXECUTION_TOOLS):
+        return "the review needs execution, runtime, or test evidence."
+    if not any(_is_meaningful_execution_observation(item) for item in cited_items):
+        return "the execution citation must show an actual test, measurement, completed experiment, or run result."
+    if not has_support or not has_counter:
+        return "cite both a supporting observation and an observation that could disprove the hypothesis."
+    if confidence == "uncertain" and not experiment_validated:
+        return "uncertain reviews require a completed isolated experiment with a validated candidate."
+    return None
+
+
+def _is_meaningful_execution_observation(item):
+    tools = set(item.get("tools") or [item.get("tool")])
+    result = str(item.get("result") or "")
+    if "run_command" in tools:
+        command = str(item.get("command") or "")
+        return bool(re.search(
+            r"\b(?:test|pytest|unittest|check|verify|repro|compile|probe|lint|smoke)\b|"
+            r"python\s+-c|(?:^|\s)[^\s]+\.py(?:\s|$)",
+            command, re.I,
+        ) and re.search(r"(?im)^Exit code:\s*\d+\s*$", result))
+    if "TERMINAL" in tools:
+        return bool(re.search(
+            r"\b(?:test|pytest|unittest|check|verify|repro|compile|probe|lint|smoke)\b|"
+            r"python\s+-c|(?:^|\s)[^\s]+\.py(?:\s|$)",
+            result, re.I,
+        ) and re.search(r"(?im)^.*Exit code:\s*\d+", result))
+    if "smoke_test" in tools:
+        return bool(re.search(r"(?im)^SMOKE TEST:\s*(?:PASS|FAIL)\b", result))
+    if "check_shape" in tools:
+        return "CHECK_SHAPE:" in result
+    if "experiment" in tools or "EXPERIMENT" in tools:
+        return bool(re.search(r"(?im)^EXPERIMENT .+:\s*completed\b", result))
+    if "run_status" in tools or "RUNSTATUS" in tools:
+        return bool(result.strip() and "only available inside" not in result.lower()
+                    and "failed:" not in result.lower())
+    return False
+
+
+def _invalidate_evidence(state):
+    state.evidence_observations.clear()
+    state.evidence_reviewed = not state.requires_evidence
+    state.evidence_requires_experiment = False
+    state.experiment_validated = False
+    state.writes_since_review = 0
+
+
+def _evidence_write_error(state):
+    if not state.requires_evidence:
+        return None
+    if not state.evidence_reviewed:
+        return "NOT APPLIED -- review_evidence must approve current, cited evidence before code can be changed."
+    if state.evidence_requires_experiment and not state.experiment_validated:
+        return "NOT APPLIED -- the evidence review marked the cause uncertain; complete an isolated experiment " \
+               "and validate a candidate before changing code."
+    return None
+
+
 def _write_checked(state, path, before, after, label, created=False):
-    """Plan gate -> lint gate -> stack gate -> confirm -> write -> impact. Returns the tool result text."""
+    """Evidence gate -> plan gate -> lint gate -> stack gate -> confirm -> write -> impact."""
     cli = state.cli
+    evidence_error = _evidence_write_error(state)
+    if evidence_error:
+        return evidence_error
     blocked = _rules.plan_gate(bool(getattr(state, "todos", None)), getattr(state, "request", ""),
                                getattr(state, "writes_total", 0), getattr(state, "writes_since_outline", 0))
     if blocked:
@@ -678,6 +890,8 @@ def _write_checked(state, path, before, after, label, created=False):
     if path.endswith(".py") and not created:
         note += _impact(cli, before, after)
     state.writes_total = getattr(state, "writes_total", 0) + 1
+    if state.requires_evidence:
+        state.writes_since_review += 1
     state.writes_since_outline = getattr(state, "writes_since_outline", 0) + 1
     note += _rules.broad_leaf_warning(state.writes_since_outline)
     stubs = _rules.find_stubs(_rel(state.root, path), "" if created else before, after)
@@ -875,6 +1089,9 @@ def _t_run_command(state, a):
     command = str(a.get("command", "")).strip()
     if not command:
         return "command is empty."
+    if state.requires_evidence and _command_may_write_code(command):
+        return ("NOT RUN -- code-writing shell commands are disabled for bug fixes; use the gated "
+                "edit_file, replace_symbol, or write_file tools instead.")
     try:
         timeout = int(a.get("timeout") or 0)
     except (TypeError, ValueError):
@@ -888,6 +1105,64 @@ def _t_run_command(state, a):
                    "started with start_run, which keeps it running and lets Pulse watch it; use "
                    "run_command only for short checks.")
     return result
+
+
+def _t_experiment(state, a):
+    argument = a.get("argument")
+    spec = a.get("spec")
+    if argument is not None and not isinstance(argument, str):
+        return "EXPERIMENT: argument must be a string."
+    if spec is not None:
+        if not isinstance(spec, dict):
+            return "EXPERIMENT: spec must be a JSON object."
+        if isinstance(argument, str) and argument.strip():
+            return "EXPERIMENT: provide either an argument or a spec, not both."
+        experiment_dir = os.path.join(state.root, ".pulse")
+        created_dir = False
+        try:
+            os.mkdir(experiment_dir)
+            created_dir = True
+        except FileExistsError:
+            pass
+        descriptor, path = tempfile.mkstemp(prefix="experiment-", suffix=".json", dir=experiment_dir)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(spec, handle)
+            result = state.cli._run_experiment(os.path.relpath(path, state.root))
+        finally:
+            os.remove(path)
+            if created_dir:
+                os.rmdir(experiment_dir)
+        _record_experiment_result(state, result)
+        return result
+    if not isinstance(argument, str) or not argument.strip():
+        return "EXPERIMENT: provide a project-relative spec path, 'status [id]', or 'cancel <id>'."
+    result = state.cli._run_experiment(argument.strip())
+    _record_experiment_result(state, result)
+    return result
+
+
+def _record_experiment_result(state, result):
+    started = re.search(r"\bEXPERIMENT\s+([A-Za-z0-9_-]+)\s+started\b", str(result), re.I)
+    if started:
+        state.experiment_job_ids.add(started.group(1))
+    if _completed_validated_experiment(state.cli, state.experiment_job_ids):
+        state.experiment_validated = True
+
+
+def _t_review_evidence(state, a):
+    if not state.requires_evidence:
+        return "Evidence review is not required for this request."
+    validated = state.experiment_validated or _completed_validated_experiment(
+        state.cli, state.experiment_job_ids)
+    problem = _evidence_review_error(state.evidence_observations, a, validated)
+    if problem:
+        state.evidence_reviewed = False
+        return f"NOT AUTHORIZED -- {problem}"
+    state.evidence_reviewed = True
+    state.evidence_requires_experiment = a["confidence"] == "uncertain"
+    state.experiment_validated = validated
+    return "Evidence gate approved. Code writes are authorized until a verification command runs."
 
 
 # ---------------------------------------------------------------------------------------
@@ -1275,18 +1550,20 @@ def _t_message_user(state, args):
 
 _HANDLERS = {
     "message_user": _t_message_user,
+    "review_evidence": _t_review_evidence,
     "start_run": _t_start_run, "run_status": _t_run_status, "restart_run": _t_restart_run,
     "stop_run": _t_stop_run,
     "read_file": _t_read_file, "list_files": _t_list_files, "grep": _t_grep, "outline": _t_outline,
     "find_definition": _t_find_definition, "find_references": _t_find_references,
     "dep_graph": _t_dep_graph, "trace_variable": _t_trace_variable, "doc_lookup": _t_doc_lookup,
     "edit_file": _t_edit_file, "replace_symbol": _t_replace_symbol, "write_file": _t_write_file,
-    "run_command": _t_run_command, "todo_write": _t_todo_write,
+    "run_command": _t_run_command, "experiment": _t_experiment, "todo_write": _t_todo_write,
     "check_shape": _t_check_shape, "smoke_test": _t_smoke_test,
 }
 _WRITERS = {"edit_file", "replace_symbol", "write_file"}
 # their output is for the person (or they may have to ask the person before they run)
-_LOUD = {"run_command", "message_user", "start_run", "restart_run", "stop_run", "check_shape", "smoke_test"}
+_LOUD = {"run_command", "experiment", "review_evidence", "message_user", "start_run", "restart_run",
+         "stop_run", "check_shape", "smoke_test"}
 
 
 def _brief(name, args):
@@ -1294,6 +1571,7 @@ def _brief(name, args):
     key = {"read_file": "path", "outline": "path", "edit_file": "path", "replace_symbol": "path",
            "write_file": "path", "grep": "pattern", "find_definition": "symbol", "find_references": "symbol",
            "trace_variable": "target", "doc_lookup": "name", "run_command": "command",
+           "experiment": "argument",
            "list_files": "pattern", "start_run": "script", "check_shape": "exprs"}.get(name)
     detail = str(args.get(key, "")) if key else ""
     if name == "check_shape" and not args.get("exprs"):
@@ -1310,6 +1588,8 @@ def _brief(name, args):
         detail += f" :: {args.get('symbol', '')}"
     if name == "todo_write":
         detail = f"{len(args.get('todos') or [])} item(s)"
+    if name == "experiment" and args.get("spec"):
+        detail = "isolated proxy comparison"
     return f"{name}  {detail}".rstrip()[:160]
 
 
@@ -1371,6 +1651,8 @@ def _execute(state, call):
     except (ValueError, TypeError):
         return (f"The arguments to {name} were not valid JSON -- your reply was probably cut off because it was "
                 "too long. Retry with a smaller call (edit_file with a short snippet, or write the file in parts).")
+    if state.requires_evidence and state.writes_since_review and name in _VERIFICATION_TOOLS:
+        _invalidate_evidence(state)
     signature = (name, raw)
     state.repeats = state.repeats + 1 if signature == state.last_call else 1
     state.last_call = signature
@@ -1388,6 +1670,19 @@ def _execute(state, call):
     except Exception as exc:
         result = f"{name} failed: {type(exc).__name__}: {exc}"
     result = _clip(str(result))
+    if state.requires_evidence and name in _EVIDENCE_TOOLS and result.strip():
+        state.evidence_sequence += 1
+        evidence_id = f"E{state.evidence_sequence}"
+        result += f"\n[Evidence {evidence_id}: {name}]"
+        state.evidence_observations.append({
+            "id": evidence_id,
+            "tool": name,
+            "tools": [name],
+            "command": str(args.get("command") or "") if name == "run_command" else "",
+            "result": result,
+        })
+        if len(state.evidence_observations) > 80:
+            del state.evidence_observations[:-80]
     if state.repeats >= _REPEAT_LIMIT:
         result += (f"\n\n(You have made this exact call {state.repeats} times in a row with the same result. "
                    "Change your approach.)")

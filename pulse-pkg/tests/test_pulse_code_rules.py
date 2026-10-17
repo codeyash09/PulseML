@@ -373,7 +373,10 @@ def test_the_turn_sends_the_planning_brief_beside_the_request(cli, monkeypatch):
 def test_the_prompt_tells_the_agent_what_it_is_held_to():
     prompt = native.SYSTEM_PROMPT
     for phrase in ("Planning: decompose until the whole job is written down", "Requirements",
-                   "Follow the request exactly, including how", "do not introduce torch",
+                   "Follow the request exactly, including how", "Never swap in a different framework",
+                   "Evidence before patches", "three independent observations",
+                   "review_evidence", "disconfirming observation",
+                   "plausible alternative", "use the `experiment` tool",
                    "Production code, not placeholders", "no `pass` or `...` bodies",
                    "every forward pass has a backward pass", "finite differences"):
         assert phrase in prompt, phrase
@@ -382,6 +385,17 @@ def test_the_prompt_tells_the_agent_what_it_is_held_to():
 def test_the_text_pipeline_prompt_carries_the_same_rules():
     from pulse import pulse_code
     prompt = pulse_code.CODE_SYSTEM_PROMPT
-    for phrase in ("never switch to torch", "No stubs", "Every forward pass has a backward pass",
+    for phrase in ("Never switch because another framework is easier", "No stubs",
+                   "three independent kinds of primary evidence", "disconfirming evidence",
+                   "EXPERIMENT:", "Every forward pass has a backward pass",
                    "finite-difference gradient check"):
         assert phrase in prompt, phrase
+
+
+def test_experiment_directive_is_available_to_the_text_coding_agent():
+    from pulse import pulse_code
+    cleaned, requests = pulse_code._CodeAgentCLI._extract_new_directives(
+        "Need a controlled comparison.\nEXPERIMENT: experiments/fix.json"
+    )
+    assert "EXPERIMENT:" not in cleaned
+    assert requests["experiment"] == ["experiments/fix.json"]

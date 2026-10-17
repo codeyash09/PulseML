@@ -15,7 +15,7 @@ stays on one full-screen layout:
     step, every value with its curve, the detectors' findings), the agent on the right.
     Questions go to the agent together with the run's evidence; it can read the code,
     run commands and propose a fix. Its reasoning and every tool call are in the
-    transcript, folded to a line each -- Ctrl+O unfolds them.
+    transcript, folded to a line each -- Ctrl+O unfolds them when the composer is empty.
 
 Nothing underneath is reimplemented. The agent is Pulse Code's (`pulse_code.run_turn`),
 the run is watched by the console's brain (`pulse_console.Console`), and setup is
@@ -107,7 +107,7 @@ HOME_COMMANDS: List[Tuple[str, str]] = [
     ("/cloud", "sign-in, workspace and sync status"),
     ("/config", "your settings, remembered between starts: /config mouse off, /config agent"),
     ("/copy", "copy the agent's last answer to the clipboard (/copy 2: the one before)"),
-    ("/mouse", "clicks open folded lines; /mouse off gives the mouse back to select text"),
+    ("/mouse", "clicks copy answers and open folded lines; /mouse off gives the mouse back to the terminal"),
     ("/help", "every command"),
     ("/exit", "leave Pulse"),
 ]
@@ -158,8 +158,10 @@ class _Question:
     """Something a hosted pipeline asked; the job thread waits on it."""
 
     def __init__(self, label: str, secret: bool = False, options: Optional[List[Any]] = None,
-                 hotkeys: Optional[Dict[str, Any]] = None) -> None:
+                 hotkeys: Optional[Dict[str, Any]] = None, title: str = "", note: str = "") -> None:
         self.label = label
+        self.title = title
+        self.note = note
         self.secret = secret
         self.options = options
         self.hotkeys = {str(k).lower(): v for k, v in (hotkeys or {}).items()}
@@ -753,8 +755,7 @@ class App:
         self.hosting: Any = None                  # the in-process run's monitor, under auto_track()
         self._screen: Any = None                  # the screen, while the loop runs
         self._hovered: Optional[tui.Entry] = None # the entry under the mouse
-        self._sel: Optional[Dict[str, Any]] = None # a selection being dragged or just made
-        self._frame: List[str] = []               # the frame last drawn (what a selection copies)
+        self._mouse_down: Optional[Tuple[int, int]] = None
         try:
             from . import pulse_supabase as cloud
             if _settings.is_set("mouse"):
@@ -942,8 +943,11 @@ class App:
                 view = self.view
                 self._draft = view.editor.take(remember=False)
                 view.question, view.secret, view.scroll = question.label, question.secret, 0
+                view.popup_title, view.popup_note = question.title, question.note
                 if question.options is not None:
                     view.options = [(str(o.label), str(o.detail or ""), str(o.tag or "")) for o in question.options]
+                    view.option_extras = [(str(getattr(o, "badge", "") or ""), str(getattr(o, "tone", "") or ""))
+                                          for o in question.options]
                     view.option_ids = list(range(len(view.options)))
                 self.dirty = True
             posted = self._post_question(question)   # on the dashboard too: the first answer wins
@@ -957,6 +961,8 @@ class App:
                     question.done.set()
                 view = self.view
                 view.question, view.secret, view.options, view.option_ids = "", False, None, []
+                view.popup_title = view.popup_note = ""
+                view.option_extras = []
                 view.editor.take(remember=False)
                 view.editor.set(self._draft)
                 self._question = None
@@ -1191,8 +1197,10 @@ class App:
         for thread in list(self._closers):
             thread.join(max(0.0, deadline - time.monotonic()))
 
-    def ask(self, label: str, secret: bool = False, placeholder: Optional[str] = None, **_ignored: Any) -> str:
-        question = _Question(label + (f"  [{placeholder}]" if placeholder else ""), secret=secret)
+    def ask(self, label: str, secret: bool = False, placeholder: Optional[str] = None,
+            title: str = "", note: str = "", **_ignored: Any) -> str:
+        question = _Question(label + (f"  [{placeholder}]" if placeholder else ""), secret=secret,
+                             title=title, note=note)
         answer = self._ask(question)
         shown = (_ui._g("mask") * min(len(answer), 12)) if secret and answer else (answer or "↵")
         self.note(f"{label}  {shown}")
@@ -1267,7 +1275,6 @@ class App:
         if not _ui.confirm(f"The agent wants to stop {name}. Stop it?", default=False):
             return "The person did not allow stopping the run."
         self.console.send_control(stream.CONTROL_STOP, reason="asked by the agent")
-        self._stopped_by_agent = (self.session or {}).get("session_id")
         return f"Asked {name} to stop."
 
     def _agent_restart_run(self) -> str:
@@ -1283,11 +1290,6 @@ class App:
         if after and after != before:
             return (f"Restarted with the current code: the new run (session {after}) is open beside you. "
                     "run_status shows how it is doing -- check it before you call the fix done.")
-        pending = self._still_starting()
-        if pending:
-            return (f"Restarted with the current code: the new run (pid {pending[0]['process'].pid}) is starting "
-                    "and has not reported a training step yet; it opens here when it does. Do not restart it "
-                    "again -- wait, then check run_status.")
         return ("The restart did not produce a new run: the old one is still the open one, and the change is "
                 "in no run." + (self._start_failure_text() or " The lines above say what happened."))
 
@@ -1607,9 +1609,9 @@ class App:
                     self._hovered = entry
                     self.dirty = True                # only a change needs a redraw
                 return
+            if not key.startswith(("press:", "drag:", "release:")):
+                self._mouse_down = None
             self.dirty = True
-            if self._sel is not None and not self._sel.get("dragging"):
-                self._sel = None                     # a key after a selection: it goes
             if key == "ctrl+c":
                 if question is not None:
                     question.cancelled = True
@@ -1627,12 +1629,18 @@ class App:
                                    if self.hosting is not None else "Ctrl+C again to leave Pulse")
                 return
             view.status = ""
+            if key == "ctrl+g":
+                self._pick_agent()
+                return
             if key == "ctrl+o":
-                view.expanded = not view.expanded
-                for entry in view.entries:           # Ctrl+O speaks for every entry again
-                    if entry.open is not None:
-                        entry.open = None
-                        entry.touch()
+                if not view.busy and question is None and view.editor.text:
+                    self._pick_agent()
+                else:
+                    view.expanded = not view.expanded
+                    for entry in view.entries:
+                        if entry.open is not None:
+                            entry.open = None
+                            entry.touch()
                 return
             if key in ("pgup", "pgdn"):
                 page = max(3, self._height // 2)
@@ -1687,6 +1695,8 @@ class App:
                 hints = tui._hints(view)
                 if hints:
                     view.editor.set(hints[0][0] + " ")
+                elif not view.editor.text:
+                    self._pick_agent()                   # Tab on an empty box: the agent list (a plain key no editor claims)
             elif key == "esc":
                 if view.editor.text:
                     view.editor.take(remember=False)           # Esc clears what was typed
@@ -1703,49 +1713,32 @@ class App:
     # ------------------------------------------------------------------ the mouse: clicks and selections
 
     def _click(self, x: int, row: int) -> None:
+        copy_hit = self.view.copy_hits.get(row)
+        if copy_hit is not None and copy_hit[0] <= x < copy_hit[1]:
+            self._copy_text(copy_hit[2].text)
+            return
+        hit = self.view.chip_hit
+        if hit is not None and row == hit[0] and hit[1] <= x < hit[2]:
+            self._pick_agent()
+            return
         entry = self.view.row_entries.get(row)
         if entry is not None and entry.foldable():
             entry.toggle(self.view.expanded)
             tui.keep_in_place(self.view, entry, row)
 
     def _mouse_button(self, key: str) -> None:
-        """A press starts a selection where it lands; a drag stretches it (within the pane it
-        started in); the release copies it -- or, with no drag, is a click."""
+        """Treat an unmoved mouse press/release as a click; dragging does not copy text."""
         kind, x, y = key.split(":")[0], *(int(v) for v in key.split(":")[1:])
-        view = self.view
         if kind == "press":
-            side = view.side is not None and 0 <= view.side_cols and x <= view.side_cols
-            cols = (0, view.side_cols) if side else (
-                view.transcript_x if view.side_cols >= 0 else 0, max(self._total_w - 1, 0))
-            self._sel = {"anchor": (x, y), "head": (x, y), "cols": cols, "dragging": True, "moved": False}
+            self._mouse_down = (x, y)
             return
-        sel = self._sel
-        if sel is None:
-            if kind == "release":
-                self._click(x, y)
-            return
-        x = max(sel["cols"][0], min(x, sel["cols"][1]))
         if kind == "drag":
-            sel["head"] = (x, y)
-            sel["moved"] = sel["moved"] or (x, y) != sel["anchor"]
+            if self._mouse_down != (x, y):
+                self._mouse_down = None
             return
-        sel["head"], sel["dragging"] = (x, y), False      # release
-        if not sel["moved"]:
-            self._sel = None
-            self._click(*sel["anchor"])
-            return
-        text = tui.selected_text(self._frame, sel)
-        if not text:
-            self._sel = None
-            return
-        sent = []
-        if self._screen is not None:
-            self._screen.copy(text)
-            sent.append("terminal")
-        threading.Thread(target=_copy_with_tool, args=(text,), daemon=True).start()
-        lines = text.count("\n") + 1
-        view.status = (f"Copied {len(text):,} characters" + (f" ({lines} lines)" if lines > 1 else "")
-                       + " -- paste with Ctrl+Shift+V (or your terminal's paste)")
+        anchor, self._mouse_down = self._mouse_down, None
+        if kind == "release" and anchor == (x, y):
+            self._click(x, y)
 
     def _key_in_list(self, key: str, question: _Question) -> None:
         view = self.view
@@ -1862,9 +1855,9 @@ class App:
         if screen is not None:
             screen.set_mouse(on)
         _settings.set("mouse", "on" if on else "off")
-        self.note("Mouse on: drag over any text to copy it, a click opens a folded line, the wheel scrolls "
-                  "(over the run pane, the pane)." if on else
-                  "Mouse off: your terminal selects and scrolls as usual. Ctrl+O opens folded lines, PgUp/PgDn "
+        self.note("Mouse on: click Copy buttons to copy an answer; click folded lines to open them. "
+                  "PgUp/PgDn scroll." if on else
+                  "Mouse off: your terminal handles text selection. Ctrl+O opens folded lines, PgUp/PgDn "
                   "scroll. /mouse on gives the app the mouse back.")
 
     def _config(self, arg: str) -> None:
@@ -1944,7 +1937,9 @@ class App:
             self.note("Nothing from the agent to copy yet." if not words
                       else f"There are only {len(words)} answers to copy from.")
             return
-        text = words[-back]
+        self._copy_text(words[-back])
+
+    def _copy_text(self, text: str) -> None:
         sent = []
         if self._screen is not None:
             self._screen.copy(text)
@@ -1969,8 +1964,8 @@ class App:
         print(_ui._s("Anything else is for the agent" + (": a question about this run, or a fix to make."
                                                         if self.console is not None else
                                                         ": a feature, a fix, a question about the code."), "dim"))
-        print(_ui._s("Ctrl+O unfolds the agent's thinking and tool output · PgUp/PgDn scroll · "
-                     "Ctrl+C cancels what is running, twice leaves.", "dim"))
+        print(_ui._s("Tab on an empty prompt or Ctrl+O while typing opens agent selection · "
+                     "Ctrl+O otherwise unfolds details · PgUp/PgDn scroll", "dim"))
 
     # ================================================================== runs on this machine
 
@@ -2101,11 +2096,7 @@ class App:
         else:
             self._park()
         console = _make_console(self, session, self._brain_agent())
-        # not while the agent is at work; headless: not once the run is over either -- its
-        # supervisor makes the one closing look (a scheduled audit due then took the look, its
-        # problem dropped as about a run no longer live, and the closing one came back "busy")
-        console.brain.hold_audits = lambda: self._job is not None or (
-            self._hold_audits_when_over and self._status not in ("live", "stalled"))
+        console.brain.hold_audits = lambda: self._job is not None      # not while the agent is at work
         if carried is not None:
             fixes, audits = carried
             console.brain.fixes = [dict(f, before_restart=True) for f in fixes][-5:] + console.brain.fixes
@@ -2749,8 +2740,6 @@ class App:
             return
 
     _slow_at = 0.0
-    _hold_audits_when_over = False
-    _stopped_by_agent: Optional[str] = None       # the session the agent itself asked to stop
 
     def _restart(self) -> Optional[str]:
         """Stop the open run if it is still going, and start it again under Pulse with the
@@ -2758,13 +2747,6 @@ class App:
         opened this app (auto_track) with its arguments; a run started elsewhere only once it
         is over (its arguments are not known here). Returns why it refused, or None."""
         from . import pulse_stream as stream
-        pending = self._still_starting()
-        if pending:
-            # a second start beside one that has not reported yet: two runs on one set of files
-            why = (f"A start of {os.path.basename(pending[0]['argv'][0])} is already on its way (pid "
-                   f"{pending[0]['process'].pid}): it opens here once it reports its first training step.")
-            self.note(why)
-            return why
         session = self.session or {}
         info = self.launched.get(session.get("session_id", ""))
         hosted = self.hosting is not None and session.get("session_id") == getattr(self.hosting, "session_id", None)
@@ -2838,6 +2820,32 @@ class App:
 
     # ================================================================== the run pane
 
+    def _agent_state(self, name: Optional[str]) -> str:
+        """"ready" when the agent in use has what it needs, else why not ("missing", "signin"...)."""
+        if not name:
+            return ""
+        try:
+            from . import pulse_cli
+            state = pulse_cli.agent_key_state(name)[0]
+        except Exception:
+            return ""
+        if state in ("missing", "signin") and getattr(self.cli, "agent_key", None):
+            return "ready"                       # a key was given for this session
+        return state
+
+    def _pick_agent(self) -> None:
+        """Open the agent dropdown: Tab on an empty box, Ctrl+O while typing, Ctrl+G, the chip, or /agent."""
+        if self.view.busy or self.view.question:
+            self.view.status, self.dirty = "Finish or cancel what is running first (Ctrl+C), then pick an agent.", True
+            return
+        self._start(self._pick_agent_job)
+
+    def _pick_agent_job(self) -> None:
+        try:
+            self._handle("/agent")
+        finally:
+            self._refresh_header()               # the chip shows the new agent and whether it has a key
+
     def _refresh_header(self) -> None:
         view = self.view
         cli = self.cli
@@ -2864,6 +2872,8 @@ class App:
             view.context = short(getattr(cli, "_project_root", None) or self.home_root)
             view.commands = HOME_COMMANDS
         view.agent = f"agent: {cli.agent_provider}" if cli.agent_provider else "no agent -- /agent"
+        view.agent_name = cli.agent_provider or ""
+        view.agent_state = self._agent_state(cli.agent_provider)
         self.dirty = True
 
     def _refresh_side(self, force: bool = False) -> None:
@@ -2974,9 +2984,6 @@ class App:
                             if self.dirty or animating:
                                 self.view.frame += 1 if animating else 0
                                 lines, row, col = tui.compose(self.view, *size)
-                                self._frame = lines
-                                if self._sel is not None and self._sel["head"] != self._sel["anchor"]:
-                                    lines = tui.highlight(lines, self._sel)
                                 split = self.view.side is not None and size[0] >= tui.SPLIT_MIN_WIDTH
                                 self._pane_w = tui.pane_width(size[0], split)
                                 self.dirty, last_frame = False, now
@@ -3306,8 +3313,8 @@ def _welcome(app: App) -> None:
     cli = app.cli
     app.note("Pulse is ready. Describe what you want built or fixed, or open a run to debug it.")
     if app.mouse:
-        app.note("Drag over any text to copy it; a click opens a folded line; the wheel scrolls; "
-                 "↑ brings back what you typed.")
+        app.note("Click a Copy button to copy an answer; click a folded line to open it. "
+                 "PgUp/PgDn scroll; ↑ brings back what you typed.")
     if not cli.agent_provider:
         app.note("No agent yet: /agent picks a model (OpenRouter models need no key -- you can sign in).")
     try:
@@ -3397,8 +3404,8 @@ def watch_in_process(monitor: Any, model: str = "") -> Optional[App]:
                 app._open_run(session)
                 app.note(f"{script} is running here, under Pulse. Ask about it any time; Ctrl+C twice "
                          "leaves Pulse and the training goes on."
-                         + (" Drag over any text to copy it; the wheel over the run's figures "
-                            "scrolls them." if app.mouse else ""))
+                         + (" Copy buttons copy answers; PgUp/PgDn scroll the transcript and "
+                            "the wheel over the run's figures scrolls them." if app.mouse else ""))
             finally:
                 app.uninstall()
             threading.Thread(target=sign_in, name="pulse-app-signin", daemon=True).start()

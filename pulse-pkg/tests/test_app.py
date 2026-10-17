@@ -187,20 +187,20 @@ def test_a_frame_fills_the_terminal_but_its_last_row(width, height):
     assert len(frame) == height - 1
     assert all(tui.visible_len(line) <= width for line in frame)
     assert 0 <= row < height and 0 <= col < width
-    assert plain(frame[row]).rstrip().endswith("❯")              # the cursor sits on the input line
+    # the cursor sits on the input line, which is the first row inside the composer's box
+    assert plain(frame[row]).rstrip().rstrip("│").rstrip().endswith("❯")
 
 
 def test_compact_layout_uses_short_unclipped_footer_hints():
     view = demo_view()
     frame = [plain(line) for line in tui.compose(view, 40, 12)[0]]
-    footer = next(line for line in frame if "Enter · / commands" in line)
-    assert "Ctrl+O" in footer and "click or Ctrl+O to expand" not in footer
+    assert any("PgUp/PgDn" in line for line in frame)
 
 
 def test_the_screen_splits_only_when_a_run_is_open_and_there_is_room():
     view = demo_view()
     home = [plain(line) for line in tui.compose(view, 100, 22)[0]]
-    assert not any("│" in line for line in home)
+    assert not any("│" in line for line in home[2:10])           # no run pane: nothing divides the transcript
     view.side = ["train.py  ● live", "~/experiments", "", "loss  0.0431"]
     wide = [plain(line) for line in tui.compose(view, 100, 22)[0]]
     body = wide[2:]
@@ -209,7 +209,7 @@ def test_the_screen_splits_only_when_a_run_is_open_and_there_is_room():
     assert any("why is the loss flat?" in line.split("│")[1] for line in body)
     view.side_brief = ["train.py  ● live", "step 10 · loss 0.04"]
     narrow = [plain(line) for line in tui.compose(view, 70, 22)[0]]
-    assert not any("│" in line for line in narrow)               # no room: the run is a strip on top
+    assert not any("│" in line for line in narrow[:8])           # no room: the run is a strip on top
     assert narrow[2].strip() == "train.py  ● live" and "step 10" in narrow[3]
 
 
@@ -241,15 +241,15 @@ def test_a_question_and_a_list_take_over_the_input_block():
     view.editor.set("")
     frame = [plain(line) for line in tui.compose(view, 90, 24)[0]]
     chosen = next(line for line in frame if "eval.py" in line)
-    assert chosen.strip().startswith("›") and any("train.py" in line and "›" not in line for line in frame)
+    assert chosen.strip().lstrip("│").strip().startswith("›") and any("train.py" in line and "›" not in line for line in frame)
 
 
 def test_the_home_bar_says_pulse_and_a_run_says_debug():
     view = demo_view()
     top = plain(tui.compose(view, 80, 24)[0][0])
-    assert top.startswith(" PULSE   ~/proj") and "/" not in top.split("~/proj")[0]
+    assert top.startswith(" ◆ PULSE   ~/proj") and "/" not in top.split("~/proj")[0]
     view.area = "DEBUG"
-    assert plain(tui.compose(view, 80, 24)[0][0]).startswith(" PULSE / DEBUG")
+    assert plain(tui.compose(view, 80, 24)[0][0]).startswith(" ◆ PULSE  /  DEBUG")
 
 
 def test_a_row_is_never_written_into_the_last_column():
@@ -514,6 +514,16 @@ def test_ctrl_o_scrolling_and_leaving(app):
     assert not app.done and "again" in app.view.status
     press(app, "ctrl+c")
     assert app.done
+
+
+def test_ctrl_o_opens_agent_selection_while_composing(app, monkeypatch):
+    opened = []
+    monkeypatch.setattr(app, "_pick_agent", lambda: opened.append(True))
+    press(app, "change model", "ctrl+o")
+    assert opened == [True] and app.view.expanded is False
+    app.view.editor.take(remember=False)
+    press(app, "ctrl+o")
+    assert app.view.expanded is True
 
 
 def test_a_job_that_fails_does_not_end_the_app(app):
@@ -1180,7 +1190,7 @@ def test_the_agents_words_and_its_thinking_look_different(monkeypatch):
     monkeypatch.setattr(ui, "color_enabled", lambda: True)
     say = [PLAIN.sub("", l) for l in tui.entry_lines(tui.Entry("say", "The lr is 0.3."), 40, False)]
     think = tui.entry_lines(tui.Entry("thinking", "maybe lr"), 40, True)
-    assert say == ["The lr is 0.3."]                                   # the agent's words: plain
+    assert say[0] == "The lr is 0.3." and say[1].strip() == "[ Copy ]"
     assert PLAIN.sub("", think[0]).startswith("Thought") and "\033[3m" in think[0]   # thinking: orange italic
     assert "\033[38;5;208m" in think[0]
     tool = tui.entry_lines(tui.Entry("tool", calls=["GREP: lr"], output=""), 40, False)
@@ -1315,8 +1325,9 @@ def test_machinery_lines_stack_and_paragraphs_breathe(app):
                         tui.Entry("edit", calls=["EDIT: t.py"], output="+x"), tui.Entry("tool", calls=["TERMINAL: ls"], output="a"),
                         tui.Entry("note", "Verified"), tui.Entry("thinking", "c d"), tui.Entry("say", "Done")]
     lines = [plain(l) for l in tui.transcript_lines(app.view, 80)]
-    assert lines == ["❯ q", "", "Thought (2 words)", "", "Plan", "Edited t.py  · +1 −0", "Ran ls  · 1 line", "Verified",
-                     "", "Thought (2 words)", "", "Done"]          # a thought opens a new step: air before it
+    assert lines == ["❯ q", "", "Thought (2 words)", "", "Plan", " " * 72 + "[ Copy ]",
+                     "Edited t.py  · +1 −0", "Ran ls  · 1 line", "Verified",
+                     "", "Thought (2 words)", "", "Done", " " * 72 + "[ Copy ]"]
 
 
 # ---------------------------------------------------------------- auto_track() opens the app
@@ -1570,7 +1581,7 @@ def test_mouse_off_gives_the_mouse_back_and_is_remembered(app, monkeypatch):
     app._screen = FakeScreen()
     app._command("/mouse off")
     assert app.mouse is False and app._screen.mouse is False and settings.get("mouse") == "off"
-    assert "your terminal selects" in text_of(app)
+    assert "your terminal handles text selection" in text_of(app)
     app._command("/mouse")                                   # toggles back
     assert app.mouse is True and app._screen.mouse is True and settings.get("mouse") == "on"
 
@@ -1877,13 +1888,27 @@ def _frame_app(app):
                         tui.Entry("say", "The loss is flat because of the + 0.5 on line 12.")]
     app._total_w, app._height = 90, 20
     frame, _r, _c = tui.compose(app.view, 90, 20)
-    app._frame = frame
     return frame
 
 
-def test_a_drag_selects_text_and_copies_it(app, monkeypatch):
+def test_copy_button_copies_the_agent_answer(app, monkeypatch):
     copied = []
-    monkeypatch.setattr(appmod, "_copy_with_tool", lambda text: copied.append(("tool", text)))
+    monkeypatch.setattr(appmod, "_copy_with_tool", lambda text: copied.append(("tool", text)) or True)
+    app._screen = FakeScreen()
+    _frame_app(app)
+    row, (start, end, entry) = next(iter(app.view.copy_hits.items()))
+    assert entry.text == "The loss is flat because of the + 0.5 on line 12."
+    assert "[ Copy ]" in plain(tui.compose(app.view, 90, 20)[0][row])
+    app.on_key(f"press:{start}:{row}")
+    app.on_key(f"release:{start}:{row}")
+    assert app._screen.copied == [entry.text]
+    assert copied == [("tool", entry.text)]
+    assert "Copied" in text_of(app)
+
+
+def test_dragging_transcript_text_does_not_copy_it(app, monkeypatch):
+    copied = []
+    monkeypatch.setattr(appmod, "_copy_with_tool", lambda text: copied.append(text))
     app._screen = FakeScreen()
     frame = _frame_app(app)
     row = next(i for i, line in enumerate(frame) if "The loss is flat" in plain(line))
@@ -1891,19 +1916,8 @@ def test_a_drag_selects_text_and_copies_it(app, monkeypatch):
     app.on_key(f"press:{col}:{row}")
     app.on_key(f"drag:{col + 7}:{row}")
     app.on_key(f"release:{col + 7}:{row}")
-    assert app._screen.copied == ["The loss"]
-    assert wait_for(lambda: copied == [("tool", "The loss")])
-    assert "Copied 8 characters" in app.view.status
-    lit = tui.highlight(frame, app._sel)
-    assert "\033[7mThe loss\033[27m" in lit[row]
-    app.on_key("a")                                          # typing: the selection goes
-    assert app._sel is None
-
-
-def test_a_selection_over_several_lines_stays_in_its_pane():
-    lines = ["  left pane one   | right one", "  left pane two   | right two"]
-    sel = {"anchor": (2, 0), "head": (14, 1), "cols": (0, 16)}
-    assert tui.selected_text(lines, sel) == "left pane one\n  left pane two"
+    assert app._screen.copied == [] and copied == []
+    assert not any(e.kind == "note" and "Copied" in e.text for e in app.view.entries)
 
 
 def test_a_press_and_release_in_place_is_still_a_click(app):
@@ -1913,7 +1927,7 @@ def test_a_press_and_release_in_place_is_still_a_click(app):
     row = next(r for r, e in app.view.row_entries.items() if e is tool)
     app.on_key(f"press:5:{row}")
     app.on_key(f"release:5:{row}")
-    assert tool.open is True and app._sel is None
+    assert tool.open is True and app._mouse_down is None
 
 
 def test_up_brings_back_what_was_typed_and_the_wheel_scrolls(app):

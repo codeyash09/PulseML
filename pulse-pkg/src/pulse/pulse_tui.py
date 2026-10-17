@@ -235,8 +235,9 @@ _SEVERITY_STYLE = {"critical": "red", "error": "red", "warning": "accent", "info
 _RED_SGR_RE = re.compile(r"\033\[(?:[0-9;]*;)?(?:31|91)(?:;[0-9;]*)?m")
 _QUIET_KINDS = {"thinking", "tool", "edit", "note"}
 _QUIET_TAG_RE = re.compile(r"\bago\b|^(?:not |ended|crashed|finished|stopped|done)")
-EXPAND_HINT = "click or ctrl+o"
+EXPAND_HINT = "click or ctrl+o when idle"
 USER_FOLD_LINES = 6                 # a pasted request longer than this folds to its first lines
+COPY_LABEL = "[ Copy ]"
 
 
 def _count(n: int, word: str) -> str:
@@ -363,6 +364,8 @@ def entry_lines(entry: Entry, width: int, expanded: bool) -> List[str]:
         # the agent speaking to the person: plain text, nothing in front of it
         for part in entry.text.strip("\n").split("\n"):
             out.extend(wrap(part, width))
+        if entry.text.strip():
+            out.append(" " * max(0, width - len(COPY_LABEL)) + s(COPY_LABEL, "accent", "bold"))
     elif kind == "thinking":
         body = [ln for ln in entry.text.strip().split("\n")]
         if entry.live and not expanded:
@@ -561,6 +564,11 @@ class View:
         self.area = ""                          # PULSE / <AREA> in the top bar; "" at home
         self.context = ""                       # project folder, or the run
         self.agent = ""                         # the model in use, or how to set one
+        self.agent_name = ""                    # the model in use, for the chip in the composer
+        self.agent_state = ""                   # "ready" / "missing" / "signin" / "local" / "custom" / ""
+        self.popup_title = ""                   # heading of the popup a text question opens in
+        self.popup_note = ""                    # a quiet line under its field
+        self.chip_hit: Optional[Tuple[int, int, int]] = None    # (row, first column, last column) of the agent chip
         self.entries: List[Entry] = []
         self.expanded = False                   # ctrl+o: thinking and tool output in full
         self.scroll = 0                         # lines up from the newest
@@ -576,12 +584,14 @@ class View:
         self.question = ""                      # shown above the field
         self.secret = False
         self.options: Optional[List[Tuple[str, str, str]]] = None   # (label, detail, tag)
+        self.option_extras: List[Tuple[str, str]] = []              # per option: (badge, tone), e.g. ("● key set", "")
         self.option_index = 0
         self.option_ids: List[int] = []         # indexes into the caller's list, after filtering
         self.status = ""                        # one transient line in the footer
         self.commands: List[Tuple[str, str]] = []   # (command, what it does), for hints
         self.frame = 0
         self.row_entries: Dict[int, Entry] = {}    # screen row -> the entry drawn there (for clicks)
+        self.copy_hits: Dict[int, Tuple[int, int, Entry]] = {}  # screen row -> copy-button columns and entry
         self.side_scroll = 0                       # lines of the run pane scrolled past (the wheel over it)
         self.side_cols = -1                        # last column of the run pane (-1: no pane beside)
         self.transcript_x = 1                      # column the transcript starts at
@@ -700,6 +710,125 @@ def body_height(height: int) -> int:
     return max(8, height) - 1 - 2
 
 
+# ---------------------------------------------------------------------------------------
+# The composer and the cards that replace it: a rounded box, the agent chip inside it
+# ---------------------------------------------------------------------------------------
+
+def _chip(view: View) -> Tuple[str, str]:
+    """The agent chip and, beside it, whether that agent can be used: ("◆ Name ▾", "● key set")."""
+    chev = s(g("chev"), "dim")
+    if view.agent_name:
+        label = s(g("logo"), "accent") + " " + s(view.agent_name, "bold") + " " + chev
+    else:
+        label = s(g("logo"), "dim") + " " + s("Choose an agent", "accent") + " " + chev
+    badge = {"ready": s(g("now") + " key set", "dim"), "local": s("local", "dim"), "custom": s("custom", "dim"),
+             "missing": s(g("todo") + " no key", "accent"), "signin": s(g("todo") + " sign in", "accent")}
+    return label, badge.get(view.agent_state, "")
+
+
+def _composer(view: View, width: int, body_h: int, rows: int = 99) -> Tuple[List[str], int, int, int, int, int]:
+    """The message box: the text on top, the agent chip under it, all inside one rounded card.
+    Returns its lines, the row of the text field and the cursor's column in them, and the row and
+    first/last column of the chip (what a click on the chip is tested against; row -1: none).
+
+    `rows` is what the screen can spare. With five or more the card is drawn; with three or four
+    it shrinks to the field and the chip on plain lines; with fewer, to the field alone -- so a
+    short terminal still shows what is being typed and where."""
+    if rows < 5:
+        prompt = s(g("cursor") + " ", "accent", "bold")
+        field, cursor_col = _field(prompt, view.editor.text, view.editor.pos, width, view.secret)
+        if rows < 3:
+            return [field], 0, cursor_col, -1, 0, 0
+        label, badge = _chip(view)
+        return [field, _ui._clip(label + ("   " + badge if badge else ""), width)], 0, cursor_col, 1, 0, visible_len(label)
+    inner = width - 4
+    prompt = s(g("cursor") + " ", "accent", "bold")
+    field, cursor_col = _field(prompt, view.editor.text, view.editor.pos, inner, view.secret)
+    body = [field]
+    if body_h >= 18:
+        body.append("")                                  # room to breathe, where there is room
+    label, badge = _chip(view)
+    chip = label + ("   " + badge if badge else "")
+    if view.busy:
+        spin = _SPIN[view.frame % len(_SPIN)] if _ui._unicode() else "/-\\|"[view.frame % 4]
+        right = s(spin + " Working", "dim")
+    else:
+        right = s("\u21b5 send" if _ui._unicode() else "Enter send", "dim")
+    gap = inner - visible_len(chip) - visible_len(right)
+    body.append(chip + " " * gap + right if gap >= 2 else _ui._clip(chip, inner))
+    lines = _ui.box(body, width, tone="dim" if view.busy else "accent")
+    return lines, 1, 2 + cursor_col, len(body), 2, 2 + visible_len(label)
+
+
+def _dropdown(view: View, width: int, avail: int) -> Tuple[List[str], int, int]:
+    """The options of a question as a card: a search field on top, one row per option with its
+    status badge at the right edge. `avail` is how many rows the screen can spare for it; the
+    card takes the room it needs (up to eight options), and on a screen too short for a card it
+    is the search line and the options on plain lines. The search field is always kept.
+    Returns the lines, the row of the search field and the cursor column in them."""
+    boxed = avail >= 6
+    inner = width - 4 if boxed else width
+    shown = view.option_ids
+    field, cursor_col = _field(s("Search ", "dim") + s(g("cursor") + " ", "accent"), view.editor.text,
+                               view.editor.pos, inner, False)
+
+    def build(rows: int) -> List[str]:
+        first = max(0, min(view.option_index - rows // 2, len(shown) - rows))
+        body: List[Optional[str]] = [field] + ([None] if boxed else [])
+        if first > 0 and rows > 1:
+            body.append(s(f"  {g('up')} {first} more", "dim"))
+        for row, option_id in enumerate(shown[first:first + rows], first):
+            label, detail, tag = view.options[option_id]
+            badge, tone = view.option_extras[option_id] if option_id < len(view.option_extras) else ("", "")
+            chosen = row == view.option_index
+            line = (s(g("sel") + " ", "accent", "bold") + s(label, "bold")) if chosen else "  " + label
+            if tag:
+                line += s(f"  {tag}", "dim" if _QUIET_TAG_RE.search(tag) else "accent")
+            if detail:
+                line += s(f"  {detail}", "dim")
+            if badge:
+                mark = s(badge, "accent" if tone == "attn" else "dim")
+                line = _ui._clip(line, max(8, inner - visible_len(mark) - 2))
+                line += " " * max(2, inner - visible_len(line) - visible_len(mark)) + mark
+            body.append(_ui._hilite(_ui._fit(line, inner)) if chosen else _ui._clip(line, inner))
+        if not shown:
+            body.append(s("  no match", "dim"))
+        elif first + rows < len(shown) and rows > 1:
+            body.append(s(f"  {g('down')} {len(shown) - first - rows} more", "dim"))
+        if boxed:
+            title = wrap(view.question, inner - 2)[0] if view.question else "Select"
+            return _ui.box(body, width, title=title, tone="accent")
+        return [line for line in body if line is not None]
+
+    rows = max(1, min(8, avail))
+    lines = build(rows)
+    while len(lines) > avail and rows > 1:           # the "more" rows and the card's edges count too
+        rows = max(1, rows - (len(lines) - avail))
+        lines = build(rows)
+    return lines, (1 if boxed else 0), (2 if boxed else 0) + cursor_col
+
+
+def _popup(view: View, width: int) -> Tuple[List[str], int, int, int]:
+    """A question that wants typed text (an API key, a name) as a centred card with the field in
+    a box of its own. Returns its lines, the row of the field and the cursor's column in them,
+    and the card's width."""
+    pw = min(width, 66)
+    inner = pw - 4
+    title = view.popup_title or ("Private answer" if view.secret else "Question")
+    body: List[Optional[str]] = [""]
+    body += [s(piece, "bold") for piece in wrap(view.question, inner)[:4]]
+    body.append("")
+    prompt = s(g("cursor") + " ", "accent", "bold")
+    field, cursor_col = _field(prompt, view.editor.text, view.editor.pos, inner - 4, view.secret)
+    field_at = len(body) + 1                              # one row under the top edge of the field's box
+    body += _ui.box([field], inner, tone="accent")
+    if view.popup_note:
+        body.append("")
+        body += [s(piece, "dim") for piece in wrap(view.popup_note, inner)[:3]]
+    body += ["", s("Enter confirm   \u00b7   Esc cancel" if _ui._unicode() else "Enter confirm - Esc cancel", "dim")]
+    return _ui.box(body, pw, title=title, tone="accent"), 1 + field_at, 4 + cursor_col, pw
+
+
 def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
     """One frame: `height` lines of at most `width` columns, and where the cursor goes
     (row, column, zero-based)."""
@@ -707,11 +836,12 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
     # into the bottom-right cell) scrolls the whole screen up a line, and the input line
     # was the one that vanished. The frame is drawn one row shorter than the screen.
     width, height = max(20, width), max(8, height) - 1
-    rule = pad(s(g("rule") * min(width, 40), "dim"), width)
-    title = s("PULSE", "bold", "accent") + (s(" / ", "dim") + s(view.area.upper(), "bold") if view.area else "")
+    rule = pad(" " + s(g("rule") * (width - 2), "dim"), width)
+    title = (s(g("logo"), "accent") + " " + s("PULSE", "bold", "accent")
+             + (s("  /  ", "dim") + s(view.area.upper(), "bold") if view.area else ""))
     if view.context:
         title += s("   " + view.context, "dim")
-    agent = s(view.agent, "dim") if view.agent else ""
+    agent = s(view.agent, "dim") if view.agent and not view.agent_name else ""
     gap = width - visible_len(title) - visible_len(agent) - 2
     top = " " + (title + " " * gap + agent if gap >= 1 else _ui._clip(title, width - 2))
     frame: List[str] = [pad(top, width), rule]
@@ -728,66 +858,65 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
 
     # ---- the input block, built bottom-up
     block: List[str] = []
+    keep = max(2, body_h - len(strip) - 2)               # rows the input block may take, footer included
     cursor_col = 0
+    field_row_in_block: Optional[int] = None
+    chip_row_in_block: Optional[int] = None
+    chip_cols = (0, 0)
+    popup = None
     if view.options is not None:
-        if view.question:
-            block.extend(s(piece, "bold") for piece in wrap(view.question, right_w)[:3])
-        shown = view.option_ids
-        rows = min(8, max(3, body_h // 3))
-        first = max(0, min(view.option_index - rows // 2, len(shown) - rows))
-        if first > 0:
-            block.append(s(f"  {g('up')} {first} more", "dim"))
-        for row, option_id in enumerate(shown[first:first + rows], first):
-            label, detail, tag = view.options[option_id]
-            chosen = row == view.option_index
-            line = (s(g("sel") + " ", "accent", "bold") + s(label, "bold") if chosen else "  " + label)
-            if tag:
-                line += s(f"  {tag}", "dim" if _QUIET_TAG_RE.search(tag) else "accent")
-            if detail:
-                line += s(f"  {detail}", "dim")
-            block.append(_ui._clip(line, right_w))
-        if not shown:
-            block.append(s("  no match", "dim"))
-        elif first + rows < len(shown):
-            block.append(s(f"  {g('down')} {len(shown) - first - rows} more", "dim"))
-        field, cursor_col = _field(s("Search ", "dim") + s(g("cursor") + " ", "accent"), view.editor.text,
-                                   view.editor.pos, right_w, False)
-        block.append(field)
-        footer = (f"{g('up')}{g('down')} · Enter · type to filter · Esc"
+        lines_dd, field_at, cursor_col = _dropdown(view, right_w, keep - 1)
+        field_row_in_block = len(block) + field_at
+        block.extend(lines_dd)
+        footer = (f"{g('up')}{g('down')} \u00b7 Enter \u00b7 type to filter \u00b7 Esc"
                   if right_w < 56 else
-                  f"{g('up')}{g('down')} move · Enter select · type to filter · Esc cancel")
+                  f"{g('up')}{g('down')} move \u00b7 Enter select \u00b7 type to filter \u00b7 Esc cancel")
     else:
         if view.question:
-            block.extend(s(piece, "bold") for piece in wrap(view.question, right_w)[:3])
-        for command, what in _hints(view)[:4]:
-            block.append(_ui._clip(s(command.ljust(14), "accent") + s(what, "dim"), right_w))
-        field, cursor_col = _field(s(g("cursor") + " ", "accent", "bold"), view.editor.text, view.editor.pos,
-                                   right_w, view.secret)
-        block.append(field)
+            popup = _popup(view, right_w)
+            if body_h - len(strip) - 3 < len(popup[0]):
+                popup = None                              # no room for a card: ask in the composer instead
+                block.extend(s(piece, "bold") for piece in wrap(view.question, right_w)[:3])
+        if popup is None:
+            for command, what in _hints(view)[:min(4, max(0, keep - 6))]:
+                block.append(_ui._clip(s(command.ljust(14), "accent") + s(what, "dim"), right_w))
+            box_lines, field_at, cursor_col, chip_at, chip_x0, chip_x1 = _composer(
+                view, right_w, body_h, rows=keep - 1 - len(block))
+            field_row_in_block = len(block) + field_at
+            if not view.question and chip_at >= 0:
+                chip_row_in_block, chip_cols = len(block) + chip_at, (chip_x0, chip_x1)
+            block.extend(box_lines)
         if view.question:
-            footer = "Enter answer · Esc cancel"
+            footer = "Enter answer \u00b7 Esc cancel"
         elif view.busy:
-            footer = "Working · Ctrl+C cancel · Ctrl+O details"
+            footer = "Working \u00b7 Ctrl+C cancel \u00b7 Ctrl+O details"
             if right_w >= 72:
-                footer += " · scroll · drag to copy"
+                footer += " \u00b7 PgUp/PgDn scroll"
         else:
-            footer = ("Enter · / commands · Ctrl+O" if right_w < 56 else
-                      "Enter send · / commands · Ctrl+O details")
-            if right_w >= 72:
-                footer += " · scroll · drag to copy"
+            agent_key = "Tab" if not view.editor.text else "Ctrl+O"
+            if right_w < 56:
+                footer = f"Enter \u00b7 {agent_key} agent \u00b7 PgUp/PgDn"
+            elif view.editor.text:
+                footer = f"Enter send \u00b7 / commands \u00b7 {agent_key} agent \u00b7 PgUp/PgDn scroll"
+            else:
+                footer = (f"Enter send \u00b7 / commands \u00b7 {agent_key} agent \u00b7 "
+                          "Ctrl+O details \u00b7 PgUp/PgDn scroll")
             if view.side is not None and right_w >= 72:
-                footer += " · Esc back"
+                footer += " \u00b7 Esc back"
     if view.status:
         footer = view.status
     if view.scroll:
-        footer = f"{g('up')} scrolled back {view.scroll} lines · End returns · " + footer
-    # Keep one quiet divider above the composer; the footer stays in the same visual group.
+        footer = f"{g('up')} scrolled back {view.scroll} lines \u00b7 End returns \u00b7 " + footer
     block.append(s(_ui._clip(footer, right_w), "dim"))
-    block = block[-max(2, body_h - len(strip) - 2):]
-    field_row_in_block = len(block) - 2
+    cut = max(0, len(block) - keep)
+    block = block[cut:]
+    if field_row_in_block is not None:
+        field_row_in_block -= cut
+    if chip_row_in_block is not None:
+        chip_row_in_block = chip_row_in_block - cut if chip_row_in_block - cut >= 0 else None
 
     # ---- the transcript above it
-    room = body_h - len(strip) - len(block) - 1          # -1: the rule over the input
+    room = body_h - len(strip) - len(block) - 1          # -1: the blank row over the composer
     lines, owners = transcript_rows(view, right_w, only_last=view.only_last and view.scroll == 0)
     if view.scroll:
         lines, owners = transcript_rows(view, right_w)    # scrolled: the whole conversation
@@ -802,7 +931,25 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
     first_row = 2 + len(strip)
     view.first_row, view.room, view.pane_w = first_row, room, right_w
     view.row_entries = {first_row + top_pad + i: owner for i, owner in enumerate(shown_owners) if owner is not None}
-    right = visible + [pad(s(g("rule") * min(right_w, 20), "dim"), right_w)] + block
+    view.copy_hits = {}
+    for i, (line, owner) in enumerate(zip(visible[top_pad:top_pad + len(shown_owners)], shown_owners)):
+        if owner is not None and owner.kind == "say" and _SGR_RE.sub("", line).strip() == COPY_LABEL:
+            row = first_row + top_pad + i
+            view.copy_hits[row] = (right_x + right_w - len(COPY_LABEL), right_x + right_w, owner)
+    popup_at = None
+    if popup is not None:
+        card, card_field_row, card_col, card_w = popup
+        over = max(0, (room - len(card)) // 2)
+        indent = max(0, (right_w - card_w) // 2)
+        for i, card_line in enumerate(card):
+            if over + i < len(visible):
+                visible[over + i] = " " * indent + card_line
+                view.row_entries.pop(first_row + over + i, None)
+        popup_at = (first_row + over + card_field_row, indent + card_col)
+    view.chip_hit = None
+    if chip_row_in_block is not None:
+        view.chip_hit = (first_row + room + 1 + chip_row_in_block, right_x + chip_cols[0], right_x + chip_cols[1])
+    right = visible + [""] + block
 
     # ---- put the columns together
     frame.extend(strip)
@@ -821,7 +968,9 @@ def compose(view: View, width: int, height: int) -> Tuple[List[str], int, int]:
             frame.append(" " + pad(right[i] if i < len(right) else "", right_w))
     frame = frame[:height]
     view.transcript_x = right_x
-    cursor_row = 2 + len(strip) + room + 1 + field_row_in_block
+    if popup_at is not None:
+        return frame, min(popup_at[0], height - 1), right_x + popup_at[1]
+    cursor_row = 2 + len(strip) + room + 1 + (field_row_in_block or 0)
     return frame, min(cursor_row, height - 1), right_x + cursor_col
 
 
@@ -994,6 +1143,7 @@ _CTRL_KEYS = {
     "\r": "enter", "\n": "enter", "\x7f": "backspace", "\x08": "backspace", "\t": "tab",
     "\x01": "ctrl+a", "\x05": "ctrl+e", "\x0b": "ctrl+k", "\x0c": "ctrl+l", "\x0f": "ctrl+o",
     "\x15": "ctrl+u", "\x17": "ctrl+w", "\x04": "ctrl+d", "\x03": "ctrl+c", "\x12": "ctrl+r",
+    "\x07": "ctrl+g",                   # fallback shortcut; some IDEs intercept Ctrl+G
 }
 _PASTE_START, _PASTE_END = "\033[200~", "\033[201~"
 _MOUSE_RE = re.compile(r"\033\[<(\d+);(\d+);(\d+)([Mm])")
@@ -1014,50 +1164,6 @@ def _mouse_key(button: int, x: int, y: int, release: bool) -> Optional[str]:
     if button & 3 == 0:
         return f"{'release' if release else 'press'}:{x}:{y}"
     return None
-
-
-def selection_cells(sel: Dict[str, Any]) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
-    """(first cell, last cell, the columns of the pane it is in), first before last."""
-    (ax, ay), (hx, hy) = sel["anchor"], sel["head"]
-    first, last = ((ax, ay), (hx, hy)) if (ay, ax) <= (hy, hx) else ((hx, hy), (ax, ay))
-    return first, last, sel["cols"]
-
-
-def _row_span(row: int, first, last, cols) -> Tuple[int, int]:
-    c0 = first[0] if row == first[1] else cols[0]
-    c1 = last[0] if row == last[1] else cols[1]
-    return max(c0, cols[0]), min(c1, cols[1])
-
-
-def selected_text(lines: List[str], sel: Dict[str, Any]) -> str:
-    """The text under a selection, as it reads on the screen: one line per row, inside the
-    pane the selection started in, trailing spaces dropped."""
-    first, last, cols = selection_cells(sel)
-    out = []
-    for row in range(first[1], last[1] + 1):
-        if row >= len(lines):
-            break
-        plain = _SGR_RE.sub("", lines[row])
-        c0, c1 = _row_span(row, first, last, cols)
-        out.append(plain[c0:c1 + 1].rstrip())
-    while out and not out[-1].strip():
-        out.pop()
-    return "\n".join(out).strip("\n")
-
-
-def highlight(lines: List[str], sel: Dict[str, Any]) -> List[str]:
-    """The frame with the selection shown in reverse video (the selected rows lose their
-    colours while selected)."""
-    first, last, cols = selection_cells(sel)
-    out = list(lines)
-    for row in range(first[1], min(last[1], len(lines) - 1) + 1):
-        plain = _SGR_RE.sub("", out[row])
-        c0, c1 = _row_span(row, first, last, cols)
-        if c1 < c0:
-            continue
-        plain = plain.ljust(c1 + 1)
-        out[row] = plain[:c0] + "\033[7m" + plain[c0:c1 + 1] + "\033[27m" + plain[c1 + 1:]
-    return out
 
 
 def parse_keys(data: str) -> Tuple[List[str], str]:

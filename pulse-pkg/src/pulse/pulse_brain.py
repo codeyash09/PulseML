@@ -97,6 +97,99 @@ _SECRET_TEXT_RE = re.compile(r"private[_-]?key|api[_-]?key|client[_-]?secret|sec
                              r"BEGIN [A-Z ]*PRIVATE KEY|\b(?:sk|rk)-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}", re.I)
 
 
+def _sanitize_mistake_text(text: str) -> str:
+    """Scrub any sensitive information (tokens, keys, passwords, bearer tokens,
+    private keys) from error text or fix explanations before storing in shared mistake memory."""
+    if not text:
+        return ""
+    cleaned = text
+    cleaned = _SECRET_TEXT_RE.sub("[REDACTED_SECRET]", cleaned)
+    cleaned = re.sub(r"bearer\s+[A-Za-z0-9_\-\.]+", "bearer [REDACTED]", cleaned, flags=re.I)
+    cleaned = re.sub(r"(?:api[-_]?key|token|secret)[\s:=]+['\"]?[A-Za-z0-9_\-\.]{8,}['\"]?", "[REDACTED_KEY]", cleaned, flags=re.I)
+    return cleaned
+
+
+def _get_project_hidden_mistake_path() -> str:
+    """Return project-local hidden shared mistakes file path (.pulse_shared_mistakes.json)."""
+    return ".pulse_shared_mistakes.json"
+
+
+def _load_project_shared_mistakes() -> List[Dict[str, Any]]:
+    """Load sanitized shared mistakes from the project-local file."""
+    path = _get_project_hidden_mistake_path()
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+    except Exception:
+        pass
+    return []
+
+
+def _save_project_shared_mistakes(mistakes: List[Dict[str, Any]]) -> None:
+    """Save sanitized shared mistakes to the project-local file."""
+    path = _get_project_hidden_mistake_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(mistakes, f, ensure_ascii=False, indent=2)
+        if os.name == "nt":
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetFileAttributesW(path, 0x02) # FILE_ATTRIBUTE_HIDDEN
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def search_shared_run_mistakes(error_query: str, limit: int = 2) -> List[Dict[str, Any]]:
+    """Search sanitized past mistakes and fixes from other people's runs that
+    are stored in the local hidden file. Returns at most `limit` concise matches
+    without flooding AI context."""
+    if not error_query:
+        return []
+    stored = _load_project_shared_mistakes()
+    query_lower = error_query.lower()
+    matches = []
+    for item in stored:
+        err_type = item.get("error_type", "").lower()
+        err_msg = item.get("error_message", "").lower()
+        expl = item.get("explanation", "").lower()
+        if any(term in err_type or term in err_msg or term in expl for term in query_lower.split() if len(term) > 3):
+            matches.append(item)
+    if not matches and stored:
+        matches = stored[-limit:]
+    return matches[:limit]
+
+
+def ingest_shared_mistake_from_run(error_type: str, error_message: str, file_path: str, fix_applied: str, explanation: str) -> None:
+    """Sanitize and ingest a resolved mistake into the local hidden shared mistakes file."""
+    sanitized_type = _sanitize_mistake_text(error_type)
+    sanitized_msg = _sanitize_mistake_text(error_message)
+    sanitized_fix = _sanitize_mistake_text(fix_applied)
+    sanitized_expl = _sanitize_mistake_text(explanation)
+    
+    stored = _load_project_shared_mistakes()
+    if any(m.get("error_message") == sanitized_msg and m.get("fix_applied") == sanitized_fix for m in stored):
+        return
+    
+    entry = {
+        "time": time.time(),
+        "error_type": sanitized_type,
+        "error_message": sanitized_msg,
+        "file_path": file_path or "",
+        "fix_applied": sanitized_fix,
+        "explanation": sanitized_expl,
+    }
+    stored.append(entry)
+    if len(stored) > 200:
+        stored = stored[-200:]
+    _save_project_shared_mistakes(stored)
+
+
+
 def _measures(name: str) -> bool:
     """A name that says the value is something the run measures (a loss, a metric, a norm, a
     learning rate, a score): drawn as a curve whatever its shape -- a loss frozen at 2.30259 or

@@ -125,7 +125,7 @@ _PROTECTED_PARTS = (".git", ".pulse_history")
 # which is exactly what a coding session needs for tests/linters/repro scripts and is
 # handled by the same shared executor + confirmation policy as the debugging agent's
 # TERMINAL: (see PulseCLI._run_terminal / pulse_terminal.py).
-_ALLOWED_TOOLS = {"defof", "callers", "depgraph", "trace", "doclookup", "changelog", "terminal", "message"}
+_ALLOWED_TOOLS = {"defof", "callers", "depgraph", "trace", "doclookup", "changelog", "terminal", "experiment", "message"}
 
 # ---------------------------------------------------------------------------------------
 # Prompts
@@ -163,6 +163,8 @@ CODE_SYSTEM_PROMPT = (
     "real assignment chain, not a guess. self.<attr> works too.\n"
     "  DOCLOOKUP: <library>.<symbol>  the real signature/docstring of an installed library function\n"
     "  CHANGELOG:                 what has changed in the project files since the session started\n"
+    "  EXPERIMENT: <spec.json|status [id]|cancel <id>>  compare evidence-based candidate fixes against an "
+    "isolated control that must reproduce the original failure; inspect the report and apply only a validated candidate\n"
     "  RUN: <script> [args]       start the project script under Pulse (inside the Pulse app), the same as "
     "/run: it runs in the background, Pulse watches it and shows it to the user. When the user asks to run, "
     "start, train, launch, or try a completed change, use this directive -- do not just tell them a command "
@@ -311,17 +313,32 @@ _QUALITY_NOTE = (
     "- A request to find or fix a problem in existing code is not a request to build: the fix is the "
     "smallest change that removes the cause, and when nothing is wrong it is no change at all. The rules "
     "below are for writing or extending code.\n"
-    "- The stack, libraries, algorithms and structure the user names are requirements. If the project is "
-    "numpy/cupy, write numpy/cupy: never switch to torch, tensorflow or jax (or any other framework or algorithm) "
-    "because it is easier. If the requested approach needs a piece that does not exist yet (a kernel, a tokenizer, "
-    "a backward pass), build it; if it is truly impossible here, say exactly what blocks it instead of substituting.\n"
+    "- The framework, libraries, language and structure the project already uses, or the user names, are "
+    "requirements. Find what the project is built on and stay on it, whatever it is (PyTorch stays PyTorch, JAX "
+    "stays JAX, NumPy stays NumPy). Change it only if the user explicitly says to. Never switch because another "
+    "framework is easier or already has the feature; write the feature in the one in use. If the approach needs a "
+    "piece that does not exist yet (a kernel, a tokenizer, a backward pass), build it; if it is truly impossible "
+    "here, say exactly what blocks it instead of substituting.\n"
     "- Write complete production code. No stubs, no `pass`/`...`/`raise NotImplementedError` bodies, no TODOs, no "
     "placeholder, dummy, mock or 'simplified' versions, no hard-coded or random values standing in for real logic or "
     "data. A training script is a full loop: data and batching, forward, loss, backward, clipping, optimizer step, "
     "schedule, evaluation, logging, checkpoints.\n"
+    "- Before a bug-fix patch, gather at least three independent kinds of primary evidence: reproduce the symptom, "
+    "inspect source/data flow and callers/configuration, and verify runtime values or focused test output. Cite exact "
+    "paths/lines and real command/test results; separate observations from interpretation. State a plausible alternative "
+    "and actively seek disconfirming evidence for both explanations. Do not edit until the evidence supports one cause; "
+    "do not treat prior model conclusions or repeated copies of one claim as proof. For feature requests, ground the "
+    "change in requirements, call paths, and focused tests. Do not use TERMINAL to write project files; those commands "
+    "are blocked. Bug-fix edits are mechanically blocked unless an independent "
+    "evidence review can cite exact quotes from the actual tool outputs; uncertainty requires a completed experiment "
+    "with a validated candidate.\n"
+    "- Make the smallest fix supported by that evidence and verify it. If competing fixes remain and the failure is "
+    "measurable, use EXPERIMENT: with original measurements and an evidence-based failure signature. The isolated "
+    "control must reproduce the failure; inspect the report and apply only a validated candidate. If that gate cannot "
+    "be met or no candidate validates, do not guess: report the uncertainty without changing code.\n"
     "- Plan in detail, then do every step: list each thing the request names, break each into single edits, and "
     "verify as you go. Do not shrink the scope.\n"
-    "- Every forward pass has a backward pass. With no autograd (numpy/cupy), each forward component gets its own "
+    "- Every forward pass has a backward pass. With no autograd (e.g. NumPy, CuPy), each forward component gets its own "
     "hand-written backward (cache what it needs, compute dX and every parameter gradient) plus a finite-difference "
     "gradient check and an overfit-one-tiny-batch check. With autograd, the backward and optimizer step must be "
     "present and every parameter must receive a gradient.\n"
@@ -342,6 +359,14 @@ class _CodeAgentCLI(PulseCLI):
     # -- what a training run does that a coding session must not ------------------------
     def _restart_process(self):
         return None
+
+    def _run_terminal(self, arg, *, is_verification=False, purpose=None):
+        if (getattr(self, "_legacy_pipeline_active", False)
+                and getattr(self, "_legacy_evidence_required", False)
+                and _agent._command_may_write_code(arg)):
+            return ("TERMINAL: not run -- code-writing shell commands are disabled for bug fixes; "
+                    "use the gated patch flow instead.")
+        return super()._run_terminal(arg, is_verification=is_verification, purpose=purpose)
 
     def _fix_log_dir(self):
         # History lives at the project root, not beside whichever file happened to be first.
@@ -867,43 +892,24 @@ _RUN_ACTIONS = {"RUN": "start_run", "RUNSTATUS": "run_status", "RESTART": "resta
                 "WAIT": "wait"}             # WAIT: is served here, not by the app (see _service_run_directives)
 
 
-def _wait(seconds):
-    """Sleep in short slices: a cancel (an exception sent to this thread) lands only between
-    them -- one long sleep held Esc off for up to ten minutes."""
-    deadline = time.monotonic() + seconds
-    while True:
-        left = deadline - time.monotonic()
-        if left <= 0:
-            return
-        time.sleep(min(0.25, left))
-
-
-def _service_run_directives(answer, budget=None):
+def _service_run_directives(answer):
     """RUN: <script> [args] / RUNSTATUS: / RESTART: / STOP: -- run control, which the Pulse
-    app provides (it owns the runs on screen). Returns the notes for the model. `budget`
-    carries the WAIT seconds one answer may still spend (shared across its lines)."""
+    app provides (it owns the runs on screen). Returns the notes for the model."""
     found = _RUN_DIRECTIVE_RE.findall(PulseCLI.normalize_directives(answer or ""))
     if not found:
         return []
     host = _ui.host()
     actions = host.run_actions() if host is not None and hasattr(host, "run_actions") else {}
-    budget = budget if budget is not None else {"wait": _WAIT_MAX_SECONDS}
     notes = []
     for name, arg in found:
         if name == "WAIT":
-            if not actions:
-                notes.append("WAIT: only available inside the Pulse app, where there is a run to wait for.")
-                continue
             try:
                 seconds = max(0.0, min(_WAIT_MAX_SECONDS, float(str(arg).split()[0])))
             except (ValueError, IndexError):
                 notes.append("WAIT: needs a number of seconds, e.g. WAIT: 120")
                 continue
-            seconds = min(seconds, budget["wait"])  # ten WAIT: 600 lines were 100 minutes
-            budget["wait"] -= seconds
-            _wait(seconds)
-            notes.append(f"Waited {seconds:.0f} s." + ("" if budget["wait"] > 0 else
-                                                       f" (That is the {_WAIT_MAX_SECONDS:.0f} s one answer may wait.)"))
+            time.sleep(seconds)
+            notes.append(f"Waited {seconds:.0f} s.")
             continue
         action = actions.get(_RUN_ACTIONS[name])
         if action is None:
@@ -927,32 +933,53 @@ def _service(cli, answer):
     # In the order written, as far as two groups go: "TERMINAL: ... then RUNSTATUS:" ran the
     # status first, and the agent read a run 19 s old where it expected 30 s more.
     text = PulseCLI.normalize_directives(answer or "")
-    if not _RUN_DIRECTIVE_RE.search(text):
-        return _service_tools(cli, answer)
-    # Line by line in the order written: the text between two run-control lines is served as
-    # one piece. Two groups (all tools, then all run control, or the other way) put a
-    # "TERMINAL: tail train.log" written after RESTART: and WAIT: before them whenever any
-    # tool line -- a MESSAGE: -- came first, and it read the old run's log.
-    notes, piece, budget = [], [], {"wait": _WAIT_MAX_SECONDS}
-    for line in text.splitlines(keepends=True):
-        if _RUN_DIRECTIVE_RE.match(line):
-            if "".join(piece).strip():
-                notes.append(_service_tools(cli, "".join(piece)))
-            piece = []
-            notes += _service_run_directives(line, budget)
-        else:
-            piece.append(line)
-    if "".join(piece).strip():
-        notes.append(_service_tools(cli, "".join(piece)))
-    return "\n\n".join(n for n in notes if n)
+    run_at = [m.start() for m in _RUN_DIRECTIVE_RE.finditer(text)]
+    tool_at = [m.start() for m in re.finditer(r"(?m)^[ \t]*([A-Z_]+):", text)
+               if m.group(1) in PulseCLI._directive_names() - set(_RUN_ACTIONS) - {"WAIT"}]
+    tools_first = bool(run_at and tool_at and min(tool_at) < min(run_at))
 
+    def tools():
+        host = _ui.host()
+        if host is not None and hasattr(host, "hush"):
+            with host.hush():
+                return cli._service_tool_requests(answer)
+        return cli._service_tool_requests(answer)
 
-def _service_tools(cli, text):
-    host = _ui.host()
-    if host is not None and hasattr(host, "hush"):
-        with host.hush():
-            return cli._service_tool_requests(text)
-    return cli._service_tool_requests(text)
+    if tools_first:
+        tool_notes = tools()
+        notes = [tool_notes] + _service_run_directives(answer)
+    else:
+        notes = _service_run_directives(answer)
+        notes.append(tools())
+    combined = "\n\n".join(n for n in notes if n)
+    if getattr(cli, "_legacy_evidence_required", False) and combined:
+        text = PulseCLI.normalize_directives(answer or "")
+        tool_names = {
+            match.group(1) for match in re.finditer(r"(?m)^[ \t]*([A-Z_]+):", text)
+            if match.group(1) in {
+                "GREP", "VIEW", "DEFOF", "CALLERS", "DEPGRAPH", "TRACE", "DOCLOOKUP",
+                "CHANGELOG", "TERMINAL", "EXPERIMENT", "RUNSTATUS",
+            }
+        }
+        if tool_names:
+            if getattr(cli, "_legacy_writes_since_review", 0) \
+                    and tool_names & {"TERMINAL", "EXPERIMENT"}:
+                cli._legacy_evidence.clear()
+                cli._legacy_writes_since_review = 0
+            if "EXPERIMENT" in tool_names:
+                cli._legacy_experiment_job_ids.update(re.findall(
+                    r"\bEXPERIMENT\s+([A-Za-z0-9_-]+)\s+started\b", combined, re.I))
+            cli._legacy_evidence_sequence += 1
+            evidence_id = f"L{cli._legacy_evidence_sequence}"
+            combined += f"\n[Evidence {evidence_id}: {', '.join(sorted(tool_names))}]"
+            cli._legacy_evidence.append({
+                "id": evidence_id,
+                "tools": sorted(tool_names),
+                "result": combined,
+            })
+            if len(cli._legacy_evidence) > 60:
+                del cli._legacy_evidence[:-60]
+    return combined
 
 
 def _tool_rounds(cli, answer, instruction):
@@ -1062,6 +1089,11 @@ def run_turn(cli, request, evidence=None):
     Models that support function calling run in the native tool loop (pulse_code_agent): the
     agent reads, edits and runs commands continuously until it has nothing left to do. Models
     that don't -- or PULSE_CODE_LEGACY=1 -- use the plan/edit/verify text pipeline below."""
+    cli._legacy_evidence_required = _agent._requires_evidence_review(request)
+    cli._legacy_evidence = []
+    cli._legacy_evidence_sequence = 0
+    cli._legacy_experiment_job_ids = set()
+    cli._legacy_writes_since_review = 0
     if os.environ.get("PULSE_CODE_LEGACY") != "1" and not getattr(cli, "_native_off", False) \
             and _agent.supported(cli):
         try:
@@ -1070,7 +1102,11 @@ def run_turn(cli, request, evidence=None):
             cli._native_off = True
             cprint("[Pulse Code] This model doesn't support tool calling -- using the step-by-step pipeline.",
                    color=_YELLOW)
-    return _run_turn_pipeline(cli, request, evidence)
+    cli._legacy_pipeline_active = True
+    try:
+        return _run_turn_pipeline(cli, request, evidence)
+    finally:
+        cli._legacy_pipeline_active = False
 
 
 def _run_turn_pipeline(cli, request, evidence=None):
@@ -1225,10 +1261,7 @@ def _run_turn_passes(cli, request):
         outcome, apply_summary = _confirm_and_apply(cli, request, plan, new_fix, new_changes)
         summary = f"{summary}\n\n{apply_summary}"
         if outcome != "applied":
-            # the step's own change is on disk whatever became of this revision (a no-op, a
-            # decline): the turn changed files, and saying "answered" skipped the restart of a
-            # fix no run uses
-            return "applied", summary
+            return outcome, summary
         fix, changes = new_fix, new_changes
 
     return outcome, summary
@@ -1351,6 +1384,12 @@ def _confirm_and_apply(cli, request, plan, fix, changes):
         # e.g. the agent already made the edit with a command: there is nothing to review
         cprint("[Pulse Code] The files already read that way; nothing was edited.", color=_YELLOW)
         return "answered", f"{plan}\n\n(The files already have this content: nothing was changed.)"
+    if _agent._requires_evidence_review(request):
+        problem = _review_legacy_evidence(cli, request, plan, fix, changes)
+        if problem:
+            cli._last_failure = problem
+            cprint(f"[Pulse Code] Evidence gate blocked the patch: {problem}", color=_YELLOW)
+            return "failed", f"{plan}\n\n(Evidence gate: {problem})"
     diff = render_diff(cli, changes)
     labels = [cli._label_for_path.get(path) or os.path.relpath(path, cli._project_root).replace(os.sep, "/")
               for path in changes]
@@ -1363,10 +1402,7 @@ def _confirm_and_apply(cli, request, plan, fix, changes):
         if asking else None
     cli._reviewer_declined = ""
     if reviewed is False:
-        denial = getattr(cli, '_last_change_denial', '') or "declined"
-        # a reviewer that could not answer has no objection to answer: retrying asks again
-        # into the same outage, three whole rounds of it
-        cli._reviewer_declined = "" if "could not answer" in denial else denial
+        cli._reviewer_declined = getattr(cli, '_last_change_denial', '') or "declined"
         _ui.change_status("not applied", color=_YELLOW, final=True, terminal_text="[Pulse Code] Not applied.")
         return "declined", f"{plan}\n\n(Not applied: {getattr(cli, '_last_change_denial', '') or 'declined'}.)"
     if asking and reviewed is None:
@@ -1415,11 +1451,51 @@ def _confirm_and_apply(cli, request, plan, fix, changes):
     created = [os.path.abspath(os.path.join(cli._project_root, s["path"])) for s in fix.get("create") or []]
     cli.add_files([p for p in created if os.path.isfile(p)], focus=False)
     cli.reload()
+    if _agent._requires_evidence_review(request):
+        cli._legacy_writes_since_review = getattr(cli, "_legacy_writes_since_review", 0) + 1
     commit = getattr(cli, "_last_commit_id", None)
     _ui.change_status("applied", detail=f"/undo to revert (commit {commit})" if commit else None, color=_GREEN, final=True,
                       terminal_text=f"\n✓ {n_files} file{'s' if n_files != 1 else ''} changed"
                       + (f"  ·  /undo to revert (commit {commit})" if commit else ""))
     return "applied", f"{plan}\n\nApplied: {fix.get('explanation', '')}"
+
+
+def _review_legacy_evidence(cli, request, plan, fix, changes):
+    observations = list(getattr(cli, "_legacy_evidence", []))
+    tools = {tool for item in observations for tool in item.get("tools", [])}
+    if len(observations) < 3 or len(tools) < 3:
+        return "gather at least three independent tool observations before proposing a bug fix."
+    if not tools & _agent._EVIDENCE_SOURCE_TOOLS:
+        return "source/code inspection evidence is missing."
+    if not tools & _agent._EVIDENCE_EXECUTION_TOOLS:
+        return "execution or runtime evidence is missing."
+    if not any("TERMINAL" in item.get("tools", []) and re.search(
+            r"(?im)^.*exit code:\s*\d+", item.get("result", "")) for item in observations):
+        return "a real TERMINAL command result with its exit code is required."
+    evidence = json.dumps(observations[-12:], ensure_ascii=False)
+    proposal = f"Explanation: {str(fix.get('explanation') or plan).strip()}\n\n{render_diff(cli, changes)}"
+    prompt = (
+        "Review whether the proposed bug fix is justified by the primary evidence below. The code has NOT been "
+        "changed. Do not defend a first guess: compare the leading hypothesis with a distinct plausible alternative "
+        "and identify an observation that could disprove the leading hypothesis. Cite at least three exact quotes "
+        "from three distinct evidence receipts; every quote must occur verbatim in its cited result, with at least "
+        "one supporting and one disconfirming observation. Set confidence to 'supported' only if the evidence rules "
+        "out the alternative; otherwise use 'uncertain'. Return only a JSON object with keys hypothesis, alternative, "
+        "confidence ('supported' or 'uncertain'), and evidence (array of {id, quote, supports}).\n\n"
+        f"Request:\n{request}\n\nPlan:\n{plan}\n\nProposed change:\n{proposal[:12000]}\n\n"
+        f"Actual tool observations:\n{evidence}"
+    )
+    try:
+        raw = cli._call_model(prompt, max_tokens=_AGENT_MAX_TOKENS, history=[])
+    except AgentRequestFailed as exc:
+        return f"independent evidence review failed: {exc}"
+    review = cli._parse_json_obj(raw)
+    problem = _agent._evidence_review_error(
+        observations, review, _agent._completed_validated_experiment(
+            cli, getattr(cli, "_legacy_experiment_job_ids", set())))
+    if problem:
+        return f"independent evidence review rejected the patch: {problem}"
+    return None
 
 
 # ---------------------------------------------------------------------------------------

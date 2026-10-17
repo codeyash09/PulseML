@@ -539,6 +539,18 @@ children, and only one unfinished leaf can be active at a time. Pulse Code updat
 outline as it completes each leaf. An unfinished outline keeps the turn open until all leaf
 work is complete or the turn reaches its safety limit.
 
+### Evidence-gated bug fixes
+
+For bug and failure fixes, Pulse Code records outputs from its inspection and execution tools.
+Before any code write, a separate evidence review must cite exact excerpts from at least three
+distinct tool results, include source inspection and a runtime/test observation, compare a
+leading cause with a plausible alternative, and cite both supporting and disconfirming evidence.
+The write tools reject patches until that review passes. If the evidence leaves competing
+causes, the agent must wait for an isolated experiment to complete and validate a candidate;
+starting an experiment alone does not authorize a patch. Verification after a patch invalidates
+the previous review, so any follow-up fix needs fresh evidence. Direct file-writing shell
+commands are blocked for bug-fix requests; use the gated patch tools instead.
+
 ### Auto mode: no stopping to ask
 
 Some shell commands the agent wants to run need an OK first: ones that delete files,
@@ -580,7 +592,7 @@ Type `pulse` in a terminal and Pulse opens as one full-screen app:
                                      │ The loss is flat at 0.5 because of the `+ 0.5` on line 12 ...
   Findings  2                        │ ────────────────────────────────────────────────────────────
   ▲ loss stopped improving at 0.5    │ ❯
-                                     │ Enter send · / commands · Ctrl+O details · PgUp/PgDn scroll
+                                     │ Enter send · Tab agent · Ctrl+O details · PgUp/PgDn scroll
 ```
 
 1. **Setup** comes first, the same as ever: account, workspace, agent model, key (or the
@@ -607,11 +619,16 @@ Type `pulse` in a terminal and Pulse opens as one full-screen app:
 |---|---|
 | Enter | send the request, or answer a question Pulse asked |
 | `/` | commands; typing shows the ones that match, Tab completes |
-| Ctrl+O | fold / unfold the agent's thinking and tool output |
-| mouse | a click on a folded line opens it where it is (and shuts it again); the wheel scrolls. The app reads the mouse, so hold Shift to select text |
-| ↑ / ↓ (empty line) | scroll back through the conversation; the screen otherwise shows the latest exchange |
+| Tab (empty composer) | open agent selection |
+| Ctrl+O | open agent selection while composing; otherwise fold / unfold the agent's thinking and tool output |
+| `/agent` or click the agent chip | open agent selection in any terminal/IDE |
+| mouse | click a **Copy** button to copy an answer or a folded line to open it; PgUp/PgDn scroll the transcript |
+| PgUp / PgDn | scroll back and forward through the conversation; the screen otherwise shows the latest exchange |
 | Ctrl+C | cancel what is running; twice at an empty prompt leaves |
 | Esc | leave the open run in the background and go back to the agent; Esc again brings it back |
+
+Each agent answer has a **Copy** button beneath it. Mouse dragging is not used for copying; use
+`/mouse off` if you want the terminal itself to handle text selection.
 
 Commands on an open run: `/findings`, `/curve <name>`, `/vars`, `/audit`, `/audits on|off`,
 `/trace <var>`, `/source`, `/pause`, `/resume`, `/stop`, `/restart`, `/output`,

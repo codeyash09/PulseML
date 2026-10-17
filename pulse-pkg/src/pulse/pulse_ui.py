@@ -34,7 +34,7 @@ import unicodedata
 __all__ = [
     "Unavailable", "enabled", "color_enabled", "header", "rule", "ok", "warn", "fail",
     "note", "kv", "subhead", "message", "answer", "show_change", "change_status", "ask", "confirm", "choose", "Option", "Stage", "ready_block",
-    "elapsed_text", "commit_looks_valid", "key_hint_for", "set_host", "host",
+    "box", "form", "elapsed_text", "commit_looks_valid", "key_hint_for", "set_host", "host",
 ]
 
 
@@ -105,7 +105,7 @@ _UNICODE = None
 def _unicode():
     global _UNICODE
     if _UNICODE is None:
-        _UNICODE = _can_encode("✓●○⚠✕→│─❯›·↑↓•")
+        _UNICODE = _can_encode("✓●○⚠✕→│─❯›·↑↓•╭╮╰╯├┤▾◆")
     return _UNICODE
 
 
@@ -113,10 +113,14 @@ def _g(name):
     """Glyphs, with an ASCII set for terminals whose encoding can't show them."""
     fancy = {"ok": "✓", "now": "●", "todo": "○", "warn": "⚠", "fail": "✕", "arrow": "→",
              "bar": "│", "rule": "─", "cursor": "❯", "sel": "›", "dot": "·", "up": "↑",
-             "down": "↓", "mask": "•"}
+             "down": "↓", "mask": "•",
+             "tl": "╭", "tr": "╮", "bl": "╰", "br": "╯", "h": "─", "v": "│", "ml": "├", "mr": "┤",
+             "chev": "▾", "logo": "◆"}
     plain = {"ok": "+", "now": "*", "todo": "o", "warn": "!", "fail": "x", "arrow": "->",
              "bar": "|", "rule": "-", "cursor": ">", "sel": ">", "dot": "-", "up": "^",
-             "down": "v", "mask": "*"}
+             "down": "v", "mask": "*",
+             "tl": "+", "tr": "+", "bl": "+", "br": "+", "h": "-", "v": "|", "ml": "+", "mr": "+",
+             "chev": "v", "logo": "*"}
     return (fancy if _unicode() else plain)[name]
 
 
@@ -134,6 +138,8 @@ _CODES = {
     "green": "\033[2m",
     "amber": "\033[38;5;208m",
     "red": "\033[31m",
+    "sel_bg": "\033[48;5;236m",   # the highlighted row of a list
+    "pill": "\033[48;5;208m\033[38;5;232m\033[1m",   # the active tab / the focused button: dark text on orange
     "grey": "\033[38;5;248m",      # a command in the app's transcript: grey, in bold
     "glow": "\033[38;5;255m",      # the same, under the mouse: it lights up
     "glow_accent": "\033[38;5;214m",  # a thought under the mouse: a brighter orange
@@ -223,6 +229,86 @@ def _emit(line=""):
 
 
 # --------------------------------------------------------------------------------------
+# Cards: rounded boxes, so a terminal screen reads like a window
+# --------------------------------------------------------------------------------------
+
+def _fit(text, width):
+    """`text` clipped or padded with spaces to exactly `width` visible columns."""
+    text = _clip(text, width)
+    return text + " " * max(0, width - _visible_len(text))
+
+
+def _hilite(line):
+    """A row painted with the selection background, which survives the resets inside it."""
+    if not color_enabled():
+        return line
+    bg = _CODES["sel_bg"]
+    return bg + line.replace(_RESET, _RESET + bg) + _RESET
+
+
+def box(lines, width, *, title="", footer="", tone="dim", pad=1):
+    """A rounded card `width` columns wide around `lines` (already styled). The border takes the
+    colour of `tone` ("dim", or "accent" for the thing that has focus); `title` sits in the top
+    edge and `footer` in the bottom one. A line that is None draws a divider."""
+    width = max(8, width)
+    inner = width - 2 - 2 * pad
+    edge = lambda text: _s(text, tone) if tone else text
+    top = edge(_g("tl") + _g("h"))
+    room = width - 3                      # what is left of an edge after its two corners and one dash
+    if title:
+        label = " " + _clip(title, room - 2) + " "
+        top += _s(label, "bold") + edge(_g("h") * max(0, room - _visible_len(label)))
+    else:
+        top += edge(_g("h") * room)
+    top += edge(_g("tr"))
+    out = [top]
+    for line in lines:
+        if line is None:
+            out.append(edge(_g("ml") + _g("h") * (width - 2) + _g("mr")))
+            continue
+        out.append(edge(_g("v")) + " " * pad + _fit(line, inner) + " " * pad + edge(_g("v")))
+    bottom = edge(_g("bl") + _g("h"))
+    if footer:
+        label = " " + _clip(footer, room - 2) + " "
+        bottom += _s(label, "dim") + edge(_g("h") * max(0, room - _visible_len(label)))
+    else:
+        bottom += edge(_g("h") * room)
+    out.append(bottom + edge(_g("br")))
+    return out
+
+
+def _card_width(limit=72):
+    return max(24, min(_width() - 2, limit))
+
+
+def _field_box(body, width, focused=False, label=None, tone=None):
+    """A text field drawn as its own small rounded box (three lines, four with a label)."""
+    lines = box([body], width, tone=tone or ("accent" if focused else "dim"))
+    return ([_s(label, "bold" if focused else "dim")] if label else []) + lines
+
+
+def _input_body(shown, cursor, room, placeholder=None, final=False, focused=True):
+    """The inside of a text field: a prompt glyph, the text scrolled so the cursor stays in view,
+    and a caret at the cursor. `room` is the columns it may take."""
+    prefix = _s(_g("cursor"), "accent" if focused else "dim") + " "
+    room = max(4, room - 2)
+    if not shown:
+        hint = _s(_clip(placeholder, room), "dim") if placeholder and not final else ""
+        return prefix + (_caret(final or not focused) + hint if hint else _caret(final or not focused))
+    start = max(0, cursor - (room - 1))
+    window = shown[start:start + room - 1]
+    here = cursor - start
+    left = _s("…", "dim") if start > 0 else ""
+    if left:
+        window, here = window[1:], here - 1
+    return prefix + left + window[:here] + _caret(final or not focused) + window[here:]
+
+
+def _caret(final=False):
+    return "" if final else _s("▏" if _unicode() else "_", "accent")
+
+
+# --------------------------------------------------------------------------------------
 # Static pieces
 # --------------------------------------------------------------------------------------
 
@@ -231,16 +317,21 @@ def rule(width=None):
 
 
 def header(state, subtitle=None, explain=None):
-    """PULSE / STATE, a rule, then an optional one-line question and explanation."""
-    _emit()
-    _emit(_s("PULSE", "bold", "accent") + _s(" / ", "dim") + _s(state.upper(), "bold"))
-    _emit(rule())
-    if subtitle:
-        _emit(_s(subtitle, "bold"))
-    if explain:
-        _emit(_s(explain, "dim"))
+    """A banner card: PULSE / STATE, then an optional question and explanation."""
+    import textwrap
+    width = _card_width()
+    inner = width - 4
+    body = [_s(_g("logo"), "accent") + " " + _s("PULSE", "bold", "accent") + _s("  /  ", "dim") + _s(state.upper(), "bold")]
     if subtitle or explain:
-        _emit()
+        body.append("")
+    if subtitle:
+        body += [_s(piece, "bold") for piece in textwrap.wrap(subtitle, inner) or [""]]
+    if explain:
+        body += [_s(piece, "dim") for piece in textwrap.wrap(explain, inner)]
+    _emit()
+    for line in box(body, width):
+        _emit(line)
+    _emit()
 
 
 def subhead(text):
@@ -483,16 +574,19 @@ def _erase_lines(count):
 # Text input
 # --------------------------------------------------------------------------------------
 
-def ask(label, *, secret=False, placeholder=None, validate=None, footer="Enter Continue"):
+def ask(label, *, secret=False, placeholder=None, validate=None, footer="Enter Continue",
+        title=None, note=None):
     """A single-line field. Returns the text typed, exactly as `input()` / `getpass()`
     would: `.strip()` is left to the caller, an empty entry returns "", Ctrl+C raises
     KeyboardInterrupt and Ctrl+D raises EOFError. `secret` echoes bullets, never the text.
 
     `validate(text)` may return a short status string to show under the field as you type
-    (purely informational -- it never blocks submitting).
+    (purely informational -- it never blocks submitting). `title` and `note` are for the app's
+    popup (its heading and a quiet line under the field); a plain terminal shows `note` under it.
     """
     if _HOST is not None:
-        return _HOST.ask(_ANSI_RE.sub("", label), secret=secret, placeholder=placeholder)
+        return _HOST.ask(_ANSI_RE.sub("", label), secret=secret, placeholder=placeholder,
+                         title=title or "", note=note or "")
     if not enabled():
         raise Unavailable("not an interactive terminal")
 
@@ -505,14 +599,11 @@ def ask(label, *, secret=False, placeholder=None, validate=None, footer="Enter C
         _erase_lines(lines_drawn[0])
         text = "".join(buf)
         shown = (_g("mask") * len(text)) if secret else text
-        field_prefix = _s(_g("cursor"), "accent") + " "
-        if shown:
-            body = shown
-        elif placeholder and not final:
-            body = _s(placeholder, "dim")
-        else:
-            body = ""
-        out = [_s(label, "dim"), field_prefix + body + ("" if final else _s("▏" if _unicode() else "_", "accent"))]
+        box_w = _card_width()
+        body = _input_body(shown, cursor, box_w - 4, placeholder, final)
+        out = [_s(_clip(label, box_w), "dim")] + box([body], box_w, tone="dim" if final else "accent")
+        if note and not final:
+            out.append(_s(_clip(note, box_w), "dim"))
         if validate is not None and not final:
             try:
                 status = validate(text) if text else None
@@ -520,7 +611,6 @@ def ask(label, *, secret=False, placeholder=None, validate=None, footer="Enter C
                 status = None
             out.append((_s(status, "dim") if status else ""))
         if not final:
-            out.append("")
             out.append(_s(footer, "dim"))
         clipped = [_clip(line, width) for line in out]
         _write("\n".join(clipped) + "\n")
@@ -565,16 +655,63 @@ def ask(label, *, secret=False, placeholder=None, validate=None, footer="Enter C
 
 
 def confirm(question, *, default=True, detail=None):
-    """Yes/No with a default on Enter. Returns True/False."""
+    """Yes/No as two buttons, the default one selected. Returns True/False.
+
+    Enter takes the selected button, Y / N answer at once, the arrow keys and Tab move between
+    them, and Esc declines. (Inside the app the question is asked in its own popup instead.)"""
+    if _HOST is not None:
+        hint = "Y/n" if default else "y/N"
+        answer = ask(f"{question}  ({hint})").strip().lower()
+        return default if not answer else answer in ("y", "yes")
     if not enabled():
         raise Unavailable("not an interactive terminal")
-    hint = "Y/n" if default else "y/N"
-    label = f"{question}  " + _s(f"({hint})", "dim")
-    result = ask(label, footer="Enter Continue")
-    answer = result.strip().lower()
-    if not answer:
-        return default
-    return answer in ("y", "yes")
+    chosen = [bool(default)]
+    drawn = [0]
+    width = _width()
+
+    def button(text, selected):
+        label = _s(text, "bold", "accent") if selected else _s(text, "dim")
+        return box([label], 12, tone="accent" if selected else "dim")
+
+    def render():
+        _erase_lines(drawn[0])
+        yes, no = button("  Yes  ", chosen[0]), button("  No  ", not chosen[0])
+        out = [_s(_clip(question, width), "bold")]
+        if detail:
+            out.append(_s(_clip(detail, width), "dim"))
+        out += [a + "  " + b for a, b in zip(yes, no)]
+        out.append(_s("\u2190 \u2192 Choose    Y / N    Enter Confirm" if _unicode() else "Left/Right Choose   Y/N   Enter Confirm", "dim"))
+        clipped = [_clip(line, width) for line in out]
+        _write("\n".join(clipped) + "\n")
+        drawn[0] = len(clipped)
+
+    try:
+        with _Keys() as keys:
+            _hide_cursor()
+            try:
+                render()
+                while True:
+                    key = keys.read()
+                    if key == "enter":
+                        break
+                    if key in ("y", "Y"):
+                        chosen[0] = True
+                        break
+                    if key in ("n", "N", "esc"):
+                        chosen[0] = False
+                        break
+                    if key in ("left", "right", "tab", "up", "down"):
+                        chosen[0] = not chosen[0]
+                        render()
+            finally:
+                _show_cursor()
+    except (KeyboardInterrupt, EOFError):
+        _erase_lines(drawn[0])
+        raise
+    except Exception as exc:
+        raise Unavailable(str(exc))
+    _erase_lines(drawn[0])
+    return chosen[0]
 
 
 # --------------------------------------------------------------------------------------
@@ -584,16 +721,19 @@ def confirm(question, *, default=True, detail=None):
 class Option:
     """One row of a list. `key` is an optional single-letter shortcut."""
 
-    def __init__(self, label, detail=None, tag=None, key=None, value=None):
+    def __init__(self, label, detail=None, tag=None, key=None, value=None, badge=None, tone=None):
         self.label = label
         self.detail = detail
         self.tag = tag
         self.key = key
         self.value = value
+        self.badge = badge          # a status shown at the row's right edge ("● key set")
+        self.tone = tone            # "attn": draws the eye (orange); anything else is quiet
 
 
 def choose(options, *, initial=0, searchable=False, max_rows=None, footer=None,
-           search_label="Search", allow_cancel=True, empty_text="No matches", hotkeys=None, title=None):
+           search_label="Search", allow_cancel=True, empty_text="No matches", hotkeys=None, title=None,
+           compact=False):
     """Pick one option. Returns its index in `options`, or None if cancelled (Esc, or Enter
     on a filtered-empty list). `title`, when given, is the question shown above the list.
 
@@ -627,7 +767,7 @@ def choose(options, *, initial=0, searchable=False, max_rows=None, footer=None,
                 out.append(i)
         return out
 
-    per_item = 2 if any(o.detail for o in options) else 1
+    per_item = 2 if (any(o.detail for o in options) and not compact) else 1
 
     def rows_available():
         chrome = 7 + (2 if searchable else 0) + (1 if title else 0)
@@ -638,12 +778,14 @@ def choose(options, *, initial=0, searchable=False, max_rows=None, footer=None,
     def render(final_index=None):
         _erase_lines(lines_drawn[0])
         vis = visible()
-        out = [_s(title, "bold")] if title else []
+        box_w = _card_width()
+        inner = box_w - 4
+        body = []
         if searchable:
             typed = "".join(query)
-            out.append(_s(search_label, "dim"))
-            out.append(_s(_g("cursor"), "accent") + " " + typed + ("" if final_index is not None else _s("▏" if _unicode() else "_", "accent")))
-            out.append(rule())
+            body.append(_s(search_label, "dim") + "  " + _s(_g("cursor"), "accent") + " " + typed
+                        + ("" if final_index is not None else _caret()))
+            body.append(None)
         rows = rows_available()
         if vis:
             pos[0] = max(0, min(pos[0], len(vis) - 1))
@@ -653,22 +795,33 @@ def choose(options, *, initial=0, searchable=False, max_rows=None, footer=None,
                 top[0] = pos[0] - rows + 1
             top[0] = max(0, min(top[0], max(0, len(vis) - rows)))
             if top[0] > 0:
-                out.append(_s(f"  {_g('up')} {top[0]} more", "dim"))
+                body.append(_s(f"  {_g('up')} {top[0]} more", "dim"))
             for slot in range(top[0], min(len(vis), top[0] + rows)):
                 opt = options[vis[slot]]
                 current = slot == pos[0]
                 marker = _s(_g("sel"), "accent", "bold") if current else " "
                 label = _s(opt.label, "bold") if current else opt.label
                 tag = ("  " + _s(opt.tag, "dim")) if opt.tag else ""
-                out.append(f" {marker} {label}{tag}")
+                inline = ("  " + _s(opt.detail, "dim")) if (compact and opt.detail) else ""
+                left = f"{marker} {label}{tag}{inline}"
+                badge = _s(opt.badge, "accent" if opt.tone == "attn" else "dim") if getattr(opt, "badge", None) else ""
+                if badge:
+                    left = _clip(left, max(8, inner - _visible_len(badge) - 2))
+                    line = left + " " * max(2, inner - _visible_len(left) - _visible_len(badge)) + badge
+                else:
+                    line = left
+                lines = [line]
                 if per_item == 2:
-                    out.append("   " + (_s(opt.detail, "dim") if opt.detail else ""))
+                    lines.append("  " + (_s(opt.detail, "dim") if opt.detail else ""))
+                for text in lines:
+                    body.append(_hilite(_fit(text, inner)) if current else text)
             hidden_below = len(vis) - (top[0] + rows)
             if hidden_below > 0:
-                out.append(_s(f"  {_g('down')} {hidden_below} more", "dim"))
+                body.append(_s(f"  {_g('down')} {hidden_below} more", "dim"))
         else:
-            out.append(_s("  " + empty_text, "dim"))
-        out.append("")
+            body.append(_s(empty_text, "dim"))
+        out = [_s(title, "bold")] if title else []
+        out += box(body, box_w, tone="accent")
         keys_hint = [f"{_g('up')}{_g('down')} Navigate", "Enter Select"]
         if searchable:
             keys_hint.append("Type to search")
@@ -736,6 +889,176 @@ def choose(options, *, initial=0, searchable=False, max_rows=None, footer=None,
     _erase_lines(lines_drawn[0])
     lines_drawn[0] = 0
     return result
+
+
+# --------------------------------------------------------------------------------------
+# A form: one card, several fields (sign up / log in)
+# --------------------------------------------------------------------------------------
+
+def form(title, subtitle=None, *, tabs=None, tab=0, fields, button="Continue", footer=None):
+    """Several fields on one card, with optional tabs along the top. Returns (tab, {name: text}) or
+    None when the person pressed Esc. Ctrl+C / Ctrl+D behave as at input().
+
+    `fields` is a list of field dicts, or (with `tabs`) one such list per tab. A field is
+    {"name", "label", "secret", "placeholder", "hint", "check"}: `hint(text)` is a quiet line shown
+    as you type, `check(text, values)` returns an error to show under the field (and stop the form
+    from being sent) or None. Values with the same name carry across tabs, so an email typed under
+    "Sign up" is still there under "Log in". `button` may be one label per tab.
+
+    Tab / Down / Enter go to the next field, Up to the previous (and, from the first field, to the
+    tabs), Left / Right switch tabs while they are focused."""
+    if _HOST is not None:
+        raise Unavailable("the app asks its own questions")
+    if not enabled():
+        raise Unavailable("not an interactive terminal")
+    tabs = list(tabs or [])
+    per_tab = [list(f) for f in fields] if tabs and fields and isinstance(fields[0], (list, tuple)) else None
+    flat = [] if per_tab else list(fields)
+
+    def current_fields(index):
+        return per_tab[index] if per_tab else flat
+
+    def label_for(index):
+        return button[index] if isinstance(button, (list, tuple)) else button
+
+    most = max((len(f) for f in (per_tab or [flat])), default=0)
+    if _height() < 15 + most * 5:
+        raise Unavailable("terminal too short for the form")
+
+    values, cursors, errors = {}, {}, {}
+    state = {"tab": max(0, min(tab, max(0, len(tabs) - 1))), "focus": 0}
+    drawn = [0]
+    width = _width()
+
+    def render(final=False):
+        _erase_lines(drawn[0])
+        card_w = _card_width()
+        inner = card_w - 4
+        index = state["tab"]
+        active = current_fields(index)
+        focus = state["focus"]
+        body = ["", _s(_g("logo"), "accent") + " " + _s("PULSE", "bold", "accent")
+                + (_s("   " + subtitle, "dim") if subtitle else ""), ""]
+        if tabs:
+            pills = []
+            for i, name in enumerate(tabs):
+                if i == index:
+                    pills.append(_s(f"  {name}  ", "bold", "accent"))      # the active tab: orange text, no fill
+                else:
+                    pills.append(_s(f"  {name}  ", "dim"))
+            body += ["  ".join(pills), ""]
+        for position, spec in enumerate(active):
+            name = spec["name"]
+            text = values.get(name, "")
+            shown = (_g("mask") * len(text)) if spec.get("secret") else text
+            focused = focus == position
+            field = _input_body(shown, cursors.get(name, len(text)), inner - 4, spec.get("placeholder"),
+                                final=final, focused=focused)
+            note = errors.get(name)
+            body += _field_box(field, inner, focused=focused, label=spec.get("label"), tone="red" if note else None)
+            status = ""                 # always one row, so nothing moves when a message appears
+            if note:
+                status = _s(_g("fail"), "red") + " " + _s(note, "red")
+            elif focused and spec.get("hint") and text:
+                try:
+                    hint = spec["hint"](text)
+                except Exception:
+                    hint = None
+                status = _s(hint, "dim") if hint else ""
+            body.append(status)
+        label = label_for(index)
+        pressed = focus == len(active)
+        text_label = f"{label}  {_g('arrow')}" if pressed else label
+        body += box([_s(text_label, "bold", "accent") if pressed else _s(text_label, "bold")],
+                    min(inner, len(label) + 10), tone="accent" if pressed else "dim")
+        body.append("")
+        hint = footer or (f"Tab Next    {_g('up')} Back    " + ("\u2190\u2192 Switch tab    " if tabs and _unicode() else "")
+                          + "Enter Continue    Esc Back")
+        out = box(body, card_w, tone="accent") + [_s(hint, "dim")]
+        clipped = [_clip(line, width) for line in out]
+        _write("\n".join(clipped) + "\n")
+        drawn[0] = len(clipped)
+
+    def submit():
+        index = state["tab"]
+        active = current_fields(index)
+        errors.clear()
+        for position, spec in enumerate(active):
+            text = values.get(spec["name"], "")
+            problem = None
+            if not text.strip():
+                problem = "Required"
+            elif spec.get("check"):
+                try:
+                    problem = spec["check"](text, values)
+                except Exception:
+                    problem = None
+            if problem:
+                errors[spec["name"]] = problem
+        if errors:
+            state["focus"] = next(p for p, spec in enumerate(active) if spec["name"] in errors)
+            return False
+        return True
+
+    try:
+        with _Keys() as keys:
+            _hide_cursor()
+            try:
+                render()
+                while True:
+                    key = keys.read()
+                    index = state["tab"]
+                    active = current_fields(index)
+                    focus = state["focus"]
+                    spec = active[focus] if 0 <= focus < len(active) else None
+                    if key == "esc":
+                        _erase_lines(drawn[0])
+                        drawn[0] = 0
+                        return None
+                    if key == "enter":
+                        if focus == -1 or (spec is not None and focus < len(active) - 1):
+                            state["focus"] = focus + 1
+                        elif submit():
+                            break
+                    elif key in ("tab", "down"):
+                        state["focus"] = (focus + 1) if focus < len(active) else (0 if key == "tab" else focus)
+                    elif key == "up":
+                        state["focus"] = max(-1 if tabs else 0, focus - 1)
+                    elif key in ("left", "right") and focus == -1:
+                        state["tab"] = (index + (1 if key == "right" else -1)) % len(tabs)
+                        errors.clear()
+                    elif spec is not None:
+                        name = spec["name"]
+                        text = values.get(name, "")
+                        at = cursors.get(name, len(text))
+                        errors.pop(name, None)
+                        if key == "backspace" and at > 0:
+                            text, at = text[:at - 1] + text[at:], at - 1
+                        elif key == "delete":
+                            text = text[:at] + text[at + 1:]
+                        elif key == "left":
+                            at = max(0, at - 1)
+                        elif key == "right":
+                            at = min(len(text), at + 1)
+                        elif key == "home":
+                            at = 0
+                        elif key == "end":
+                            at = len(text)
+                        elif len(key) == 1 and key >= " ":
+                            text, at = text[:at] + key + text[at:], at + 1
+                        values[name], cursors[name] = text, at
+                    render()
+            finally:
+                _show_cursor()
+    except (KeyboardInterrupt, EOFError):
+        _erase_lines(drawn[0])
+        raise
+    except Unavailable:
+        raise
+    except Exception as exc:
+        raise Unavailable(str(exc))
+    _erase_lines(drawn[0])
+    return state["tab"], {spec["name"]: values.get(spec["name"], "") for spec in current_fields(state["tab"])}
 
 
 # --------------------------------------------------------------------------------------
