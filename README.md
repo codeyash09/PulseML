@@ -55,17 +55,6 @@ To open Pulse, run:
 python -m pulse
 ```
 
-To start a training script under Pulse:
-
-```text
-python -m pulse run --stream train.py
-```
-
-Replace `train.py` with your script path and put any script arguments after it. Pulse
-launches the existing script with the active environment's Python; no source-code edits
-are needed. `--stream` lets you watch the run from another terminal. See
-[The `pulse` command](#the-pulse-command) for more run and attach options.
-
 ### AI provider configuration
 
 Pulse supports cloud and local AI providers.
@@ -74,10 +63,6 @@ Pulse supports cloud and local AI providers.
 
 OpenRouter serves every major model behind one account and has free models. Pulse can get
 a key for you:
-
-```bash
-pulse openrouter            # sign in, or create an account, in your browser
-```
 
 or just press Enter at any API key question. Pulse asks for a key in `pulse run`,
 `pulse code` and when you switch agents, and every one of those offers the
@@ -190,18 +175,6 @@ pulse_monitor.Monitor      ---stream--->  pulse_brain.Brain
 ```
 
 Start the script through Pulse; no source changes are needed:
-
-```text
-python -m pulse run --stream train.py
-```
-
-The run streams metrics to a separate brain process. To open that process explicitly:
-
-```text
-python -m pulse.brain                      # newest session
-python -m pulse.brain <session-dir> --model openrouter/deepseek/deepseek-v4.1-flash
-python -m pulse.brain <session-dir> --once # one pass over a finished run
-```
 
 ### What the training process pays
 
