@@ -24,35 +24,8 @@ dependencies separate from other projects.
 - An AI provider is optional for monitoring. Pulse's AI agent setup can sign you in with
   OpenRouter or use a provider API key.
 
-### 1. Create and activate an environment
 
-Run these commands from your project directory.
-
-**Windows — PowerShell:**
-
-```powershell
-py -3 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-If PowerShell activation is blocked by your execution policy, use Command Prompt instead:
-
-```bat
-py -3 -m venv .venv
-.venv\Scripts\activate.bat
-```
-
-Or skip activation and use `.venv\Scripts\python.exe` in place of `python` in the
-remaining commands.
-
-**macOS / Linux:**
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-### 2. Install Pulse
+### 1. Install Pulse
 
 With the environment activated:
 
@@ -65,7 +38,7 @@ Using `python -m pip` ensures Pulse is installed for the Python interpreter sele
 the active environment. If you already have a project environment, activate it and run
 the second command there instead of creating a new one.
 
-### 3. Verify and launch
+### 2. Verify and launch
 
 ```text
 python -m pulse --version
